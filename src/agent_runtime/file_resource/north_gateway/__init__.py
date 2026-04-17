@@ -1,11 +1,30 @@
-"""统一文件资源服务北向网关包。
+"""统一文件资源服务北向网关业务包。
 
-该包用于承载统一文件资源服务对外提供的服务边界定义，
-后续会在此包下定义统一文件资源服务的北向服务契约、
-对外请求模型、对外响应模型以及对外异常语义。
-
-注意：
-- 该包表达的是服务边界，而不是内部业务规则实现。
-- 北向网关只描述本服务提供什么能力，不直接承载资源存储、
-  元数据解析或对象存储协作等内部实现细节。
+该包按业务域组织统一文件资源服务对外提供的全部北向契约：
+- resource_create_contracts: 资源创建（从本地文件 / Base64 创建）
+- resource_access_contracts: 资源访问（按 ID 批量获取）
+- resource_delete_contracts: 资源删除（按 ID 批量删除）
 """
+from agent_runtime.file_resource.north_gateway.resource_access_contracts import (
+    FileResourceAccessNorthGateway,
+    FileResourceAccessResult,
+)
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import (
+    Base64CreateRequest,
+    FileResourceCreateNorthGateway,
+    FileResourceCreateResult,
+    LocalFileCreateRequest,
+)
+from agent_runtime.file_resource.north_gateway.resource_delete_contracts import (
+    FileResourceDeleteNorthGateway,
+)
+
+__all__ = [
+    "LocalFileCreateRequest",
+    "Base64CreateRequest",
+    "FileResourceCreateResult",
+    "FileResourceCreateNorthGateway",
+    "FileResourceAccessResult",
+    "FileResourceAccessNorthGateway",
+    "FileResourceDeleteNorthGateway",
+]
