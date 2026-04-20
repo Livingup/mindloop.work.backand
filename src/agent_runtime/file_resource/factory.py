@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_runtime.file_resource.config import (
-    AgentRuntimeYamlConfig,
-    AgentRuntimeYamlConfigLoader,
     FileResourceServiceConfig,
     ObjectStorageGatewayConfig,
 )
@@ -73,18 +71,21 @@ class FileResourceServiceFactory:
 
     @staticmethod
     def create_from_yaml_file(yaml_file_path: str) -> FileResourceService:
-        """从 YAML 配置文件创建统一文件资源服务实例。"""
+        """从 YAML 配置文件创建统一文件资源服务实例。
 
-        yaml_config = AgentRuntimeYamlConfigLoader().load_from_yaml_file(yaml_file_path)
-        return FileResourceServiceFactory.create_from_yaml_config(yaml_config)
+        会先加载 ConfigRegistry，再从全局单例读取配置。
+        """
+        from agent_runtime.config import ConfigRegistry
+
+        ConfigRegistry.load(yaml_file_path)
+        svc_config = ConfigRegistry.instance().file_resource_service
+        return FileResourceServiceFactory.create_from_config(svc_config)
 
     @staticmethod
-    def create_from_yaml_config(
-        yaml_config: AgentRuntimeYamlConfig,
+    def create_from_config(
+        svc_config: FileResourceServiceConfig,
     ) -> FileResourceService:
-        """从结构化 YAML 配置创建统一文件资源服务实例。"""
-
-        svc_config = yaml_config.file_resource_service
+        """从结构化配置创建统一文件资源服务实例。"""
         return FileResourceService(
             archive_repository=InMemoryFileResourceArchiveRepository(),
             local_storage=FileResourceServiceFactory._create_local_storage(svc_config),

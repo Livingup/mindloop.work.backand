@@ -64,3 +64,7 @@ file_resource_service:
 
     # 对象存储连接超时时间（秒）。
     connect_timeout_seconds: 10
+
+conversation_repository:
+  # 会话数据存储根目录（SQLite 元数据 + JSONL 消息文件）。
+  data_dir: "G:/project/AgentRuntime/runtime-data/conversations"

@@ -1,0 +1,56 @@
+"""文件资源解析南向适配器 —— 桥接统一文件资源服务。
+
+该适配器实现 ResourceResolver 接口，内部委托统一文件资源服务
+（FileResourceService）完成资源 Base64 内容读取和元数据获取。
+
+这是生产环境和开发环境通用的适配实现：
+只要注入的 FileResourceService 实例不同（真实仓储 vs 内存仓储），
+即可在不同环境下运行，无需修改本适配器代码。
+"""
+from __future__ import annotations
+
+from agent_runtime.uni_llm.south_gateway.resource_resolver.contracts import (
+    ResourceMeta,
+)
+
+
+class FileResourceResolverAdapter:
+    """基于统一文件资源服务的资源解析适配器。
+
+    该适配器将 ResourceResolver 接口的调用转发给 FileResourceService，
+    把文件资源服务的内部模型（FileResourceAccessResult）转换为
+    消息渲染所需的 ResourceMeta。
+    """
+
+    def __init__(self, file_resource_service: object) -> None:
+        # 统一文件资源服务实例。该服务提供资源的本地路径、Base64 内容、
+        # 对象存储地址和结构化元数据，是资源解析的数据源。
+        self._file_resource_service = file_resource_service
+
+    async def get_base64(self, resource_id: str) -> str:
+        """按资源标识获取 Base64 编码的资源内容。
+
+        委托 FileResourceService.get_resources 获取资源访问结果，
+        返回其中的 resource_base64_content 字段。
+        """
+        results = self._file_resource_service.get_resources([resource_id])
+        result = results[0]
+        if result is None:
+            raise ValueError(f"资源不存在: {resource_id}")
+        return result.resource_base64_content
+
+    async def get_resource_meta(self, resource_id: str) -> ResourceMeta:
+        """按资源标识获取资源元数据。
+
+        委托 FileResourceService.get_resources 获取资源访问结果，
+        将 FileResourceAccessResult 的 MIME 类型和元数据类别
+        转换为消息渲染所需的 ResourceMeta。
+        """
+        results = self._file_resource_service.get_resources([resource_id])
+        result = results[0]
+        if result is None:
+            raise ValueError(f"资源不存在: {resource_id}")
+        return ResourceMeta(
+            mime_type=result.resource_mime_type,
+            resource_category=result.resource_metadata.resource_category,
+        )
