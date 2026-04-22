@@ -40,6 +40,10 @@
 
 **工具注册机制**：各模块的 `@tool` 装饰工具函数需在 `cli.py` 中显式 import 对应模块来触发注册（不采用全量扫描，避免启动变慢）。新增工具模块时需在 `cli.py` 中添加一行 `import`。
 
+### Skill 模块（skill）
+
+Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通用公共目录，不绑定本项目），解析各子目录中 `SKILL.md` 的 YAML frontmatter，提供 Skill 列表查询和刷新能力。遵循 Agent Skills Open Standard 规范。Skill 仓库路径在 `config/agent_runtime.yaml` 的 `skill_service.skills_dir` 中配置。用户直接在仓库目录下创建/编辑/删除 Skill 子目录，无需通过 API。启动时自动扫描 + 接口触发重新扫描。只解析 frontmatter 元数据（name、description、license、compatibility、metadata、allowed-tools），不读取 Markdown 正文（Agent 拿到目录路径后自行按规范读取）。DDD 分层：领域实体 SkillDefinition（聚合根，含 name 格式校验）+ 仓储接口/文件系统实现（扫描目录 + 解析 SKILL.md）+ 领域服务 + 北向网关（SkillGateway Protocol + DTO + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai skill list`（列出所有 Skill）/ `spread-ai skill refresh`（重新扫描）。REST：`GET /api/skills` / `POST /api/skills/refresh`。
+
 ---
 
 ## 规划模块

@@ -16,6 +16,9 @@ from agent_runtime.tool.north_gateway.local_tool_cli_adapter import (
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_cli_adapter import (
     prompt_group,
 )
+from agent_runtime.skill.skill_config import SkillConfig
+from agent_runtime.skill.skill_factory import SkillFactory
+from agent_runtime.skill.north_gateway.skill_cli_adapter import create_skill_cli_group
 
 
 @click.group()
@@ -33,6 +36,10 @@ import agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools  # noqa: F401  MCP 元工
 # 注册本地工具模块的子命令组。
 _tool_gateway = LocalToolFactory.create()
 main.add_command(create_tool_cli_group(_tool_gateway), name="tool")
+
+# 注册 Skill 模块的子命令组。
+_skill_gateway = SkillFactory.create(SkillConfig(skills_dir=str(Path.home() / ".spread-ai" / "skills")))
+main.add_command(create_skill_cli_group(_skill_gateway), name="skill")
 
 # 注册 MCP 客户端模块的两个子命令组。
 from agent_runtime.mcp.mcp_client.mcp_client_factory import McpClientFactory
@@ -55,7 +62,13 @@ main.add_command(create_mcp_cli_group(_mcp_gateway), name="mcp")
     help="提示词片段存储目录路径。",
     show_default=True,
 )
-def serve(host: str, port: int, snippets_dir: str) -> None:
+@click.option(
+    "--skills-dir",
+    default=str(Path.home() / ".spread-ai" / "skills"),
+    help="Skill 仓库目录路径。",
+    show_default=True,
+)
+def serve(host: str, port: int, snippets_dir: str, skills_dir: str) -> None:
     """启动 REST API 服务器。"""
     import uvicorn
     from fastapi import FastAPI
@@ -84,6 +97,11 @@ def serve(host: str, port: int, snippets_dir: str) -> None:
 
     mcp_gateway = McpClientFactory.create()
 
+    # Skill 模块。
+    from agent_runtime.skill.north_gateway.skill_rest_adapter import create_skill_router
+
+    skill_gateway = SkillFactory.create(SkillConfig(skills_dir=skills_dir))
+
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务")
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
@@ -104,6 +122,11 @@ def serve(host: str, port: int, snippets_dir: str) -> None:
         create_mcp_router(mcp_gateway),
         prefix="/api/mcp",
         tags=["MCP 服务使用"],
+    )
+    app.include_router(
+        create_skill_router(skill_gateway),
+        prefix="/api/skills",
+        tags=["Skill"],
     )
 
     uvicorn.run(app, host=host, port=port)

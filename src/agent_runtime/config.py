@@ -35,6 +35,7 @@ from agent_runtime.file_resource.config import (
     FileResourceServiceConfig,
     ObjectStorageGatewayConfig,
 )
+from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.uni_llm.config import ConversationRepositoryConfig
 
 
@@ -80,6 +81,9 @@ class AgentRuntimeConfig:
 
     # 会话消息持久化仓库配置。
     conversation_repository: ConversationRepositoryConfig
+
+    # Skill 服务配置。
+    skill_service: SkillConfig
 
 
 # ── 配置注册中心（全局单例） ─────────────────────────────────
@@ -178,6 +182,11 @@ class ConfigRegistry:
         """实时读取会话消息持久化仓储配置（数据目录等）。"""
         return self._config.conversation_repository
 
+    @property
+    def skill_service(self) -> SkillConfig:
+        """实时读取 Skill 服务配置（仓库目录路径）。"""
+        return self._config.skill_service
+
 
 # ── 文件监听实现 ─────────────────────────────────────────────
 
@@ -262,10 +271,13 @@ def _load_yaml_config(
     resource_data = _require_section(config_data, "file_resource_service")
     conv_repo_data = _require_section(config_data, "conversation_repository")
 
+    skill_data = _require_section(config_data, "skill_service")
+
     return AgentRuntimeConfig(
         agent_runtime_service=_build_runtime_config(runtime_data),
         file_resource_service=_build_resource_config(resource_data),
         conversation_repository=_build_conv_repo_config(conv_repo_data),
+        skill_service=_build_skill_config(skill_data),
     )
 
 
@@ -308,6 +320,13 @@ def _build_oss_config(data: dict[str, Any]) -> ObjectStorageGatewayConfig:
         object_storage_access_key_id=str(data["object_storage_access_key_id"]),
         object_storage_access_key_secret=str(data["object_storage_access_key_secret"]),
         connect_timeout_seconds=int(data.get("connect_timeout_seconds", 60)),
+    )
+
+
+def _build_skill_config(data: dict[str, Any]) -> SkillConfig:
+    """从 YAML 字典构建 Skill 服务配置。"""
+    return SkillConfig(
+        skills_dir=str(data["skills_dir"]),
     )
 
 

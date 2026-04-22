@@ -118,6 +118,9 @@ file_resource_service:
 
 conversation_repository:
   data_dir: "{conversation_data_dir}"
+
+skill_service:
+  skills_dir: "{(tmp_path / 'skills').as_posix()}"
 """.strip(),
         encoding="utf-8",
     )
