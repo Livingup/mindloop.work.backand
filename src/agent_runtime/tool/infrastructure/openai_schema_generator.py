@@ -1,0 +1,47 @@
+"""OpenAI 平台工具 Schema 生成器。
+
+使用 openai SDK 的 pydantic_function_tool 从 Pydantic 模型生成
+OpenAI Function Calling 格式的工具定义。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from openai import pydantic_function_tool
+
+from agent_runtime.tool.infrastructure._pydantic_model_builder import (
+    build_pydantic_model,
+)
+from agent_runtime.tool.local_tool_definition import LocalToolDefinition
+
+
+class OpenAISchemaGenerator:
+    """OpenAI 平台工具 Schema 生成器。
+
+    实现 ToolSchemaGenerator 协议。
+    使用 openai SDK 的 pydantic_function_tool 生成 OpenAI Function Calling 格式。
+    """
+
+    @property
+    def platform(self) -> str:
+        """平台标识。"""
+        return "openai"
+
+    def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
+        """生成 OpenAI 格式的工具 Schema。
+
+        委托给 openai SDK 的 pydantic_function_tool，
+        由 SDK 负责 Pydantic 模型→JSON Schema 的转换和格式包装。
+
+        Args:
+            tool_def: 本地工具定义实体。
+
+        Returns:
+            OpenAI Function Calling 格式字典（ChatCompletionToolParam）。
+        """
+        model = build_pydantic_model(tool_def.fn)
+        return pydantic_function_tool(
+            model,
+            name=tool_def.tool_name,
+            description=tool_def.description,
+        )

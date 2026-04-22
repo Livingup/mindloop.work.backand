@@ -1,0 +1,57 @@
+"""Gemini (Google) 平台工具 Schema 生成器。
+
+使用 google-genai SDK 的 types.FunctionDeclaration 构建工具声明，
+由 SDK 处理 Schema 格式（types.Schema）。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from google.genai import types
+
+from agent_runtime.tool.infrastructure._pydantic_model_builder import (
+    build_pydantic_model,
+)
+from agent_runtime.tool.local_tool_definition import LocalToolDefinition
+
+
+class GeminiSchemaGenerator:
+    """Gemini (Google) 平台工具 Schema 生成器。
+
+    实现 ToolSchemaGenerator 协议。
+    使用 google-genai SDK 的 types.FunctionDeclaration 和 types.Schema
+    构建 Gemini 格式的工具声明。
+    """
+
+    @property
+    def platform(self) -> str:
+        """平台标识。"""
+        return "gemini"
+
+    def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
+        """生成 Gemini 格式的工具 Schema。
+
+        从函数签名提取 Pydantic 模型，使用 model_json_schema() 生成
+        标准 JSON Schema，再通过 google-genai SDK 的 types.Schema
+        转换为 Gemini 平台格式。
+
+        Args:
+            tool_def: 本地工具定义实体。
+
+        Returns:
+            Gemini FunctionDeclaration 格式字典。
+        """
+        model = build_pydantic_model(tool_def.fn)
+        json_schema = model.model_json_schema()
+
+        # 使用 google-genai SDK 的 types.Schema 将标准 JSON Schema
+        # 转换为 Gemini 平台所需格式。
+        gemini_parameters = types.Schema.model_validate(json_schema)
+
+        declaration = types.FunctionDeclaration(
+            name=tool_def.tool_name,
+            description=tool_def.description,
+            parameters=gemini_parameters,
+        )
+        # 返回可序列化的字典形式。
+        return declaration.model_dump(exclude_none=True)
