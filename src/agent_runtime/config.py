@@ -38,7 +38,7 @@ from agent_runtime.file_resource.config import (
 from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
 from agent_runtime.prompt_template.prompt_template_config import PromptTemplateConfig
 from agent_runtime.skill.skill_config import SkillConfig
-from agent_runtime.uni_llm.config import ConversationRepositoryConfig
+from agent_runtime.conversation_message.config import ConversationRepositoryConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────

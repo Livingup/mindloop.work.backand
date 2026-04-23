@@ -1,23 +1,25 @@
-"""会话持久化：仓储接口与实现。
+"""会话仓储混合持久化实现：SQLite 元数据 + JSONL 消息文件。
 
-位于 uni_llm 应用服务层（非 message 领域层）。
-message 领域层只提供模型和领域服务，持久化由本模块负责。
+存储布局：
+    {data_dir}/
+    ├── conversations.db                  ← SQLite（会话元数据 + 派生状态）
+    └── messages/
+        └── {task_id}/
+            └── {conversation_id}.jsonl   ← 每行一条消息
 
-会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id
-
-本模块提供：
-- ConversationRepository: 会话仓储协议接口
-- InMemoryConversationRepository: 内存实现（开发和测试用）
-- SqliteConversationRepository: 混合持久化实现（SQLite 元数据 + JSONL 消息文件）
+消息采用 JSONL 格式以获得最佳读写效率：
+- append_message: 追加一行（O(1)）
+- get（加载完整历史）: 顺序读取文件
+- save（全量覆写）: 重写整个文件
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-from agent_runtime.uni_llm.message.models import (
+from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
     ImagePart,
@@ -69,145 +71,34 @@ def _dict_to_part(d: dict[str, Any]) -> UniPart:
     raise ValueError(f"Unknown part kind: {kind}")
 
 
-# ── 会话仓储协议接口 ────────────────────────────────────────────
+def _message_to_json_line(msg: UniMessage) -> str:
+    """将统一消息序列化为单行 JSON 字符串，用于 JSONL 文件追加写入。"""
+    d = {
+        "role": msg.role,
+        "content": [_part_to_dict(p) for p in msg.content],
+    }
+    if msg.source_provider is not None:
+        d["source_provider"] = msg.source_provider
+    if msg.source_vendor is not None:
+        d["source_vendor"] = msg.source_vendor
+    if msg.provider_extras is not None:
+        d["provider_extras"] = msg.provider_extras
+    return json.dumps(d, ensure_ascii=False)
 
 
-class ConversationRepository(Protocol):
-    """会话聚合根持久化仓储协议接口。
-
-    会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id
-    - agent_id: Agent 定义标识（模板/类型）
-    - agent_instance_id: Agent 运行时实例标识（每次运行唯一）
-
-    支持两种写入模式：
-    - 全量覆写：save() 替换全部消息、状态和供应商状态
-    - 增量操作：append_message()、save_state()、save_provider_state()
-    """
-
-    async def create(
-        self,
-        conv: Conversation,
-        *,
-        task_id: str,
-        thread_id: str,
-        agent_id: str,
-        agent_instance_id: str,
-    ) -> None:
-        """持久化一个新创建的会话，同时记录其所属层级关系。"""
-        ...
-
-    async def get(self, conversation_id: str) -> Conversation:
-        """根据会话 ID 加载完整会话。未找到时抛出 KeyError。"""
-        ...
-
-    async def save(self, conv: Conversation) -> None:
-        """全量覆写：替换会话的全部消息、派生状态和供应商状态。"""
-        ...
-
-    async def delete(self, conversation_id: str) -> None:
-        """删除会话及其所有数据。会话不存在时静默跳过。"""
-        ...
-
-    # ── 增量操作 ─────────────────────────────────────────────────
-
-    async def append_message(self, conversation_id: str, msg: UniMessage) -> None:
-        """追加一条消息（增量写入，不重写整个文件）。"""
-        ...
-
-    async def save_state(self, conversation_id: str, state: ConversationState) -> None:
-        """覆写会话的派生统计状态（模态、图片数、PDF 页数等）。"""
-        ...
-
-    async def save_provider_state(
-        self, conversation_id: str, provider: str, state: Any,
-    ) -> None:
-        """新增或更新单个 LLM 供应商的会话状态（如 OpenAI checkpoint）。"""
-        ...
-
-    # ── 层级查询 ─────────────────────────────────────────────────
-
-    async def list_by_task(self, task_id: str) -> list[str]:
-        """查询指定任务下的所有会话 ID 列表。"""
-        ...
-
-    async def list_by_thread(self, thread_id: str) -> list[str]:
-        """查询指定线程下的所有会话 ID 列表。"""
-        ...
-
-    async def list_by_agent(self, agent_id: str) -> list[str]:
-        """查询指定 Agent 定义下的所有会话 ID 列表。"""
-        ...
-
-    async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
-        """查询指定 Agent 运行时实例下的所有会话 ID 列表。"""
-        ...
+def _json_line_to_message(line: str) -> UniMessage:
+    """将单行 JSON 字符串反序列化为统一消息对象，用于从 JSONL 文件还原消息。"""
+    d = json.loads(line)
+    return UniMessage(
+        role=d["role"],
+        content=[_dict_to_part(p) for p in d["content"]],
+        source_provider=d.get("source_provider"),
+        source_vendor=d.get("source_vendor"),
+        provider_extras=d.get("provider_extras"),
+    )
 
 
-# ── 内存实现（开发和测试用） ────────────────────────────────────
-
-
-class InMemoryConversationRepository:
-    """会话仓储内存实现。
-
-    所有数据存储在 Python 字典中，进程结束即丢失。
-    仅用于开发调试和单元测试场景。
-    """
-
-    def __init__(self) -> None:
-        self._store: dict[str, Conversation] = {}
-        self._hierarchy: dict[str, dict[str, str]] = {}
-
-    async def create(
-        self, conv: Conversation, *, task_id: str, thread_id: str,
-        agent_id: str, agent_instance_id: str,
-    ) -> None:
-        self._store[conv.id] = conv
-        self._hierarchy[conv.id] = {
-            "task_id": task_id, "thread_id": thread_id,
-            "agent_id": agent_id, "agent_instance_id": agent_instance_id,
-        }
-
-    async def get(self, conversation_id: str) -> Conversation:
-        conv = self._store.get(conversation_id)
-        if conv is None:
-            raise KeyError(f"Conversation not found: {conversation_id}")
-        return conv
-
-    async def save(self, conv: Conversation) -> None:
-        self._store[conv.id] = conv
-
-    async def delete(self, conversation_id: str) -> None:
-        self._store.pop(conversation_id, None)
-        self._hierarchy.pop(conversation_id, None)
-
-    async def append_message(self, conversation_id: str, msg: UniMessage) -> None:
-        conv = await self.get(conversation_id)
-        conv.messages.append(msg)
-
-    async def save_state(self, conversation_id: str, state: ConversationState) -> None:
-        conv = await self.get(conversation_id)
-        conv.state = state
-
-    async def save_provider_state(
-        self, conversation_id: str, provider: str, state: Any,
-    ) -> None:
-        conv = await self.get(conversation_id)
-        conv.provider_state[provider] = state
-
-    async def list_by_task(self, task_id: str) -> list[str]:
-        return [cid for cid, h in self._hierarchy.items() if h["task_id"] == task_id]
-
-    async def list_by_thread(self, thread_id: str) -> list[str]:
-        return [cid for cid, h in self._hierarchy.items() if h["thread_id"] == thread_id]
-
-    async def list_by_agent(self, agent_id: str) -> list[str]:
-        return [cid for cid, h in self._hierarchy.items() if h["agent_id"] == agent_id]
-
-    async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
-        return [cid for cid, h in self._hierarchy.items() if h["agent_instance_id"] == agent_instance_id]
-
-
-# ── SQLite 混合持久化实现 ───────────────────────────────────────
+# ── SQLite Schema ────────────────────────────────────────────────
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS conversations (
@@ -238,33 +129,6 @@ CREATE TABLE IF NOT EXISTS provider_state (
     PRIMARY KEY (conversation_id, provider)
 );
 """
-
-
-def _message_to_json_line(msg: UniMessage) -> str:
-    """将统一消息序列化为单行 JSON 字符串，用于 JSONL 文件追加写入。"""
-    d = {
-        "role": msg.role,
-        "content": [_part_to_dict(p) for p in msg.content],
-    }
-    if msg.source_provider is not None:
-        d["source_provider"] = msg.source_provider
-    if msg.source_vendor is not None:
-        d["source_vendor"] = msg.source_vendor
-    if msg.provider_extras is not None:
-        d["provider_extras"] = msg.provider_extras
-    return json.dumps(d, ensure_ascii=False)
-
-
-def _json_line_to_message(line: str) -> UniMessage:
-    """将单行 JSON 字符串反序列化为统一消息对象，用于从 JSONL 文件还原消息。"""
-    d = json.loads(line)
-    return UniMessage(
-        role=d["role"],
-        content=[_dict_to_part(p) for p in d["content"]],
-        source_provider=d.get("source_provider"),
-        source_vendor=d.get("source_vendor"),
-        provider_extras=d.get("provider_extras"),
-    )
 
 
 class SqliteConversationRepository:

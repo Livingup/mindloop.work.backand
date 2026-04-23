@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from agent_runtime.uni_llm.south_gateway.resource_resolver.contracts import (
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceMeta,
 )
 

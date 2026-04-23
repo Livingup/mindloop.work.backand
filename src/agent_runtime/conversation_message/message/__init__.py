@@ -10,14 +10,14 @@
 不关心：系统提示词、模型参数、执行策略、非标服务商 HTTP 层差异翻译。
 这些由上层统一 LLM 调用服务编排。
 """
-from agent_runtime.uni_llm.message.operations import (
+from agent_runtime.conversation_message.message.operations import (
     add_user_message,
     create_conversation,
     get_supported_providers,
     ingest_response,
     render_messages,
 )
-from agent_runtime.uni_llm.message.models import (
+from agent_runtime.conversation_message.message.models import (
     MODALITY_IMAGE,
     MODALITY_PDF,
     MODALITY_TEXT,

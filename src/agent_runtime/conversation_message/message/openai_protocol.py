@@ -22,7 +22,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent_runtime.uni_llm.message.models import (
+from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI,
     ROLE_ASSISTANT,
     Conversation,
@@ -32,7 +32,7 @@ from agent_runtime.uni_llm.message.models import (
     UniMessage,
     UniPart,
 )
-from agent_runtime.uni_llm.south_gateway.resource_resolver.contracts import (
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
 )
 

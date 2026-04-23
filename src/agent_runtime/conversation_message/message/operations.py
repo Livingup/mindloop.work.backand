@@ -22,10 +22,10 @@ import logging
 import uuid
 from typing import Any
 
-from agent_runtime.uni_llm.message.claude_protocol import ClaudeAdapter
-from agent_runtime.uni_llm.message.gemini_protocol import GeminiAdapter
-from agent_runtime.uni_llm.message.openai_protocol import OpenAIAdapter
-from agent_runtime.uni_llm.message.models import (
+from agent_runtime.conversation_message.message.claude_protocol import ClaudeAdapter
+from agent_runtime.conversation_message.message.gemini_protocol import GeminiAdapter
+from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
+from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
     PartMeta,
@@ -34,7 +34,7 @@ from agent_runtime.uni_llm.message.models import (
     UniMessage,
     UniPart,
 )
-from agent_runtime.uni_llm.south_gateway.resource_resolver.contracts import (
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
 )
 

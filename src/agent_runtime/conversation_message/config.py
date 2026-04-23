@@ -1,4 +1,4 @@
-"""统一 LLM 域配置模型。
+"""会话消息域配置模型。
 
 各域配置 dataclass 归各域所有，顶层 ConfigRegistry 聚合引用。
 """

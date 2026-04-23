@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_runtime.uni_llm.message.models import (
+from agent_runtime.conversation_message.message.models import (
     MODALITY_IMAGE,
     MODALITY_PDF,
     MODALITY_TEXT,
