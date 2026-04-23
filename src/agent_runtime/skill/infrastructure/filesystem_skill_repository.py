@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -26,10 +27,15 @@ class FilesystemSkillRepository:
     扫描结果缓存在内存中，调用 scan() 可刷新。
     """
 
-    def __init__(self, skills_dir: str) -> None:
-        self._skills_dir = Path(skills_dir)
+    def __init__(self, skills_dir_accessor: Callable[[], str]) -> None:
+        self._skills_dir_accessor = skills_dir_accessor
         self._skills: list[SkillDefinition] = []
         self.scan()
+
+    @property
+    def _skills_dir(self) -> Path:
+        """实时从配置中心读取 Skill 仓库根目录路径（避免配置数据冗余）。"""
+        return Path(self._skills_dir_accessor())
 
     def list_all(self) -> list[SkillDefinition]:
         """列出所有已发现的 Skill。"""

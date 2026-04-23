@@ -6,9 +6,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
 from agent_runtime.mcp.mcp_client.mcp_client_service import McpClientService
 from agent_runtime.mcp.mcp_client.infrastructure.mcp_session_manager import (
     McpSessionManager,
@@ -28,17 +25,19 @@ class McpClientFactory:
     """
 
     @staticmethod
-    def create(config: McpClientConfig) -> McpClientGatewayImpl:
-        """根据配置创建 MCP 客户端北向网关实例。
+    def create() -> McpClientGatewayImpl:
+        """创建 MCP 客户端北向网关实例。
 
-        Args:
-            config: MCP 客户端服务配置。
+        配置通过访问器从 ConfigRegistry 实时读取，不存储配置副本。
 
         Returns:
             McpClientGatewayImpl 北向网关实例（满足 McpClientGateway 契约）。
         """
-        config_dir = Path(config.config_dir)
-        repository = YamlMcpServiceRepository(config_dir)
+        from agent_runtime.config import ConfigRegistry
+
+        repository = YamlMcpServiceRepository(
+            config_dir_accessor=lambda: ConfigRegistry.instance().mcp_client.config_dir,
+        )
         session_manager = McpSessionManager()
         service = McpClientService(repository, session_manager)
         gateway = McpClientGatewayImpl(service, session_manager)

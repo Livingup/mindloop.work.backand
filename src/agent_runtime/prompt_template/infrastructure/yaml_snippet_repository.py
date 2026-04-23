@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -21,12 +21,17 @@ logger = logging.getLogger(__name__)
 class YamlFileSnippetRepository:
     """基于 YAML 文件的提示词片段仓储实现。"""
 
-    def __init__(self, snippets_dir: str | Path) -> None:
-        self._snippets_dir = Path(snippets_dir)
+    def __init__(self, snippets_dir_accessor: Callable[[], str]) -> None:
+        self._snippets_dir_accessor = snippets_dir_accessor
         # name → YAML 文件绝对路径的内存索引。
         self._index: dict[str, Path] = {}
         self._snippets_dir.mkdir(parents=True, exist_ok=True)
         self._scan()
+
+    @property
+    def _snippets_dir(self) -> Path:
+        """实时从配置中心读取提示词片段存储根目录路径（避免配置数据冗余）。"""
+        return Path(self._snippets_dir_accessor())
 
     def find_by_name(self, name: str) -> PromptSnippet | None:
         """根据唯一描述名查找片段。未找到时返回 None。"""

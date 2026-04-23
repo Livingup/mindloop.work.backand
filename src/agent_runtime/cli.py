@@ -40,7 +40,7 @@ import agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools  # noqa: F401  MCP 元工
 def _prompt_gateway_factory() -> object:
     """创建提示词模板北向网关实例。"""
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory
-    return PromptTemplateFactory.create(ConfigRegistry.instance().prompt_template)
+    return PromptTemplateFactory.create()
 
 
 def _tool_gateway_factory() -> object:
@@ -52,13 +52,13 @@ def _tool_gateway_factory() -> object:
 def _skill_gateway_factory() -> object:
     """创建 Skill 北向网关实例。"""
     from agent_runtime.skill.skill_factory import SkillFactory
-    return SkillFactory.create(ConfigRegistry.instance().skill_service)
+    return SkillFactory.create()
 
 
 def _mcp_gateway_factory() -> object:
     """创建 MCP 客户端北向网关实例。"""
     from agent_runtime.mcp.mcp_client.mcp_client_factory import McpClientFactory
-    return McpClientFactory.create(ConfigRegistry.instance().mcp_client)
+    return McpClientFactory.create()
 
 
 # ── 注册 CLI 子命令组 ──────────────────────────────────────────
@@ -93,9 +93,7 @@ def serve(host: str | None, port: int | None) -> None:
     import uvicorn
     from fastapi import FastAPI
 
-    cfg = ConfigRegistry.instance()
-
-    # 各模块网关统一从 ConfigRegistry 获取配置创建。
+    # 各模块网关通过无参工厂创建，配置由工厂内部从 ConfigRegistry 实时读取。
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory
     from agent_runtime.prompt_template.north_gateway.prompt_snippet_rest_adapter import (
         create_prompt_snippet_router,
@@ -112,10 +110,10 @@ def serve(host: str | None, port: int | None) -> None:
         create_mcp_router,
     )
 
-    prompt_gateway = PromptTemplateFactory.create(cfg.prompt_template)
+    prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
-    skill_gateway = SkillFactory.create(cfg.skill_service)
-    mcp_gateway = McpClientFactory.create(cfg.mcp_client)
+    skill_gateway = SkillFactory.create()
+    mcp_gateway = McpClientFactory.create()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务")
     app.include_router(
@@ -145,7 +143,7 @@ def serve(host: str | None, port: int | None) -> None:
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。
-    runtime_cfg = cfg.agent_runtime_service
+    runtime_cfg = ConfigRegistry.instance().agent_runtime_service
     uvicorn.run(
         app,
         host=host or runtime_cfg.service_host,

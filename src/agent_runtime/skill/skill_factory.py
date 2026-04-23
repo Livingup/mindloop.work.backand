@@ -6,7 +6,6 @@ from agent_runtime.skill.infrastructure.filesystem_skill_repository import (
     FilesystemSkillRepository,
 )
 from agent_runtime.skill.north_gateway.skill_gateway_impl import SkillGatewayImpl
-from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.skill.skill_service import SkillService
 
 
@@ -14,11 +13,16 @@ class SkillFactory:
     """Skill 模块工厂。"""
 
     @staticmethod
-    def create(config: SkillConfig) -> SkillGatewayImpl:
-        """根据配置创建 Skill 北向网关实例。
+    def create() -> SkillGatewayImpl:
+        """创建 Skill 北向网关实例。
 
+        配置通过访问器从 ConfigRegistry 实时读取，不存储配置副本。
         装配链路：文件系统仓储 → 领域服务 → 北向网关。
         """
-        repo = FilesystemSkillRepository(config.skills_dir)
+        from agent_runtime.config import ConfigRegistry
+
+        repo = FilesystemSkillRepository(
+            skills_dir_accessor=lambda: ConfigRegistry.instance().skill_service.skills_dir,
+        )
         service = SkillService(repo)
         return SkillGatewayImpl(service)

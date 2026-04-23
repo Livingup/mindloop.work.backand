@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
@@ -20,15 +21,19 @@ class YamlMcpServiceRepository:
     每个服务配置对应一个 YAML 文件，文件名（不含后缀）即 service_id。
     """
 
-    def __init__(self, config_dir: Path) -> None:
+    def __init__(self, config_dir_accessor: Callable[[], str]) -> None:
         """初始化仓储。
 
         Args:
-            config_dir: YAML 配置文件存放目录。
-                        默认为 ~/.spread-ai/mcp-servers/
+            config_dir_accessor: 配置目录路径访问器，每次调用时实时从配置中心读取。
         """
-        self._config_dir = config_dir
+        self._config_dir_accessor = config_dir_accessor
         self._config_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _config_dir(self) -> Path:
+        """实时从配置中心读取 MCP 服务配置目录路径（避免配置数据冗余）。"""
+        return Path(self._config_dir_accessor())
 
     def find_all(self) -> list[McpServiceDefinition]:
         """列出所有服务配置。
