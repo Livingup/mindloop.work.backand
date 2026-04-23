@@ -168,5 +168,5 @@ local_tool/
 │   ├── local_tool_contracts.py        # 对外数据模型（DTO）
 │   ├── local_tool_cli_adapter.py      # CLI 接入
 │   └── local_tool_rest_adapter.py     # REST 接入
-└── README.md
+└── AGENTS.md
 ```
