@@ -407,11 +407,12 @@ def _load_dot_env(yaml_config_path: Path, env_file_path: str | None) -> None:
 
 
 def _resolve_env_vars(value: Any) -> Any:
-    """递归解析配置值中的 ${ENV_VAR} 占位符。
+    """递归解析配置值中的 ${ENV_VAR} 占位符，并展开 ~ 为用户主目录。
 
     支持格式：
     - ${ENV_VAR}          — 必须存在，不存在则报错
     - ${ENV_VAR:-default}  — 不存在时使用缺省值
+    - ~/path              — 展开为用户主目录（跨平台）
     """
     if isinstance(value, str):
         def _replace(match: re.Match) -> str:
@@ -426,7 +427,9 @@ def _resolve_env_vars(value: Any) -> Any:
                 f"环境变量 {env_key} 未设置，且未指定缺省值。"
                 f"请在 .env 文件或系统环境变量中配置。"
             )
-        return _ENV_VAR_PATTERN.sub(_replace, value)
+        resolved = _ENV_VAR_PATTERN.sub(_replace, value)
+        # 展开 ~ 为用户主目录（跨平台：Windows → %USERPROFILE%，Unix → $HOME）。
+        return os.path.expanduser(resolved)
     if isinstance(value, dict):
         return {k: _resolve_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):
