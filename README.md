@@ -12,7 +12,7 @@
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载 YAML 配置文件并分发给各业务域。支持环境变量占位符解析、.env 文件加载、watchdog 文件监听热更新。
+全局单例 ConfigRegistry，统一加载 `config/agent_runtime.yaml` 配置文件并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端）均纳入此 YAML 统一管理，各模块只认 ConfigRegistry 内存数据，不关心配置文件的加载与维护。CLI 入口（`cli.py`）作为组合根，启动时加载 ConfigRegistry，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
 
 ### 统一历史对话消息领域（uni_llm/message）
 

@@ -69,6 +69,14 @@ conversation_repository:
   # 会话数据存储根目录（SQLite 元数据 + JSONL 消息文件）。
   data_dir: "G:/project/AgentRuntime/runtime-data/conversations"
 
+prompt_template:
+  # 提示词片段 YAML 文件存储根目录。
+  snippets_dir: "G:/project/AgentRuntime/runtime-data/prompt-snippets"
+
 skill_service:
   # Skill 仓库根目录（包含各 skill 子目录，遵循 Agent Skills Open Standard 规范）。
   skills_dir: "G:/skills"
+
+mcp_client:
+  # MCP 服务定义 YAML 文件存放目录（每个服务一个 YAML 文件）。
+  config_dir: "G:/project/AgentRuntime/runtime-data/mcp-servers"

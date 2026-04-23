@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import click
 
@@ -55,20 +55,22 @@ def _serialize_detail(item: Any) -> dict[str, Any]:
 
 
 
-def create_tool_cli_group(gateway: LocalToolGateway) -> click.Group:
+def create_tool_cli_group(gateway_factory: Callable[[], LocalToolGateway]) -> click.Group:
     """创建本地工具 CLI 命令组。
 
     Args:
-        gateway: 本地工具北向网关实例。
+        gateway_factory: 网关工厂函数，在命令执行时延迟创建网关实例。
 
     Returns:
         click.Group 命令组，挂在 spread-ai tool 下。
     """
 
     @click.group("tool")
-    def tool_group() -> None:
+    @click.pass_context
+    def tool_group(ctx: click.Context) -> None:
         """本地工具管理：查询、列出、执行系统工具。"""
-        pass
+        ctx.ensure_object(dict)
+        ctx.obj["gateway"] = gateway_factory()
 
     @tool_group.command("list")
     @click.option(
@@ -82,8 +84,10 @@ def create_tool_cli_group(gateway: LocalToolGateway) -> click.Group:
         default=False,
         help="按 group 分组返回结果。",
     )
-    def list_tools(filter_group: str | None, group_by: bool) -> None:
+    @click.pass_context
+    def list_tools(ctx: click.Context, filter_group: str | None, group_by: bool) -> None:
         """列出所有公开工具。"""
+        gateway = ctx.obj["gateway"]
         result = gateway.list_tools(public_only=True, group_by=group_by)
 
         if group_by:
@@ -104,8 +108,10 @@ def create_tool_cli_group(gateway: LocalToolGateway) -> click.Group:
 
     @tool_group.command("get")
     @click.argument("names")
-    def get_tool(names: str) -> None:
+    @click.pass_context
+    def get_tool(ctx: click.Context, names: str) -> None:
         """查询指定工具详情。NAMES 为逗号分隔的工具名列表（如 add,greet）。"""
+        gateway = ctx.obj["gateway"]
         name_list = [n.strip() for n in names.split(",") if n.strip()]
         if not name_list:
             _error_json("请提供至少一个工具名称。")
@@ -124,8 +130,10 @@ def create_tool_cli_group(gateway: LocalToolGateway) -> click.Group:
             click.echo(json.dumps(results, ensure_ascii=False, indent=2))
 
     @tool_group.command("groups")
-    def list_groups() -> None:
+    @click.pass_context
+    def list_groups(ctx: click.Context) -> None:
         """列出所有工具分组名称。"""
+        gateway = ctx.obj["gateway"]
         grouped = gateway.list_tools(public_only=True, group_by=True)
         click.echo(json.dumps(sorted(grouped.keys()), ensure_ascii=False, indent=2))
 

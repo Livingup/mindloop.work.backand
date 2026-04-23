@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import click
 
@@ -60,23 +60,27 @@ def _run_async(coro: Any, gateway: Any = None) -> Any:
 # ══════════════════════════════════════════════════════════════════
 
 
-def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
+def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway]) -> click.Group:
     """创建 MCP 服务配置管理 CLI 命令组。
 
     Args:
-        gateway: MCP 客户端北向网关实例。
+        gateway_factory: 网关工厂函数，在命令执行时延迟创建网关实例。
 
     Returns:
         click.Group 命令组，挂载到 spread-ai mcp-config 下。
     """
 
     @click.group("mcp-config", help="MCP 服务配置管理（本地 CRUD）")
-    def mcp_config_group() -> None:
-        pass
+    @click.pass_context
+    def mcp_config_group(ctx: click.Context) -> None:
+        ctx.ensure_object(dict)
+        ctx.obj["gateway"] = gateway_factory()
 
     @mcp_config_group.command("list", help="列出所有已配置的 MCP 服务")
-    def list_services() -> None:
+    @click.pass_context
+    def list_services(ctx: click.Context) -> None:
         """列出所有 MCP 服务配置。"""
+        gateway = ctx.obj["gateway"]
         try:
             services = gateway.list_services()
             items = [
@@ -95,8 +99,10 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_config_group.command("get", help="获取指定 MCP 服务的定义配置")
     @click.argument("service_id")
-    def get_service(service_id: str) -> None:
+    @click.pass_context
+    def get_service(ctx: click.Context, service_id: str) -> None:
         """查看指定 MCP 服务的配置详情。"""
+        gateway = ctx.obj["gateway"]
         try:
             info = gateway.get_service(service_id)
             data: dict[str, Any] = {
@@ -115,7 +121,8 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
     @mcp_config_group.command("add", help="从 YAML 文件添加 MCP 服务配置")
     @click.option("--file", "yaml_file", required=True, help="YAML 配置文件路径")
     @click.option("--id", "service_id", required=True, help="服务 ID")
-    def add_service(yaml_file: str, service_id: str) -> None:
+    @click.pass_context
+    def add_service(ctx: click.Context, yaml_file: str, service_id: str) -> None:
         """从 YAML 文件添加 MCP 服务配置。"""
         import yaml
         from pathlib import Path
@@ -131,6 +138,7 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
             if not isinstance(data, dict):
                 _error_json("YAML 文件内容必须是字典格式")
 
+            gateway = ctx.obj["gateway"]
             config = McpServiceAddRequest(
                 service_id=service_id,
                 name=data.get("name", ""),
@@ -148,8 +156,10 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_config_group.command("remove", help="删除 MCP 服务配置")
     @click.argument("service_id")
-    def remove_service(service_id: str) -> None:
+    @click.pass_context
+    def remove_service(ctx: click.Context, service_id: str) -> None:
         """删除指定 MCP 服务的配置并断开连接。"""
+        gateway = ctx.obj["gateway"]
         try:
             _run_async(gateway.remove_service(service_id), gateway)
             _output_json({"status": "success", "message": f"已删除 MCP 服务: {service_id}"})
@@ -159,7 +169,8 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
     @mcp_config_group.command("update", help="从 YAML 文件更新 MCP 服务配置")
     @click.argument("service_id")
     @click.option("--file", "yaml_file", required=True, help="YAML 配置文件路径")
-    def update_service(service_id: str, yaml_file: str) -> None:
+    @click.pass_context
+    def update_service(ctx: click.Context, service_id: str, yaml_file: str) -> None:
         """从 YAML 文件更新指定 MCP 服务的配置（部分更新）。"""
         import yaml
         from pathlib import Path
@@ -175,6 +186,7 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
             if not isinstance(data, dict):
                 _error_json("YAML 文件内容必须是字典格式")
 
+            gateway = ctx.obj["gateway"]
             update = McpServiceUpdateRequest(
                 name=data.get("name"),
                 description=data.get("description"),
@@ -190,8 +202,10 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_config_group.command("enable", help="启用 MCP 服务")
     @click.argument("service_id")
-    def enable_service(service_id: str) -> None:
+    @click.pass_context
+    def enable_service(ctx: click.Context, service_id: str) -> None:
         """启用指定 MCP 服务。"""
+        gateway = ctx.obj["gateway"]
         try:
             gateway.enable_service(service_id)
             _output_json({"status": "success", "message": f"已启用 MCP 服务: {service_id}"})
@@ -200,8 +214,10 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_config_group.command("disable", help="禁用 MCP 服务")
     @click.argument("service_id")
-    def disable_service(service_id: str) -> None:
+    @click.pass_context
+    def disable_service(ctx: click.Context, service_id: str) -> None:
         """禁用指定 MCP 服务。"""
+        gateway = ctx.obj["gateway"]
         try:
             gateway.disable_service(service_id)
             _output_json({"status": "success", "message": f"已禁用 MCP 服务: {service_id}"})
@@ -217,24 +233,28 @@ def create_mcp_config_cli_group(gateway: McpClientGateway) -> click.Group:
 # ══════════════════════════════════════════════════════════════════
 
 
-def create_mcp_cli_group(gateway: McpClientGateway) -> click.Group:
+def create_mcp_cli_group(gateway_factory: Callable[[], McpClientGateway]) -> click.Group:
     """创建 MCP 服务使用 CLI 命令组。
 
     Args:
-        gateway: MCP 客户端北向网关实例。
+        gateway_factory: 网关工厂函数，在命令执行时延迟创建网关实例。
 
     Returns:
         click.Group 命令组，挂载到 spread-ai mcp 下。
     """
 
     @click.group("mcp", help="MCP 服务使用（需连接远程服务）")
-    def mcp_group() -> None:
-        pass
+    @click.pass_context
+    def mcp_group(ctx: click.Context) -> None:
+        ctx.ensure_object(dict)
+        ctx.obj["gateway"] = gateway_factory()
 
     @mcp_group.command("inspect", help="查看 MCP 服务的能力和使用指南")
     @click.argument("service_id")
-    def inspect_service(service_id: str) -> None:
+    @click.pass_context
+    def inspect_service(ctx: click.Context, service_id: str) -> None:
         """连接远程服务，获取 capabilities + instructions。"""
+        gateway = ctx.obj["gateway"]
         try:
             detail = _run_async(gateway.get_service_detail(service_id), gateway)
             _output_json({
@@ -249,8 +269,10 @@ def create_mcp_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_group.command("tools", help="列出 MCP 服务的工具")
     @click.argument("service_id")
-    def list_tools(service_id: str) -> None:
+    @click.pass_context
+    def list_tools(ctx: click.Context, service_id: str) -> None:
         """列出指定 MCP 服务的所有工具。"""
+        gateway = ctx.obj["gateway"]
         try:
             tools = _run_async(gateway.list_tools(service_id), gateway)
             items = [
@@ -263,8 +285,10 @@ def create_mcp_cli_group(gateway: McpClientGateway) -> click.Group:
     @mcp_group.command("tool-detail", help="查看工具参数定义")
     @click.argument("service_id")
     @click.argument("tool_names", nargs=-1, required=True)
-    def tool_detail(service_id: str, tool_names: tuple[str, ...]) -> None:
+    @click.pass_context
+    def tool_detail(ctx: click.Context, service_id: str, tool_names: tuple[str, ...]) -> None:
         """查看指定工具的 inputSchema。"""
+        gateway = ctx.obj["gateway"]
         try:
             tools = _run_async(
                 gateway.get_tool_detail(service_id, list(tool_names)), gateway
@@ -283,8 +307,10 @@ def create_mcp_cli_group(gateway: McpClientGateway) -> click.Group:
 
     @mcp_group.command("resources", help="列出 MCP 服务的资源")
     @click.argument("service_id")
-    def list_resources(service_id: str) -> None:
+    @click.pass_context
+    def list_resources(ctx: click.Context, service_id: str) -> None:
         """列出指定 MCP 服务的所有资源。"""
+        gateway = ctx.obj["gateway"]
         try:
             resources = _run_async(gateway.list_resources(service_id), gateway)
             items = [
@@ -303,8 +329,10 @@ def create_mcp_cli_group(gateway: McpClientGateway) -> click.Group:
     @mcp_group.command("read-resource", help="读取 MCP 服务的资源内容")
     @click.argument("service_id")
     @click.argument("uri")
-    def read_resource(service_id: str, uri: str) -> None:
+    @click.pass_context
+    def read_resource(ctx: click.Context, service_id: str, uri: str) -> None:
         """读取指定 MCP 服务的资源内容。"""
+        gateway = ctx.obj["gateway"]
         try:
             content = _run_async(gateway.read_resource(service_id, uri), gateway)
             data: dict[str, Any] = {

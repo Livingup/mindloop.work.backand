@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 import click
 
@@ -33,30 +33,36 @@ def _serialize_skill(item: Any) -> dict[str, Any]:
     return result
 
 
-def create_skill_cli_group(gateway: SkillGateway) -> click.Group:
+def create_skill_cli_group(gateway_factory: Callable[[], SkillGateway]) -> click.Group:
     """创建 Skill CLI 命令组。
 
     Args:
-        gateway: Skill 北向网关实例。
+        gateway_factory: 网关工厂函数，在命令执行时延迟创建网关实例。
 
     Returns:
         click.Group 命令组，挂载到 spread-ai skill 下。
     """
 
     @click.group("skill", help="Skill 发现与管理")
-    def skill_group() -> None:
-        pass
+    @click.pass_context
+    def skill_group(ctx: click.Context) -> None:
+        ctx.ensure_object(dict)
+        ctx.obj["gateway"] = gateway_factory()
 
     @skill_group.command("list", help="列出所有已发现的 Skill")
-    def list_skills() -> None:
+    @click.pass_context
+    def list_skills(ctx: click.Context) -> None:
         """列出所有 Skill（完整元数据 + 目录路径）。"""
+        gateway = ctx.obj["gateway"]
         skills = gateway.list_skills()
         items = [_serialize_skill(s) for s in skills]
         click.echo(json.dumps(items, ensure_ascii=False, indent=2))
 
     @skill_group.command("refresh", help="重新扫描 Skill 仓库目录")
-    def refresh_skills() -> None:
+    @click.pass_context
+    def refresh_skills(ctx: click.Context) -> None:
         """触发重新扫描 Skill 仓库目录。"""
+        gateway = ctx.obj["gateway"]
         gateway.refresh()
         skills = gateway.list_skills()
         click.echo(

@@ -35,6 +35,8 @@ from agent_runtime.file_resource.config import (
     FileResourceServiceConfig,
     ObjectStorageGatewayConfig,
 )
+from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
+from agent_runtime.prompt_template.prompt_template_config import PromptTemplateConfig
 from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.uni_llm.config import ConversationRepositoryConfig
 
@@ -82,8 +84,14 @@ class AgentRuntimeConfig:
     # 会话消息持久化仓库配置。
     conversation_repository: ConversationRepositoryConfig
 
+    # 提示词模板服务配置。
+    prompt_template: PromptTemplateConfig
+
     # Skill 服务配置。
     skill_service: SkillConfig
+
+    # MCP 客户端服务配置。
+    mcp_client: McpClientConfig
 
 
 # ── 配置注册中心（全局单例） ─────────────────────────────────
@@ -183,9 +191,19 @@ class ConfigRegistry:
         return self._config.conversation_repository
 
     @property
+    def prompt_template(self) -> PromptTemplateConfig:
+        """实时读取提示词模板服务配置（片段存储目录等）。"""
+        return self._config.prompt_template
+
+    @property
     def skill_service(self) -> SkillConfig:
         """实时读取 Skill 服务配置（仓库目录路径）。"""
         return self._config.skill_service
+
+    @property
+    def mcp_client(self) -> McpClientConfig:
+        """实时读取 MCP 客户端服务配置（服务定义目录等）。"""
+        return self._config.mcp_client
 
 
 # ── 文件监听实现 ─────────────────────────────────────────────
@@ -271,13 +289,17 @@ def _load_yaml_config(
     resource_data = _require_section(config_data, "file_resource_service")
     conv_repo_data = _require_section(config_data, "conversation_repository")
 
+    prompt_data = _require_section(config_data, "prompt_template")
     skill_data = _require_section(config_data, "skill_service")
+    mcp_data = _require_section(config_data, "mcp_client")
 
     return AgentRuntimeConfig(
         agent_runtime_service=_build_runtime_config(runtime_data),
         file_resource_service=_build_resource_config(resource_data),
         conversation_repository=_build_conv_repo_config(conv_repo_data),
+        prompt_template=_build_prompt_template_config(prompt_data),
         skill_service=_build_skill_config(skill_data),
+        mcp_client=_build_mcp_client_config(mcp_data),
     )
 
 
@@ -323,10 +345,24 @@ def _build_oss_config(data: dict[str, Any]) -> ObjectStorageGatewayConfig:
     )
 
 
+def _build_prompt_template_config(data: dict[str, Any]) -> PromptTemplateConfig:
+    """从 YAML 字典构建提示词模板服务配置。"""
+    return PromptTemplateConfig(
+        snippets_dir=str(data["snippets_dir"]),
+    )
+
+
 def _build_skill_config(data: dict[str, Any]) -> SkillConfig:
     """从 YAML 字典构建 Skill 服务配置。"""
     return SkillConfig(
         skills_dir=str(data["skills_dir"]),
+    )
+
+
+def _build_mcp_client_config(data: dict[str, Any]) -> McpClientConfig:
+    """从 YAML 字典构建 MCP 客户端服务配置。"""
+    return McpClientConfig(
+        config_dir=str(data["config_dir"]),
     )
 
 
