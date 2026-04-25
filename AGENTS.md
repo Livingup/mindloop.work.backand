@@ -40,24 +40,15 @@
 
 Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通用公共目录，不绑定本项目），解析各子目录中 `SKILL.md` 的 YAML frontmatter，提供 Skill 列表查询和刷新能力。遵循 Agent Skills Open Standard 规范。Skill 仓库路径在 `config/agent_runtime.yaml` 的 `skill_service.skills_dir` 中配置。用户直接在仓库目录下创建/编辑/删除 Skill 子目录，无需通过 API。启动时自动扫描 + 接口触发重新扫描。只解析 frontmatter 元数据（name、description、license、compatibility、metadata、allowed-tools），不读取 Markdown 正文（Agent 拿到目录路径后自行按规范读取）。DDD 分层：领域实体 SkillDefinition（聚合根，含 name 格式校验）+ 仓储接口/文件系统实现（扫描目录 + 解析 SKILL.md）+ 领域服务 + 北向网关（SkillGateway Protocol + DTO + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai skill list`（列出所有 Skill）/ `spread-ai skill refresh`（重新扫描）。REST：`GET /api/skills` / `POST /api/skills/refresh`。
 
+### Agent 定义模块（agent_definition）
+
+负责 Agent 静态模板数据管理。每个 Agent 定义一个 YAML 文件，文件名即 `agent_id`，默认存储在 `~/.spread-ai/agents/` 下，配置项为 `agent_definition.definitions_dir`。定义字段包括 `agent_id`、可选 `name` / `description`、`group`、系统提示词混合数组、本地工具 ID、MCP 服务工具绑定、Skill ID、可用子 Agent ID、是否系统内置后台 Agent、是否禁用。系统提示词数组支持 `text` 与 `template_id` 交叉混合并保持顺序，例如 `[{text: ...}, {template_id: ...}, {text: ...}]`。DDD 分层：领域实体 AgentDefinition（聚合根，携带文件名安全和引用列表去重校验）+ 值对象 SystemPromptSegment / McpToolBinding + 仓储接口/YAML 实现（`~/.spread-ai/agents/{agent_id}.yaml`）+ 领域服务 + 北向网关（Protocol + 请求模型 + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai agent list/get/create/update/delete/enable/disable`。REST：`/api/agents` CRUD + enable/disable。
+
 ---
 
 ## 规划模块
 
-### 模块一：Agent 定义
-
-Agent 的静态模板数据，描述一个 Agent 是什么、能做什么。每个 Agent 定义为独立 YAML 文件（文件名即 agent_id），存储在 `.spread-ai/agents/` 下。
-
-- 名称、描述（做什么、什么时候使用）
-- 系统提示词（支持引用可复用提示词片段进行模板拼接）
-- 本地工具列表
-- MCP 工具列表（MCP 服务 ID + 可用工具）
-- Skill 列表
-- 子 Agent 列表
-
-提示词片段存储在 `.spread-ai/prompt-snippets/` 下，每个片段文件自声明唯一描述名，启动时扫描建立映射。
-
-### 模块二：LLM 服务商
+### 模块一：LLM 服务商
 
 LLM 服务商与模型的注册与元数据管理。
 
@@ -66,7 +57,7 @@ LLM 服务商与模型的注册与元数据管理。
 - 模型使用的协议（OpenAI / Claude / Gemini）
 - 自定义请求头、API Key 等凭证信息
 
-### 模块三：Agent 执行引擎
+### 模块二：Agent 执行引擎
 
 Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 
@@ -76,7 +67,7 @@ Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 - 将 LLM 返回的工具调用请求转发给工具执行引擎
 - 将工具执行结果生成工具结果消息，继续调用 LLM
 
-### 模块四：LLM 统一调用客户端
+### 模块三：LLM 统一调用客户端
 
 统一的 LLM 调用入口，屏蔽不同平台协议差异。
 
@@ -85,7 +76,7 @@ Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 - HTTP 请求和响应的原始报文记录（根据配置控制记录详细程度：是否打印 tools schema、是否打印系统提示词等）
 - 调用目标平台 SDK 请求 LLM，将结果返回给 Agent 执行引擎
 
-### 模块五：工具执行引擎
+### 模块四：工具执行引擎
 
 负责工具定义的实现与调用执行。
 

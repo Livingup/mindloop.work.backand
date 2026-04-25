@@ -31,6 +31,7 @@ from watchdog.observers import Observer
 
 logger = logging.getLogger(__name__)
 
+from agent_runtime.agent_definition.agent_definition_config import AgentDefinitionConfig
 from agent_runtime.file_resource.config import (
     FileResourceServiceConfig,
     ObjectStorageGatewayConfig,
@@ -92,6 +93,9 @@ class AgentRuntimeConfig:
 
     # MCP 客户端服务配置。
     mcp_client: McpClientConfig
+
+    # Agent 定义服务配置。
+    agent_definition: AgentDefinitionConfig
 
 
 # ── 配置注册中心（全局单例） ─────────────────────────────────
@@ -205,6 +209,11 @@ class ConfigRegistry:
         """实时读取 MCP 客户端服务配置（服务定义目录等）。"""
         return self._config.mcp_client
 
+    @property
+    def agent_definition(self) -> AgentDefinitionConfig:
+        """实时读取 Agent 定义服务配置（定义文件目录等）。"""
+        return self._config.agent_definition
+
 
 # ── 文件监听实现 ─────────────────────────────────────────────
 
@@ -292,6 +301,7 @@ def _load_yaml_config(
     prompt_data = _require_section(config_data, "prompt_template")
     skill_data = _require_section(config_data, "skill_service")
     mcp_data = _require_section(config_data, "mcp_client")
+    agent_definition_data = _require_section(config_data, "agent_definition")
 
     return AgentRuntimeConfig(
         agent_runtime_service=_build_runtime_config(runtime_data),
@@ -300,6 +310,7 @@ def _load_yaml_config(
         prompt_template=_build_prompt_template_config(prompt_data),
         skill_service=_build_skill_config(skill_data),
         mcp_client=_build_mcp_client_config(mcp_data),
+        agent_definition=_build_agent_definition_config(agent_definition_data),
     )
 
 
@@ -363,6 +374,13 @@ def _build_mcp_client_config(data: dict[str, Any]) -> McpClientConfig:
     """从 YAML 字典构建 MCP 客户端服务配置。"""
     return McpClientConfig(
         config_dir=str(data["config_dir"]),
+    )
+
+
+def _build_agent_definition_config(data: dict[str, Any]) -> AgentDefinitionConfig:
+    """从 YAML 字典构建 Agent 定义服务配置。"""
+    return AgentDefinitionConfig(
+        definitions_dir=str(data["definitions_dir"]),
     )
 
 

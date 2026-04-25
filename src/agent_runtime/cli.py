@@ -61,6 +61,14 @@ def _mcp_gateway_factory() -> object:
     return McpClientFactory.create()
 
 
+def _agent_definition_gateway_factory() -> object:
+    """创建 Agent 定义北向网关实例。"""
+    from agent_runtime.agent_definition.agent_definition_factory import (
+        AgentDefinitionFactory,
+    )
+    return AgentDefinitionFactory.create()
+
+
 # ── 注册 CLI 子命令组 ──────────────────────────────────────────
 
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_cli_adapter import (
@@ -74,12 +82,19 @@ from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_cli_adapter import (
     create_mcp_cli_group,
     create_mcp_config_cli_group,
 )
+from agent_runtime.agent_definition.north_gateway.agent_definition_cli_adapter import (
+    create_agent_definition_cli_group,
+)
 
 main.add_command(create_prompt_cli_group(_prompt_gateway_factory), name="prompt")
 main.add_command(create_tool_cli_group(_tool_gateway_factory), name="tool")
 main.add_command(create_skill_cli_group(_skill_gateway_factory), name="skill")
 main.add_command(create_mcp_config_cli_group(_mcp_gateway_factory), name="mcp-config")
 main.add_command(create_mcp_cli_group(_mcp_gateway_factory), name="mcp")
+main.add_command(
+    create_agent_definition_cli_group(_agent_definition_gateway_factory),
+    name="agent",
+)
 
 
 # ── serve 命令 ─────────────────────────────────────────────────
@@ -109,11 +124,18 @@ def serve(host: str | None, port: int | None) -> None:
         create_mcp_config_router,
         create_mcp_router,
     )
+    from agent_runtime.agent_definition.agent_definition_factory import (
+        AgentDefinitionFactory,
+    )
+    from agent_runtime.agent_definition.north_gateway.agent_definition_rest_adapter import (
+        create_agent_definition_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
+    agent_definition_gateway = AgentDefinitionFactory.create()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务")
     app.include_router(
@@ -140,6 +162,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_skill_router(skill_gateway),
         prefix="/api/skills",
         tags=["Skill"],
+    )
+    app.include_router(
+        create_agent_definition_router(agent_definition_gateway),
+        prefix="/api/agents",
+        tags=["Agent 定义"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。

@@ -80,3 +80,7 @@ skill_service:
 mcp_client:
   # MCP 服务定义 YAML 文件存放目录（每个服务一个 YAML 文件）。
   config_dir: "~/.spread-ai/mcp-servers"
+
+agent_definition:
+  # Agent 定义 YAML 文件存放目录（每个 Agent 定义一个 YAML 文件，文件名即 agent_id）。
+  definitions_dir: "~/.spread-ai/agents"
