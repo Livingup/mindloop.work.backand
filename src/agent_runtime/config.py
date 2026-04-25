@@ -2,6 +2,8 @@
 
 全局单例，统一加载 YAML 配置文件并分发给各业务域。
 支持热更新：reload() 后所有消费方实时读到最新值。
+配置文件启动时只读取原始 YAML；各业务配置段在被访问时才解析环境变量并构建强类型对象，
+避免无关模块的必填环境变量阻塞 CLI 子命令启动。
 
 使用方式：
     # 启动时加载一次
@@ -111,9 +113,21 @@ class ConfigRegistry:
     _instance: ConfigRegistry | None = None
     _lock = threading.Lock()
 
-    def __init__(self, config: AgentRuntimeConfig, yaml_path: str) -> None:
-        self._config = config
+    def __init__(
+        self,
+        config: AgentRuntimeConfig | dict[str, Any],
+        yaml_path: str,
+        env_file_path: str | None = None,
+    ) -> None:
+        if isinstance(config, AgentRuntimeConfig):
+            self._config: AgentRuntimeConfig | None = config
+            self._raw_config_data: dict[str, Any] | None = None
+        else:
+            self._config = None
+            self._raw_config_data = config
         self._yaml_path = yaml_path
+        self._env_file_path = env_file_path
+        self._section_cache: dict[str, Any] = {}
         self._watcher: _ConfigFileWatcher | None = None
 
     # ── 单例生命周期 ──────────────────────────────────────
@@ -131,8 +145,8 @@ class ConfigRegistry:
         watch=True 时自动启动文件监听，YAML 文件保存后自动热更新。
         """
         with cls._lock:
-            config = _load_yaml_config(yaml_file_path, env_file_path)
-            cls._instance = cls(config, yaml_file_path)
+            config_data = _load_yaml_config(yaml_file_path, env_file_path)
+            cls._instance = cls(config_data, yaml_file_path, env_file_path)
             if watch:
                 cls._instance._start_watching()
 
@@ -142,7 +156,12 @@ class ConfigRegistry:
         with cls._lock:
             if cls._instance is None:
                 raise RuntimeError("ConfigRegistry 尚未初始化，请先调用 load()。")
-            cls._instance._config = _load_yaml_config(cls._instance._yaml_path)
+            cls._instance._raw_config_data = _load_yaml_config(
+                cls._instance._yaml_path,
+                cls._instance._env_file_path,
+            )
+            cls._instance._config = None
+            cls._instance._section_cache.clear()
 
     @classmethod
     def instance(cls) -> ConfigRegistry:
@@ -182,37 +201,81 @@ class ConfigRegistry:
     @property
     def agent_runtime_service(self) -> AgentRuntimeServiceConfig:
         """实时读取宿主运行时服务配置（实例名、环境、监听地址等）。"""
-        return self._config.agent_runtime_service
+        if self._config is not None:
+            return self._config.agent_runtime_service
+        return self._get_section_config(
+            "agent_runtime_service", _build_runtime_config,
+        )
 
     @property
     def file_resource_service(self) -> FileResourceServiceConfig:
         """实时读取统一文件资源服务配置（存储路径、对象存储网关等）。"""
-        return self._config.file_resource_service
+        if self._config is not None:
+            return self._config.file_resource_service
+        return self._get_section_config(
+            "file_resource_service", _build_resource_config,
+        )
 
     @property
     def conversation_repository(self) -> ConversationRepositoryConfig:
         """实时读取会话消息持久化仓储配置（数据目录等）。"""
-        return self._config.conversation_repository
+        if self._config is not None:
+            return self._config.conversation_repository
+        return self._get_section_config(
+            "conversation_repository", _build_conv_repo_config,
+        )
 
     @property
     def prompt_template(self) -> PromptTemplateConfig:
         """实时读取提示词模板服务配置（片段存储目录等）。"""
-        return self._config.prompt_template
+        if self._config is not None:
+            return self._config.prompt_template
+        return self._get_section_config(
+            "prompt_template", _build_prompt_template_config,
+        )
 
     @property
     def skill_service(self) -> SkillConfig:
         """实时读取 Skill 服务配置（仓库目录路径）。"""
-        return self._config.skill_service
+        if self._config is not None:
+            return self._config.skill_service
+        return self._get_section_config(
+            "skill_service", _build_skill_config,
+        )
 
     @property
     def mcp_client(self) -> McpClientConfig:
         """实时读取 MCP 客户端服务配置（服务定义目录等）。"""
-        return self._config.mcp_client
+        if self._config is not None:
+            return self._config.mcp_client
+        return self._get_section_config(
+            "mcp_client", _build_mcp_client_config,
+        )
 
     @property
     def agent_definition(self) -> AgentDefinitionConfig:
         """实时读取 Agent 定义服务配置（定义文件目录等）。"""
-        return self._config.agent_definition
+        if self._config is not None:
+            return self._config.agent_definition
+        return self._get_section_config(
+            "agent_definition", _build_agent_definition_config,
+        )
+
+    def _get_section_config(self, section_name: str, builder: Any) -> Any:
+        """按需解析并构建单个配置段。
+
+        ConfigRegistry 启动时只保存原始 YAML 数据。具体业务模块访问自己的配置属性时，
+        才解析该配置段中的环境变量并构建强类型配置对象，避免无关配置段的必填环境变量阻塞 CLI。
+        """
+        if section_name in self._section_cache:
+            return self._section_cache[section_name]
+        if self._raw_config_data is None:
+            raise RuntimeError("ConfigRegistry 缺少原始配置数据，无法按需解析配置段。")
+        raw_section = _require_section(self._raw_config_data, section_name)
+        resolved_section = _resolve_env_vars(raw_section)
+        section_config = builder(resolved_section)
+        self._section_cache[section_name] = section_config
+        return section_config
 
 
 # ── 文件监听实现 ─────────────────────────────────────────────
@@ -279,8 +342,12 @@ _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 def _load_yaml_config(
     yaml_file_path: str,
     env_file_path: str | None = None,
-) -> AgentRuntimeConfig:
-    """从 YAML 文件解析总配置。"""
+) -> dict[str, Any]:
+    """从 YAML 文件读取原始总配置。
+
+    注意：此处不递归解析环境变量，也不构建所有配置段。
+    具体配置段在 ConfigRegistry 对应 property 被访问时才按需解析和构建。
+    """
 
     config_path = Path(yaml_file_path)
     if not config_path.exists():
@@ -291,27 +358,7 @@ def _load_yaml_config(
     config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(config_data, dict):
         raise ValueError("配置文件内容必须是对象结构。")
-
-    config_data = _resolve_env_vars(config_data)
-
-    runtime_data = _require_section(config_data, "agent_runtime_service")
-    resource_data = _require_section(config_data, "file_resource_service")
-    conv_repo_data = _require_section(config_data, "conversation_repository")
-
-    prompt_data = _require_section(config_data, "prompt_template")
-    skill_data = _require_section(config_data, "skill_service")
-    mcp_data = _require_section(config_data, "mcp_client")
-    agent_definition_data = _require_section(config_data, "agent_definition")
-
-    return AgentRuntimeConfig(
-        agent_runtime_service=_build_runtime_config(runtime_data),
-        file_resource_service=_build_resource_config(resource_data),
-        conversation_repository=_build_conv_repo_config(conv_repo_data),
-        prompt_template=_build_prompt_template_config(prompt_data),
-        skill_service=_build_skill_config(skill_data),
-        mcp_client=_build_mcp_client_config(mcp_data),
-        agent_definition=_build_agent_definition_config(agent_definition_data),
-    )
+    return config_data
 
 
 def _build_runtime_config(data: dict[str, Any]) -> AgentRuntimeServiceConfig:

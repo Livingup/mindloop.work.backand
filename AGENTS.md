@@ -12,7 +12,7 @@
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载 `config/agent_runtime.yaml` 配置文件并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端）均纳入此 YAML 统一管理，各模块只认 ConfigRegistry 内存数据，不关心配置文件的加载与维护。CLI 入口（`cli.py`）作为组合根，启动时加载 ConfigRegistry，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
+全局单例 ConfigRegistry，统一加载 `config/agent_runtime.yaml` 配置文件并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端、Agent 定义）均纳入此 YAML 统一管理，各模块只认 ConfigRegistry 内存数据，不关心配置文件的加载与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
 
 ### 会话消息模块（conversation_message）
 
@@ -35,6 +35,8 @@
 **mcp_meta_tools** — 供 Agent 使用的 5 个 MCP 元工具（@tool 装饰器注册为本地工具，async 函数）：mcp_get_service_detail / mcp_list_resources / mcp_read_resource / mcp_get_tool_detail / mcp_call_tool。依赖 mcp_client 北向网关契约。
 
 **工具注册机制**：各模块的 `@tool` 装饰工具函数需在 `cli.py` 中显式 import 对应模块来触发注册（不采用全量扫描，避免启动变慢）。新增工具模块时需在 `cli.py` 中添加一行 `import`。
+
+**CLI 设计原则**：`spread-ai` 是给用户、脚本、CI 和外部 Agent 调用的统一脚本命令入口。命令按业务域组织，输入输出保持结构化；复杂输入使用文件；错误输出 JSON 且使用非 0 exit code；查询命令不产生业务副作用；子命令不能被无关模块配置阻塞。
 
 ### Skill 模块（skill）
 
