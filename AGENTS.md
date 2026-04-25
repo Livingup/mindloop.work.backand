@@ -12,7 +12,7 @@
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载 `config/agent_runtime.yaml` 配置文件并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端、Agent 定义）均纳入此 YAML 统一管理，各模块只认 ConfigRegistry 内存数据，不关心配置文件的加载与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai` 发布态 CLI 按 `--config` → `SPREAD_AI_CONFIG` → `~/.spread-ai/agent_runtime.yaml` 的顺序发现配置；若用户默认配置不存在，则首次运行自动从包内模板生成。仓库根目录的 `config/agent_runtime.yaml` 作为项目开发态配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端、Agent 定义）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的加载与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
 
 ### 会话消息模块（conversation_message）
 

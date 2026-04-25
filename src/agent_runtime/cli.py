@@ -4,30 +4,74 @@
 服务模式通过 spread-ai serve 启动 REST API 服务器。
 
 组合根职责：
-1. 加载全局配置注册中心（ConfigRegistry）
-2. 通过各模块工厂创建网关实例（延迟创建，命令执行时才触发）
-3. 将网关工厂函数传递给 CLI adapter，由 adapter 在命令回调中调用
+1. 解析 CLI 配置文件路径（--config → SPREAD_AI_CONFIG → ~/.spread-ai/agent_runtime.yaml）
+2. 首次运行自动生成用户默认配置
+3. 加载全局配置注册中心（ConfigRegistry）
+4. 通过各模块工厂创建网关实例（延迟创建，命令执行时才触发）
+5. 将网关工厂函数传递给 CLI adapter，由 adapter 在命令回调中调用
 """
 from __future__ import annotations
+
+import os
+from importlib import resources
+from pathlib import Path
 
 import click
 
 from agent_runtime.config import ConfigRegistry
 
-# 默认配置文件路径（相对于项目根目录）。
-_DEFAULT_CONFIG = "config/agent_runtime.yaml"
+# 配置环境变量名称。
+_CONFIG_ENV_NAME = "SPREAD_AI_CONFIG"
+
+
+def _user_default_config_path() -> Path:
+    """返回发布态默认用户配置文件路径。"""
+    return Path.home() / ".spread-ai" / "agent_runtime.yaml"
+
+
+def _ensure_user_default_config() -> str:
+    """确保用户默认配置存在；不存在时从包内模板首次生成。"""
+    user_config_path = _user_default_config_path()
+    if user_config_path.exists():
+        return str(user_config_path)
+
+    user_config_path.parent.mkdir(parents=True, exist_ok=True)
+    template_path = resources.files("agent_runtime.defaults").joinpath("agent_runtime.yaml")
+    user_config_path.write_text(
+        template_path.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return str(user_config_path)
+
+
+def _resolve_config_path(config_path: str | None) -> str:
+    """按优先级解析 CLI 配置文件路径。
+
+    优先级：
+    1. 用户显式传入 --config
+    2. 环境变量 SPREAD_AI_CONFIG
+    3. 用户目录 ~/.spread-ai/agent_runtime.yaml
+    4. 若用户目录配置不存在，则首次运行自动生成默认配置
+    """
+    if config_path is not None:
+        return str(Path(os.path.expanduser(config_path)))
+
+    env_config_path = os.environ.get(_CONFIG_ENV_NAME)
+    if env_config_path:
+        return str(Path(os.path.expanduser(env_config_path)))
+
+    return _ensure_user_default_config()
 
 
 @click.group()
 @click.option(
     "--config", "config_path",
-    default=_DEFAULT_CONFIG,
-    help="配置文件路径。",
-    show_default=True,
+    default=None,
+    help="配置文件路径（优先级高于环境变量 SPREAD_AI_CONFIG 和用户默认配置）。",
 )
-def main(config_path: str) -> None:
+def main(config_path: str | None) -> None:
     """spread-ai：通用 Agent 运行时环境服务 CLI。"""
-    ConfigRegistry.load(config_path)
+    ConfigRegistry.load(_resolve_config_path(config_path))
 
 
 # ── @tool 装饰器注册（import 触发） ──────────────────────────────
