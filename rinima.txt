@@ -328,5 +328,4 @@ LoginController 是一个 Spring REST 控制器，使用 @RestController 注解�
     - 禁止对任何文件执行：`git checkout` / `git restore` / `git reset` / `git stash` / `git clean`
     - 禁止为了让工作区 clean 去做任何清理/回滚操作；你的职责是“只提交你修改了的文件”，不是“清理工作区”。
     - 多 Git 仓库 / 子 Git 仓库无需预先扫描。默认按当前任务所在 Git 仓库执行 Codebase RAG 维护和 Git 提交。如果 `git add -- <file...>` 报错，提示文件不属于当前仓库、pathspec 不匹配、或涉及子 Git 仓库，则再针对报错文件执行 `git -C <文件所在目录> rev-parse --show-toplevel` 获取该文件所属 Git root，并按该 Git root 单独执行暂存、知识库维护和提交。不同 Git root 的文件不能混在同一次 `git add` / `git commit` 中。
-    - 测试失败时必须区分：本次任务引入的失败必须修复；历史遗留失败或与本次任务无关的失败不得顺手扩大修改范围，应记录失败命令、失败文件和失败原因，并在最终报告中说明。
 
