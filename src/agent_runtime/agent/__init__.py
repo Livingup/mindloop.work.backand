@@ -1,13 +1,13 @@
 """Agent 运行时实例与任务管理模块。
 
-该模块负责程序内部动态运行态管理：
+该模块负责程序内部动态运行态与执行循环管理：
 - 任务 AgentTask；
 - 运行时 Agent 实例 AgentInstance；
 - 一个任务内唯一根 Agent 实例；
 - 任务内 Agent 实例父子关系树；
-- 任务和实例状态流转。
+- 任务和实例状态流转；
+- Agent 执行循环、LLM 请求、工具调度与实例 Trace 记录。
 
-真正的 Agent 执行循环、LLM 请求客户端和工具调度由后续模块实现。
 """
 
 from agent_runtime.agent.agent_instance import (
@@ -32,6 +32,12 @@ from agent_runtime.agent.agent_task import (
     AgentTaskStatus,
 )
 from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
+from agent_runtime.agent.agent_execution_engine import (
+    AgentExecutionEngine,
+    AgentExecutionRequest,
+    AgentExecutionResult,
+)
+from agent_runtime.agent.agent_execution_factory import AgentExecutionFactory
 
 __all__ = [
     "AgentInstance",
@@ -52,4 +58,8 @@ __all__ = [
     "AGENT_TASK_STATUS_FAILED",
     "AGENT_TASK_STATUS_CANCELLED",
     "AgentRuntimeFactory",
+    "AgentExecutionEngine",
+    "AgentExecutionRequest",
+    "AgentExecutionResult",
+    "AgentExecutionFactory",
 ]

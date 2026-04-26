@@ -62,6 +62,20 @@ conversation_repository:
   # 会话数据存储根目录（SQLite 元数据 + JSONL 消息文件）。
   data_dir: "~/.spread-ai/conversations"
 
+agent_runtime:
+  # Agent 任务、实例和父子关系运行态仓储类型。sqlite 支持本机多 worker / 多进程共享。
+  repository_type: "sqlite"
+
+  # Agent 运行态 SQLite 数据目录。
+  data_dir: "~/.spread-ai/agent-runtime"
+
+  # Agent 实例执行过程 Markdown Trace 文件目录。
+  trace_dir: "~/.spread-ai/agent-traces"
+
+agent_execution:
+  # 单个 Agent 实例一次执行中允许的最大工具调用轮次，防止工具调用死循环。
+  max_tool_rounds: 20
+
 prompt_template:
   # 提示词片段 YAML 文件存储根目录。
   snippets_dir: "~/.spread-ai/prompt-snippets"

@@ -139,6 +139,9 @@ class ToolUsePart:
     # 工具调用参数。
     input: Any
 
+    # 平台工具调用 ID。OpenAI Responses 使用 call_id，Anthropic 使用 tool_use.id；Gemini 无 ID 时可为空。
+    tool_use_id: str | None = None
+
     # 内容块类型标识，固定为 "tool_use"。
     kind: str = field(default="tool_use", init=False)
 

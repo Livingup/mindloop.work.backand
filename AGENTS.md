@@ -12,7 +12,7 @@
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；除 `config init` 外，`spread-ai serve` 和所有 CLI 管理命令都固定加载这一个初始化后的运行配置文件，不再支持 `--config` / `SPREAD_AI_CONFIG`，也不再从包内 defaults 模板自动生成配置。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；除 `config init` 外，`spread-ai serve` 和所有 CLI 管理命令都固定加载这一个初始化后的运行配置文件，不再支持 `--config` / `SPREAD_AI_CONFIG`，也不再从包内 defaults 模板自动生成配置。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
 
 ### 会话消息模块（conversation_message）
 
@@ -48,7 +48,13 @@ Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通�
 
 ### Agent 运行时实例与任务管理模块（agent）
 
-负责程序内部动态运行态管理，不执行真正的 Agent 循环和 LLM 请求。一个项目运行时支持无上限多个 task 并发；每个 task 支持无上限多个 Agent 实例并发；每个 task 必须且只能有一个根 Agent 实例入口，并在 task 内维护 Agent 实例父子关系树。核心领域模型包括 `AgentTask`（任务聚合根，字段含 `task_id`、`root_agent_instance_id`、`agent_instance_ids`、`parent_child_relations`、任务状态和时间戳）、`AgentInstance`（运行时实例，字段含 `instance_id`、`task_id`、`thread_id`、`agent_definition_id`、`llm_provider_id`、`llm_model_binding_id`、`conversation_id`、`trace_id`、实例状态和时间戳）、`AgentParentChildRelation`（同一 task 内父子实例关系边）。任务/实例状态均为 `created` / `running` / `paused` / `completed` / `failed` / `cancelled`，状态流转显式触发；`agent instance completed` 不自动代表 `task completed`，任务完成由执行编排层显式标记。DDD 分层：领域实体 `AgentTask` / `AgentInstance` + 值对象 `AgentParentChildRelation` + 仓储接口 `AgentRuntimeRepository` + 线程安全内存实现 `InMemoryAgentRuntimeRepository`（单进程内 `RLock` 保护读写）+ 领域服务 `AgentRuntimeService` + 北向网关 `AgentRuntimeGateway` + 工厂 `AgentRuntimeFactory`。工厂在单 Python 进程内返回同一个网关实例，保证内部调用方共享同一份 task/instance 运行态；多进程/多机器共享运行态后续需要 SQLite/PostgreSQL 等共享仓储实现。本模块当前只作为后续 Agent 执行引擎的内部依赖，不提供 CLI/REST 管理命令。
+负责程序内部动态运行态管理和真正 Agent 执行循环。本模块不提供 REST/CLI 运行态管理接口，只作为程序内部调用入口。一个项目运行时支持无上限多个 task 并发；每个 task 支持无上限多个 Agent 实例并发；每个 task 必须且只能有一个根 Agent 实例入口，并在 task 内维护 Agent 实例父子关系树。核心领域模型包括 `AgentTask`（任务聚合根，字段含 `task_id`、`root_agent_instance_id`、`agent_instance_ids`、`parent_child_relations`、任务状态和时间戳）、`AgentInstance`（运行时实例，字段含 `instance_id`、`task_id`、`thread_id`、`agent_definition_id`、`llm_provider_id`、`llm_model_binding_id`、`conversation_id`、`trace_id`、实例状态和时间戳）、`AgentParentChildRelation`（同一 task 内父子实例关系边）。任务/实例状态均为 `created` / `running` / `paused` / `completed` / `failed` / `cancelled`，状态流转显式触发；`agent instance completed` 不自动代表 `task completed`，root 执行循环正常结束时由 `AgentExecutionEngine` 显式完成实例和任务。父子树规则：唯一 root，root 不能有 parent，非 root 必须有且只有一个 parent，父子实例必须属于同一 task，禁止环，所有实例必须从 root 可达。运行态仓储接口为 `AgentRuntimeRepository`，基础设施实现包括线程安全内存仓储 `InMemoryAgentRuntimeRepository` 和 SQLite 共享仓储 `SqliteAgentRuntimeRepository`；`agent_runtime.repository_type=sqlite` 时 task、Agent 实例和父子关系写入 `agent_runtime.data_dir/agent_runtime.db`，开启 WAL，支持本机 FastAPI 多 worker / 多 Python 进程共享运行态。`AgentRuntimeFactory` 根据 ConfigRegistry 装配 memory/sqlite 仓储，并在单 Python 进程内复用同一网关。
+
+`AgentExecutionEngine` 是内部执行循环入口：创建 task + root Agent 实例，加载 `AgentDefinition`，拼接系统提示词（支持 `text` 与 `template_id`，但 Trace 不记录系统提示词），创建/加载 Conversation，追加用户消息，解析 LLM provider/binding，构造当前 AgentDefinition 允许的工具 schema，调用通用 LLM 请求客户端，收到 assistant 响应后写回 Conversation；如果响应包含 `ToolUsePart`，交给 `AgentToolDispatcher` 执行本地工具或 MCP 工具，追加 `ToolResultPart` 后继续下一轮 LLM，直到没有工具调用或超过 `agent_execution.max_tool_rounds`。执行失败时显式 fail instance 和 task。`AgentToolDispatcher` 只暴露当前 `AgentDefinition.tool_ids` 和 `AgentDefinition.mcp_tools` 允许的工具：本地工具通过 `LocalToolGateway.execute_tool()` 执行；MCP 工具以 `mcp__{service_id}__{tool_name}` 暴露给 LLM，执行时还原 service/tool 并通过 `McpClientGateway.call_tool()` 调用。每个 Agent 实例执行过程由 `AgentTraceRecorder` 单独写 Markdown 文件到 `agent_runtime.trace_dir`，文件只记录 `agent_definition_id`、task/instance/thread/trace ID、用户消息、assistant 消息、工具结果和完成/失败事件，不记录系统提示词、工具 schema、工具清单、API Key 或请求头。
+
+### 通用 LLM 请求客户端（llm_client）
+
+负责真实 LLM API 请求编排，屏蔽不同 API 协议的请求细节。`LlmRequestService` 接收 `LlmPromptRequest`，使用 `conversation_message.render_messages()` 渲染目标 `api_format` 的历史消息，合并 `ResolvedLlmProviderModel` 中的 `model_alias`、`api_base_url`、`api_keys`、`custom_headers`、`retry`、`tool_choice`、`thinking`、`custom_request_params` 和本轮覆盖参数，按 API Key 列表轮换并按 `LlmRetryPolicy` 对 429/5xx 等临时错误做重试；成功后调用 `conversation_message.ingest_response()` 归一化 assistant 响应并写回 Conversation。南向协议客户端当前实现三类已具备 message adapter 的 API 格式：`openai_responses`、`anthropic_messages`、`gemini_generate_content`。全局枚举中存在但本轮未实现真实调用的 `openai_chat_completions` 与 `zhipu_chat_completions` 需要先补齐 conversation_message 协议适配器后再接入。
 
 ### LLM 服务商与模型注册模块（llm_model_registry）
 
@@ -58,30 +64,4 @@ Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通�
 
 ## 规划模块
 
-### 模块一：Agent 执行引擎
-
-Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
-
-- 根据用户选择的 Agent 定义创建 Agent 实例
-- 根据 Agent 定义和用户选择的 LLM 服务商与模型创建 LLM 请求参数
-- 循环调用 LLM 执行任务
-- 将 LLM 返回的工具调用请求转发给工具执行引擎
-- 将工具执行结果生成工具结果消息，继续调用 LLM
-
-### 模块二：LLM 统一调用客户端
-
-统一的 LLM 调用入口，屏蔽不同平台协议差异。
-
-- 接收统一的输入：用户消息/工具执行结果消息、会话 ID、系统提示词、tools 定义、服务商与模型 ID
-- 根据目标平台协议组装规范请求参数
-- HTTP 请求和响应的原始报文记录（根据配置控制记录详细程度：是否打印 tools schema、是否打印系统提示词等）
-- 调用目标平台 SDK 请求 LLM，将结果返回给 Agent 执行引擎
-
-### 模块三：工具执行引擎
-
-负责工具定义的实现与调用执行。
-
-- 支持本地工具和 MCP 工具两种类型
-- MCP 工具通过封装转发 MCP 客户端实现
-- 定义通用的基础请求参数和响应参数规范，所有工具的执行请求和结果都派生于此
-
+暂无。

@@ -99,7 +99,13 @@ class GeminiAdapter:
                 content.append(TextPart(text=part["text"]))
             elif part.get("functionCall"):
                 fc = part["functionCall"]
-                content.append(ToolUsePart(name=fc.get("name", ""), input=fc.get("args")))
+                content.append(
+                    ToolUsePart(
+                        name=fc.get("name", ""),
+                        input=fc.get("args"),
+                        tool_use_id=None,
+                    )
+                )
             # inlineData / fileData 仅用户侧出现，响应一般不会
 
         return UniMessage(

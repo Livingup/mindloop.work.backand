@@ -167,6 +167,25 @@ class AgentInstance:
         """实例是否已经进入终态。"""
         return self.status in _TERMINAL_AGENT_INSTANCE_STATUSES
 
+    def bind_conversation(
+        self,
+        conversation_id: str,
+        *,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        """绑定历史会话 ID。
+
+        Agent 实例创建时可能还没有 Conversation；执行循环创建会话后调用该方法写回引用。
+        如果已经绑定同一个 conversation_id，则保持幂等；如果已绑定不同会话，则拒绝覆盖，
+        避免一个运行实例的历史对话引用被意外切换。
+        """
+        _require_non_blank(conversation_id, "conversation_id")
+        if self.conversation_id == conversation_id:
+            return self
+        if self.conversation_id is not None:
+            raise ValueError("Agent 实例已经绑定其他 conversation_id，不能覆盖。")
+        return replace(self, conversation_id=conversation_id, updated_at=at or _utc_now())
+
     def transition_to(
         self,
         target_status: AgentInstanceStatus,

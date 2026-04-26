@@ -1,0 +1,389 @@
+# -*- coding: utf-8 -*-
+"""Agent 任务与实例运行态 SQLite 仓储实现。"""
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from threading import RLock
+
+from agent_runtime.agent.agent_instance import AgentInstance
+from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
+
+
+_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    task_id                TEXT PRIMARY KEY,
+    root_agent_instance_id TEXT NOT NULL,
+    agent_instance_ids     TEXT NOT NULL,
+    status                 TEXT NOT NULL,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
+    started_at             TEXT,
+    paused_at              TEXT,
+    finished_at            TEXT,
+    failed_at              TEXT,
+    failure_message        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status);
+
+CREATE TABLE IF NOT EXISTS agent_instances (
+    instance_id          TEXT PRIMARY KEY,
+    task_id              TEXT NOT NULL,
+    thread_id            TEXT NOT NULL,
+    agent_definition_id  TEXT NOT NULL,
+    llm_provider_id      TEXT NOT NULL,
+    llm_model_binding_id TEXT NOT NULL,
+    conversation_id      TEXT,
+    trace_id             TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    started_at           TEXT,
+    paused_at            TEXT,
+    finished_at          TEXT,
+    failed_at            TEXT,
+    failure_message      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_task   ON agent_instances(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_thread ON agent_instances(thread_id);
+CREATE INDEX IF NOT EXISTS idx_agent_instances_status ON agent_instances(status);
+
+CREATE TABLE IF NOT EXISTS agent_parent_child_relations (
+    relation_id        TEXT PRIMARY KEY,
+    task_id            TEXT NOT NULL,
+    parent_instance_id TEXT NOT NULL,
+    child_instance_id  TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_relations_task   ON agent_parent_child_relations(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_relations_parent ON agent_parent_child_relations(parent_instance_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_relations_child_once
+    ON agent_parent_child_relations(task_id, child_instance_id);
+"""
+
+
+class SqliteAgentRuntimeRepository:
+    """Agent 运行态 SQLite 仓储。
+
+    该仓储把 task、Agent 实例和 task 内父子关系树写入同一个 SQLite 数据库。
+    SQLite 开启 WAL，适合本机 FastAPI 多 worker / 多 Python 进程共享运行态。
+    仓储方法内部使用进程内 RLock 保护同一连接上的并发访问；跨进程并发由 SQLite 事务保障。
+    """
+
+    def __init__(self, data_dir: str | Path) -> None:
+        # Agent 运行态数据目录。这里保存 agent_runtime.db，不保存用户静态定义或 LLM 注册数据。
+        self._data_dir = Path(data_dir).expanduser()
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = self._data_dir / "agent_runtime.db"
+
+        # check_same_thread=False 允许同一进程内不同执行线程复用仓储连接；实际操作由 _lock 串行化。
+        self._conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+        self._lock = RLock()
+
+    def close(self) -> None:
+        """关闭底层 SQLite 连接。"""
+        with self._lock:
+            self._conn.close()
+
+    def save_task(self, task: AgentTask) -> None:
+        """保存或覆盖任务运行态，并同步该任务的父子关系树。"""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO agent_tasks (
+                    task_id, root_agent_instance_id, agent_instance_ids, status,
+                    created_at, updated_at, started_at, paused_at, finished_at,
+                    failed_at, failure_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.task_id,
+                    task.root_agent_instance_id,
+                    json.dumps(list(task.agent_instance_ids), ensure_ascii=False),
+                    task.status,
+                    _datetime_to_text(task.created_at),
+                    _datetime_to_text(task.updated_at),
+                    _optional_datetime_to_text(task.started_at),
+                    _optional_datetime_to_text(task.paused_at),
+                    _optional_datetime_to_text(task.finished_at),
+                    _optional_datetime_to_text(task.failed_at),
+                    task.failure_message,
+                ),
+            )
+            self._conn.executemany(
+                """
+                INSERT OR REPLACE INTO agent_parent_child_relations (
+                    relation_id, task_id, parent_instance_id, child_instance_id, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        relation.relation_id,
+                        relation.task_id,
+                        relation.parent_instance_id,
+                        relation.child_instance_id,
+                        _datetime_to_text(relation.created_at),
+                    )
+                    for relation in task.parent_child_relations
+                ],
+            )
+            self._conn.commit()
+
+    def get_task(self, task_id: str) -> AgentTask | None:
+        """按 task_id 获取任务运行态。"""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT task_id, root_agent_instance_id, agent_instance_ids, status,
+                       created_at, updated_at, started_at, paused_at, finished_at,
+                       failed_at, failure_message
+                FROM agent_tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            relations = self._load_task_relations(task_id)
+            instance_ids = self._load_task_instance_ids(
+                task_id=task_id,
+                root_agent_instance_id=row[1],
+                stored_instance_ids=tuple(json.loads(row[2])),
+                relations=relations,
+            )
+            return _row_to_task(row, relations, instance_ids)
+
+    def list_tasks(self) -> list[AgentTask]:
+        """列出当前仓储中的全部任务。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT task_id, root_agent_instance_id, agent_instance_ids, status,
+                       created_at, updated_at, started_at, paused_at, finished_at,
+                       failed_at, failure_message
+                FROM agent_tasks ORDER BY created_at ASC
+                """
+            ).fetchall()
+            tasks: list[AgentTask] = []
+            for row in rows:
+                relations = self._load_task_relations(row[0])
+                instance_ids = self._load_task_instance_ids(
+                    task_id=row[0],
+                    root_agent_instance_id=row[1],
+                    stored_instance_ids=tuple(json.loads(row[2])),
+                    relations=relations,
+                )
+                tasks.append(_row_to_task(row, relations, instance_ids))
+            return tasks
+
+    def save_agent_instance(self, instance: AgentInstance) -> None:
+        """保存或覆盖 Agent 实例运行态。"""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO agent_instances (
+                    instance_id, task_id, thread_id, agent_definition_id,
+                    llm_provider_id, llm_model_binding_id, conversation_id, trace_id,
+                    status, created_at, updated_at, started_at, paused_at,
+                    finished_at, failed_at, failure_message
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    instance.instance_id,
+                    instance.task_id,
+                    instance.thread_id,
+                    instance.agent_definition_id,
+                    instance.llm_provider_id,
+                    instance.llm_model_binding_id,
+                    instance.conversation_id,
+                    instance.trace_id,
+                    instance.status,
+                    _datetime_to_text(instance.created_at),
+                    _datetime_to_text(instance.updated_at),
+                    _optional_datetime_to_text(instance.started_at),
+                    _optional_datetime_to_text(instance.paused_at),
+                    _optional_datetime_to_text(instance.finished_at),
+                    _optional_datetime_to_text(instance.failed_at),
+                    instance.failure_message,
+                ),
+            )
+            self._conn.commit()
+
+    def get_agent_instance(self, instance_id: str) -> AgentInstance | None:
+        """按 instance_id 获取 Agent 实例运行态。"""
+        with self._lock:
+            row = self._conn.execute(
+                _INSTANCE_SELECT_SQL + " WHERE instance_id = ?",
+                (instance_id,),
+            ).fetchone()
+            return _row_to_instance(row) if row else None
+
+    def list_agent_instances_by_task(self, task_id: str) -> list[AgentInstance]:
+        """列出某个任务下的全部 Agent 实例。"""
+        with self._lock:
+            rows = self._conn.execute(
+                _INSTANCE_SELECT_SQL + " WHERE task_id = ? ORDER BY created_at ASC",
+                (task_id,),
+            ).fetchall()
+            return [_row_to_instance(row) for row in rows]
+
+    def list_agent_instances_by_thread(self, thread_id: str) -> list[AgentInstance]:
+        """列出某个线程下的全部 Agent 实例。"""
+        with self._lock:
+            rows = self._conn.execute(
+                _INSTANCE_SELECT_SQL + " WHERE thread_id = ? ORDER BY created_at ASC",
+                (thread_id,),
+            ).fetchall()
+            return [_row_to_instance(row) for row in rows]
+
+    def contains_task(self, task_id: str) -> bool:
+        """判断任务是否存在。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM agent_tasks WHERE task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            return row is not None
+
+    def contains_agent_instance(self, instance_id: str) -> bool:
+        """判断 Agent 实例是否存在。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM agent_instances WHERE instance_id = ? LIMIT 1",
+                (instance_id,),
+            ).fetchone()
+            return row is not None
+
+    def _load_task_relations(self, task_id: str) -> tuple[AgentParentChildRelation, ...]:
+        """加载指定 task 的父子关系树边集合。"""
+        rows = self._conn.execute(
+            """
+            SELECT relation_id, task_id, parent_instance_id, child_instance_id, created_at
+            FROM agent_parent_child_relations
+            WHERE task_id = ?
+            ORDER BY created_at ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        return tuple(
+            AgentParentChildRelation(
+                relation_id=row[0],
+                task_id=row[1],
+                parent_instance_id=row[2],
+                child_instance_id=row[3],
+                created_at=_text_to_datetime(row[4]),
+            )
+            for row in rows
+        )
+
+
+    def _load_task_instance_ids(
+        self,
+        *,
+        task_id: str,
+        root_agent_instance_id: str,
+        stored_instance_ids: tuple[str, ...],
+        relations: tuple[AgentParentChildRelation, ...],
+    ) -> tuple[str, ...]:
+        """从多个事实来源合并 task 内实例 ID。
+
+        agent_tasks.agent_instance_ids 是聚合快照；在多进程并发追加子 Agent 时可能被最后一次写入覆盖。
+        因此 SQLite 仓储读取时还会合并 agent_instances 表和父子关系表，保证查询视图尽量反映所有已提交事实。
+        """
+        ordered: list[str] = []
+
+        def add(instance_id: str) -> None:
+            if instance_id not in ordered:
+                ordered.append(instance_id)
+
+        add(root_agent_instance_id)
+        for instance_id in stored_instance_ids:
+            add(instance_id)
+        rows = self._conn.execute(
+            "SELECT instance_id FROM agent_instances WHERE task_id = ? ORDER BY created_at ASC",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            add(row[0])
+        for relation in relations:
+            add(relation.parent_instance_id)
+            add(relation.child_instance_id)
+        return tuple(ordered)
+
+
+_INSTANCE_SELECT_SQL = """
+SELECT instance_id, task_id, thread_id, agent_definition_id,
+       llm_provider_id, llm_model_binding_id, conversation_id, trace_id,
+       status, created_at, updated_at, started_at, paused_at,
+       finished_at, failed_at, failure_message
+FROM agent_instances
+"""
+
+
+def _row_to_task(
+    row: sqlite3.Row | tuple,
+    relations: tuple[AgentParentChildRelation, ...],
+    instance_ids: tuple[str, ...],
+) -> AgentTask:
+    """将 SQLite task 行还原为 AgentTask 聚合根。"""
+    return AgentTask(
+        task_id=row[0],
+        root_agent_instance_id=row[1],
+        agent_instance_ids=instance_ids,
+        status=row[3],
+        created_at=_text_to_datetime(row[4]),
+        updated_at=_text_to_datetime(row[5]),
+        started_at=_optional_text_to_datetime(row[6]),
+        paused_at=_optional_text_to_datetime(row[7]),
+        finished_at=_optional_text_to_datetime(row[8]),
+        failed_at=_optional_text_to_datetime(row[9]),
+        failure_message=row[10],
+        parent_child_relations=relations,
+    )
+
+
+def _row_to_instance(row: sqlite3.Row | tuple) -> AgentInstance:
+    """将 SQLite instance 行还原为 AgentInstance 实体。"""
+    return AgentInstance(
+        instance_id=row[0],
+        task_id=row[1],
+        thread_id=row[2],
+        agent_definition_id=row[3],
+        llm_provider_id=row[4],
+        llm_model_binding_id=row[5],
+        conversation_id=row[6],
+        trace_id=row[7],
+        status=row[8],
+        created_at=_text_to_datetime(row[9]),
+        updated_at=_text_to_datetime(row[10]),
+        started_at=_optional_text_to_datetime(row[11]),
+        paused_at=_optional_text_to_datetime(row[12]),
+        finished_at=_optional_text_to_datetime(row[13]),
+        failed_at=_optional_text_to_datetime(row[14]),
+        failure_message=row[15],
+    )
+
+
+def _datetime_to_text(value: datetime) -> str:
+    """序列化必填 datetime。"""
+    return value.isoformat()
+
+
+def _optional_datetime_to_text(value: datetime | None) -> str | None:
+    """序列化可选 datetime。"""
+    return value.isoformat() if value is not None else None
+
+
+def _text_to_datetime(value: str) -> datetime:
+    """反序列化必填 datetime。"""
+    return datetime.fromisoformat(value)
+
+
+def _optional_text_to_datetime(value: str | None) -> datetime | None:
+    """反序列化可选 datetime。"""
+    return datetime.fromisoformat(value) if value else None

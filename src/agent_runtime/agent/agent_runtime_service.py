@@ -276,6 +276,22 @@ class AgentRuntimeService:
         """取消 Agent 实例。"""
         return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_CANCELLED)
 
+    def bind_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        """为 Agent 实例绑定历史会话 ID。
+
+        执行循环创建 Conversation 发生在实例创建之后时，需要把 conversation_id 写回实例运行态，
+        让 task/instance 管理视图能够直接追溯该实例对应的历史对话。
+        """
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            updated = instance.bind_conversation(conversation_id)
+            self._repository.save_agent_instance(updated)
+            return updated
+
     def _transition_task(
         self,
         task_id: str,

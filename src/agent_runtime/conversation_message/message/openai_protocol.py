@@ -117,7 +117,11 @@ class OpenAIAdapter:
                 except (json.JSONDecodeError, TypeError):
                     parsed_input = arguments
                 content.append(
-                    ToolUsePart(name=item.get("name", ""), input=parsed_input)
+                    ToolUsePart(
+                        name=item.get("name", ""),
+                        input=parsed_input,
+                        tool_use_id=item.get("call_id") or item.get("id"),
+                    )
                 )
 
         return UniMessage(

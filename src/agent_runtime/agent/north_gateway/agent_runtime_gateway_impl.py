@@ -143,3 +143,14 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
     def cancel_agent_instance(self, instance_id: str) -> AgentInstance:
         """取消 Agent 实例。"""
         return self._service.cancel_agent_instance(instance_id)
+
+    def bind_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        """为 Agent 实例绑定历史会话 ID。"""
+        return self._service.bind_agent_instance_conversation(
+            instance_id,
+            conversation_id,
+        )

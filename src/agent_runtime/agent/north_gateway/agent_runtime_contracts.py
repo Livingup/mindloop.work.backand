@@ -165,3 +165,12 @@ class AgentRuntimeGateway(Protocol):
 
     def cancel_agent_instance(self, instance_id: str) -> AgentInstance:
         """取消 Agent 实例。"""
+        ...
+
+    def bind_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        """为 Agent 实例绑定历史会话 ID。"""
+        ...

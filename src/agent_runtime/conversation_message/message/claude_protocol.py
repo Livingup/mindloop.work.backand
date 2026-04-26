@@ -96,7 +96,13 @@ class ClaudeAdapter:
             elif block_type in ("thinking", "redacted_thinking"):
                 content.append(ThinkingPart(text=block.get("thinking")))
             elif block_type == "tool_use":
-                content.append(ToolUsePart(name=block["name"], input=block.get("input")))
+                content.append(
+                    ToolUsePart(
+                        name=block["name"],
+                        input=block.get("input"),
+                        tool_use_id=block.get("id"),
+                    )
+                )
             # 其他块（citations 等）暂不解出公共语义，但保留在消息级 raw 中
 
         return UniMessage(
