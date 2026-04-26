@@ -70,7 +70,7 @@ class GeminiAdapter:
         """将 Gemini 原始响应归一化为 UniMessage。
 
         从响应的 candidates[0].content.parts 中提取公共语义 parts，
-        同时将完整的 parts 数组存入 provider_extras["gemini"]["raw"]。
+        同时将完整的 parts 数组存入 provider_extras["gemini_generate_content"]["raw"]。
 
         Gemini 响应结构示例：
         {
@@ -215,7 +215,7 @@ def _build_gemini_tool(msg: UniMessage) -> dict[str, Any]:
 def _build_gemini_model(msg: UniMessage) -> dict[str, Any]:
     """将 assistant 消息转换为 Gemini 格式。
 
-    同平台（source_provider == "gemini"）：原样回灌 raw（含 thoughtSignature，无损）。
+    同平台（source_provider == "gemini_generate_content"）：原样回灌 raw（含 thoughtSignature，无损）。
     跨平台：公共层降级，只取 text part。
     """
     # 同平台无损回灌

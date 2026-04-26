@@ -125,6 +125,7 @@ class ResolvedLlmProviderModelResponse(BaseModel):
     model_name: str
     model_alias: str
     api_format: str
+    sdk_platform: str
     api_base_url: str
     api_keys: list[dict[str, Any]] = Field(default_factory=list)
     custom_headers: dict[str, str] = Field(default_factory=dict)

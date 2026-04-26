@@ -118,7 +118,7 @@ async def render_messages(
     合并 model / temperature / max_tokens 等参数后发送请求。
 
     参数说明：
-    - target: 目标协议标识（如 "claude" / "deepseek"）
+    - target: 目标协议标识 / api_format（如 "anthropic_messages" / "openai_responses"）
     - resolver: 资源解析器，按需将 resourceId → base64/URL
     - options: 透传给 adapter.render()，各 adapter 自定义
       （如 OpenAI 的 {"stored": True}）
@@ -148,7 +148,7 @@ def ingest_response(
     4. adapter.update_state：更新 providerState（如 OpenAI 记录 checkpoint）
 
     参数说明：
-    - provider: 响应来源协议标识（如 "claude" / "deepseek"）
+    - provider: 响应来源协议标识 / api_format（如 "anthropic_messages" / "openai_responses"）
     - raw_response: LLM API 原始响应（JSON 解析后的 dict）
     - options: 可选参数，支持：
       - vendor: 实际服务商标识（如 "openrouter"），记录到 source_vendor

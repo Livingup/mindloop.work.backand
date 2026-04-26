@@ -48,7 +48,7 @@ class ClaudeRenderResult:
 
     包含渲染后的 messages 数组和本次实际应用的缓存断点位置。
     调用方在 API 调用成功后应将 applied_cache_breakpoint_indexes
-    写回 conv.provider_state["claude"]["cache_breakpoint_indexes"]，
+    写回 conv.provider_state["anthropic_messages"]["cache_breakpoint_indexes"]，
     供下次渲染时复用缓存前缀。
     """
 
@@ -77,7 +77,7 @@ class ClaudeAdapter:
         """将 Claude 原始响应归一化为 UniMessage。
 
         从响应的 content 数组中提取公共语义 parts（text / thinking / tool_use），
-        同时将完整的 content 数组存入 provider_extras["claude"]["raw"] 供同平台回灌。
+        同时将完整的 content 数组存入 provider_extras["anthropic_messages"]["raw"] 供同平台回灌。
 
         Claude 响应结构示例：
         {
@@ -235,7 +235,7 @@ def _build_claude_tool(msg: UniMessage) -> dict[str, Any]:
 def _build_claude_assistant(msg: UniMessage) -> dict[str, Any]:
     """将 assistant 消息转换为 Claude 格式。
 
-    同平台（source_provider == "claude"）：原样回灌 raw（无损，含 signature）。
+    同平台（source_provider == "anthropic_messages"）：原样回灌 raw（无损，含 signature）。
     跨平台：公共层降级，只合并 text part（丢 thinking / tool_*）。
     """
     # 同平台无损回灌

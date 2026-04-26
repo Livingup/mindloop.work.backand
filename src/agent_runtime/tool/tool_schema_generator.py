@@ -1,6 +1,6 @@
 """工具 Schema 生成器接口。
 
-各 LLM 平台（OpenAI / Claude / Gemini）在各自模块中实现此接口，
+各 LLM SDK 平台（OpenAI / Anthropic / Gemini / Zhipu）在各自模块中实现此接口，
 使用各自 SDK 从函数签名（类型注解 + Pydantic 模型）解析生成该平台所需格式的 JSON Schema。
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ class ToolSchemaGenerator(Protocol):
 
     @property
     def platform(self) -> str:
-        """平台标识（如 "openai"、"claude"、"gemini"）。"""
+        """SDK 平台标识（如 "openai"、"anthropic"、"gemini"、"zhipu"）。"""
         ...
 
     def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:

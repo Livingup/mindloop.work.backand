@@ -85,7 +85,7 @@ class LlmModelMetadataSaveRequest:
 class LlmProviderSaveRequest:
     """保存 LLM 服务商定义请求。
 
-    调用方提交完整服务商配置，由领域实体校验 provider_id、模型接入项 ID、api_format、JSON 自定义请求字段
+    调用方提交完整服务商配置，由领域实体校验 provider_id、模型接入项 ID、全局枚举 api_format、JSON 自定义请求字段
     和 API Key 等结构后，再由领域服务校验所有 model_id 引用均已存在。
     """
 

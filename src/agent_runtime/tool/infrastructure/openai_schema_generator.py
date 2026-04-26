@@ -9,6 +9,7 @@ from typing import Any
 
 from openai import pydantic_function_tool
 
+from agent_runtime.llm_api_protocol import SDK_PLATFORM_OPENAI
 from agent_runtime.tool.infrastructure._pydantic_model_builder import (
     build_pydantic_model,
 )
@@ -24,8 +25,8 @@ class OpenAISchemaGenerator:
 
     @property
     def platform(self) -> str:
-        """平台标识。"""
-        return "openai"
+        """SDK 平台标识。"""
+        return SDK_PLATFORM_OPENAI
 
     def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
         """生成 OpenAI 格式的工具 Schema。

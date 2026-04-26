@@ -218,18 +218,6 @@ def create_llm_model_registry_cli_group(
         gateway.delete_provider(provider_id)
         _output_json({"status": "success", "message": f"已删除 LLM 服务商定义: {provider_id}"})
 
-    @providers_group.command("models", help="列出指定服务商的模型接入项")
-    @click.argument("provider_id")
-    @click.pass_context
-    def list_provider_models(ctx: click.Context, provider_id: str) -> None:
-        """列出指定服务商下的模型接入项。"""
-        gateway = ctx.obj["gateway"]
-        try:
-            bindings = gateway.list_provider_model_bindings(provider_id)
-            _output_json([_binding_to_dict(item) for item in bindings])
-        except KeyError as e:
-            _error_json(str(e))
-
     @registry_group.command("resolve", help="解析服务商模型接入项的最终调用配置")
     @click.argument("provider_id")
     @click.argument("binding_id")

@@ -17,11 +17,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from agent_runtime.llm_api_protocol import (
+    API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_GEMINI_GENERATE_CONTENT,
+    API_FORMAT_OPENAI_RESPONSES,
+    API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
+)
+
 # ── 基础类型 ─────────────────────────────────────────────────────
 
-# 协议标识（开放字符串，可注册第三方）。
-# 内置三家: "claude" | "gemini" | "openai"
-# 第三方示例: "deepseek" | "qwen" | "glm" | ...
+# 协议标识（开放字符串，当前统一使用 llm_api_protocol 中定义的具体 API 协议格式）。
+# 示例："anthropic_messages" | "openai_responses" | "openai_chat_completions" | "gemini_generate_content"
 Provider: TypeAlias = str
 
 # 服务商标识（元数据，本层不依据它做任何逻辑）。
@@ -33,10 +39,16 @@ Modality: TypeAlias = str
 # 消息角色。
 Role: TypeAlias = str
 
-# 内置 Provider 常量，方便调用方引用。
-PROVIDER_CLAUDE: str = "claude"
-PROVIDER_GEMINI: str = "gemini"
-PROVIDER_OPENAI: str = "openai"
+# 内置 Provider 常量，方便调用方引用。Provider 取值与 api_format 保持一致。
+PROVIDER_ANTHROPIC_MESSAGES: str = API_FORMAT_ANTHROPIC_MESSAGES
+PROVIDER_GEMINI_GENERATE_CONTENT: str = API_FORMAT_GEMINI_GENERATE_CONTENT
+PROVIDER_OPENAI_RESPONSES: str = API_FORMAT_OPENAI_RESPONSES
+PROVIDER_ZHIPU_CHAT_COMPLETIONS: str = API_FORMAT_ZHIPU_CHAT_COMPLETIONS
+
+# 兼容旧命名：Claude/Gemini/OpenAI 旧常量仍可引用，但值已统一为具体 API 协议格式。
+PROVIDER_CLAUDE: str = PROVIDER_ANTHROPIC_MESSAGES
+PROVIDER_GEMINI: str = PROVIDER_GEMINI_GENERATE_CONTENT
+PROVIDER_OPENAI: str = PROVIDER_OPENAI_RESPONSES
 
 # 角色常量。
 ROLE_USER: str = "user"
@@ -178,7 +190,7 @@ class UniMessage:
     # LLM 平台原始响应。仅 assistant 消息才有。
     # user / tool 消息是纯通用 POJO，永远没有此字段。
     #
-    # key = source_provider 值（如 "claude" / "deepseek"）。
+    # key = source_provider 值（如 "anthropic_messages" / "openai_responses"）。
     # value = {"raw": [...]} 原始响应内容数组。
     # 同平台渲染时：直接回灌 raw（无损）。
     # 跨平台渲染时：忽略 raw，仅用 content[] 公共层重建（降级）。
@@ -281,8 +293,8 @@ class Conversation:
     各平台的会话运行态以及由消息列表派生的统计状态。
 
     - messages：历史消息列表，是会话的唯一真相源。
-    - provider_state：各平台的会话运行态，render 时读取，API 成功后写回。
-      key = provider 标识（如 "claude" / "openai" / "deepseek"），
+    - provider_state：各 API 协议格式的会话运行态，render 时读取，API 成功后写回。
+      key = provider/api_format 标识（如 "anthropic_messages" / "openai_responses"），
       value 由各 ProviderAdapter 自定义。
     - state：派生状态，由 messages 驱动。
     """
@@ -296,14 +308,14 @@ class Conversation:
     # 派生状态。messages 是真相源，state 由状态维护模块同步。
     state: ConversationState = field(default_factory=ConversationState)
 
-    # 各平台的会话运行态，render 时读取，API 成功后写回。
-    # key = provider 标识（如 "claude" / "openai" / "deepseek"），
+    # 各 API 协议格式的会话运行态，render 时读取，API 成功后写回。
+    # key = provider/api_format 标识（如 "anthropic_messages" / "openai_responses"），
     # value 由各 ProviderAdapter 自定义。
     #
     # 内置示例：
-    #   claude:   {"cache_breakpoint_indexes": [int, ...]}
-    #   openai:   {"last_response_id": str, "last_message_index": int, "prompt_cache_key": str}
-    #   gemini:   {"cached_content": str}
+    #   anthropic_messages:        {"cache_breakpoint_indexes": [int, ...]}
+    #   openai_responses:          {"last_response_id": str, "last_message_index": int, "prompt_cache_key": str}
+    #   gemini_generate_content:   {"cached_content": str}
     provider_state: dict[str, Any] = field(default_factory=dict)
 
     def append_message(
@@ -379,7 +391,7 @@ class ProviderAdapter(Protocol):
 
     @property
     def provider(self) -> str:
-        """协议标识，如 "claude"、"deepseek"。"""
+        """协议标识，即具体 api_format，如 "anthropic_messages"、"openai_responses"。"""
         ...
 
     def normalize_response(self, raw_response: Any) -> UniMessage:

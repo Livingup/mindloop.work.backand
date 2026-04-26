@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_repository import (
     LlmModelRegistryRepository,
@@ -48,6 +49,9 @@ class ResolvedLlmProviderModel:
 
     # 服务商模型调用协议格式。
     api_format: str
+
+    # api_format 所属 SDK 平台，例如 openai、anthropic、gemini、zhipu。
+    sdk_platform: str
 
     # 已应用模型专属覆盖后的 API base URL。
     api_base_url: str
@@ -97,6 +101,7 @@ class ResolvedLlmProviderModel:
             "model_name": self.model_name,
             "model_alias": self.model_alias,
             "api_format": self.api_format,
+            "sdk_platform": self.sdk_platform,
             "api_base_url": self.api_base_url,
             "api_keys": [item.to_dict() for item in self.api_keys],
             "custom_headers": dict(self.custom_headers),
@@ -240,6 +245,7 @@ class LlmModelRegistryService:
             model_name=metadata.name,
             model_alias=binding.model_alias,
             api_format=binding.api_format,
+            sdk_platform=get_sdk_platform_for_api_format(binding.api_format),
             api_base_url=binding.api_base_url or provider.api_base_url,
             api_keys=binding.api_keys or provider.api_keys,
             custom_headers=merged_headers,

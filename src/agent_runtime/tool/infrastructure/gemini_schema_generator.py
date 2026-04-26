@@ -9,6 +9,7 @@ from typing import Any
 
 from google.genai import types
 
+from agent_runtime.llm_api_protocol import SDK_PLATFORM_GEMINI
 from agent_runtime.tool.infrastructure._pydantic_model_builder import (
     build_pydantic_model,
 )
@@ -25,8 +26,8 @@ class GeminiSchemaGenerator:
 
     @property
     def platform(self) -> str:
-        """平台标识。"""
-        return "gemini"
+        """SDK 平台标识。"""
+        return SDK_PLATFORM_GEMINI
 
     def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
         """生成 Gemini 格式的工具 Schema。

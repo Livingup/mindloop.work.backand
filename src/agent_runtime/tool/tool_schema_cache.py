@@ -46,7 +46,7 @@ class ToolSchemaCache:
 
         Args:
             tool_def: 工具定义实体。
-            platform: 平台标识（如 "openai"）。
+            platform: SDK 平台标识（如 "openai"、"anthropic"、"gemini"、"zhipu"）。
 
         Returns:
             该平台格式的 JSON Schema 字典。

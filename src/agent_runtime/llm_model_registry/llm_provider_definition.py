@@ -133,7 +133,7 @@ class LlmProviderModelBinding:
     # 服务商请求时实际使用的模型名。例如同一个模型元数据在不同中转服务里可能叫不同别名。
     model_alias: str
 
-    # 服务商模型调用协议格式，例如 openai_responses、claude_messages、gemini_generate_content。
+    # 服务商模型调用协议格式，例如 anthropic_messages、openai_responses、openai_chat_completions、gemini_generate_content、zhipu_chat_completions。
     api_format: str
 
     # 自定义 tool_choice JSON 字符串。模块只校验 JSON 合法性，不理解协议语义。

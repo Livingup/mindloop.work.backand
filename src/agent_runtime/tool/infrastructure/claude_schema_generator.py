@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from agent_runtime.llm_api_protocol import SDK_PLATFORM_ANTHROPIC
 from agent_runtime.tool.infrastructure._pydantic_model_builder import (
     build_pydantic_model,
 )
@@ -23,8 +24,8 @@ class ClaudeSchemaGenerator:
 
     @property
     def platform(self) -> str:
-        """平台标识。"""
-        return "claude"
+        """SDK 平台标识。"""
+        return SDK_PLATFORM_ANTHROPIC
 
     def generate(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
         """生成 Claude 格式的工具 Schema。

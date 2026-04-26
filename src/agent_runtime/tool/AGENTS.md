@@ -107,7 +107,7 @@ class ToolSchemaGenerator(Protocol):
 
     @property
     def platform(self) -> str:
-        """平台标识（如 "openai"、"claude"、"gemini"）。"""
+        """SDK 平台标识（如 "openai"、"anthropic"、"gemini"、"zhipu"）。"""
         ...
 
     def generate(self, tool_def: LocalToolDefinition) -> dict:

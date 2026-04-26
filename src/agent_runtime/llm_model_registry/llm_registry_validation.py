@@ -10,6 +10,8 @@ import json
 import re
 from typing import Iterable
 
+from agent_runtime.llm_api_protocol import validate_llm_api_format
+
 
 # 用户自定义注册数据的 ID 同时会作为 YAML 文件名或 URL 路径片段，必须避免路径穿越、隐藏文件和
 # Windows 保留设备名问题。允许点号是为了兼容 gemini-3.1-pro、gpt-5.4 等模型型号命名。
@@ -24,10 +26,6 @@ _WINDOWS_RESERVED_FILE_NAMES = {
 
 # LLM 输入模态采用开放字符串集合；这里仅校验文件/API 友好的格式，不把未来新模态写死在代码里。
 _MODALITY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-
-
-# API 协议格式由 LLM 统一调用客户端消费，本模块只校验其可作为稳定配置枚举值使用的格式。
-_API_FORMAT_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 
 def validate_registry_id(value: str, field_name: str) -> None:
@@ -112,15 +110,7 @@ def validate_unique_registry_ids(values: Iterable[str], field_name: str) -> None
 
 def validate_api_format(value: str) -> None:
     """校验服务商模型接入项的 API 协议格式字段。"""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("api_format 不能为空。")
-    if value != value.strip():
-        raise ValueError("api_format 不能包含首尾空白字符。")
-    if not _API_FORMAT_PATTERN.match(value):
-        raise ValueError(
-            f"api_format '{value}' 格式无效，要求以字母开头，"
-            "仅包含字母、数字、下划线、短横线和点号。"
-        )
+    validate_llm_api_format(value, "api_format")
 
 
 def validate_json_string(value: str | None, field_name: str) -> None:

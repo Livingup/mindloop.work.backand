@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import click
 
+from agent_runtime.llm_api_protocol import SDK_PLATFORM_ANTHROPIC
 from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
 )
@@ -49,7 +50,7 @@ def _serialize_detail(item: Any) -> dict[str, Any]:
         "group": item.group,
         "public": item.public,
         "wiki": item.wiki,
-        "schema": item.schemas.get("claude", {}),
+        "schema": item.schemas.get(SDK_PLATFORM_ANTHROPIC, {}),
     }
 
 

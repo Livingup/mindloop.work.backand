@@ -81,7 +81,7 @@ class OpenAIAdapter:
 
         从响应的 output 数组中提取公共语义 parts（reasoning → thinking，
         message → text，function_call → tool_use），同时将完整的 output 数组
-        存入 provider_extras["openai"]["raw"]。
+        存入 provider_extras["openai_responses"]["raw"]。
 
         OpenAI 响应结构示例：
         {
@@ -207,7 +207,7 @@ class OpenAIAdapter:
 
         将响应中的 id（作为 last_response_id）、当前消息索引
         （作为 last_message_index）和 prompt_cache_key 写入
-        provider_state["openai"]，供下次 store=true 渲染时走 gap 模式。
+        provider_state["openai_responses"]，供下次 store=true 渲染时走 gap 模式。
 
         store=false 时不更新 checkpoint。
         """
@@ -260,7 +260,7 @@ async def _build_openai_user(
 def _build_openai_assistant(msg: UniMessage) -> list[Any]:
     """将 assistant 消息转换为 OpenAI Responses API 格式。
 
-    同平台（source_provider == "openai"）：展开 output items 到顶层 input
+    同平台（source_provider == "openai_responses"）：展开 output items 到顶层 input
     （含 reasoning / message / function_call，无损）。
     跨平台：合成一条 assistant message item（降级）。
 
