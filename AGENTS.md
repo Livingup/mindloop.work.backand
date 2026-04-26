@@ -46,20 +46,15 @@ Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通�
 
 负责 Agent 静态模板数据管理。每个 Agent 定义一个 YAML 文件，文件名即 `agent_id`，默认存储在 `~/.spread-ai/agents/` 下，配置项为 `agent_definition.definitions_dir`。定义字段包括 `agent_id`、可选 `name` / `description`、`group`、系统提示词混合数组、本地工具 ID、MCP 服务工具绑定、Skill ID、可用子 Agent ID、是否系统内置后台 Agent、是否禁用。系统提示词数组支持 `text` 与 `template_id` 交叉混合并保持顺序，例如 `[{text: ...}, {template_id: ...}, {text: ...}]`。DDD 分层：领域实体 AgentDefinition（聚合根，携带文件名安全和引用列表去重校验）+ 值对象 SystemPromptSegment / McpToolBinding + 仓储接口/YAML 实现（`~/.spread-ai/agents/{agent_id}.yaml`）+ 领域服务 + 北向网关（Protocol + 请求模型 + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai agent list/get/create/update/delete/enable/disable`。REST：`/api/agents` CRUD + enable/disable。
 
+### LLM 服务商与模型注册模块（llm_model_registry）
+
+负责用户自定义的 LLM 模型型号元数据、服务商定义和服务商模型接入项管理。主配置只保存注册数据根目录 `llm_model_registry.registry_dir`，默认 `~/.spread-ai/llm-model-registry`；具体业务数据不写死在系统配置或代码中，而是按 `models/{model_id}.yaml` 与 `providers/{provider_id}.yaml` 分目录存储。模型元数据字段包括 `model_id`、`name`、`context_window`、`max_output_tokens`、`compression_threshold`、`supports_tool_calling`、`supports_structured_output`、`supported_input_modalities` 和模型侧 `thinking` JSON 字符串。服务商定义字段包括 `provider_id`、可选 `name`、默认 `api_base_url`、服务商级 `custom_headers`、默认 `api_keys`、`retry` 重试策略，以及 `models` 接入项列表；每个接入项包含 `id`、关联 `model_id`、请求实际模型名 `model_alias`、`api_format`、自定义 JSON 字符串 `tool_choice` / `thinking` / `custom_request_params`、模型专属 `api_base_url`、模型专属 `custom_headers` 和模型专属 `api_keys`。领域规则：ID 需要满足跨平台文件名安全格式；保存服务商时校验接入项引用的模型元数据必须存在；接入项 ID 在同一服务商内不能重复；`thinking` / `tool_choice` / `custom_request_params` 只校验 JSON 字符串合法性，不理解厂商语义；解析接入项时模型专属 base URL/API Keys 覆盖服务商默认值，headers 由服务商级与模型级合并且模型级同名覆盖。DDD 分层：领域实体 LlmModelMetadata / LlmProviderDefinition（聚合根）+ 值对象 LlmApiKey / LlmRetryPolicy / LlmProviderModelBinding + 仓储接口/YAML 实现 + 领域服务 + 北向网关（Protocol + 请求模型 + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai llm-registry models list/get/save/delete`、`spread-ai llm-registry providers list/get/save/delete/models`、`spread-ai llm-registry resolve`。REST：`/api/llm-registry/models`、`/api/llm-registry/providers`、`/api/llm-registry/providers/{provider_id}/models/{binding_id}/resolved`。
+
 ---
 
 ## 规划模块
 
-### 模块一：LLM 服务商
-
-LLM 服务商与模型的注册与元数据管理。
-
-- 服务商支持哪些模型
-- 模型元数据参数（最大输入 token、最大输出 token、思考设置、输入模态支持等）
-- 模型使用的协议（OpenAI / Claude / Gemini）
-- 自定义请求头、API Key 等凭证信息
-
-### 模块二：Agent 执行引擎
+### 模块一：Agent 执行引擎
 
 Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 
@@ -69,7 +64,7 @@ Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 - 将 LLM 返回的工具调用请求转发给工具执行引擎
 - 将工具执行结果生成工具结果消息，继续调用 LLM
 
-### 模块三：LLM 统一调用客户端
+### 模块二：LLM 统一调用客户端
 
 统一的 LLM 调用入口，屏蔽不同平台协议差异。
 
@@ -78,7 +73,7 @@ Agent 的核心编排层，负责 Agent 实例的创建和任务执行循环。
 - HTTP 请求和响应的原始报文记录（根据配置控制记录详细程度：是否打印 tools schema、是否打印系统提示词等）
 - 调用目标平台 SDK 请求 LLM，将结果返回给 Agent 执行引擎
 
-### 模块四：工具执行引擎
+### 模块三：工具执行引擎
 
 负责工具定义的实现与调用执行。
 

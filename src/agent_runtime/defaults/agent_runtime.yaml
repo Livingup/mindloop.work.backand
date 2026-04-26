@@ -38,3 +38,6 @@ mcp_client:
 
 agent_definition:
   definitions_dir: "~/.spread-ai/agents"
+
+llm_model_registry:
+  registry_dir: "~/.spread-ai/llm-model-registry"

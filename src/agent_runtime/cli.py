@@ -113,6 +113,14 @@ def _agent_definition_gateway_factory() -> object:
     return AgentDefinitionFactory.create()
 
 
+def _llm_model_registry_gateway_factory() -> object:
+    """创建 LLM 服务商与模型注册北向网关实例。"""
+    from agent_runtime.llm_model_registry.llm_model_registry_factory import (
+        LlmModelRegistryFactory,
+    )
+    return LlmModelRegistryFactory.create()
+
+
 # ── 注册 CLI 子命令组 ──────────────────────────────────────────
 
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_cli_adapter import (
@@ -129,6 +137,9 @@ from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_cli_adapter import (
 from agent_runtime.agent_definition.north_gateway.agent_definition_cli_adapter import (
     create_agent_definition_cli_group,
 )
+from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_cli_adapter import (
+    create_llm_model_registry_cli_group,
+)
 
 main.add_command(create_prompt_cli_group(_prompt_gateway_factory), name="prompt")
 main.add_command(create_tool_cli_group(_tool_gateway_factory), name="tool")
@@ -138,6 +149,10 @@ main.add_command(create_mcp_cli_group(_mcp_gateway_factory), name="mcp")
 main.add_command(
     create_agent_definition_cli_group(_agent_definition_gateway_factory),
     name="agent",
+)
+main.add_command(
+    create_llm_model_registry_cli_group(_llm_model_registry_gateway_factory),
+    name="llm-registry",
 )
 
 
@@ -174,12 +189,19 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.agent_definition.north_gateway.agent_definition_rest_adapter import (
         create_agent_definition_router,
     )
+    from agent_runtime.llm_model_registry.llm_model_registry_factory import (
+        LlmModelRegistryFactory,
+    )
+    from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_rest_adapter import (
+        create_llm_model_registry_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
+    llm_model_registry_gateway = LlmModelRegistryFactory.create()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务")
     app.include_router(
@@ -211,6 +233,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_agent_definition_router(agent_definition_gateway),
         prefix="/api/agents",
         tags=["Agent 定义"],
+    )
+    app.include_router(
+        create_llm_model_registry_router(llm_model_registry_gateway),
+        prefix="/api/llm-registry",
+        tags=["LLM 服务商与模型注册"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。

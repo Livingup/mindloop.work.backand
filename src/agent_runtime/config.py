@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
 from agent_runtime.prompt_template.prompt_template_config import PromptTemplateConfig
 from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.conversation_message.config import ConversationRepositoryConfig
+from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -98,6 +99,13 @@ class AgentRuntimeConfig:
 
     # Agent 定义服务配置。
     agent_definition: AgentDefinitionConfig
+
+    # LLM 服务商与模型注册模块配置。
+    llm_model_registry: LlmModelRegistryConfig = field(
+        default_factory=lambda: LlmModelRegistryConfig(
+            registry_dir="~/.spread-ai/llm-model-registry",
+        ),
+    )
 
 
 # ── 配置注册中心（全局单例） ─────────────────────────────────
@@ -259,6 +267,15 @@ class ConfigRegistry:
             return self._config.agent_definition
         return self._get_section_config(
             "agent_definition", _build_agent_definition_config,
+        )
+
+    @property
+    def llm_model_registry(self) -> LlmModelRegistryConfig:
+        """实时读取 LLM 服务商与模型注册模块配置（注册数据根目录等）。"""
+        if self._config is not None:
+            return self._config.llm_model_registry
+        return self._get_section_config(
+            "llm_model_registry", _build_llm_model_registry_config,
         )
 
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
@@ -428,6 +445,13 @@ def _build_agent_definition_config(data: dict[str, Any]) -> AgentDefinitionConfi
     """从 YAML 字典构建 Agent 定义服务配置。"""
     return AgentDefinitionConfig(
         definitions_dir=str(data["definitions_dir"]),
+    )
+
+
+def _build_llm_model_registry_config(data: dict[str, Any]) -> LlmModelRegistryConfig:
+    """从 YAML 字典构建 LLM 服务商与模型注册模块配置。"""
+    return LlmModelRegistryConfig(
+        registry_dir=str(data["registry_dir"]),
     )
 
 
