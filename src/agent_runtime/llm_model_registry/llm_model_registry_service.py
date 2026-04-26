@@ -88,9 +88,6 @@ class ResolvedLlmProviderModel:
     # 支持的输入模态。
     supported_input_modalities: tuple[str, ...]
 
-    # 模型元数据侧的 thinking JSON 字符串。服务商请求 thinking 独立存放在 thinking 字段。
-    model_metadata_thinking: str | None
-
     def to_dict(self) -> dict[str, Any]:
         """转换为对 CLI/REST 友好的字典结构。"""
         return {
@@ -113,7 +110,6 @@ class ResolvedLlmProviderModel:
             "supports_tool_calling": self.supports_tool_calling,
             "supports_structured_output": self.supports_structured_output,
             "supported_input_modalities": list(self.supported_input_modalities),
-            "model_metadata_thinking": self.model_metadata_thinking,
         }
 
 
@@ -257,5 +253,4 @@ class LlmModelRegistryService:
             supports_tool_calling=metadata.supports_tool_calling,
             supports_structured_output=metadata.supports_structured_output,
             supported_input_modalities=metadata.supported_input_modalities,
-            model_metadata_thinking=metadata.thinking,
         )

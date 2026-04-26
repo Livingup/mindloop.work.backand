@@ -25,8 +25,8 @@ from agent_runtime.llm_model_registry.llm_provider_definition import (
 class LlmModelMetadataSaveRequest:
     """保存模型元数据请求。
 
-    调用方提交完整模型型号能力数据，由领域实体校验 model_id 文件名安全、token 容量字段、输入模态数组
-    和 thinking JSON 字符串合法性后持久化为用户目录 YAML 文件。
+    调用方提交完整模型型号能力数据，由领域实体校验 model_id 文件名安全、token 容量字段和输入模态数组后，
+    持久化为用户目录 YAML 文件。
     """
 
     # 模型型号唯一标识，同时也是 models/{model_id}.yaml 文件名主名。
@@ -53,9 +53,6 @@ class LlmModelMetadataSaveRequest:
     # 支持的输入模态列表。
     supported_input_modalities: tuple[str, ...] = ("text",)
 
-    # 模型侧 thinking 自定义 JSON 字符串。
-    thinking: str | None = None
-
     def to_metadata(self) -> LlmModelMetadata:
         """转换为 LlmModelMetadata 聚合根。"""
         return LlmModelMetadata(
@@ -67,7 +64,6 @@ class LlmModelMetadataSaveRequest:
             supports_tool_calling=self.supports_tool_calling,
             supports_structured_output=self.supports_structured_output,
             supported_input_modalities=self.supported_input_modalities,
-            thinking=self.thinking,
         )
 
     @classmethod
@@ -82,7 +78,6 @@ class LlmModelMetadataSaveRequest:
             supports_tool_calling=metadata.supports_tool_calling,
             supports_structured_output=metadata.supports_structured_output,
             supported_input_modalities=metadata.supported_input_modalities,
-            thinking=metadata.thinking,
         )
 
 

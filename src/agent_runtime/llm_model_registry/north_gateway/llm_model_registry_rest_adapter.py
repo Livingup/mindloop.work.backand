@@ -44,7 +44,6 @@ class LlmModelMetadataBody(BaseModel):
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
     supported_input_modalities: list[str] = Field(default_factory=lambda: ["text"])
-    thinking: str | None = None
 
 
 class LlmModelMetadataResponse(BaseModel):
@@ -58,7 +57,6 @@ class LlmModelMetadataResponse(BaseModel):
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
     supported_input_modalities: list[str] = Field(default_factory=list)
-    thinking: str | None = None
 
 
 class LlmApiKeyBody(BaseModel):
@@ -140,7 +138,6 @@ class ResolvedLlmProviderModelResponse(BaseModel):
     supports_tool_calling: bool
     supports_structured_output: bool
     supported_input_modalities: list[str] = Field(default_factory=list)
-    model_metadata_thinking: str | None = None
 
 
 # ── 路由工厂 ─────────────────────────────────────────────────────
@@ -285,7 +282,6 @@ def _body_to_model_request(
         supports_tool_calling=body.supports_tool_calling,
         supports_structured_output=body.supports_structured_output,
         supported_input_modalities=tuple(body.supported_input_modalities),
-        thinking=body.thinking,
     )
 
 

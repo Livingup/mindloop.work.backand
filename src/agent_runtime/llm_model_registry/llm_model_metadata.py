@@ -6,12 +6,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_runtime.llm_model_registry.llm_registry_validation import (
-    validate_json_string,
     validate_modalities,
     validate_optional_text,
     validate_positive_int,
     validate_registry_id,
-)
+ )
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +19,7 @@ class LlmModelMetadata:
 
     模型元数据描述“模型型号本身具备什么能力”，不绑定任何服务商、API Key 或实际请求地址。
     例如 gemini-3.1-pro 可以声明上下文窗口、最大输出 token、是否支持工具调用、是否支持结构化输出、
-    支持 text/image 等输入模态，以及可选的 thinking 自定义 JSON 字符串。
+    以及支持 text/image 等输入模态。具体请求时的 thinking 参数由服务商模型接入项维护。
     """
 
     # 模型型号唯一标识，同时作为 ~/.spread-ai/llm-model-registry/models/{model_id}.yaml 的文件名主名。
@@ -47,9 +46,6 @@ class LlmModelMetadata:
     # 支持的输入模态列表，例如 text、image、audio、video、pdf。保持开放枚举，便于未来扩展新模态。
     supported_input_modalities: tuple[str, ...] = field(default_factory=lambda: ("text",))
 
-    # 模型侧思考能力/思考设置的自定义 JSON 字符串。本模块只校验 JSON 合法性，不理解具体厂商语义。
-    thinking: str | None = None
-
     def __post_init__(self) -> None:
         """实体创建时校验模型元数据的核心业务规则。"""
         validate_registry_id(self.model_id, "model_id")
@@ -67,7 +63,6 @@ class LlmModelMetadata:
             "supported_input_modalities",
             validate_modalities(self.supported_input_modalities),
         )
-        validate_json_string(self.thinking, "thinking")
 
     def to_dict(self) -> dict[str, Any]:
         """将模型元数据转换为 YAML 友好的字典结构。"""
@@ -82,8 +77,6 @@ class LlmModelMetadata:
         }
         if self.compression_threshold is not None:
             data["compression_threshold"] = self.compression_threshold
-        if self.thinking is not None:
-            data["thinking"] = self.thinking
         return data
 
     @classmethod
@@ -103,5 +96,4 @@ class LlmModelMetadata:
             supported_input_modalities=tuple(
                 str(item) for item in data.get("supported_input_modalities", ["text"])
             ),
-            thinking=data.get("thinking"),
         )
