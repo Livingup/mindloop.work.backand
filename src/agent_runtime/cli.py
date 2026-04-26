@@ -4,74 +4,106 @@
 服务模式通过 spread-ai serve 启动 REST API 服务器。
 
 组合根职责：
-1. 解析 CLI 配置文件路径（--config → SPREAD_AI_CONFIG → ~/.spread-ai/agent_runtime.yaml）
-2. 首次运行自动生成用户默认配置
+1. 提供 spread-ai config init，将用户提供的服务配置复制到 ~/.spread-ai/agent_runtime.yaml
+2. 除 config init 外，所有命令固定加载 ~/.spread-ai/agent_runtime.yaml
 3. 加载全局配置注册中心（ConfigRegistry）
 4. 通过各模块工厂创建网关实例（延迟创建，命令执行时才触发）
 5. 将网关工厂函数传递给 CLI adapter，由 adapter 在命令回调中调用
 """
 from __future__ import annotations
 
-import os
-from importlib import resources
+import json
+import shutil
 from pathlib import Path
 
 import click
 
 from agent_runtime.config import ConfigRegistry
 
-# 配置环境变量名称。
-_CONFIG_ENV_NAME = "SPREAD_AI_CONFIG"
 
-
-def _user_default_config_path() -> Path:
-    """返回发布态默认用户配置文件路径。"""
+def _runtime_config_path() -> Path:
+    """返回初始化后的唯一运行配置文件路径。"""
     return Path.home() / ".spread-ai" / "agent_runtime.yaml"
 
 
-def _ensure_user_default_config() -> str:
-    """确保用户默认配置存在；不存在时从包内模板首次生成。"""
-    user_config_path = _user_default_config_path()
-    if user_config_path.exists():
-        return str(user_config_path)
-
-    user_config_path.parent.mkdir(parents=True, exist_ok=True)
-    template_path = resources.files("agent_runtime.defaults").joinpath("agent_runtime.yaml")
-    user_config_path.write_text(
-        template_path.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    return str(user_config_path)
+def _load_initialized_runtime_config() -> None:
+    """加载已经初始化好的运行配置；不存在时提示用户先执行 config init。"""
+    config_path = _runtime_config_path()
+    if not config_path.is_file():
+        raise click.ClickException(
+            f"运行配置文件不存在: {config_path}。请先执行 "
+            "spread-ai config init --source <agent_runtime.yaml> 初始化服务配置。"
+        )
+    ConfigRegistry.load(str(config_path))
 
 
-def _resolve_config_path(config_path: str | None) -> str:
-    """按优先级解析 CLI 配置文件路径。
-
-    优先级：
-    1. 用户显式传入 --config
-    2. 环境变量 SPREAD_AI_CONFIG
-    3. 用户目录 ~/.spread-ai/agent_runtime.yaml
-    4. 若用户目录配置不存在，则首次运行自动生成默认配置
-    """
-    if config_path is not None:
-        return str(Path(os.path.expanduser(config_path)))
-
-    env_config_path = os.environ.get(_CONFIG_ENV_NAME)
-    if env_config_path:
-        return str(Path(os.path.expanduser(env_config_path)))
-
-    return _ensure_user_default_config()
+def _echo_json(data: dict[str, object], *, err: bool = False) -> None:
+    """输出结构化 JSON，方便用户、脚本和 Agent 解析。"""
+    click.echo(json.dumps(data, ensure_ascii=False, indent=2), err=err)
 
 
-@click.group()
-@click.option(
-    "--config", "config_path",
-    default=None,
-    help="配置文件路径（优先级高于环境变量 SPREAD_AI_CONFIG 和用户默认配置）。",
-)
-def main(config_path: str | None) -> None:
+@click.group(invoke_without_command=True)
+@click.pass_context
+def main(ctx: click.Context) -> None:
     """spread-ai：通用 Agent 运行时环境服务 CLI。"""
-    ConfigRegistry.load(_resolve_config_path(config_path))
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+        ctx.exit()
+    if ctx.invoked_subcommand == "config":
+        return
+    _load_initialized_runtime_config()
+
+
+# ── config 命令组 ────────────────────────────────────────────────
+
+
+@click.group("config")
+def config_group() -> None:
+    """运行配置初始化与管理命令。"""
+
+
+@config_group.command("init")
+@click.option(
+    "--source",
+    "source_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="用于初始化的 agent_runtime.yaml 服务配置文件路径。",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="目标配置已存在时允许覆盖。",
+)
+def init_config(source_path: Path, force: bool) -> None:
+    """将用户提供的服务配置复制为 spread-ai 唯一运行配置。"""
+    target_path = _runtime_config_path()
+    target_exists_before_init = target_path.exists()
+    if target_exists_before_init and not force:
+        _echo_json(
+            {
+                "status": "error",
+                "message": f"运行配置已存在: {target_path}。如需覆盖请增加 --force。",
+                "config_path": str(target_path),
+            },
+            err=True,
+        )
+        raise click.exceptions.Exit(1)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_path, target_path)
+    _echo_json(
+        {
+            "status": "ok",
+            "message": "运行配置初始化完成。",
+            "source_path": str(source_path),
+            "config_path": str(target_path),
+            "overwritten": target_exists_before_init,
+        }
+    )
+
+
+main.add_command(config_group, name="config")
 
 
 # ── @tool 装饰器注册（import 触发） ──────────────────────────────

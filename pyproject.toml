@@ -39,8 +39,6 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-"agent_runtime.defaults" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
