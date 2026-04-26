@@ -10,6 +10,7 @@ import json
 import re
 from typing import Iterable
 
+from agent_runtime.input_modality import SUPPORTED_INPUT_MODALITIES
 from agent_runtime.llm_api_protocol import validate_llm_api_format
 
 
@@ -24,8 +25,7 @@ _WINDOWS_RESERVED_FILE_NAMES = {
 }
 
 
-# LLM 输入模态采用开放字符串集合；这里仅校验文件/API 友好的格式，不把未来新模态写死在代码里。
-_MODALITY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+# LLM 模型元数据中的 supported_input_modalities 必须从系统当前支持的输入模态集合中选择。
 
 
 def validate_registry_id(value: str, field_name: str) -> None:
@@ -73,25 +73,24 @@ def validate_modalities(values: Iterable[str]) -> tuple[str, ...]:
     """校验模型支持的输入模态数组并返回去重后的不可变元组。
 
     业务规则：
-    - 输入模态不能为空，模型至少应声明 text/image/audio/video/pdf 等一种输入能力；
-    - 当前不枚举限制所有合法模态，避免未来新模态需要修改代码；
+    - 输入模态不能为空，模型至少应声明 text/image/pdf 中的一种输入能力；
+    - 模型声明的模态只能来自系统当前支持的输入模态集合；
     - 同一模型的模态声明不允许重复，避免管理后台展示和调用侧判断产生歧义。
     """
     normalized: list[str] = []
     seen: set[str] = set()
     for item in values:
-        modality = str(item).strip()
+        modality = str(item).strip().lower()
         if not modality:
             raise ValueError("supported_input_modalities 不能包含空值。")
-        if not _MODALITY_PATTERN.match(modality):
+        if modality not in SUPPORTED_INPUT_MODALITIES:
+            supported = ", ".join(sorted(SUPPORTED_INPUT_MODALITIES))
             raise ValueError(
-                f"输入模态 '{modality}' 格式无效，要求以字母开头，"
-                "仅包含字母、数字、下划线和短横线。"
+                f"输入模态 '{modality}' 不受系统支持，当前仅支持: {supported}"
             )
-        key = modality.lower()
-        if key in seen:
+        if modality in seen:
             raise ValueError(f"supported_input_modalities 存在重复模态: {modality}")
-        seen.add(key)
+        seen.add(modality)
         normalized.append(modality)
     if not normalized:
         raise ValueError("supported_input_modalities 至少需要声明一种输入模态。")

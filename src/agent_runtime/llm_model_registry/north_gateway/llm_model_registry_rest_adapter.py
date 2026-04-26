@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
@@ -43,7 +44,9 @@ class LlmModelMetadataBody(BaseModel):
     compression_threshold: int | None = None
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
-    supported_input_modalities: list[str] = Field(default_factory=lambda: ["text"])
+    supported_input_modalities: list[str] = Field(
+        default_factory=lambda: [INPUT_MODALITY_TEXT]
+    )
 
 
 class LlmModelMetadataResponse(BaseModel):

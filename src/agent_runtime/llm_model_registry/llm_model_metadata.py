@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_registry_validation import (
     validate_modalities,
     validate_optional_text,
@@ -43,8 +44,10 @@ class LlmModelMetadata:
     # 是否支持结构化输出。用于决定是否可启用 JSON schema / response_format 等结构化响应参数。
     supports_structured_output: bool = False
 
-    # 支持的输入模态列表，例如 text、image、audio、video、pdf。保持开放枚举，便于未来扩展新模态。
-    supported_input_modalities: tuple[str, ...] = field(default_factory=lambda: ("text",))
+    # 支持的输入模态列表，只能从系统当前支持的 text、image、pdf 中选择。
+    supported_input_modalities: tuple[str, ...] = field(
+        default_factory=lambda: (INPUT_MODALITY_TEXT,)
+    )
 
     def __post_init__(self) -> None:
         """实体创建时校验模型元数据的核心业务规则。"""
@@ -94,6 +97,6 @@ class LlmModelMetadata:
             supports_tool_calling=bool(data.get("supports_tool_calling", False)),
             supports_structured_output=bool(data.get("supports_structured_output", False)),
             supported_input_modalities=tuple(
-                str(item) for item in data.get("supported_input_modalities", ["text"])
+                str(item) for item in data.get("supported_input_modalities", [INPUT_MODALITY_TEXT])
             ),
         )

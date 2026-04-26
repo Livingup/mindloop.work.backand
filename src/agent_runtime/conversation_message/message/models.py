@@ -17,6 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from agent_runtime.input_modality import (
+    INPUT_MODALITY_IMAGE,
+    INPUT_MODALITY_PDF,
+    INPUT_MODALITY_TEXT,
+)
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
@@ -55,10 +60,10 @@ ROLE_USER: str = "user"
 ROLE_ASSISTANT: str = "assistant"
 ROLE_TOOL: str = "tool"
 
-# 模态常量。
-MODALITY_TEXT: str = "text"
-MODALITY_IMAGE: str = "image"
-MODALITY_PDF: str = "pdf"
+# 模态常量。保留 MODALITY_* 旧命名作为消息模块公共 API，实际值来自全局输入模态定义。
+MODALITY_TEXT: str = INPUT_MODALITY_TEXT
+MODALITY_IMAGE: str = INPUT_MODALITY_IMAGE
+MODALITY_PDF: str = INPUT_MODALITY_PDF
 
 
 # ── UniPart：消息内容块 ──────────────────────────────────────────
@@ -70,8 +75,8 @@ class TextPart:
     # 文本内容。
     text: str
 
-    # 内容块类型标识，固定为 "text"。
-    kind: str = field(default="text", init=False)
+    # 内容块类型标识，固定为 text。
+    kind: str = field(default=INPUT_MODALITY_TEXT, init=False)
 
 
 @dataclass(slots=True)
@@ -86,8 +91,8 @@ class ImagePart:
     # 统一文件资源标识，指向 FileResourceArchive.resource_id。
     resource_id: str
 
-    # 内容块类型标识，固定为 "image"。
-    kind: str = field(default="image", init=False)
+    # 内容块类型标识，固定为 image。
+    kind: str = field(default=INPUT_MODALITY_IMAGE, init=False)
 
 
 @dataclass(slots=True)
@@ -101,8 +106,8 @@ class PdfPart:
     # 统一文件资源标识，指向 FileResourceArchive.resource_id。
     resource_id: str
 
-    # 内容块类型标识，固定为 "pdf"。
-    kind: str = field(default="pdf", init=False)
+    # 内容块类型标识，固定为 pdf。
+    kind: str = field(default=INPUT_MODALITY_PDF, init=False)
 
 
 @dataclass(slots=True)
@@ -202,18 +207,18 @@ class UniMessage:
 
 @dataclass(slots=True)
 class TextPartMeta:
-    kind: str = "text"
+    kind: str = INPUT_MODALITY_TEXT
 
 
 @dataclass(slots=True)
 class ImagePartMeta:
-    kind: str = "image"
+    kind: str = INPUT_MODALITY_IMAGE
 
 
 @dataclass(slots=True)
 class PdfPartMeta:
     page_count: int
-    kind: str = "pdf"
+    kind: str = INPUT_MODALITY_PDF
 
 
 @dataclass(slots=True)
@@ -243,11 +248,11 @@ PartMeta: TypeAlias = (
 
 def _infer_part_meta(part: Any) -> PartMeta:
     kind = getattr(part, "kind", None)
-    if kind == "text":
+    if kind == INPUT_MODALITY_TEXT:
         return TextPartMeta()
-    if kind == "image":
+    if kind == INPUT_MODALITY_IMAGE:
         return ImagePartMeta()
-    if kind == "pdf":
+    if kind == INPUT_MODALITY_PDF:
         return PdfPartMeta(page_count=0)
     if kind == "thinking":
         return ThinkingPartMeta()

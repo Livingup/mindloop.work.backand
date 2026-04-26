@@ -26,13 +26,6 @@ file_resource_service:
   # 统一文件资源服务对外访问资源时的公共地址前缀。
   file_resource_public_base_url: "http://127.0.0.1:8000/file-resource"
 
-  # 当前统一文件资源服务允许接入的 MIME 类型。
-  enabled_resource_mime_types:
-    - "image/jpeg"
-    - "image/png"
-    - "image/webp"
-    - "application/pdf"
-
   # 当前统一文件资源服务使用的对象存储南向网关实现。
   # 可选值示例：memory / aliyun_oss
   object_storage_gateway_provider: "aliyun_oss"

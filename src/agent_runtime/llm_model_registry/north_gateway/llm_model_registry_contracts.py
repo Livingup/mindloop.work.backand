@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
@@ -51,7 +52,7 @@ class LlmModelMetadataSaveRequest:
     supports_structured_output: bool = False
 
     # 支持的输入模态列表。
-    supported_input_modalities: tuple[str, ...] = ("text",)
+    supported_input_modalities: tuple[str, ...] = (INPUT_MODALITY_TEXT,)
 
     def to_metadata(self) -> LlmModelMetadata:
         """转换为 LlmModelMetadata 聚合根。"""
