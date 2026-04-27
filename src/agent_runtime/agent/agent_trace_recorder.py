@@ -46,7 +46,7 @@ class AgentTraceRecorder:
     """按 Agent 实例记录执行过程的 Markdown Trace。
 
     Trace 只记录 Agent 定义 ID 和对话过程详情，刻意不记录系统提示词、工具 schema、工具清单、
-    API Key、请求头等敏感或冗余信息。每个 Agent 实例对应一个独立 Markdown 文件，方便人工排障。
+    API Key、请求头等敏感或冗余信息。每个 Agent 实例对应一个独立 Markdown 文件，并按 task_id 子目录归档，方便人工排障。
     """
 
     def __init__(self, trace_dir_accessor: Any) -> None:
@@ -113,13 +113,15 @@ class AgentTraceRecorder:
             file.write("\n")
 
     def _trace_path(self, identity: AgentTraceIdentity) -> Path:
-        """根据 Agent 实例身份生成 Trace 文件路径。"""
+        """根据 Agent 实例身份生成按 task 分组的 Trace 文件路径。"""
         root = Path(str(self._trace_dir_accessor()))
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        safe_task_id = _safe_file_part(identity.task_id)
         safe_agent_id = _safe_file_part(identity.agent_definition_id)
+        safe_instance_id = _safe_file_part(identity.instance_id)
         safe_trace_id = _safe_file_part(identity.trace_id)
         suffix = uuid4().hex[:8]
-        return root / f"{safe_agent_id}_{timestamp}_{safe_trace_id}_{suffix}.md"
+        return root / safe_task_id / f"{safe_agent_id}_{timestamp}_{safe_instance_id}_{safe_trace_id}_{suffix}.md"
 
 
 def _format_message(message: UniMessage) -> str:
