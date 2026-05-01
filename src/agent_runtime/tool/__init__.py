@@ -12,6 +12,12 @@ from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
 )
 from agent_runtime.tool.tool_decorator import tool
+from agent_runtime.tool.tool_execution_models import (
+    BaseToolRequest,
+    BaseToolResult,
+    FrontendMessage,
+    LoopControl,
+)
 from agent_runtime.tool.tool_schema_cache import ToolSchemaCache
 from agent_runtime.tool.tool_schema_generator import ToolSchemaGenerator
 
@@ -21,6 +27,10 @@ __all__ = [
     "LocalToolGateway",
     "LocalToolRepository",
     "LocalToolService",
+    "BaseToolRequest",
+    "BaseToolResult",
+    "FrontendMessage",
+    "LoopControl",
     "ToolSchemaCache",
     "ToolSchemaGenerator",
     "tool",

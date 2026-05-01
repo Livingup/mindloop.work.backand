@@ -41,6 +41,8 @@ class LocalToolFactory:
         Returns:
             LocalToolGatewayImpl 实例，实现 LocalToolGateway 协议。
         """
+        import agent_runtime.agent_lifecycle.agent_lifecycle_tool  # noqa: F401
+
         repository = get_global_repository()
         if schema_cache is None:
             schema_cache = ToolSchemaCache()

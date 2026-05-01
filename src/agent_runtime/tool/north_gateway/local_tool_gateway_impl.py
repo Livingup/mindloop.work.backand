@@ -54,13 +54,21 @@ class LocalToolGatewayImpl:
             group=info["group"],
             public=info["public"],
             wiki=info["wiki"],
+            category=info["category"],
+            always_enabled=info["always_enabled"],
+            allowed_loop_decisions=info["allowed_loop_decisions"],
             schemas=info.get("schemas", {}),
         )
 
     async def execute_tool(self, request: ToolExecuteRequest) -> ToolExecuteResult:
         """执行工具。"""
         result = await self._service.execute_tool(request.tool_name, request.params)
-        return ToolExecuteResult(tool_name=request.tool_name, result=result)
+        payload = result.model_dump(mode="python")
+        payload.pop("tool_name", None)
+        return ToolExecuteResult(
+            tool_name=request.tool_name,
+            **payload,
+        )
 
     def get_wiki_list(self) -> dict[str, list[ToolWikiItem]]:
         """获取工具 wiki 列表，按 group 分组。"""
@@ -72,6 +80,9 @@ class LocalToolGatewayImpl:
                     tool_name=i["tool_name"],
                     wiki=i["wiki"],
                     group=i["group"],
+                    category=i["category"],
+                    always_enabled=i["always_enabled"],
+                    allowed_loop_decisions=i["allowed_loop_decisions"],
                     schemas=i.get("schemas", {}),
                 )
                 for i in items
@@ -86,4 +97,7 @@ class LocalToolGatewayImpl:
             description=info["description"],
             group=info["group"],
             wiki=info.get("wiki"),
+            category=info["category"],
+            always_enabled=info["always_enabled"],
+            allowed_loop_decisions=info["allowed_loop_decisions"],
         )

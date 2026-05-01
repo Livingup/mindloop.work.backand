@@ -14,6 +14,7 @@ from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
     ToolExecuteRequest,
 )
+from agent_runtime.tool.tool_execution_models import LoopDecision, ToolCategory
 
 
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
@@ -25,6 +26,9 @@ class ToolSummaryResponse(BaseModel):
     description: str
     group: str
     wiki: str | None = None
+    category: ToolCategory = "business"
+    always_enabled: bool = False
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
 
 
 class ToolDetailResponse(BaseModel):
@@ -34,6 +38,9 @@ class ToolDetailResponse(BaseModel):
     group: str
     public: bool
     wiki: str | None
+    category: ToolCategory
+    always_enabled: bool
+    allowed_loop_decisions: tuple[LoopDecision, ...]
     schemas: dict[str, dict[str, Any]] = {}
 
 
@@ -42,6 +49,9 @@ class ToolWikiItemResponse(BaseModel):
     tool_name: str
     wiki: str | None
     group: str
+    category: ToolCategory = "business"
+    always_enabled: bool = False
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
     schemas: dict[str, dict[str, Any]] = {}
 
 
@@ -54,6 +64,14 @@ class ToolExecResponse(BaseModel):
     """工具执行响应体。"""
     tool_name: str
     result: Any
+    success: bool
+    execution_status: str
+    error_code: str | None = None
+    error_message: str | None = None
+    output: Any = None
+    loop_control: dict[str, Any]
+    frontend_message: dict[str, Any] | None = None
+    metadata: dict[str, Any] = {}
 
 
 # ── 路由工厂 ─────────────────────────────────────────────────────
@@ -84,7 +102,10 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
                     continue
                 output[group_name] = [
                     {"tool_name": i.tool_name, "description": i.description,
-                     "group": i.group, "wiki": i.wiki}
+                     "group": i.group, "wiki": i.wiki,
+                     "category": i.category,
+                     "always_enabled": i.always_enabled,
+                     "allowed_loop_decisions": i.allowed_loop_decisions}
                     for i in items
                 ]
             return output
@@ -95,6 +116,9 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
             ToolSummaryResponse(
                 tool_name=i.tool_name, description=i.description,
                 group=i.group, wiki=i.wiki,
+                category=i.category,
+                always_enabled=i.always_enabled,
+                allowed_loop_decisions=i.allowed_loop_decisions,
             )
             for i in items
         ]
@@ -107,7 +131,11 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
         for group_name, items in result.items():
             output[group_name] = [
                 {"tool_name": i.tool_name, "wiki": i.wiki,
-                 "group": i.group, "schemas": i.schemas}
+                 "group": i.group,
+                 "category": i.category,
+                 "always_enabled": i.always_enabled,
+                 "allowed_loop_decisions": i.allowed_loop_decisions,
+                 "schemas": i.schemas}
                 for i in items
             ]
         return output
@@ -122,7 +150,11 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
         return ToolDetailResponse(
             tool_name=detail.tool_name, description=detail.description,
             group=detail.group, public=detail.public,
-            wiki=detail.wiki, schemas=detail.schemas,
+            wiki=detail.wiki,
+            category=detail.category,
+            always_enabled=detail.always_enabled,
+            allowed_loop_decisions=detail.allowed_loop_decisions,
+            schemas=detail.schemas,
         )
 
     @router.post("/{name}/exec", response_model=ToolExecResponse)
@@ -134,10 +166,10 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"本地工具不存在: {name}")
-        except TypeError as e:
-            raise HTTPException(status_code=400, detail=f"参数不匹配: {e}")
+        result_payload = exec_result.model_dump(mode="json")
         return ToolExecResponse(
-            tool_name=exec_result.tool_name, result=exec_result.result,
+            **result_payload,
+            result=exec_result.result,
         )
 
     return router

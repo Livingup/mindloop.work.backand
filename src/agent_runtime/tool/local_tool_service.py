@@ -11,11 +11,19 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import typing
 from typing import Any
+
+from pydantic import BaseModel
 
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
 from agent_runtime.tool.local_tool_repository import LocalToolRepository
 from agent_runtime.tool.tool_schema_cache import ToolSchemaCache
+from agent_runtime.tool.tool_execution_models import (
+    BaseToolResult,
+    build_tool_error_result,
+    wrap_tool_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +98,7 @@ class LocalToolService:
         self,
         tool_name: str,
         params: dict[str, Any],
-    ) -> Any:
+    ) -> BaseToolResult:
         """执行指定工具。
 
         支持同步和异步工具函数：同步函数直接调用，异步函数自动 await。
@@ -100,18 +108,34 @@ class LocalToolService:
             params: 传给工具函数的参数字典。
 
         Returns:
-            工具函数的返回值。
+            统一工具执行结果。旧工具返回普通值时会自动包装为成功结果。
 
         Raises:
             KeyError: 工具不存在。
-            TypeError: 参数不匹配。
+            KeyError: 工具不存在。
         """
         tool_def = self._repo.get_by_name(tool_name)
         logger.info("执行本地工具: %s, 参数: %s", tool_name, params)
-        result = tool_def.fn(**params)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        try:
+            result = tool_def.fn(**_build_tool_call_kwargs(tool_def.fn, params))
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.exception("本地工具执行失败: %s", tool_name)
+            return build_tool_error_result(
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+        unified_result = wrap_tool_output(result)
+        if unified_result.loop_decision not in tool_def.allowed_loop_decisions:
+            return build_tool_error_result(
+                error_code="LoopDecisionNotAllowed",
+                error_message=(
+                    f"工具 {tool_name} 返回了不允许的循环决策: "
+                    f"{unified_result.loop_decision}"
+                ),
+            )
+        return unified_result
 
     # ── 业务用例 4：获取工具 wiki 列表 ────────────────────────────────
 
@@ -133,6 +157,9 @@ class LocalToolService:
                 "tool_name": t.tool_name,
                 "wiki": t.wiki,
                 "group": t.group,
+                "category": t.category,
+                "always_enabled": t.always_enabled,
+                "allowed_loop_decisions": t.allowed_loop_decisions,
                 "schemas": self._schema_cache.get_all_schemas(t),
             }
             grouped.setdefault(t.group, []).append(item)
@@ -147,6 +174,9 @@ class LocalToolService:
             "description": tool_def.description,
             "group": tool_def.group,
             "wiki": tool_def.wiki,
+            "category": tool_def.category,
+            "always_enabled": tool_def.always_enabled,
+            "allowed_loop_decisions": tool_def.allowed_loop_decisions,
         }
 
     def _build_tool_detail(self, tool_def: LocalToolDefinition) -> dict[str, Any]:
@@ -157,5 +187,34 @@ class LocalToolService:
             "group": tool_def.group,
             "public": tool_def.public,
             "wiki": tool_def.wiki,
+            "category": tool_def.category,
+            "always_enabled": tool_def.always_enabled,
+            "allowed_loop_decisions": tool_def.allowed_loop_decisions,
             "schemas": self._schema_cache.get_all_schemas(tool_def),
         }
+
+
+def _build_tool_call_kwargs(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """根据工具函数签名构建调用参数。"""
+    sig = inspect.signature(fn)
+    call_params = [
+        (name, parameter)
+        for name, parameter in sig.parameters.items()
+        if name not in ("self", "cls")
+    ]
+    if len(call_params) != 1:
+        return params
+
+    param_name, _ = call_params[0]
+    annotation = typing.get_type_hints(fn).get(param_name)
+    if not isinstance(annotation, type) or not issubclass(annotation, BaseModel):
+        return params
+
+    value = params.get(param_name)
+    if isinstance(value, annotation):
+        request_model = value
+    elif isinstance(value, dict):
+        request_model = annotation(**value)
+    else:
+        request_model = annotation(**params)
+    return {param_name: request_model}

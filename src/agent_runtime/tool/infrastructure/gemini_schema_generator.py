@@ -43,7 +43,7 @@ class GeminiSchemaGenerator:
             Gemini FunctionDeclaration 格式字典。
         """
         model = build_pydantic_model(tool_def.fn)
-        json_schema = model.model_json_schema()
+        json_schema = _inline_json_schema_refs(model.model_json_schema())
 
         # 使用 google-genai SDK 的 types.Schema 将标准 JSON Schema
         # 转换为 Gemini 平台所需格式。
@@ -56,3 +56,30 @@ class GeminiSchemaGenerator:
         )
         # 返回可序列化的字典形式。
         return declaration.model_dump(exclude_none=True)
+
+
+def _inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """内联 Pydantic JSON Schema 中的 $defs/$ref，适配 google-genai types.Schema。"""
+    defs = schema.get("$defs") or {}
+
+    def resolve(value: Any) -> Any:
+        if isinstance(value, list):
+            return [resolve(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        ref = value.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            name = ref.removeprefix("#/$defs/")
+            target = defs.get(name, {})
+            merged = {**target, **{k: v for k, v in value.items() if k != "$ref"}}
+            return resolve(merged)
+        return {
+            key: resolve(item)
+            for key, item in value.items()
+            if key not in {"$defs"}
+        }
+
+    resolved = resolve(schema)
+    if not isinstance(resolved, dict):
+        raise TypeError("工具 JSON Schema 解析结果必须是字典。")
+    return resolved

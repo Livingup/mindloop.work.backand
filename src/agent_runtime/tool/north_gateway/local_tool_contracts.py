@@ -7,6 +7,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from pydantic import Field as PydanticField
+
+from agent_runtime.tool.tool_execution_models import (
+    BaseToolRequest,
+    LoopDecision,
+    ToolCategory,
+    ToolResultEnvelope,
+)
+
 
 # ── 对外数据模型 ──────────────────────────────────────────────────────
 
@@ -26,6 +35,15 @@ class ToolSummary:
 
     # 人类可读的 wiki 文档。
     wiki: str | None = None
+
+    # 工具类别。
+    category: ToolCategory = "business"
+
+    # 是否默认对所有 Agent 启用。
+    always_enabled: bool = False
+
+    # 当前工具允许返回的循环控制决策集合。
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +65,15 @@ class ToolDetail:
     # 人类可读的 wiki 文档。
     wiki: str | None
 
+    # 工具类别。
+    category: ToolCategory
+
+    # 是否默认对所有 Agent 启用。
+    always_enabled: bool
+
+    # 当前工具允许返回的循环控制决策集合。
+    allowed_loop_decisions: tuple[LoopDecision, ...]
+
     # 各平台 JSON Schema（平台标识 → schema 字典）。
     schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -64,30 +91,57 @@ class ToolWikiItem:
     # 工具分组。
     group: str
 
+    # 工具类别。
+    category: ToolCategory = "business"
+
+    # 是否默认对所有 Agent 启用。
+    always_enabled: bool = False
+
+    # 当前工具允许返回的循环控制决策集合。
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
+
     # 各平台 JSON Schema（平台标识 → schema 字典）。
     schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
-@dataclass(frozen=True, slots=True)
-class ToolExecuteRequest:
+class ToolExecuteRequest(BaseToolRequest):
     """工具执行请求。"""
 
-    # 工具名称。
-    tool_name: str
+    tool_name: str = PydanticField(description="工具名称。")
+    params: dict[str, Any] = PydanticField(default_factory=dict, description="传给工具函数的参数字典。")
 
-    # 传给工具函数的参数字典。
-    params: dict[str, Any] = field(default_factory=dict)
+    def __init__(
+        self,
+        tool_name: str | None = None,
+        params: dict[str, Any] | None = None,
+        **data: Any,
+    ) -> None:
+        if tool_name is not None:
+            data.setdefault("tool_name", tool_name)
+        if params is not None:
+            data.setdefault("params", params)
+        super().__init__(**data)
 
 
-@dataclass(frozen=True, slots=True)
-class ToolExecuteResult:
+class ToolExecuteResult(ToolResultEnvelope):
     """工具执行结果。"""
 
-    # 工具名称。
-    tool_name: str
+    def __init__(
+        self,
+        tool_name: str | None = None,
+        result: Any = None,
+        **data: Any,
+    ) -> None:
+        if tool_name is not None:
+            data.setdefault("tool_name", tool_name)
+        if result is not None:
+            data.setdefault("output", result)
+        super().__init__(**data)
 
-    # 执行结果。
-    result: Any
+    @property
+    def result(self) -> Any:
+        """兼容旧调用方的 result 字段，等价于统一协议中的 output。"""
+        return self.output
 
 
 # ── 北向网关接口 ──────────────────────────────────────────────────────

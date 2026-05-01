@@ -19,6 +19,11 @@ from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
     ToolExecuteRequest,
 )
+from agent_runtime.tool.tool_execution_models import (
+    BaseToolResult,
+    LoopControl,
+    build_tool_error_result,
+)
 
 
 AGENT_MCP_TOOL_NAME_PREFIX = "mcp__"
@@ -36,6 +41,9 @@ class ToolDispatchResult:
 
     # 写回 conversation_message 的工具结果内容块。
     result_part: ToolResultPart
+
+    # 工具返回的统一执行结果，Runtime 根据其中的 loop_control 控制下一轮循环。
+    tool_result: BaseToolResult
 
 
 class AgentToolDispatcher:
@@ -66,7 +74,7 @@ class AgentToolDispatcher:
     ) -> tuple[LlmToolDefinition, ...]:
         """根据 AgentDefinition 能力边界构建本轮 LLM 可见工具定义。"""
         tools: list[LlmToolDefinition] = []
-        for tool_name in agent_definition.tool_ids:
+        for tool_name in self._visible_local_tool_names(agent_definition):
             detail = self._local_tool_gateway.get_tool(tool_name)
             schema = detail.schemas.get(sdk_platform)
             if schema is None:
@@ -121,7 +129,8 @@ class AgentToolDispatcher:
         tool_use: ToolUsePart,
     ) -> ToolDispatchResult:
         """执行本地工具调用。"""
-        if tool_use.name not in agent_definition.tool_ids:
+        detail = self._local_tool_gateway.get_tool(tool_use.name)
+        if tool_use.name not in agent_definition.tool_ids and not detail.always_enabled:
             raise PermissionError(f"Agent {agent_definition.agent_id} 无权调用本地工具: {tool_use.name}")
         params = _ensure_dict_arguments(tool_use.input)
         result = await self._local_tool_gateway.execute_tool(
@@ -132,8 +141,9 @@ class AgentToolDispatcher:
             source="local",
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
-                output=result.result,
+                output=result.to_serializable_dict(),
             ),
+            tool_result=result,
         )
 
     async def _dispatch_mcp_tool(
@@ -150,15 +160,37 @@ class AgentToolDispatcher:
         result = await self._mcp_client_gateway.call_tool(service_id, tool_name, params)
         output: Any = result.structured_content if result.structured_content is not None else result.content
         if result.is_error:
-            output = {"is_error": True, "content": result.content, "structured_content": result.structured_content}
+            tool_result = build_tool_error_result(
+                error_code="McpToolError",
+                error_message=result.content,
+                output={"content": result.content, "structured_content": result.structured_content},
+            )
+        else:
+            tool_result = BaseToolResult(
+                success=True,
+                execution_status="success",
+                output=output,
+                loop_control=LoopControl(decision="continue"),
+            )
         return ToolDispatchResult(
             tool_name=tool_use.name,
             source="mcp",
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
-                output=output,
+                output=tool_result.to_serializable_dict(),
             ),
+            tool_result=tool_result,
         )
+
+    def _visible_local_tool_names(self, agent_definition: AgentDefinition) -> tuple[str, ...]:
+        """返回当前 Agent 可见的本地工具名，包含显式授权和默认启用工具。"""
+        explicit_tool_names = tuple(agent_definition.tool_ids)
+        visible_tool_names = list(explicit_tool_names)
+        all_tools = self._local_tool_gateway.list_tools(public_only=False, group_by=False)
+        for item in all_tools:
+            if item.always_enabled and item.tool_name not in visible_tool_names:
+                visible_tool_names.append(item.tool_name)
+        return tuple(visible_tool_names)
 
 
 def build_mcp_exposed_tool_name(service_id: str, tool_name: str) -> str:

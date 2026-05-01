@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from agent_runtime.tool.tool_execution_models import LoopDecision, ToolCategory
+
 # 工具名称最大长度。
 _TOOL_NAME_MAX_LENGTH = 80
 
@@ -46,6 +48,15 @@ class LocalToolDefinition:
     # 人类可读的工具介绍文档（用于生成系统工具说明文档），可为 None。
     wiki: str | None = None
 
+    # 工具类别。普通业务工具默认不表达生命周期，只返回 continue 决策。
+    category: ToolCategory = "business"
+
+    # 是否默认对所有 Agent 可用。生命周期工具等系统级工具可使用该能力自动注入。
+    always_enabled: bool = False
+
+    # 当前工具允许返回的循环控制决策集合，用于 Runtime 侧做协议约束。
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
+
     def __post_init__(self) -> None:
         """实体创建时校验业务规则。"""
         # ── tool_name 校验 ──────────────────────────────────────────
@@ -73,3 +84,7 @@ class LocalToolDefinition:
         # ── group 校验 ──────────────────────────────────────────────
         if not self.group or not self.group.strip():
             raise ValueError("工具分组不能为空。")
+
+        # ── allowed_loop_decisions 校验 ──────────────────────────────
+        if not self.allowed_loop_decisions:
+            raise ValueError("工具允许的循环决策集合不能为空。")

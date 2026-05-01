@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, TypeVar
 
+from agent_runtime.tool.tool_execution_models import LoopDecision, ToolCategory
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 # ── 装饰器附加在函数上的元数据属性名 ──────────────────────────────
@@ -23,6 +25,9 @@ TOOL_DESCRIPTION_ATTR = "_tool_description"
 TOOL_GROUP_ATTR = "_tool_group"
 TOOL_PUBLIC_ATTR = "_tool_public"
 TOOL_WIKI_ATTR = "_tool_wiki"
+TOOL_CATEGORY_ATTR = "_tool_category"
+TOOL_ALWAYS_ENABLED_ATTR = "_tool_always_enabled"
+TOOL_ALLOWED_LOOP_DECISIONS_ATTR = "_tool_allowed_loop_decisions"
 
 
 def tool(
@@ -32,6 +37,9 @@ def tool(
     group: str = "default",
     public: bool = True,
     wiki: str | None = None,
+    category: ToolCategory = "business",
+    always_enabled: bool = False,
+    allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",),
 ) -> Callable[[F], F]:
     """声明一个本地工具函数的装饰器。
 
@@ -55,6 +63,9 @@ def tool(
         setattr(fn, TOOL_GROUP_ATTR, group)
         setattr(fn, TOOL_PUBLIC_ATTR, public)
         setattr(fn, TOOL_WIKI_ATTR, wiki)
+        setattr(fn, TOOL_CATEGORY_ATTR, category)
+        setattr(fn, TOOL_ALWAYS_ENABLED_ATTR, always_enabled)
+        setattr(fn, TOOL_ALLOWED_LOOP_DECISIONS_ATTR, allowed_loop_decisions)
         # 延迟导入避免循环依赖，注册到全局注册表。
         from agent_runtime.tool._global_registry import get_global_registry
         get_global_registry().register_function(fn)
@@ -94,3 +105,18 @@ def get_tool_public(fn: Any) -> bool:
 def get_tool_wiki(fn: Any) -> str | None:
     """获取 @tool 装饰函数的 wiki 文档。未装饰时抛出 AttributeError。"""
     return getattr(fn, TOOL_WIKI_ATTR)
+
+
+def get_tool_category(fn: Any) -> ToolCategory:
+    """获取 @tool 装饰函数的工具类别。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_CATEGORY_ATTR)
+
+
+def get_tool_always_enabled(fn: Any) -> bool:
+    """获取 @tool 装饰函数的默认启用标志。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_ALWAYS_ENABLED_ATTR)
+
+
+def get_tool_allowed_loop_decisions(fn: Any) -> tuple[LoopDecision, ...]:
+    """获取 @tool 装饰函数允许返回的循环决策集合。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_ALLOWED_LOOP_DECISIONS_ATTR)

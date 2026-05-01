@@ -41,15 +41,23 @@ def _serialize_summary(item: Any) -> dict[str, Any]:
         "description": item.description,
         "group": item.group,
         "wiki": item.wiki,
+        "category": item.category,
+        "always_enabled": item.always_enabled,
+        "allowed_loop_decisions": item.allowed_loop_decisions,
     }
 
 
 def _serialize_detail(item: Any) -> dict[str, Any]:
     """将 ToolDetail 序列化为字典。"""
     return {
+        "tool_name": item.tool_name,
+        "description": item.description,
         "group": item.group,
         "public": item.public,
         "wiki": item.wiki,
+        "category": item.category,
+        "always_enabled": item.always_enabled,
+        "allowed_loop_decisions": item.allowed_loop_decisions,
         "schema": item.schemas.get(SDK_PLATFORM_ANTHROPIC, {}),
     }
 

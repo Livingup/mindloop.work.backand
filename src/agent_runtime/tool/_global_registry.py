@@ -52,6 +52,9 @@ class _GlobalRegistry:
             group=getattr(fn, "_tool_group", "default"),
             public=getattr(fn, "_tool_public", True),
             wiki=getattr(fn, "_tool_wiki", None),
+            category=getattr(fn, "_tool_category", "business"),
+            always_enabled=getattr(fn, "_tool_always_enabled", False),
+            allowed_loop_decisions=getattr(fn, "_tool_allowed_loop_decisions", ("continue",)),
         )
         get_global_repository().add(tool_def)
 
