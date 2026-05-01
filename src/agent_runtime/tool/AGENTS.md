@@ -1,19 +1,19 @@
-# 本地工具模块（local_tool）
+# 统一工具模块（tool）
 
-负责本地工具的定义、自动发现、注册、执行，以及各 LLM 平台工具 JSON Schema 的生成与缓存管理。
+负责本地工具的定义、自动发现、注册、执行、统一执行协议，以及各 LLM 平台工具 JSON Schema 的生成与缓存管理。
 
 ## 对外服务能力
 
 本模块对外提供四个服务：
 
-1. **列出所有工具** — 默认只返回 `public=True` 的工具，支持是否按 `group` 分组后返回结果（默认不分组）。返回工具名称、描述、分组和各平台 JSON Schema。
-2. **按名称查询工具** — 不受 `public` 限制，返回工具的完整信息（名称、描述、wiki、分组、各平台 JSON Schema）。
-3. **执行工具** — 传入 tool_name + params，调用工具函数，返回执行结果。
-4. **获取工具 wiki 列表** — 默认只返回 `public=True` 的工具，必须按 `group` 分组。每个工具返回工具名称、wiki、group 和各平台 JSON Schema。
+1. **列出所有工具** — 默认只返回 `public=True` 的工具，支持是否按 `group` 分组后返回结果（默认不分组）。返回工具名称、描述、分组、wiki、category、always_enabled、allowed_loop_decisions 等元数据。
+2. **按名称查询工具** — 不受 `public` 限制，返回工具的完整信息（名称、描述、wiki、分组、统一协议元数据、各平台 JSON Schema）。
+3. **执行工具** — 传入 tool_name + params，调用工具函数，返回统一 `BaseToolResult` / `ToolExecuteResult` 执行结果。
+4. **获取工具 wiki 列表** — 默认只返回 `public=True` 的工具，必须按 `group` 分组。每个工具返回工具名称、wiki、group、统一协议元数据和各平台 JSON Schema。
 
 ## 工具定义方式
 
-各业务模块使用 `@tool` 装饰器声明工具函数，并在 `cli.py` 中显式 import 对应模块来触发注册。
+各业务模块使用 `@tool` 装饰器声明工具函数，并在组合根或工厂中显式 import 对应模块来触发注册。面向 CLI 的工具通常由 `cli.py` import；运行时默认启用工具需要由对应工厂触发注册，例如 `LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool`。
 
 ### @tool 装饰器字段
 
@@ -24,13 +24,16 @@
 | `group` | str | 否 | `"default"` | 工具分组（如 "文件"、"网络"、"数据库"） |
 | `public` | bool | 否 | `True` | 是否公开（列出所有工具时是否可见） |
 | `wiki` | str | 否 | `None` | 人类可读的工具介绍文档（用于生成系统工具说明文档） |
+| `category` | `"business" \| "lifecycle" \| "system"` | 否 | `"business"` | 工具类别，普通业务工具使用 business，生命周期沟通工具使用 lifecycle |
+| `always_enabled` | bool | 否 | `False` | 是否默认对所有 Agent 暴露，不需要写入每个 `AgentDefinition.tool_ids` |
+| `allowed_loop_decisions` | tuple | 否 | `("continue",)` | 该工具允许返回的循环控制决策集合 |
 
 ### 简单参数示例
 
 参数直接使用 Python 类型注解，适合参数少、无复杂约束的工具：
 
 ```python
-from agent_runtime.local_tool import tool
+from agent_runtime.tool import tool
 
 @tool(
     name="search_files",
@@ -49,7 +52,7 @@ def search_files(query: str, max_results: int = 10) -> str:
 ```python
 from enum import Enum
 from pydantic import BaseModel, Field
-from agent_runtime.local_tool import tool
+from agent_runtime.tool import tool
 
 class FileType(str, Enum):
     TEXT = "text"
@@ -74,17 +77,30 @@ def advanced_search(params: SearchParams) -> str:
 ### 工具实现规范
 
 1. **参数类型注解必须完整** — 每个参数必须有类型注解，各平台 SDK 依赖类型注解生成 JSON Schema。
-2. **返回值类型为 `str`** — 工具返回结果统一为字符串，由工具实现方负责将结果序列化为可读文本。
-3. **异常处理** — 工具内部异常应自行捕获并返回错误描述字符串，不应向外抛出未处理异常。
+2. **普通工具可返回原始业务值** — 旧工具可继续返回 `str`、`dict`、`list` 等原始结果，`LocalToolService` 会自动包装为 `BaseToolResult(output=原始值, loop_control.decision="continue")`。
+3. **新工具可返回 `BaseToolResult`** — 需要表达执行状态、错误信息、前端展示消息或循环控制时，工具应直接返回 `BaseToolResult` 或兼容子类。
+4. **异常会被结构化封装** — 工具抛出的异常会由 `LocalToolService` 转换为 `success=False`、`execution_status="failed"` 的结构化结果；工具内部仍可按业务需要自行捕获并返回更友好的 `BaseToolResult`。
+5. **循环决策必须被授权** — 普通业务工具默认只允许 `continue`，只有在 `allowed_loop_decisions` 中声明的决策才能返回。生命周期工具可声明 `pause`、`complete`、`terminate`、`fail`。
+6. **单参数 Pydantic 请求模型优先用于复杂工具** — 如果工具函数只有一个参数且参数类型是 Pydantic `BaseModel` 子类，服务会把调用 params 构造成该请求模型实例，适合继承 `BaseToolRequest` 表达 task、agent_instance、trace 等上下文。
+
+### 统一工具执行协议
+
+`tool_execution_models.py` 定义统一协议：
+
+1. **`BaseToolRequest`** — 所有工具请求模型的统一基类，包含 `request_id`、`task_id`、`agent_instance_id`、`trace_id` 等可选上下文，并允许扩展字段。
+2. **`BaseToolResult`** — 所有工具执行结果的统一基类，包含 `success`、`execution_status`、`error_code`、`error_message`、`output`、`loop_control`、`frontend_message`、`metadata`。
+3. **`LoopControl`** — 工具对 Agent 执行循环表达下一步决策，`decision` 支持 `continue`、`pause`、`complete`、`terminate`、`fail`。
+4. **`FrontendMessage`** — 工具需要前端展示消息时使用，显式声明 `text`、`text_format`、`channel` 和渲染元数据。
+5. **`ToolResultEnvelope` / `ToolExecuteResult`** — 网关层带 `tool_name` 的执行结果信封，`result` 是 `output` 的兼容别名。
 
 ## 工具注册机制
 
-`@tool` 装饰器在模块被导入时自动将工具注册到全局注册表。不采用 `pkgutil.walk_packages` 全量扫描（避免启动变慢），而是在 `cli.py` 中显式 import 工具模块来触发注册。**新增工具模块时需在 `cli.py` 中添加一行 import。**
+`@tool` 装饰器在模块被导入时自动将工具注册到全局注册表。不采用 `pkgutil.walk_packages` 全量扫描（避免启动变慢），而是由组合根或工厂显式 import 工具模块来触发注册。**新增工具模块时需要选择合适的注册触发点：面向 CLI 的工具通常在 `cli.py` 中 import；运行时必须默认可用的工具需要在对应 Factory 中 import。**
 
 ```
 程序启动
   ↓
-cli.py 显式 import 工具模块
+组合根或工厂显式 import 工具模块
   ↓
 模块被 import → @tool 装饰器自动触发注册到全局注册表
   ↓
@@ -98,6 +114,7 @@ cli.py 显式 import 工具模块
 1. **生成**：由各平台实现 `ToolSchemaGenerator` 接口，使用各自 SDK 从函数签名（类型注解 + Pydantic 模型）解析生成该平台所需格式的 JSON Schema。
 2. **缓存**：生成后的 Schema 按 `(tool_name, platform)` 索引缓存，同一工具同一平台只生成一次。
 3. **查询**：对外查询工具时返回各平台的 Schema，调用 LLM 时直接取缓存，无需重复生成。
+4. **Gemini 嵌套模型兼容**：Gemini 生成器会内联 Pydantic JSON Schema 中的 `$defs/$ref`，以支持 `agent_lifecycle` 这类包含嵌套结构化参数的工具。
 
 ### ToolSchemaGenerator 接口
 
@@ -121,7 +138,7 @@ class ToolSchemaGenerator(Protocol):
 
 ### 领域层
 
-- **`LocalToolDefinition`**：领域实体（同时也是聚合根，每个工具独立，无跨工具的一致性约束）。持有工具名称、描述、分组、公开标志、wiki 和函数引用，自身携带字段校验业务规则。
+- **`LocalToolDefinition`**：领域实体（同时也是聚合根，每个工具独立，无跨工具的一致性约束）。持有工具名称、描述、分组、公开标志、wiki、category、always_enabled、allowed_loop_decisions 和函数引用，自身携带字段校验业务规则。
 - **`LocalToolRepository`**：仓储接口（Protocol），定义在领域层。集合语义，方法用业务语言命名。
 - **`LocalToolService`**：领域服务（无状态），协调仓储和 Schema 缓存，提供四个业务用例：
   1. 列出所有工具（支持 public 过滤、group 分组）
@@ -147,16 +164,18 @@ class ToolSchemaGenerator(Protocol):
 ### 工具声明
 
 - **`@tool` 装饰器**：声明工具函数，附加元数据，import 时自动注册到全局注册表。
+- **统一执行协议模型**：`BaseToolRequest`、`BaseToolResult`、`LoopControl`、`FrontendMessage`、`ToolResultEnvelope` 是工具执行与 Agent 循环控制的公共协议。
 
 ## 目录结构
 
 ```
-local_tool/
+tool/
 ├── __init__.py                    # 模块公开 API
 ├── tool_decorator.py              # @tool 装饰器（import 时自动注册）
 ├── local_tool_definition.py       # 领域实体（聚合根）
 ├── local_tool_repository.py       # 仓储接口（Protocol）
 ├── local_tool_service.py          # 领域服务
+├── tool_execution_models.py       # 统一工具请求/结果/循环控制协议
 ├── tool_schema_generator.py       # Schema 生成器接口（Protocol）
 ├── tool_schema_cache.py           # Schema 缓存管理
 ├── infrastructure/
