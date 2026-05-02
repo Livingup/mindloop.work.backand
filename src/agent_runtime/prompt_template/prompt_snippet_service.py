@@ -53,29 +53,37 @@ class PromptSnippetService:
         return snippet
 
     def update_snippet(self, request: PromptSnippetUpdateRequest) -> PromptSnippet:
-        """更新提示词片段。目标片段不存在时抛出 KeyError。"""
+        """更新提示词片段。
+
+        编排流程（模式 C）：
+        1. 从仓储获取当前聚合根
+        2. 调用聚合根的 with_updates() 业务行为方法，由聚合根自身完成字段合并和校验
+        3. 如果 name 变更，校验唯一性约束并更新仓储索引
+        4. 调用仓储 save() 落地更新后的聚合根
+
+        目标片段不存在时抛出 KeyError。
+        """
+        # 1. 从仓储获取聚合根。
         current = self._repo.find_by_name(request.current_name)
         if current is None:
             raise KeyError(f"提示词片段不存在: {request.current_name}")
 
-        new_name = request.new_name if request.new_name is not None else current.name
-        new_text = request.new_text if request.new_text is not None else current.text
-        new_category = (
-            request.new_category if request.new_category is not None
-            else current.category
+        # 2. 通过聚合根行为方法应用更新（聚合根内部完成字段合并和不变量校验）。
+        updated = current.with_updates(
+            new_name=request.new_name,
+            new_text=request.new_text,
+            new_category=request.new_category,
         )
 
-        # 如果修改了 name，校验新 name 不与其他片段冲突。
-        if new_name != current.name and self._repo.exists(new_name):
-            raise ValueError(f"提示词片段已存在: {new_name}")
+        # 3. name 变更时的跨聚合根约束（唯一性检查属于领域服务职责）。
+        if updated.name != current.name:
+            if self._repo.exists(updated.name):
+                raise ValueError(f"提示词片段已存在: {updated.name}")
+            self._repo.rename(current.name, updated.name)
 
-        # 如果 name 变更，需要更新仓储索引映射。
-        if new_name != current.name:
-            self._repo.rename(current.name, new_name)
-
-        updated = PromptSnippet(name=new_name, text=new_text, category=new_category)
+        # 4. 仓储落地聚合根。
         self._repo.save(updated)
-        logger.info("更新提示词片段: %s -> %s", request.current_name, new_name)
+        logger.info("更新提示词片段: %s -> %s", request.current_name, updated.name)
         return updated
 
     def delete_snippet(self, name: str) -> None:

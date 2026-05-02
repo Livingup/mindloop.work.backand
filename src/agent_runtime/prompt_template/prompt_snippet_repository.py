@@ -35,3 +35,7 @@ class PromptSnippetRepository(Protocol):
     def rename(self, old_name: str, new_name: str) -> None:
         """更新持久化标识的 name 映射。"""
         ...
+
+    def reload(self) -> None:
+        """重新从持久化存储加载所有聚合根到内存。用于跨进程一致性同步。"""
+        ...
