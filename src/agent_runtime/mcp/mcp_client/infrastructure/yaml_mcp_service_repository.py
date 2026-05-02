@@ -82,6 +82,22 @@ class YamlMcpServiceRepository:
         """是否存在指定服务配置。"""
         return self._get_file_path(service_id).exists()
 
+    def config_dir_mtime(self) -> float:
+        """获取配置目录的最大修改时间戳。
+
+        返回配置目录自身及其下所有 YAML 文件中最大的 mtime。
+        用于跨进程变更检测。
+        """
+        config_dir = self._config_dir
+        if not config_dir.exists():
+            return 0.0
+        max_mtime = config_dir.stat().st_mtime
+        for yaml_file in config_dir.glob("*.yaml"):
+            file_mtime = yaml_file.stat().st_mtime
+            if file_mtime > max_mtime:
+                max_mtime = file_mtime
+        return max_mtime
+
     # ── 内部方法 ──
 
     def _get_file_path(self, service_id: str) -> Path:

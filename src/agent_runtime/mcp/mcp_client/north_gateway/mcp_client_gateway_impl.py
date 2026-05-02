@@ -63,6 +63,7 @@ class McpClientGatewayImpl:
                 transport_type=d.transport_type,
                 enabled=d.enabled,
                 connected=self._session_manager.is_connected(d.service_id),
+                group=d.group,
             )
             for d in definitions
         ]
@@ -77,6 +78,7 @@ class McpClientGatewayImpl:
             transport=d.transport.to_dict(),
             enabled=d.enabled,
             connected=self._session_manager.is_connected(d.service_id),
+            group=d.group,
             usage_guide=d.usage_guide,
         )
 
@@ -89,6 +91,7 @@ class McpClientGatewayImpl:
             transport=transport,
             description=config.description,
             enabled=config.enabled,
+            group=config.group,
             usage_guide=config.usage_guide,
         )
         self._service.add_service(definition)
@@ -102,6 +105,8 @@ class McpClientGatewayImpl:
             kwargs["description"] = update.description
         if update.transport is not None:
             kwargs["transport"] = self._build_transport_config(update.transport)
+        if update.group is not None:
+            kwargs["group"] = update.group
         if update.usage_guide is not None:
             kwargs["usage_guide"] = update.usage_guide
         self._service.update_service(service_id, **kwargs)
@@ -146,6 +151,34 @@ class McpClientGatewayImpl:
     # ══════════════════════════════════════════
     # 协议操作
     # ══════════════════════════════════════════
+
+    async def connect_all_enabled(self) -> dict[str, str | None]:
+        """启动时尝试连接所有已启用的 MCP 服务。
+
+        单个服务连接失败不影响其他服务。
+
+        Returns:
+            {service_id: None} 成功，{service_id: "错误信息"} 失败。
+        """
+        return await self._service.connect_all_enabled()
+
+    async def connect_service(self, service_id: str) -> None:
+        """手动连接指定 MCP 服务。"""
+        await self._service.ensure_connected(service_id)
+
+    async def reconcile_connections(self) -> None:
+        """根据当前配置状态对齐连接池。
+
+        断开已删除/禁用的连接，连接新增已启用的服务。
+        """
+        await self._service.reconcile_connections()
+
+    async def reconcile_if_config_changed(self) -> None:
+        """若配置目录 mtime 变化，则 reconcile 连接池。
+
+        懒检测：REST 调用前执行，感知 CLI / 手动编辑导致的配置变更。
+        """
+        await self._service.reconcile_if_config_changed()
 
     async def ensure_connected(self, service_id: str) -> None:
         """确保与指定 MCP 服务的连接已建立。"""

@@ -131,6 +131,10 @@ class McpSessionManager:
         """是否已连接。"""
         return service_id in self._connections
 
+    def connected_service_ids(self) -> list[str]:
+        """返回当前所有已连接的 service_id 列表。"""
+        return list(self._connections.keys())
+
     def get_capabilities(self, service_id: str) -> McpServiceCapabilities | None:
         """获取已连接服务的缓存能力信息。"""
         conn = self._connections.get(service_id)

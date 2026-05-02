@@ -63,3 +63,14 @@ class McpServiceRepository(Protocol):
             是否存在。
         """
         ...
+
+    def config_dir_mtime(self) -> float:
+        """获取配置目录的最大修改时间戳。
+
+        返回配置目录自身及其下所有 YAML 文件中最大的 mtime。
+        用于跨进程变更检测：对比前后两次 mtime 即可判断是否有外部修改。
+
+        Returns:
+            最大 mtime（Unix 时间戳），目录不存在时返回 0.0。
+        """
+        ...

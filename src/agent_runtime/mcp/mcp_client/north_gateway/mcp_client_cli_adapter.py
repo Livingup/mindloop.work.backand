@@ -90,6 +90,7 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                     "description": s.description,
                     "transport_type": s.transport_type,
                     "enabled": s.enabled,
+                    "group": s.group,
                 }
                 for s in services
             ]
@@ -111,6 +112,7 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                 "description": info.description,
                 "transport": info.transport,
                 "enabled": info.enabled,
+                "group": info.group,
             }
             if info.usage_guide:
                 data["usage_guide"] = info.usage_guide
@@ -145,6 +147,7 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                 transport=data.get("transport", {"type": "stdio"}),
                 description=data.get("description"),
                 enabled=data.get("enabled", True),
+                group=data.get("group", "default"),
                 usage_guide=data.get("usage_guide"),
             )
             gateway.add_service(config)
@@ -191,6 +194,7 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                 name=data.get("name"),
                 description=data.get("description"),
                 transport=data.get("transport"),
+                group=data.get("group"),
                 usage_guide=data.get("usage_guide"),
             )
             gateway.update_service(service_id, update)

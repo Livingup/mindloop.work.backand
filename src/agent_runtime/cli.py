@@ -196,8 +196,13 @@ main.add_command(
 @click.option("--port", default=None, type=int, help="监听端口（覆盖配置文件）。")
 def serve(host: str | None, port: int | None) -> None:
     """启动 REST API 服务器。"""
+    import logging as _logging
+    from contextlib import asynccontextmanager
+
     import uvicorn
     from fastapi import FastAPI
+
+    _serve_logger = _logging.getLogger("agent_runtime.serve")
 
     # 各模块网关通过无参工厂创建，配置由工厂内部从 ConfigRegistry 实时读取。
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory
@@ -235,7 +240,19 @@ def serve(host: str | None, port: int | None) -> None:
     agent_definition_gateway = AgentDefinitionFactory.create()
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
 
-    app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务")
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        """应用生命周期：启动时自动连接所有已启用的 MCP 服务。"""
+        _serve_logger.info("正在自动连接已启用的 MCP 服务…")
+        results = await mcp_gateway.connect_all_enabled()
+        ok = sum(1 for v in results.values() if v is None)
+        fail = sum(1 for v in results.values() if v is not None)
+        _serve_logger.info("MCP 服务自动连接完成：成功 %d，失败 %d", ok, fail)
+        yield
+        # 关闭时断开所有 MCP 连接
+        await mcp_gateway.shutdown()
+
+    app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
         prefix="/api/prompt-snippets",

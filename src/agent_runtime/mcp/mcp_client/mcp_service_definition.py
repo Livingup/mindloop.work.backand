@@ -40,6 +40,9 @@ class McpServiceDefinition:
     enabled: bool = True
     """是否启用此服务。"""
 
+    group: str = "default"
+    """服务分组标签，用于管理界面分组展示。"""
+
     usage_guide: str | None = None
     """本地补充的使用指南。与 MCP 服务自带的 instructions 合并后返回给 Agent。"""
 
@@ -92,6 +95,8 @@ class McpServiceDefinition:
         }
         if self.description:
             data["description"] = self.description
+        if self.group != "default":
+            data["group"] = self.group
         if self.usage_guide:
             data["usage_guide"] = self.usage_guide
         return data
@@ -125,5 +130,6 @@ class McpServiceDefinition:
             transport=transport,
             description=data.get("description"),
             enabled=data.get("enabled", True),
+            group=data.get("group", "default"),
             usage_guide=data.get("usage_guide"),
         )

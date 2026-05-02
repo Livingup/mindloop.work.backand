@@ -33,6 +33,7 @@ class McpServiceSummaryResponse(BaseModel):
     transport_type: str
     enabled: bool
     connected: bool
+    group: str = "default"
 
 
 class McpServiceInfoResponse(BaseModel):
@@ -49,6 +50,7 @@ class McpServiceInfoResponse(BaseModel):
     transport: dict[str, Any]
     enabled: bool
     connected: bool
+    group: str = "default"
     usage_guide: str | None = None
 
 
@@ -63,6 +65,7 @@ class McpServiceAddBody(BaseModel):
     transport: dict[str, Any]
     description: str | None = None
     enabled: bool = True
+    group: str = "default"
     usage_guide: str | None = None
 
 
@@ -75,6 +78,7 @@ class McpServiceUpdateBody(BaseModel):
     name: str | None = None
     description: str | None = None
     transport: dict[str, Any] | None = None
+    group: str | None = None
     usage_guide: str | None = None
 
 
@@ -177,8 +181,9 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
     router = APIRouter()
 
     @router.get("/", response_model=list[McpServiceSummaryResponse])
-    def list_services() -> list[dict]:
+    async def list_services() -> list[dict]:
         """列出所有已配置的 MCP 服务。"""
+        await gateway.reconcile_if_config_changed()
         services = gateway.list_services()
         return [
             {
@@ -188,13 +193,15 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
                 "transport_type": s.transport_type,
                 "enabled": s.enabled,
                 "connected": s.connected,
+                "group": s.group,
             }
             for s in services
         ]
 
     @router.get("/{service_id}", response_model=McpServiceInfoResponse)
-    def get_service(service_id: str) -> dict:
+    async def get_service(service_id: str) -> dict:
         """获取指定 MCP 服务的定义配置。"""
+        await gateway.reconcile_if_config_changed()
         try:
             info = gateway.get_service(service_id)
         except KeyError as e:
@@ -206,11 +213,12 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
             "transport": info.transport,
             "enabled": info.enabled,
             "connected": info.connected,
+            "group": info.group,
             "usage_guide": info.usage_guide,
         }
 
     @router.post("/", response_model=StatusResponse, status_code=201)
-    def add_service(body: McpServiceAddBody) -> dict:
+    async def add_service(body: McpServiceAddBody) -> dict:
         """添加 MCP 服务配置。"""
         try:
             config = McpServiceAddRequest(
@@ -219,21 +227,24 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
                 transport=body.transport,
                 description=body.description,
                 enabled=body.enabled,
+                group=body.group,
                 usage_guide=body.usage_guide,
             )
             gateway.add_service(config)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        await gateway.reconcile_connections()
         return {"status": "success", "message": f"已添加 MCP 服务: {body.service_id}"}
 
     @router.patch("/{service_id}", response_model=StatusResponse)
-    def update_service(service_id: str, body: McpServiceUpdateBody) -> dict:
+    async def update_service(service_id: str, body: McpServiceUpdateBody) -> dict:
         """更新 MCP 服务配置（部分更新）。"""
         try:
             update = McpServiceUpdateRequest(
                 name=body.name,
                 description=body.description,
                 transport=body.transport,
+                group=body.group,
                 usage_guide=body.usage_guide,
             )
             gateway.update_service(service_id, update)
@@ -241,6 +252,7 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        await gateway.reconcile_connections()
         return {"status": "success", "message": f"已更新 MCP 服务: {service_id}"}
 
     @router.delete("/{service_id}", response_model=StatusResponse)
@@ -253,22 +265,35 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
         return {"status": "success", "message": f"已删除 MCP 服务: {service_id}"}
 
     @router.post("/{service_id}/enable", response_model=StatusResponse)
-    def enable_service(service_id: str) -> dict:
+    async def enable_service(service_id: str) -> dict:
         """启用 MCP 服务。"""
         try:
             gateway.enable_service(service_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        await gateway.reconcile_connections()
         return {"status": "success", "message": f"已启用 MCP 服务: {service_id}"}
 
     @router.post("/{service_id}/disable", response_model=StatusResponse)
-    def disable_service(service_id: str) -> dict:
+    async def disable_service(service_id: str) -> dict:
         """禁用 MCP 服务。"""
         try:
             gateway.disable_service(service_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        await gateway.reconcile_connections()
         return {"status": "success", "message": f"已禁用 MCP 服务: {service_id}"}
+
+    @router.post("/{service_id}/connect", response_model=StatusResponse)
+    async def connect_service(service_id: str) -> dict:
+        """手动连接指定 MCP 服务。"""
+        try:
+            await gateway.connect_service(service_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except (ConnectionError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"status": "success", "message": f"已连接 MCP 服务: {service_id}"}
 
     return router
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from agent_runtime.mcp.mcp_client.mcp_service_definition import McpServiceDefinition
@@ -23,6 +24,8 @@ from agent_runtime.mcp.mcp_client.infrastructure.mcp_session_manager import (
     McpSessionManager,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class McpClientService:
     """MCP 客户端领域服务。
@@ -38,6 +41,28 @@ class McpClientService:
     ) -> None:
         self._repository = repository
         self._session_manager = session_manager
+        # mtime 快照：用于检测外部进程（CLI / 手动编辑）对配置文件的修改
+        self._last_config_mtime: float = 0.0
+
+    def _snapshot_mtime(self) -> None:
+        """更新 mtime 快照为当前值（本进程写操作后调用，避免触发不必要的 reconcile）。"""
+        self._last_config_mtime = self._repository.config_dir_mtime()
+
+    def _is_config_changed(self) -> bool:
+        """检查配置目录 mtime 是否发生变化（外部进程修改了 YAML 文件）。"""
+        current_mtime = self._repository.config_dir_mtime()
+        return current_mtime != self._last_config_mtime
+
+    async def reconcile_if_config_changed(self) -> None:
+        """若配置目录 mtime 变化，则 reconcile 连接池。
+
+        懒检测：仅在被调用时检查 mtime，无额外线程。
+        用于 REST 进程感知 CLI / 手动编辑导致的配置变更。
+        """
+        if self._is_config_changed():
+            logger.info("检测到 MCP 配置目录变更（mtime 变化），执行 reconcile…")
+            await self.reconcile_connections()
+            self._snapshot_mtime()
 
     # ══════════════════════════════════════════
     # 配置管理用例
@@ -75,6 +100,7 @@ class McpClientService:
             )
 
         self._repository.save(definition)
+        self._snapshot_mtime()
 
     def update_service(self, service_id: str, **kwargs: Any) -> None:
         """更新 MCP 服务配置（部分更新）。
@@ -93,6 +119,7 @@ class McpClientService:
 
         definition.validate()
         self._repository.save(definition)
+        self._snapshot_mtime()
 
     def enable_service(self, service_id: str) -> None:
         """启用 MCP 服务。
@@ -103,6 +130,7 @@ class McpClientService:
         definition = self.get_service(service_id)
         definition.enabled = True
         self._repository.save(definition)
+        self._snapshot_mtime()
 
     def disable_service(self, service_id: str) -> None:
         """禁用 MCP 服务。
@@ -113,6 +141,7 @@ class McpClientService:
         definition = self.get_service(service_id)
         definition.enabled = False
         self._repository.save(definition)
+        self._snapshot_mtime()
 
     async def remove_service(self, service_id: str) -> None:
         """删除 MCP 服务配置并断开连接。
@@ -126,6 +155,66 @@ class McpClientService:
         # 先断开连接，再删除配置
         await self._session_manager.disconnect(service_id)
         self._repository.delete(service_id)
+        self._snapshot_mtime()
+
+    # ══════════════════════════════════════════
+    # 启动连接
+    # ══════════════════════════════════════════
+
+    async def connect_all_enabled(self) -> dict[str, str | None]:
+        """尝试连接所有已启用的 MCP 服务。
+
+        逐个连接，单个服务连接失败只记录日志，不影响其他服务。
+        用于应用启动时批量建立连接。
+
+        Returns:
+            {service_id: None} 表示连接成功，{service_id: "错误信息"} 表示连接失败。
+        """
+        results: dict[str, str | None] = {}
+        definitions = self._repository.find_all()
+
+        for definition in definitions:
+            if not definition.enabled:
+                continue
+            try:
+                await self._session_manager.connect(definition)
+                results[definition.service_id] = None
+                logger.info("启动连接 MCP 服务成功: %s", definition.service_id)
+            except Exception as e:
+                results[definition.service_id] = str(e)
+                logger.warning(
+                    "启动连接 MCP 服务失败: %s — %s", definition.service_id, e
+                )
+
+        self._snapshot_mtime()
+        return results
+
+    async def reconcile_connections(self) -> None:
+        """根据当前配置状态对齐连接池。
+
+        对比仓储中的服务定义与 McpSessionManager 中的活跃连接：
+        - 已删除或已禁用的服务 → 断开连接
+        - 已启用但未连接的服务 → 尝试连接（失败只记日志）
+
+        用于配置文件被外部修改后（CLI / 手动编辑 YAML）自动恢复一致性。
+        """
+        definitions = {d.service_id: d for d in self._repository.find_all()}
+        connected_ids = self._session_manager.connected_service_ids()
+
+        # 断开已删除或已禁用的服务
+        for sid in connected_ids:
+            if sid not in definitions or not definitions[sid].enabled:
+                logger.info("Reconcile: 断开不再需要的 MCP 服务连接: %s", sid)
+                await self._session_manager.disconnect(sid)
+
+        # 连接已启用但未连接的服务
+        for sid, defn in definitions.items():
+            if defn.enabled and not self._session_manager.is_connected(sid):
+                try:
+                    await self._session_manager.connect(defn)
+                    logger.info("Reconcile: 已连接 MCP 服务: %s", sid)
+                except Exception as e:
+                    logger.warning("Reconcile: 连接 MCP 服务失败: %s — %s", sid, e)
 
     # ══════════════════════════════════════════
     # 协议操作用例

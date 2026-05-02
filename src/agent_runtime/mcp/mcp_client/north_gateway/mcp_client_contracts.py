@@ -27,6 +27,8 @@ class McpServiceSummary:
     """传输方式标识：'stdio' 或 'streamable-http'。"""
     enabled: bool
     connected: bool
+    group: str = "default"
+    """服务分组标签。"""
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class McpServiceInfo:
     """传输配置（嵌套字典，含 type 字段标识传输方式）。"""
     enabled: bool
     connected: bool
+    group: str = "default"
+    """服务分组标签。"""
     usage_guide: str | None = None
 
 
@@ -61,6 +65,8 @@ class McpServiceAddRequest:
     """传输配置（嵌套字典，含 type 字段标识传输方式）。"""
     description: str | None = None
     enabled: bool = True
+    group: str = "default"
+    """服务分组标签。"""
     usage_guide: str | None = None
 
 
@@ -76,6 +82,8 @@ class McpServiceUpdateRequest:
     description: str | None = None
     transport: dict | None = None
     """传输配置（整体替换）。"""
+    group: str | None = None
+    """服务分组标签。"""
     usage_guide: str | None = None
 
 
