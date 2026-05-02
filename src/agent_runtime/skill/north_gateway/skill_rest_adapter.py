@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from agent_runtime.skill.north_gateway.skill_contracts import SkillGateway
@@ -27,6 +27,7 @@ class SkillInfoResponse(BaseModel):
     compatibility: str | None = None
     metadata: dict[str, str] = {}
     allowed_tools: str | None = None
+    group: str = "default"
 
 
 class RefreshResponse(BaseModel):
@@ -34,6 +35,26 @@ class RefreshResponse(BaseModel):
 
     message: str
     count: int
+
+
+class SetGroupBody(BaseModel):
+    """设置分组请求体。"""
+
+    group: str
+
+
+class StatusResponse(BaseModel):
+    """通用状态响应。"""
+
+    status: str
+    message: str
+
+
+class SkillContentResponse(BaseModel):
+    """Skill 内容响应。"""
+
+    skill_id: str
+    content: str
 
 
 # ── 路由工厂 ──────────────────────────────────────────────────
@@ -64,9 +85,27 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
                 "compatibility": s.compatibility,
                 "metadata": s.metadata,
                 "allowed_tools": s.allowed_tools,
+                "group": s.group,
             }
             for s in skills
         ]
+
+    @router.patch("/{skill_id}/group", response_model=StatusResponse)
+    def set_skill_group(skill_id: str, body: SetGroupBody) -> dict[str, Any]:
+        """设置指定 Skill 的应用层分组。"""
+        gateway.set_skill_group(skill_id, body.group)
+        return {"status": "success", "message": f"已设置 Skill '{skill_id}' 分组为 '{body.group}'"}
+
+    @router.get("/{skill_id}/content", response_model=SkillContentResponse)
+    def get_skill_content(skill_id: str) -> dict[str, Any]:
+        """读取指定 Skill 的 SKILL.md 正文内容（去除 frontmatter）。"""
+        try:
+            content = gateway.get_skill_content(skill_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        return {"skill_id": skill_id, "content": content}
 
     @router.post("/refresh", response_model=RefreshResponse)
     def refresh_skills() -> dict[str, Any]:

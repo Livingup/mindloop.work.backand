@@ -459,9 +459,10 @@ def _build_prompt_template_config(data: dict[str, Any]) -> PromptTemplateConfig:
 
 def _build_skill_config(data: dict[str, Any]) -> SkillConfig:
     """从 YAML 字典构建 Skill 服务配置。"""
-    return SkillConfig(
-        skills_dir=str(data["skills_dir"]),
-    )
+    kwargs: dict[str, Any] = {"skills_dir": str(data["skills_dir"])}
+    if "skill_groups_file" in data:
+        kwargs["skill_groups_file"] = str(data["skill_groups_file"])
+    return SkillConfig(**kwargs)
 
 
 def _build_mcp_client_config(data: dict[str, Any]) -> McpClientConfig:
