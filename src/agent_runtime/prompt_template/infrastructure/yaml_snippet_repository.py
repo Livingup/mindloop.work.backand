@@ -1,17 +1,18 @@
 """基于 YAML 文件的提示词片段仓储实现。
 
 设计原则：
-- 内存中持有完整的聚合根集合（PromptSnippet 实例），作为唯一数据源。
-- 所有读操作直接从内存返回，零文件 I/O。
+- 内存中持有完整的聚合根集合（PromptSnippet 实例），作为读操作的主要数据源。
 - 所有写操作先更新内存中的聚合根集合，再同步持久化到 YAML 文件。
 - 启动时从文件系统加载所有聚合根到内存（冷启动恢复）。
-- 跨进程一致性通过 reload() 方法支持（由上层按需调用，如 watchdog 文件监听触发）。
+- 读操作前自动检测文件系统变更（目录 mtime），有外部修改时自动 reload，
+  解决 CLI 与 REST 跨进程数据不一致问题。
 
 片段以独立 YAML 文件存储，文件名使用 UUID，按 category 子目录组织。
 """
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +35,8 @@ class YamlFileSnippetRepository:
         self._snippets_dir_accessor = snippets_dir_accessor
         # 内存中的聚合根集合：name → (聚合根实例, 持久化文件路径)。
         self._store: dict[str, tuple[PromptSnippet, Path]] = {}
+        # 上次加载时文件系统的最大 mtime，用于检测外部修改。
+        self._last_disk_mtime: float = 0.0
         self._snippets_dir.mkdir(parents=True, exist_ok=True)
         self._load_from_disk()
 
@@ -42,19 +45,22 @@ class YamlFileSnippetRepository:
         """实时从配置中心读取提示词片段存储根目录路径。"""
         return Path(self._snippets_dir_accessor())
 
-    # ── 读操作（纯内存） ─────────────────────────────────────────
+    # ── 读操作（内存优先，自动检测外部变更） ──────────────────────
 
     def find_by_name(self, name: str) -> PromptSnippet | None:
-        """根据唯一描述名查找片段。未找到时返回 None。纯内存操作。"""
+        """根据唯一描述名查找片段。未找到时返回 None。"""
+        self._sync_if_changed()
         entry = self._store.get(name)
         return entry[0] if entry is not None else None
 
     def find_all(self) -> list[PromptSnippet]:
-        """返回所有聚合根实例。纯内存操作。"""
+        """返回所有聚合根实例。"""
+        self._sync_if_changed()
         return [snippet for snippet, _ in self._store.values()]
 
     def exists(self, name: str) -> bool:
-        """判断指定 name 的片段是否存在。纯内存操作。"""
+        """判断指定 name 的片段是否存在。"""
+        self._sync_if_changed()
         return name in self._store
 
     # ── 写操作（先更新内存，再持久化文件） ──────────────────────
@@ -85,6 +91,8 @@ class YamlFileSnippetRepository:
         self._store[snippet.name] = (snippet, path)
         # 再持久化到文件。
         self._write_yaml(path, snippet)
+        # 更新 mtime 快照，避免自己的写入触发不必要的 reload。
+        self._last_disk_mtime = self._get_disk_mtime()
 
     def delete(self, name: str) -> bool:
         """删除聚合根。先从内存移除，再删除持久化文件。返回是否实际删除了。"""
@@ -93,6 +101,7 @@ class YamlFileSnippetRepository:
             _, path = entry
             if path.exists():
                 path.unlink()
+            self._last_disk_mtime = self._get_disk_mtime()
             return True
         return False
 
@@ -111,6 +120,33 @@ class YamlFileSnippetRepository:
         """
         self._load_from_disk()
 
+    def _sync_if_changed(self) -> None:
+        """读操作前自动检测文件系统变更，有外部修改时自动 reload。
+
+        通过比较目录及所有 .yaml 文件的最大 mtime 与上次快照来判断是否有外部写入。
+        仅当检测到变更时才执行全量 reload，无变更时开销极小（仅 stat 调用）。
+        """
+        current_mtime = self._get_disk_mtime()
+        if current_mtime > self._last_disk_mtime:
+            logger.debug("检测到文件系统变更 (mtime %.3f → %.3f)，重新加载。",
+                         self._last_disk_mtime, current_mtime)
+            self._load_from_disk()
+
+    def _get_disk_mtime(self) -> float:
+        """获取存储目录中所有 .yaml 文件和目录本身的最大 mtime。"""
+        snippets_dir = self._snippets_dir
+        if not snippets_dir.exists():
+            return 0.0
+        max_mtime = os.path.getmtime(snippets_dir)
+        for path in snippets_dir.rglob("*.yaml"):
+            try:
+                mt = os.path.getmtime(path)
+                if mt > max_mtime:
+                    max_mtime = mt
+            except OSError:
+                continue
+        return max_mtime
+
     # ── 内部方法 ─────────────────────────────────────────────────
 
     def _load_from_disk(self) -> None:
@@ -118,6 +154,7 @@ class YamlFileSnippetRepository:
 
         递归遍历存储目录中的 .yaml 文件，反序列化为 PromptSnippet 聚合根，
         存入内存集合。name 重复时记录警告并跳过后发现的文件。
+        加载完成后更新 mtime 快照。
         """
         self._store.clear()
         for path in self._snippets_dir.rglob("*.yaml"):
@@ -136,6 +173,7 @@ class YamlFileSnippetRepository:
 
             self._store[snippet.name] = (snippet, path)
 
+        self._last_disk_mtime = self._get_disk_mtime()
         logger.info("提示词片段加载完成，内存中共 %d 个聚合根。", len(self._store))
 
     def _deserialize(self, path: Path) -> PromptSnippet:
