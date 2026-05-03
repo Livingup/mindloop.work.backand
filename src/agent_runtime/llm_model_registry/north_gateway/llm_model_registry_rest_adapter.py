@@ -11,7 +11,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from agent_runtime.input_modality import INPUT_MODALITY_TEXT
+from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
+from agent_runtime.llm_api_protocol import SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
@@ -144,6 +145,11 @@ class ResolvedLlmProviderModelResponse(BaseModel):
     supported_input_modalities: list[str] = Field(default_factory=list)
 
 
+class LlmRegistryMetadataResponse(BaseModel):
+    api_formats: list[str] = Field(default_factory=list)
+    input_modalities: list[str] = Field(default_factory=list)
+
+
 # ── 路由工厂 ─────────────────────────────────────────────────────
 
 
@@ -159,6 +165,13 @@ def create_llm_model_registry_router(
         FastAPI APIRouter，挂载时建议使用 prefix="/api/llm-registry"。
     """
     router = APIRouter()
+
+    @router.get("/metadata", response_model=LlmRegistryMetadataResponse)
+    def get_registry_metadata() -> LlmRegistryMetadataResponse:
+        return LlmRegistryMetadataResponse(
+            api_formats=list(SUPPORTED_LLM_API_FORMATS),
+            input_modalities=sorted(SUPPORTED_INPUT_MODALITIES),
+        )
 
     @router.get("/models", response_model=list[LlmModelMetadataResponse])
     def list_model_metadata() -> list[LlmModelMetadataResponse]:
