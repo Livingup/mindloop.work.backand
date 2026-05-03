@@ -27,6 +27,10 @@ class McpServiceSummary:
     """传输方式标识：'stdio' 或 'streamable-http'。"""
     enabled: bool
     connected: bool
+    connection_status: str = "disconnected"
+    last_error: str | None = None
+    retry_attempt: int = 0
+    next_retry_at: float | None = None
     group: str = "default"
     """服务分组标签。"""
 
@@ -47,6 +51,10 @@ class McpServiceInfo:
     """传输配置（嵌套字典，含 type 字段标识传输方式）。"""
     enabled: bool
     connected: bool
+    connection_status: str = "disconnected"
+    last_error: str | None = None
+    retry_attempt: int = 0
+    next_retry_at: float | None = None
     group: str = "default"
     """服务分组标签。"""
     usage_guide: str | None = None
@@ -200,6 +208,22 @@ class McpClientGateway(Protocol):
 
     async def test_connection(self, service_id: str) -> McpTestResult:
         """测试连接：临时建立 → initialize → 获取能力 → 断开。"""
+        ...
+
+    async def connect_all_enabled(self) -> dict[str, str | None]:
+        """调度所有已启用 MCP 服务后台连接。"""
+        ...
+
+    async def connect_service(self, service_id: str) -> None:
+        """手动重连指定 MCP 服务。"""
+        ...
+
+    async def reconcile_connections(self) -> None:
+        """根据当前配置状态对齐连接运行态。"""
+        ...
+
+    async def reconcile_if_config_changed(self) -> None:
+        """若配置目录 mtime 变化，则 reconcile 连接运行态。"""
         ...
 
     # ── 协议操作 ──

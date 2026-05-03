@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import suppress
 from typing import Any
 
 from agent_runtime.mcp.mcp_client.mcp_service_definition import McpServiceDefinition
 from agent_runtime.mcp.mcp_client.mcp_service_repository import McpServiceRepository
 from agent_runtime.mcp.mcp_client.mcp_value_objects import (
+    McpConnectionStatus,
     McpResourceContent,
     McpResourceInfo,
     McpServiceCapabilities,
@@ -152,8 +155,7 @@ class McpClientService:
         if not self._repository.contains(service_id):
             raise KeyError(f"MCP 服务 '{service_id}' 不存在")
 
-        # 先断开连接，再删除配置
-        await self._session_manager.disconnect(service_id)
+        await self._session_manager.mark_disabled(service_id)
         self._repository.delete(service_id)
         self._snapshot_mtime()
 
@@ -162,29 +164,16 @@ class McpClientService:
     # ══════════════════════════════════════════
 
     async def connect_all_enabled(self) -> dict[str, str | None]:
-        """尝试连接所有已启用的 MCP 服务。
-
-        逐个连接，单个服务连接失败只记录日志，不影响其他服务。
-        用于应用启动时批量建立连接。
-
-        Returns:
-            {service_id: None} 表示连接成功，{service_id: "错误信息"} 表示连接失败。
-        """
         results: dict[str, str | None] = {}
         definitions = self._repository.find_all()
 
         for definition in definitions:
             if not definition.enabled:
+                await self._session_manager.mark_disabled(definition.service_id)
                 continue
-            try:
-                await self._session_manager.connect(definition)
-                results[definition.service_id] = None
-                logger.info("启动连接 MCP 服务成功: %s", definition.service_id)
-            except Exception as e:
-                results[definition.service_id] = str(e)
-                logger.warning(
-                    "启动连接 MCP 服务失败: %s — %s", definition.service_id, e
-                )
+            self._session_manager.schedule_reconnect(definition)
+            status = self._session_manager.get_connection_status(definition.service_id)
+            results[definition.service_id] = status.last_error
 
         self._snapshot_mtime()
         return results
@@ -199,22 +188,18 @@ class McpClientService:
         用于配置文件被外部修改后（CLI / 手动编辑 YAML）自动恢复一致性。
         """
         definitions = {d.service_id: d for d in self._repository.find_all()}
-        connected_ids = self._session_manager.connected_service_ids()
+        known_ids = self._session_manager.known_service_ids()
 
-        # 断开已删除或已禁用的服务
-        for sid in connected_ids:
+        for sid in known_ids:
             if sid not in definitions or not definitions[sid].enabled:
                 logger.info("Reconcile: 断开不再需要的 MCP 服务连接: %s", sid)
-                await self._session_manager.disconnect(sid)
+                await self._session_manager.mark_disabled(sid)
 
-        # 连接已启用但未连接的服务
         for sid, defn in definitions.items():
-            if defn.enabled and not self._session_manager.is_connected(sid):
-                try:
-                    await self._session_manager.connect(defn)
-                    logger.info("Reconcile: 已连接 MCP 服务: %s", sid)
-                except Exception as e:
-                    logger.warning("Reconcile: 连接 MCP 服务失败: %s — %s", sid, e)
+            if defn.enabled:
+                self._session_manager.schedule_reconnect(defn)
+            else:
+                await self._session_manager.mark_disabled(sid)
 
     # ══════════════════════════════════════════
     # 协议操作用例
@@ -236,7 +221,25 @@ class McpClientService:
         if not definition.enabled:
             raise ValueError(f"MCP 服务 '{service_id}' 已禁用")
 
-        await self._session_manager.connect(definition)
+        try:
+            await self._session_manager.connect(definition)
+        except (Exception, asyncio.CancelledError):
+            self._session_manager.schedule_reconnect(definition)
+            raise
+
+    async def connect_service(self, service_id: str) -> None:
+        definition = self.get_service(service_id)
+        if not definition.enabled:
+            raise ValueError(f"MCP 服务 '{service_id}' 已禁用")
+        try:
+            await self._session_manager.reconnect_now(definition)
+        except (Exception, asyncio.CancelledError):
+            self._session_manager.schedule_reconnect(definition)
+            raise
+
+    def get_connection_status(self, service_id: str) -> McpConnectionStatus:
+        self.get_service(service_id)
+        return self._session_manager.get_connection_status(service_id)
 
     async def test_connection(self, service_id: str) -> McpServiceCapabilities:
         """测试连接：临时建立 → initialize → 获取能力 → 断开。
@@ -297,31 +300,51 @@ class McpClientService:
     async def list_tools(self, service_id: str) -> list[McpToolSummary]:
         """列出指定服务的所有工具（名称 + 描述）。"""
         await self.ensure_connected(service_id)
-        return await self._session_manager.list_tools(service_id)
+        try:
+            return await self._session_manager.list_tools(service_id)
+        except (Exception, asyncio.CancelledError) as e:
+            await self._handle_protocol_failure(service_id, e)
+            raise ConnectionError(f"MCP 服务 '{service_id}' 工具列表获取失败: {e}") from e
 
     async def get_tool_detail(
         self, service_id: str, tool_names: list[str]
     ) -> list[McpToolInfo]:
         """批量获取工具的 inputSchema。"""
         await self.ensure_connected(service_id)
-        return await self._session_manager.get_tool_detail(service_id, tool_names)
+        try:
+            return await self._session_manager.get_tool_detail(service_id, tool_names)
+        except (Exception, asyncio.CancelledError) as e:
+            await self._handle_protocol_failure(service_id, e)
+            raise ConnectionError(f"MCP 服务 '{service_id}' 工具详情获取失败: {e}") from e
 
     async def call_tool(
         self, service_id: str, tool_name: str, arguments: dict[str, Any]
     ) -> McpToolResult:
         """执行 MCP 工具。"""
         await self.ensure_connected(service_id)
-        return await self._session_manager.call_tool(service_id, tool_name, arguments)
+        try:
+            return await self._session_manager.call_tool(service_id, tool_name, arguments)
+        except (Exception, asyncio.CancelledError) as e:
+            await self._handle_protocol_failure(service_id, e)
+            raise ConnectionError(f"MCP 服务 '{service_id}' 工具执行失败: {e}") from e
 
     async def list_resources(self, service_id: str) -> list[McpResourceInfo]:
         """列出指定服务的资源。"""
         await self.ensure_connected(service_id)
-        return await self._session_manager.list_resources(service_id)
+        try:
+            return await self._session_manager.list_resources(service_id)
+        except (Exception, asyncio.CancelledError) as e:
+            await self._handle_protocol_failure(service_id, e)
+            raise ConnectionError(f"MCP 服务 '{service_id}' 资源列表获取失败: {e}") from e
 
     async def read_resource(self, service_id: str, uri: str) -> McpResourceContent:
         """读取指定资源内容。"""
         await self.ensure_connected(service_id)
-        return await self._session_manager.read_resource(service_id, uri)
+        try:
+            return await self._session_manager.read_resource(service_id, uri)
+        except (Exception, asyncio.CancelledError) as e:
+            await self._handle_protocol_failure(service_id, e)
+            raise ConnectionError(f"MCP 服务 '{service_id}' 资源读取失败: {e}") from e
 
     # ── 内部方法 ──
 
@@ -341,3 +364,10 @@ class McpClientService:
             parts.append(local_usage_guide.strip())
 
         return "\n\n".join(parts) if parts else None
+
+    async def _handle_protocol_failure(self, service_id: str, error: BaseException) -> None:
+        with suppress(KeyError):
+            definition = self.get_service(service_id)
+            await self._session_manager.mark_connection_lost(service_id, str(error))
+            if definition.enabled:
+                self._session_manager.schedule_reconnect(definition)

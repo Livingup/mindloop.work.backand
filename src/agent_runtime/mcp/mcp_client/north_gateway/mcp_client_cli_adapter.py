@@ -90,6 +90,11 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                     "description": s.description,
                     "transport_type": s.transport_type,
                     "enabled": s.enabled,
+                    "connected": s.connected,
+                    "connection_status": s.connection_status,
+                    "last_error": s.last_error,
+                    "retry_attempt": s.retry_attempt,
+                    "next_retry_at": s.next_retry_at,
                     "group": s.group,
                 }
                 for s in services
@@ -112,6 +117,11 @@ def create_mcp_config_cli_group(gateway_factory: Callable[[], McpClientGateway])
                 "description": info.description,
                 "transport": info.transport,
                 "enabled": info.enabled,
+                "connected": info.connected,
+                "connection_status": info.connection_status,
+                "last_error": info.last_error,
+                "retry_attempt": info.retry_attempt,
+                "next_retry_at": info.next_retry_at,
                 "group": info.group,
             }
             if info.usage_guide:

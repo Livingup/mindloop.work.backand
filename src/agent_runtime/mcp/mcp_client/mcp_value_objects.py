@@ -8,6 +8,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+MCP_CONNECTION_STATUS_CONNECTED = "connected"
+MCP_CONNECTION_STATUS_CONNECTING = "connecting"
+MCP_CONNECTION_STATUS_RECONNECTING = "reconnecting"
+MCP_CONNECTION_STATUS_FAILED = "failed"
+MCP_CONNECTION_STATUS_DISCONNECTED = "disconnected"
+MCP_CONNECTION_STATUS_DISABLED = "disabled"
+
+
+@dataclass(frozen=True)
+class McpConnectionStatus:
+    """MCP 服务连接运行态。"""
+
+    service_id: str
+    status: str = MCP_CONNECTION_STATUS_DISCONNECTED
+    connected: bool = False
+    last_error: str | None = None
+    retry_attempt: int = 0
+    next_retry_at: float | None = None
+    last_connected_at: float | None = None
+    last_disconnected_at: float | None = None
+
 
 @dataclass(frozen=True)
 class McpServiceCapabilities:

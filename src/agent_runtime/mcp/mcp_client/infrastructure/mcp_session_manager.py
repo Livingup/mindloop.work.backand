@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import AsyncExitStack
+import time
+from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass, field
 from typing import Any
 
 from mcp import ClientSession, types
@@ -18,6 +20,13 @@ from mcp.client.streamable_http import streamable_http_client
 
 from agent_runtime.mcp.mcp_client.mcp_service_definition import McpServiceDefinition
 from agent_runtime.mcp.mcp_client.mcp_value_objects import (
+    MCP_CONNECTION_STATUS_CONNECTED,
+    MCP_CONNECTION_STATUS_CONNECTING,
+    MCP_CONNECTION_STATUS_DISABLED,
+    MCP_CONNECTION_STATUS_DISCONNECTED,
+    MCP_CONNECTION_STATUS_FAILED,
+    MCP_CONNECTION_STATUS_RECONNECTING,
+    McpConnectionStatus,
     McpResourceContent,
     McpResourceInfo,
     McpServiceCapabilities,
@@ -27,6 +36,10 @@ from agent_runtime.mcp.mcp_client.mcp_value_objects import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MCP_CONNECT_TIMEOUT_SECONDS = 10.0
+_MCP_RECONNECT_BASE_DELAY_SECONDS = 2.0
+_MCP_RECONNECT_MAX_DELAY_SECONDS = 60.0
 
 
 class _ManagedConnection:
@@ -38,12 +51,26 @@ class _ManagedConnection:
     def __init__(
         self,
         session: ClientSession,
-        exit_stack: AsyncExitStack,
         capabilities: McpServiceCapabilities,
+        close_event: asyncio.Event,
+        owner_task: asyncio.Task,
     ) -> None:
         self.session = session
-        self.exit_stack = exit_stack
         self.capabilities = capabilities
+        self.close_event = close_event
+        self.owner_task = owner_task
+
+
+@dataclass
+class _ConnectionRuntimeState:
+    status: str = MCP_CONNECTION_STATUS_DISCONNECTED
+    last_error: str | None = None
+    retry_attempt: int = 0
+    next_retry_at: float | None = None
+    last_connected_at: float | None = None
+    last_disconnected_at: float | None = None
+    reconnect_task: asyncio.Task | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class McpSessionManager:
@@ -55,7 +82,7 @@ class McpSessionManager:
 
     def __init__(self) -> None:
         self._connections: dict[str, _ManagedConnection] = {}
-        self._lock = asyncio.Lock()
+        self._runtime_states: dict[str, _ConnectionRuntimeState] = {}
 
     # ── 连接管理 ──
 
@@ -73,59 +100,73 @@ class McpSessionManager:
         Raises:
             ConnectionError: 连接或初始化失败。
         """
-        async with self._lock:
-            if definition.service_id in self._connections:
-                return self._connections[definition.service_id].capabilities
-
-            try:
-                exit_stack = AsyncExitStack()
-                await exit_stack.__aenter__()
-
-                session = await self._create_session(definition, exit_stack)
-                init_result = await session.initialize()
-
-                capabilities = self._extract_capabilities(init_result)
-
-                self._connections[definition.service_id] = _ManagedConnection(
-                    session=session,
-                    exit_stack=exit_stack,
-                    capabilities=capabilities,
-                )
-
-                logger.info(
-                    "已连接 MCP 服务: %s (%s v%s)",
-                    definition.service_id,
-                    capabilities.server_name,
-                    capabilities.server_version,
-                )
-                return capabilities
-
-            except Exception as e:
-                # 连接失败时清理 exit_stack
-                try:
-                    await exit_stack.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                raise ConnectionError(
-                    f"连接 MCP 服务 '{definition.service_id}' 失败: {e}"
-                ) from e
+        return await self._connect(definition, status=MCP_CONNECTION_STATUS_CONNECTING)
 
     async def disconnect(self, service_id: str) -> None:
         """断开指定服务的连接。"""
-        async with self._lock:
-            conn = self._connections.pop(service_id, None)
-            if conn is not None:
-                try:
-                    await conn.exit_stack.__aexit__(None, None, None)
-                except Exception as e:
-                    logger.warning("断开 MCP 服务 '%s' 时出错: %s", service_id, e)
-                logger.info("已断开 MCP 服务: %s", service_id)
+        await self.cancel_reconnect(service_id)
+        state = self._state(service_id)
+        async with state.lock:
+            await self._close_connection(service_id)
+            state.status = MCP_CONNECTION_STATUS_DISCONNECTED
+            state.last_error = None
+            state.next_retry_at = None
+            state.last_disconnected_at = time.time()
 
     async def disconnect_all(self) -> None:
         """断开所有连接（应用关闭时调用）。"""
-        service_ids = list(self._connections.keys())
+        service_ids = set(self._connections.keys()) | set(self._runtime_states.keys())
         for service_id in service_ids:
             await self.disconnect(service_id)
+
+    async def mark_disabled(self, service_id: str) -> None:
+        """标记服务禁用并停止重连。"""
+        await self.cancel_reconnect(service_id)
+        state = self._state(service_id)
+        async with state.lock:
+            await self._close_connection(service_id)
+            state.status = MCP_CONNECTION_STATUS_DISABLED
+            state.last_error = None
+            state.next_retry_at = None
+            state.last_disconnected_at = time.time()
+
+    async def mark_connection_lost(self, service_id: str, error: str) -> None:
+        """标记已连接服务异常断连。"""
+        state = self._state(service_id)
+        async with state.lock:
+            await self._close_connection(service_id)
+            self._record_failure(state, error)
+
+    def schedule_reconnect(self, definition: McpServiceDefinition) -> None:
+        """为服务调度后台指数退避重连。"""
+        state = self._state(definition.service_id)
+        if not definition.enabled:
+            state.status = MCP_CONNECTION_STATUS_DISABLED
+            return
+        if self.is_connected(definition.service_id):
+            return
+        if state.reconnect_task is not None and not state.reconnect_task.done():
+            return
+        state.reconnect_task = asyncio.create_task(self._reconnect_loop(definition))
+
+    async def reconnect_now(self, definition: McpServiceDefinition) -> McpServiceCapabilities:
+        """立即执行一次手动重连。"""
+        await self.disconnect(definition.service_id)
+        state = self._state(definition.service_id)
+        state.retry_attempt = 0
+        state.next_retry_at = None
+        return await self._connect(definition, status=MCP_CONNECTION_STATUS_CONNECTING)
+
+    async def cancel_reconnect(self, service_id: str) -> None:
+        """取消服务后台重连任务。"""
+        state = self._state(service_id)
+        task = state.reconnect_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(Exception, asyncio.CancelledError):
+                await task
+        state.reconnect_task = None
+        state.next_retry_at = None
 
     def is_connected(self, service_id: str) -> bool:
         """是否已连接。"""
@@ -135,10 +176,27 @@ class McpSessionManager:
         """返回当前所有已连接的 service_id 列表。"""
         return list(self._connections.keys())
 
+    def known_service_ids(self) -> list[str]:
+        return list(set(self._connections.keys()) | set(self._runtime_states.keys()))
+
     def get_capabilities(self, service_id: str) -> McpServiceCapabilities | None:
         """获取已连接服务的缓存能力信息。"""
         conn = self._connections.get(service_id)
         return conn.capabilities if conn else None
+
+    def get_connection_status(self, service_id: str) -> McpConnectionStatus:
+        """获取 MCP 服务连接运行态。"""
+        state = self._state(service_id)
+        return McpConnectionStatus(
+            service_id=service_id,
+            status=state.status,
+            connected=self.is_connected(service_id),
+            last_error=state.last_error,
+            retry_attempt=state.retry_attempt,
+            next_retry_at=state.next_retry_at,
+            last_connected_at=state.last_connected_at,
+            last_disconnected_at=state.last_disconnected_at,
+        )
 
     # ── 协议操作 ──
 
@@ -279,6 +337,176 @@ class McpSessionManager:
         if conn is None:
             raise ConnectionError(f"MCP 服务 '{service_id}' 未连接")
         return conn.session
+
+    def _state(self, service_id: str) -> _ConnectionRuntimeState:
+        return self._runtime_states.setdefault(service_id, _ConnectionRuntimeState())
+
+    async def _connect(
+        self,
+        definition: McpServiceDefinition,
+        *,
+        status: str,
+    ) -> McpServiceCapabilities:
+        service_id = definition.service_id
+        state = self._state(service_id)
+        async with state.lock:
+            if service_id in self._connections:
+                state.status = MCP_CONNECTION_STATUS_CONNECTED
+                state.last_error = None
+                state.next_retry_at = None
+                return self._connections[service_id].capabilities
+
+            state.status = status
+            state.last_error = None
+            state.next_retry_at = None
+            close_event = asyncio.Event()
+            ready_future: asyncio.Future[tuple[ClientSession, McpServiceCapabilities]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            owner_task = asyncio.create_task(
+                self._connection_owner(definition, close_event, ready_future)
+            )
+
+            try:
+                session, capabilities = await asyncio.wait_for(
+                    asyncio.shield(ready_future),
+                    timeout=_MCP_CONNECT_TIMEOUT_SECONDS,
+                )
+                self._connections[service_id] = _ManagedConnection(
+                    session=session,
+                    capabilities=capabilities,
+                    close_event=close_event,
+                    owner_task=owner_task,
+                )
+                state.status = MCP_CONNECTION_STATUS_CONNECTED
+                state.last_error = None
+                state.retry_attempt = 0
+                state.next_retry_at = None
+                state.last_connected_at = time.time()
+                logger.info(
+                    "已连接 MCP 服务: %s (%s v%s)",
+                    service_id,
+                    capabilities.server_name,
+                    capabilities.server_version,
+                )
+                return capabilities
+            except TimeoutError as e:
+                ready_future.cancel()
+                await self._stop_owner_task(owner_task, close_event)
+                error = f"连接 MCP 服务 '{service_id}' 超时"
+                self._record_failure(state, error)
+                raise ConnectionError(error) from e
+            except asyncio.CancelledError as e:
+                ready_future.cancel()
+                await self._stop_owner_task(owner_task, close_event)
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
+                error = f"连接 MCP 服务 '{service_id}' 失败: {e}"
+                self._record_failure(state, error)
+                raise ConnectionError(error) from e
+            except Exception as e:
+                await self._stop_owner_task(owner_task, close_event)
+                error = f"连接 MCP 服务 '{service_id}' 失败: {e}"
+                self._record_failure(state, error)
+                raise ConnectionError(error) from e
+
+    async def _close_connection(self, service_id: str) -> None:
+        conn = self._connections.pop(service_id, None)
+        if conn is None:
+            return
+        await self._stop_owner_task(conn.owner_task, conn.close_event)
+        logger.info("已断开 MCP 服务: %s", service_id)
+
+    async def _connection_owner(
+        self,
+        definition: McpServiceDefinition,
+        close_event: asyncio.Event,
+        ready_future: asyncio.Future[tuple[ClientSession, McpServiceCapabilities]],
+    ) -> None:
+        service_id = definition.service_id
+        exit_stack = AsyncExitStack()
+        try:
+            await exit_stack.__aenter__()
+            session = await self._create_session(definition, exit_stack)
+            init_result = await session.initialize()
+            capabilities = self._extract_capabilities(init_result)
+            if not ready_future.done():
+                ready_future.set_result((session, capabilities))
+            await close_event.wait()
+        except asyncio.CancelledError as e:
+            if not ready_future.done():
+                ready_future.set_exception(ConnectionError(f"连接 MCP 服务 '{service_id}' 初始化被取消"))
+            raise
+        except Exception as e:
+            if not ready_future.done():
+                ready_future.set_exception(e)
+            else:
+                logger.warning("MCP 服务连接 owner 异常退出: %s — %s", service_id, e)
+        finally:
+            await self._close_exit_stack(exit_stack)
+            current_task = asyncio.current_task()
+            conn = self._connections.get(service_id)
+            if conn is not None and conn.owner_task is current_task:
+                self._connections.pop(service_id, None)
+
+    async def _stop_owner_task(
+        self,
+        owner_task: asyncio.Task,
+        close_event: asyncio.Event,
+    ) -> None:
+        close_event.set()
+        if owner_task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(owner_task), timeout=5.0)
+        except TimeoutError:
+            owner_task.cancel()
+            with suppress(Exception, asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(asyncio.shield(owner_task), timeout=5.0)
+        except (Exception, asyncio.CancelledError):
+            pass
+
+    async def _close_exit_stack(self, exit_stack: AsyncExitStack) -> None:
+        try:
+            await exit_stack.__aexit__(None, None, None)
+        except (Exception, asyncio.CancelledError) as e:
+            logger.debug("关闭 MCP 连接资源时出错: %s", e)
+
+    def _record_failure(self, state: _ConnectionRuntimeState, error: str) -> None:
+        state.status = MCP_CONNECTION_STATUS_FAILED
+        state.last_error = error
+        state.retry_attempt += 1
+        state.last_disconnected_at = time.time()
+        state.next_retry_at = state.last_disconnected_at + self._retry_delay(state.retry_attempt)
+
+    def _retry_delay(self, retry_attempt: int) -> float:
+        exponent = max(retry_attempt - 1, 0)
+        return min(
+            _MCP_RECONNECT_BASE_DELAY_SECONDS * (2 ** exponent),
+            _MCP_RECONNECT_MAX_DELAY_SECONDS,
+        )
+
+    async def _reconnect_loop(self, definition: McpServiceDefinition) -> None:
+        service_id = definition.service_id
+        state = self._state(service_id)
+        try:
+            while definition.enabled and not self.is_connected(service_id):
+                if state.retry_attempt > 0:
+                    delay = self._retry_delay(state.retry_attempt)
+                    state.next_retry_at = time.time() + delay
+                    await asyncio.sleep(delay)
+                try:
+                    await self._connect(
+                        definition,
+                        status=MCP_CONNECTION_STATUS_RECONNECTING,
+                    )
+                    return
+                except Exception as e:
+                    logger.warning("后台重连 MCP 服务失败: %s — %s", service_id, e)
+        finally:
+            if state.reconnect_task is asyncio.current_task():
+                state.reconnect_task = None
 
     async def _create_session(
         self, definition: McpServiceDefinition, exit_stack: AsyncExitStack

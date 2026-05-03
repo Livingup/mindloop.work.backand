@@ -196,8 +196,9 @@ main.add_command(
 @click.option("--port", default=None, type=int, help="监听端口（覆盖配置文件）。")
 def serve(host: str | None, port: int | None) -> None:
     """启动 REST API 服务器。"""
+    import asyncio as _asyncio
     import logging as _logging
-    from contextlib import asynccontextmanager
+    from contextlib import asynccontextmanager, suppress
 
     import uvicorn
     from fastapi import FastAPI
@@ -243,14 +244,26 @@ def serve(host: str | None, port: int | None) -> None:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         """应用生命周期：启动时自动连接所有已启用的 MCP 服务。"""
-        _serve_logger.info("正在自动连接已启用的 MCP 服务…")
-        results = await mcp_gateway.connect_all_enabled()
-        ok = sum(1 for v in results.values() if v is None)
-        fail = sum(1 for v in results.values() if v is not None)
-        _serve_logger.info("MCP 服务自动连接完成：成功 %d，失败 %d", ok, fail)
-        yield
-        # 关闭时断开所有 MCP 连接
-        await mcp_gateway.shutdown()
+        async def auto_connect_mcp_services() -> None:
+            _serve_logger.info("正在调度已启用 MCP 服务的后台连接…")
+            try:
+                results = await mcp_gateway.connect_all_enabled()
+                _serve_logger.info("MCP 服务后台连接已调度：%d", len(results))
+                for service_id, error in results.items():
+                    if error is not None:
+                        _serve_logger.warning("MCP 服务当前连接异常：%s — %s", service_id, error)
+            except (Exception, _asyncio.CancelledError) as e:
+                _serve_logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
+
+        auto_connect_task = _asyncio.create_task(auto_connect_mcp_services())
+        try:
+            yield
+        finally:
+            if not auto_connect_task.done():
+                auto_connect_task.cancel()
+                with suppress(Exception, _asyncio.CancelledError):
+                    await auto_connect_task
+            await mcp_gateway.shutdown()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
     app.include_router(

@@ -55,29 +55,41 @@ class McpClientGatewayImpl:
     def list_services(self) -> list[McpServiceSummary]:
         """列出所有已配置的 MCP 服务。"""
         definitions = self._service.list_services()
-        return [
-            McpServiceSummary(
-                service_id=d.service_id,
-                name=d.name,
-                description=d.description,
-                transport_type=d.transport_type,
-                enabled=d.enabled,
-                connected=self._session_manager.is_connected(d.service_id),
-                group=d.group,
+        items: list[McpServiceSummary] = []
+        for d in definitions:
+            status = self._service.get_connection_status(d.service_id)
+            items.append(
+                McpServiceSummary(
+                    service_id=d.service_id,
+                    name=d.name,
+                    description=d.description,
+                    transport_type=d.transport_type,
+                    enabled=d.enabled,
+                    connected=status.connected,
+                    connection_status=status.status,
+                    last_error=status.last_error,
+                    retry_attempt=status.retry_attempt,
+                    next_retry_at=status.next_retry_at,
+                    group=d.group,
+                )
             )
-            for d in definitions
-        ]
+        return items
 
     def get_service(self, service_id: str) -> McpServiceInfo:
         """获取服务配置详情。"""
         d = self._service.get_service(service_id)
+        status = self._service.get_connection_status(service_id)
         return McpServiceInfo(
             service_id=d.service_id,
             name=d.name,
             description=d.description,
             transport=d.transport.to_dict(),
             enabled=d.enabled,
-            connected=self._session_manager.is_connected(d.service_id),
+            connected=status.connected,
+            connection_status=status.status,
+            last_error=status.last_error,
+            retry_attempt=status.retry_attempt,
+            next_retry_at=status.next_retry_at,
             group=d.group,
             usage_guide=d.usage_guide,
         )
@@ -164,7 +176,7 @@ class McpClientGatewayImpl:
 
     async def connect_service(self, service_id: str) -> None:
         """手动连接指定 MCP 服务。"""
-        await self._service.ensure_connected(service_id)
+        await self._service.connect_service(service_id)
 
     async def reconcile_connections(self) -> None:
         """根据当前配置状态对齐连接池。

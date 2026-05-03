@@ -8,6 +8,7 @@ Agent 在对话中通过这些工具自主发现和调用 MCP 服务。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -41,6 +42,10 @@ def _get_gateway() -> McpClientGateway:
     return _gateway
 
 
+def _tool_error(message: str) -> str:
+    return json.dumps({"is_error": True, "content": message}, ensure_ascii=False)
+
+
 # ══════════════════════════════════════════
 # 5 个 MCP 元工具
 # ══════════════════════════════════════════
@@ -62,8 +67,11 @@ async def mcp_get_service_detail(service_id: str) -> str:
     Returns:
         JSON 格式的服务能力详情。
     """
-    gw = _get_gateway()
-    detail = await gw.get_service_detail(service_id)
+    try:
+        gw = _get_gateway()
+        detail = await gw.get_service_detail(service_id)
+    except (Exception, asyncio.CancelledError) as e:
+        return _tool_error(f"MCP 服务详情获取失败: {e}")
     return json.dumps(
         {
             "supports_tools": detail.supports_tools,
@@ -92,8 +100,11 @@ async def mcp_list_resources(service_id: str) -> str:
     Returns:
         JSON 格式的资源列表。
     """
-    gw = _get_gateway()
-    resources = await gw.list_resources(service_id)
+    try:
+        gw = _get_gateway()
+        resources = await gw.list_resources(service_id)
+    except (Exception, asyncio.CancelledError) as e:
+        return _tool_error(f"MCP 资源列表获取失败: {e}")
     return json.dumps(
         [
             {
@@ -125,8 +136,11 @@ async def mcp_read_resource(service_id: str, uri: str) -> str:
     Returns:
         JSON 格式的资源内容。
     """
-    gw = _get_gateway()
-    content = await gw.read_resource(service_id, uri)
+    try:
+        gw = _get_gateway()
+        content = await gw.read_resource(service_id, uri)
+    except (Exception, asyncio.CancelledError) as e:
+        return _tool_error(f"MCP 资源读取失败: {e}")
     result: dict[str, Any] = {
         "uri": content.uri,
         "mime_type": content.mime_type,
@@ -156,9 +170,12 @@ async def mcp_get_tool_detail(service_id: str, tool_names: str) -> str:
     Returns:
         JSON 格式的工具参数定义列表。
     """
-    gw = _get_gateway()
     names = [n.strip() for n in tool_names.split(",") if n.strip()]
-    tools = await gw.get_tool_detail(service_id, names)
+    try:
+        gw = _get_gateway()
+        tools = await gw.get_tool_detail(service_id, names)
+    except (Exception, asyncio.CancelledError) as e:
+        return _tool_error(f"MCP 工具详情获取失败: {e}")
     return json.dumps(
         [
             {
@@ -191,17 +208,16 @@ async def mcp_call_tool(service_id: str, tool_name: str, arguments: str) -> str:
     Returns:
         JSON 格式的执行结果。
     """
-    gw = _get_gateway()
-
     try:
         args_dict = json.loads(arguments)
     except json.JSONDecodeError as e:
-        return json.dumps(
-            {"is_error": True, "content": f"参数 JSON 解析失败: {e}"},
-            ensure_ascii=False,
-        )
+        return _tool_error(f"参数 JSON 解析失败: {e}")
 
-    result = await gw.call_tool(service_id, tool_name, args_dict)
+    try:
+        gw = _get_gateway()
+        result = await gw.call_tool(service_id, tool_name, args_dict)
+    except (Exception, asyncio.CancelledError) as e:
+        return _tool_error(f"MCP 工具执行失败: {e}")
     data: dict[str, Any] = {
         "content": result.content,
         "is_error": result.is_error,
