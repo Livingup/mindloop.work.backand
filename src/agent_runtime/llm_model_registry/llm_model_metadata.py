@@ -26,14 +26,13 @@ class LlmModelMetadata:
     # 模型型号唯一标识，同时作为 ~/.spread-ai/llm-model-registry/models/{model_id}.yaml 的文件名主名。
     model_id: str
 
-    # 模型展示名。默认通常与 model_id 一致，用于管理后台、CLI 和后续 Agent 选择界面展示。
-    name: str
-
     # 模型最大上下文窗口 token 数，用于 Agent 执行引擎判断历史消息是否需要压缩或裁剪。
     context_window: int
 
     # 模型单次响应最大输出 token 数，用于 LLM 请求参数上限控制。
     max_output_tokens: int
+
+    group: str = "default"
 
     # 会话压缩触发阈值。为空时表示该模型不声明专属阈值，由调用方使用系统默认策略。
     compression_threshold: int | None = None
@@ -52,11 +51,10 @@ class LlmModelMetadata:
     def __post_init__(self) -> None:
         """实体创建时校验模型元数据的核心业务规则。"""
         validate_registry_id(self.model_id, "model_id")
-        validate_optional_text(self.name, "name")
-        if not self.name.strip():
-            raise ValueError("name 不能为空。")
         validate_positive_int(self.context_window, "context_window")
         validate_positive_int(self.max_output_tokens, "max_output_tokens")
+        validate_optional_text(self.group, "group")
+        object.__setattr__(self, "group", self.group.strip())
         if self.compression_threshold is not None:
             validate_positive_int(self.compression_threshold, "compression_threshold")
             if self.compression_threshold > self.context_window:
@@ -71,9 +69,9 @@ class LlmModelMetadata:
         """将模型元数据转换为 YAML 友好的字典结构。"""
         data: dict[str, Any] = {
             "model_id": self.model_id,
-            "name": self.name,
             "context_window": self.context_window,
             "max_output_tokens": self.max_output_tokens,
+            "group": self.group,
             "supports_tool_calling": self.supports_tool_calling,
             "supports_structured_output": self.supports_structured_output,
             "supported_input_modalities": list(self.supported_input_modalities),
@@ -87,9 +85,9 @@ class LlmModelMetadata:
         """从 YAML 字典创建模型元数据实体。"""
         return cls(
             model_id=str(data.get("model_id") or model_id),
-            name=str(data.get("name") or model_id),
             context_window=int(data.get("context_window", 0)),
             max_output_tokens=int(data.get("max_output_tokens", 0)),
+            group=str(data.get("group") or "default"),
             compression_threshold=(
                 int(data["compression_threshold"])
                 if data.get("compression_threshold") is not None else None

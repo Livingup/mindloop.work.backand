@@ -39,9 +39,9 @@ class LlmModelMetadataBody(BaseModel):
     model_id 来自 URL 路径，body 只提交模型能力字段。
     """
 
-    name: str
     context_window: int
     max_output_tokens: int
+    group: str = "default"
     compression_threshold: int | None = None
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
@@ -54,9 +54,9 @@ class LlmModelMetadataResponse(BaseModel):
     """模型元数据响应体。"""
 
     model_id: str
-    name: str
     context_window: int
     max_output_tokens: int
+    group: str = "default"
     compression_threshold: int | None = None
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
@@ -100,7 +100,7 @@ class LlmProviderBody(BaseModel):
     provider_id 来自 URL 路径，body 只提交服务商调用配置和模型接入项。
     """
 
-    name: str | None = None
+    group: str = "default"
     api_base_url: str
     custom_headers: dict[str, str] = Field(default_factory=dict)
     api_keys: list[LlmApiKeyBody] = Field(default_factory=list)
@@ -112,7 +112,7 @@ class LlmProviderResponse(BaseModel):
     """服务商定义响应体。"""
 
     provider_id: str
-    name: str | None = None
+    group: str = "default"
     api_base_url: str
     custom_headers: dict[str, str] = Field(default_factory=dict)
     api_keys: list[dict[str, Any]] = Field(default_factory=list)
@@ -126,7 +126,6 @@ class ResolvedLlmProviderModelResponse(BaseModel):
     provider_id: str
     binding_id: str
     model_id: str
-    model_name: str
     model_alias: str
     api_format: str
     sdk_platform: str
@@ -292,9 +291,9 @@ def _body_to_model_request(
     """将 REST 模型元数据保存请求体转换为北向保存请求。"""
     return LlmModelMetadataSaveRequest(
         model_id=model_id,
-        name=body.name,
         context_window=body.context_window,
         max_output_tokens=body.max_output_tokens,
+        group=body.group,
         compression_threshold=body.compression_threshold,
         supports_tool_calling=body.supports_tool_calling,
         supports_structured_output=body.supports_structured_output,
@@ -309,7 +308,7 @@ def _body_to_provider_request(
     """将 REST 服务商保存请求体转换为北向保存请求。"""
     return LlmProviderSaveRequest(
         provider_id=provider_id,
-        name=body.name,
+        group=body.group,
         api_base_url=body.api_base_url,
         custom_headers=dict(body.custom_headers),
         api_keys=tuple(_body_to_api_key(item) for item in body.api_keys),

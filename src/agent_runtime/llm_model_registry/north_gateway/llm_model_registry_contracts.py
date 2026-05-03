@@ -33,14 +33,13 @@ class LlmModelMetadataSaveRequest:
     # 模型型号唯一标识，同时也是 models/{model_id}.yaml 文件名主名。
     model_id: str
 
-    # 模型展示名。
-    name: str
-
     # 模型最大上下文窗口 token 数。
     context_window: int
 
     # 模型单次响应最大输出 token 数。
     max_output_tokens: int
+
+    group: str = "default"
 
     # 会话压缩触发阈值。
     compression_threshold: int | None = None
@@ -58,9 +57,9 @@ class LlmModelMetadataSaveRequest:
         """转换为 LlmModelMetadata 聚合根。"""
         return LlmModelMetadata(
             model_id=self.model_id,
-            name=self.name,
             context_window=self.context_window,
             max_output_tokens=self.max_output_tokens,
+            group=self.group,
             compression_threshold=self.compression_threshold,
             supports_tool_calling=self.supports_tool_calling,
             supports_structured_output=self.supports_structured_output,
@@ -72,9 +71,9 @@ class LlmModelMetadataSaveRequest:
         """从 LlmModelMetadata 聚合根创建保存请求。"""
         return cls(
             model_id=metadata.model_id,
-            name=metadata.name,
             context_window=metadata.context_window,
             max_output_tokens=metadata.max_output_tokens,
+            group=metadata.group,
             compression_threshold=metadata.compression_threshold,
             supports_tool_calling=metadata.supports_tool_calling,
             supports_structured_output=metadata.supports_structured_output,
@@ -93,8 +92,8 @@ class LlmProviderSaveRequest:
     # 服务商唯一标识，同时也是 providers/{provider_id}.yaml 文件名主名。
     provider_id: str
 
-    # 人类可读服务商名称。
-    name: str | None = None
+    # 服务商自定义分组，用于管理界面聚合展示。
+    group: str = "default"
 
     # 服务商默认 API base URL。
     api_base_url: str = ""
@@ -115,7 +114,7 @@ class LlmProviderSaveRequest:
         """转换为 LlmProviderDefinition 聚合根。"""
         return LlmProviderDefinition(
             provider_id=self.provider_id,
-            name=self.name,
+            group=self.group,
             api_base_url=self.api_base_url,
             custom_headers=self.custom_headers,
             api_keys=self.api_keys,
@@ -128,7 +127,7 @@ class LlmProviderSaveRequest:
         """从 LlmProviderDefinition 聚合根创建保存请求。"""
         return cls(
             provider_id=provider.provider_id,
-            name=provider.name,
+            group=provider.group,
             api_base_url=provider.api_base_url,
             custom_headers=dict(provider.custom_headers),
             api_keys=provider.api_keys,

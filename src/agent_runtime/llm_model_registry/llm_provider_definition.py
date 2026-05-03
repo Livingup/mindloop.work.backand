@@ -227,8 +227,8 @@ class LlmProviderDefinition:
     # 服务商唯一标识，同时作为 ~/.spread-ai/llm-model-registry/providers/{provider_id}.yaml 的文件名主名。
     provider_id: str
 
-    # 人类可读服务商名称。为空时管理界面可直接展示 provider_id。
-    name: str | None = None
+    # 服务商自定义分组，用于管理界面按用户定义的供应方类别聚合展示。
+    group: str = "default"
 
     # 服务商默认 API base URL。单个模型接入项未配置专属 URL 时使用此地址。
     api_base_url: str = ""
@@ -248,7 +248,8 @@ class LlmProviderDefinition:
     def __post_init__(self) -> None:
         """实体创建时校验服务商定义核心业务规则。"""
         validate_registry_id(self.provider_id, "provider_id")
-        validate_optional_text(self.name, "name")
+        validate_optional_text(self.group, "group")
+        object.__setattr__(self, "group", self.group.strip())
         if not self.api_base_url or not self.api_base_url.strip():
             raise ValueError("api_base_url 不能为空。")
         object.__setattr__(self, "custom_headers", _normalize_headers(self.custom_headers))
@@ -260,12 +261,11 @@ class LlmProviderDefinition:
         """将服务商定义转换为 YAML 友好的字典结构。"""
         data: dict[str, Any] = {
             "provider_id": self.provider_id,
+            "group": self.group,
             "api_base_url": self.api_base_url,
             "models": [item.to_dict() for item in self.models],
             "retry": self.retry.to_dict(),
         }
-        if self.name is not None:
-            data["name"] = self.name
         if self.custom_headers:
             data["custom_headers"] = dict(self.custom_headers)
         if self.api_keys:
@@ -277,7 +277,7 @@ class LlmProviderDefinition:
         """从 YAML 字典创建服务商定义。"""
         return cls(
             provider_id=str(data.get("provider_id") or provider_id),
-            name=data.get("name"),
+            group=str(data.get("group") or "default"),
             api_base_url=str(data.get("api_base_url", "")),
             custom_headers={str(k): str(v) for k, v in (data.get("custom_headers") or {}).items()},
             api_keys=tuple(

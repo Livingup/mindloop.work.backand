@@ -41,9 +41,6 @@ class ResolvedLlmProviderModel:
     # 关联的模型元数据 ID，例如 gemini-3-flash。
     model_id: str
 
-    # 模型展示名，来自模型元数据。
-    model_name: str
-
     # 服务商请求时实际使用的模型名。
     model_alias: str
 
@@ -98,7 +95,6 @@ class ResolvedLlmProviderModel:
             "provider_id": self.provider_id,
             "binding_id": self.binding_id,
             "model_id": self.model_id,
-            "model_name": self.model_name,
             "model_alias": self.model_alias,
             "api_format": self.api_format,
             "sdk_platform": self.sdk_platform,
@@ -242,7 +238,6 @@ class LlmModelRegistryService:
             provider_id=provider.provider_id,
             binding_id=binding.id,
             model_id=metadata.model_id,
-            model_name=metadata.name,
             model_alias=binding.model_alias,
             api_format=binding.api_format,
             sdk_platform=get_sdk_platform_for_api_format(binding.api_format),
