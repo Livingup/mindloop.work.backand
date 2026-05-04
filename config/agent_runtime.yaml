@@ -23,9 +23,6 @@ file_resource_service:
   # 统一文件资源服务本地热存储根目录。
   local_resource_storage_root_path: "~/.spread-ai/file-resource"
 
-  # 统一文件资源服务对外访问资源时的公共地址前缀。
-  file_resource_public_base_url: "http://127.0.0.1:8000/file-resource"
-
   # 当前统一文件资源服务使用的对象存储南向网关实现。
   # 可选值示例：memory / aliyun_oss
   object_storage_gateway_provider: "aliyun_oss"
@@ -43,7 +40,7 @@ file_resource_service:
     # 对象存储桶名称。
     object_storage_bucket_name: "agent-runtime-resources"
 
-    # 对象存储公共访问地址前缀。
+    # 资源上传到对象存储后返回给前端/模型访问的公共 URL 前缀。
     object_storage_public_base_url: "https://agent-runtime-resources.oss-cn-hongkong.aliyuncs.com/agent-runtime/file-resource"
 
     # 对象存储对象键前缀，用于统一文件资源服务在桶内做业务隔离。
