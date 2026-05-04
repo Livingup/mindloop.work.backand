@@ -9,5 +9,5 @@ from dataclasses import dataclass
 class McpClientConfig:
     """MCP 客户端服务配置。"""
 
-    # MCP 服务定义 YAML 文件存放目录（每个服务一个 YAML 文件）。
+    # MCP 服务配置 YAML 文件存放目录（每个文件对应一个可连接的 MCP 服务）。
     config_dir: str

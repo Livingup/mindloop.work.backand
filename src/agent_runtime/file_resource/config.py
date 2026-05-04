@@ -12,7 +12,7 @@ from dataclasses import dataclass
 class ObjectStorageGatewayConfig:
     """对象存储南向网关配置。"""
 
-    # 对象存储网关提供商标识（memory / aliyun_oss）。
+    # 对象存储网关提供商标识。
     gateway_provider: str
 
     # 对象存储服务 endpoint。
