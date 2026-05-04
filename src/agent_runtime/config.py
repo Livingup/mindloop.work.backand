@@ -120,6 +120,17 @@ class AgentRuntimeConfig:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigRegistrySnapshot:
+    yaml_path: str
+    env_file_path: str | None
+    raw_yaml: str
+    raw_config_data: dict[str, Any]
+    section_names: list[str]
+    loaded_section_names: list[str]
+    watch_enabled: bool
+
+
 # ── 配置注册中心（全局单例） ─────────────────────────────────
 
 
@@ -135,16 +146,26 @@ class ConfigRegistry:
 
     def __init__(
         self,
-        config: AgentRuntimeConfig | dict[str, Any],
+        config: AgentRuntimeConfig | dict[str, Any] | tuple[dict[str, Any], str],
         yaml_path: str,
         env_file_path: str | None = None,
     ) -> None:
         if isinstance(config, AgentRuntimeConfig):
             self._config: AgentRuntimeConfig | None = config
             self._raw_config_data: dict[str, Any] | None = None
+            self._raw_yaml: str = ""
+        elif isinstance(config, tuple):
+            self._config = None
+            self._raw_config_data = config[0]
+            self._raw_yaml = config[1]
         else:
             self._config = None
             self._raw_config_data = config
+            self._raw_yaml = yaml.safe_dump(
+                config,
+                allow_unicode=True,
+                sort_keys=False,
+            )
         self._yaml_path = yaml_path
         self._env_file_path = env_file_path
         self._section_cache: dict[str, Any] = {}
@@ -176,10 +197,12 @@ class ConfigRegistry:
         with cls._lock:
             if cls._instance is None:
                 raise RuntimeError("ConfigRegistry 尚未初始化，请先调用 load()。")
-            cls._instance._raw_config_data = _load_yaml_config(
+            raw_config_data, raw_yaml = _load_yaml_config(
                 cls._instance._yaml_path,
                 cls._instance._env_file_path,
             )
+            cls._instance._raw_config_data = raw_config_data
+            cls._instance._raw_yaml = raw_yaml
             cls._instance._config = None
             cls._instance._section_cache.clear()
 
@@ -215,6 +238,20 @@ class ConfigRegistry:
             self._watcher.stop()
             self._watcher = None
             logger.info("已停止配置文件监听。")
+
+    def snapshot(self) -> ConfigRegistrySnapshot:
+        raw_config_data = self._raw_config_data
+        if raw_config_data is None:
+            raw_config_data = {}
+        return ConfigRegistrySnapshot(
+            yaml_path=self._yaml_path,
+            env_file_path=self._env_file_path,
+            raw_yaml=self._raw_yaml,
+            raw_config_data=dict(raw_config_data),
+            section_names=list(raw_config_data.keys()),
+            loaded_section_names=sorted(self._section_cache.keys()),
+            watch_enabled=self._watcher is not None,
+        )
 
     # ── 配置属性（实时读取） ──────────────────────────────
 
@@ -389,7 +426,7 @@ _ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 def _load_yaml_config(
     yaml_file_path: str,
     env_file_path: str | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
     """从 YAML 文件读取原始总配置。
 
     注意：此处不递归解析环境变量，也不构建所有配置段。
@@ -402,10 +439,11 @@ def _load_yaml_config(
 
     _load_dot_env(config_path, env_file_path)
 
-    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw_yaml = config_path.read_text(encoding="utf-8")
+    config_data = yaml.safe_load(raw_yaml) or {}
     if not isinstance(config_data, dict):
         raise ValueError("配置文件内容必须是对象结构。")
-    return config_data
+    return config_data, raw_yaml
 
 
 def _build_runtime_config(data: dict[str, Any]) -> AgentRuntimeServiceConfig:

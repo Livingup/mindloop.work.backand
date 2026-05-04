@@ -233,6 +233,12 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_rest_adapter import (
         create_llm_model_registry_router,
     )
+    from agent_runtime.system_settings.system_settings_factory import (
+        SystemSettingsFactory,
+    )
+    from agent_runtime.system_settings.north_gateway.system_settings_rest_adapter import (
+        create_system_settings_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -240,6 +246,7 @@ def serve(host: str | None, port: int | None) -> None:
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
+    system_settings_gateway = SystemSettingsFactory.create()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -300,6 +307,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
+    )
+    app.include_router(
+        create_system_settings_router(system_settings_gateway),
+        prefix="/api/system-settings",
+        tags=["系统设置"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。
