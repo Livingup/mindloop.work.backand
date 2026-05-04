@@ -62,7 +62,7 @@ class AgentRuntimeServiceConfig:
     # 当前运行时服务环境标识（local / dev / test / prod）。
     service_environment: str
 
-    # 后端进程绑定的本机网卡地址。
+    # 后端 API 暴露范围：127.0.0.1 仅本机访问，0.0.0.0 允许通过本机所有网卡访问。
     service_host: str
 
     # 当前运行时服务监听端口。
