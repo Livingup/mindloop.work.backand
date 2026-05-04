@@ -44,7 +44,6 @@ from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.conversation_message.config import ConversationRepositoryConfig
 from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
-from agent_runtime.agent.agent_execution_config import AgentExecutionConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -105,11 +104,6 @@ class AgentRuntimeConfig:
     # Agent 运行态管理配置。
     agent_runtime: AgentRuntimeStateConfig = field(
         default_factory=AgentRuntimeStateConfig,
-    )
-
-    # Agent 执行循环配置。
-    agent_execution: AgentExecutionConfig = field(
-        default_factory=AgentExecutionConfig,
     )
 
     # LLM 服务商与模型注册模块配置。
@@ -328,15 +322,6 @@ class ConfigRegistry:
         )
 
     @property
-    def agent_execution(self) -> AgentExecutionConfig:
-        """实时读取 Agent 执行循环配置（最大工具调用轮次等）。"""
-        if self._config is not None:
-            return self._config.agent_execution
-        return self._get_section_config(
-            "agent_execution", _build_agent_execution_config,
-        )
-
-    @property
     def llm_model_registry(self) -> LlmModelRegistryConfig:
         """实时读取 LLM 服务商与模型注册模块配置（注册数据根目录等）。"""
         if self._config is not None:
@@ -523,13 +508,6 @@ def _build_agent_runtime_state_config(data: dict[str, Any]) -> AgentRuntimeState
         repository_type=str(data.get("repository_type", "sqlite")),
         data_dir=str(data.get("data_dir", "~/.spread-ai/agent-runtime")),
         trace_dir=str(data.get("trace_dir", "~/.spread-ai/agent-traces")),
-    )
-
-
-def _build_agent_execution_config(data: dict[str, Any]) -> AgentExecutionConfig:
-    """从 YAML 字典构建 Agent 执行循环配置。"""
-    return AgentExecutionConfig(
-        max_tool_rounds=int(data.get("max_tool_rounds", 20)),
     )
 
 

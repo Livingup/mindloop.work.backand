@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Agent 执行循环引擎工厂。"""
 from __future__ import annotations
 
@@ -96,5 +96,4 @@ class AgentExecutionFactory:
             llm_request_service=LlmClientFactory.create(_LazyFileResourceResolver()),
             tool_dispatcher=tool_dispatcher,
             trace_recorder=trace_recorder,
-            default_max_tool_rounds=config.agent_execution.max_tool_rounds,
         )

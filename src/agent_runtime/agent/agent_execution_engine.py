@@ -72,9 +72,6 @@ class AgentExecutionRequest:
     # 已有 conversation_id。为空时执行器新建 conversation。
     conversation_id: str | None = None
 
-    # 最大工具调用轮次，防止工具调用死循环。不传时使用 agent_execution.max_tool_rounds 配置默认值。
-    max_tool_rounds: int | None = None
-
     # render_messages 透传选项。
     render_options: dict[str, Any] = field(default_factory=dict)
 
@@ -93,7 +90,6 @@ class AgentExecutionRequest:
         task_id: str | None = None,
         root_instance_id: str | None = None,
         conversation_id: str | None = None,
-        max_tool_rounds: int | None = None,
         render_options: dict[str, Any] | None = None,
         request_overrides: dict[str, Any] | None = None,
     ) -> "AgentExecutionRequest":
@@ -108,7 +104,6 @@ class AgentExecutionRequest:
             task_id=task_id,
             root_instance_id=root_instance_id,
             conversation_id=conversation_id,
-            max_tool_rounds=max_tool_rounds,
             render_options=render_options or {},
             request_overrides=request_overrides or {},
         )
@@ -152,7 +147,6 @@ class AgentExecutionEngine:
         llm_request_service: LlmRequestService,
         tool_dispatcher: AgentToolDispatcher,
         trace_recorder: AgentTraceRecorder,
-        default_max_tool_rounds: int = 20,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -170,10 +164,6 @@ class AgentExecutionEngine:
         self._tool_dispatcher = tool_dispatcher
         # Agent 实例 Markdown Trace 记录器。
         self._trace_recorder = trace_recorder
-        # 默认最大工具调用轮次。请求未显式指定时使用该值，防止工具调用死循环。
-        if default_max_tool_rounds < 0:
-            raise ValueError("default_max_tool_rounds 必须是非负整数。")
-        self._default_max_tool_rounds = default_max_tool_rounds
 
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
@@ -210,14 +200,7 @@ class AgentExecutionEngine:
                 sdk_platform=resolved_model.sdk_platform,
             )
 
-            max_tool_rounds = (
-                request.max_tool_rounds
-                if request.max_tool_rounds is not None
-                else self._default_max_tool_rounds
-            )
-
             plain_text_fallback_count = 0
-            tool_round_count = 0
             while True:
                 llm_response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
@@ -261,10 +244,6 @@ class AgentExecutionEngine:
                         )
                     continue
                 plain_text_fallback_count = 0
-
-                if tool_round_count >= max_tool_rounds:
-                    raise RuntimeError(f"工具调用轮次超过上限: {max_tool_rounds}")
-                tool_round_count += 1
 
                 tool_result_message, tool_results = await self._execute_tool_uses(
                     agent_definition,
