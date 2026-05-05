@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any
 
 from agent_runtime.conversation_message.message.operations import (
@@ -76,6 +77,7 @@ class LlmRequestService:
         if not api_keys:
             api_keys = [None]
 
+        request_started_at = time.perf_counter()
         await self._event_publisher.publish(
             request.communication_context,
             "llm.request.started",
@@ -144,6 +146,7 @@ class LlmRequestService:
                             "assistant_part_count": len(assistant_message.content),
                             "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
                             "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
+                            "duration_ms": int((time.perf_counter() - request_started_at) * 1000),
                         },
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},

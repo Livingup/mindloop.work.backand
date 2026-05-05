@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -131,14 +132,18 @@ class AgentToolDispatcher:
         """执行 LLM 返回的一次工具调用，并返回可写入会话的 ToolResultPart。"""
         source = "mcp" if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX) else "local"
         tool_call_id = _tool_use_ref(tool_use)
+        started_at = time.perf_counter()
         await self._event_publisher.publish(
             communication_context,
             "tool.call.started",
             {
                 "tool_call_id": tool_call_id,
                 "tool_name": tool_use.name,
+                "title": tool_use.name,
                 "source": source,
+                "tool_source": source,
                 "input": tool_use.input,
+                "arguments_preview": _preview_arguments(tool_use.input),
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -156,8 +161,10 @@ class AgentToolDispatcher:
                     "tool_call_id": tool_call_id,
                     "tool_name": tool_use.name,
                     "source": source,
+                    "tool_source": source,
                     "error_type": exc.__class__.__name__,
                     "error_message": str(exc),
+                    "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 },
                 source="tool_dispatcher",
                 correlation_id=tool_call_id,
@@ -170,11 +177,13 @@ class AgentToolDispatcher:
                 "tool_call_id": tool_call_id,
                 "tool_name": result.tool_name,
                 "source": result.source,
+                "tool_source": result.source,
                 "success": result.tool_result.success,
                 "execution_status": result.tool_result.execution_status,
                 "loop_decision": result.tool_result.loop_decision,
                 "error_code": result.tool_result.error_code,
                 "error_message": result.tool_result.error_message,
+                "duration_ms": int((time.perf_counter() - started_at) * 1000),
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -340,3 +349,11 @@ def _ensure_dict_arguments(value: Any) -> dict[str, Any]:
 def _tool_use_ref(tool_use: ToolUsePart) -> str:
     """确定工具结果要关联的工具调用引用。"""
     return tool_use.tool_use_id or tool_use.name
+
+
+def _preview_arguments(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    return {"input": value}

@@ -10,6 +10,7 @@ from agent_runtime.agent.agent_instance import AgentInstance
 from agent_runtime.agent.agent_execution_engine import (
     AgentExecutionEngine,
     AgentExecutionResult,
+    AgentMessageSubmissionResult,
 )
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
@@ -64,6 +65,7 @@ class CreateRootAgentInstanceResponse(BaseModel):
 
 class SendAgentInstanceMessageBody(BaseModel):
     user_message: str
+    client_message_id: str | None = None
     render_options: dict[str, Any] = Field(default_factory=dict)
     request_overrides: dict[str, Any] = Field(default_factory=dict)
     communication_stream_id: str | None = None
@@ -76,6 +78,15 @@ class AgentExecutionResponse(BaseModel):
     trace_file_path: str
     communication_stream_id: str | None = None
     assistant_message_text: str | None = None
+
+
+class AgentMessageSubmissionResponse(BaseModel):
+    status: str
+    task_id: str
+    agent_instance_id: str
+    conversation_id: str | None = None
+    communication_stream_id: str
+    event_stream_url: str
 
 
 def create_agent_runtime_router(
@@ -139,29 +150,31 @@ def create_agent_runtime_router(
 
     @router.post(
         "/instances/{instance_id}/messages",
-        response_model=AgentExecutionResponse,
+        response_model=AgentMessageSubmissionResponse,
+        status_code=202,
     )
     async def send_agent_instance_message(
         instance_id: str,
         body: SendAgentInstanceMessageBody,
-    ) -> AgentExecutionResponse:
+    ) -> AgentMessageSubmissionResponse:
         if execution_engine is None:
             raise HTTPException(status_code=501, detail="Agent 执行引擎未启用。")
         if not body.user_message.strip():
             raise HTTPException(status_code=400, detail="user_message 不能为空。")
         try:
-            result = await execution_engine.run_agent_instance_message(
+            result = await execution_engine.submit_agent_instance_message(
                 agent_instance_id=instance_id,
                 user_text=body.user_message,
                 render_options=body.render_options,
                 request_overrides=body.request_overrides,
                 communication_stream_id=body.communication_stream_id,
+                client_message_id=body.client_message_id,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
-        return _execution_response(result)
+        return _submission_response(result)
 
     return router
 
@@ -226,6 +239,17 @@ def _execution_response(result: AgentExecutionResult) -> AgentExecutionResponse:
         trace_file_path=result.trace_file_path,
         communication_stream_id=result.communication_stream_id,
         assistant_message_text=_assistant_message_text(result.assistant_message),
+    )
+
+
+def _submission_response(result: AgentMessageSubmissionResult) -> AgentMessageSubmissionResponse:
+    return AgentMessageSubmissionResponse(
+        status=result.status,
+        task_id=result.task_id,
+        agent_instance_id=result.instance_id,
+        conversation_id=result.conversation_id,
+        communication_stream_id=result.communication_stream_id,
+        event_stream_url=f"/api/communication/streams/{result.communication_stream_id}/events",
     )
 
 
