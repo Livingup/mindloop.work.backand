@@ -42,7 +42,7 @@ class LocalToolFactory:
             LocalToolGatewayImpl 实例，实现 LocalToolGateway 协议。
         """
         import agent_runtime.agent_lifecycle.agent_lifecycle_tool  # noqa: F401
-        import agent_runtime.tool.context_tools  # noqa: F401
+        import agent_runtime.file_tools.file_tools  # noqa: F401
 
         repository = get_global_repository()
         if schema_cache is None:

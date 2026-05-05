@@ -1,6 +1,6 @@
 """本地工具 CLI 接入适配。
 
-提供 spread-ai tool 子命令组，供 Agent / 外部 AI 发现、查询和执行系统工具。
+提供 spread-ai tool 子命令组，供 Agent / 外部 AI 发现和查询系统工具。
 输出格式为 JSON，方便 Agent / 外部 AI 解析。
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ def create_tool_cli_group(gateway_factory: Callable[[], LocalToolGateway]) -> cl
     @click.group("tool")
     @click.pass_context
     def tool_group(ctx: click.Context) -> None:
-        """本地工具管理：查询、列出、执行系统工具。"""
+        """本地工具管理：查询和列出系统工具。"""
         ctx.ensure_object(dict)
         ctx.obj["gateway"] = gateway_factory()
 

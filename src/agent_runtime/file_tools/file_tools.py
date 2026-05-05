@@ -319,7 +319,7 @@ def _collect_text_search_matches(
 @tool(
     name="file_read",
     description="按行范围读取指定文本文件内容，使用 line_count 与 max_chars 控制输出大小。",
-    group="context",
+    group="file",
     category="system",
 )
 def file_read(request: FileReadRequest) -> BaseToolResult:
@@ -369,7 +369,7 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
 @tool(
     name="context_document_discover",
     description="给定项目根目录，返回该项目内所有 AGENTS.md / AGENT.md 上下文文档的绝对路径列表。",
-    group="context",
+    group="file",
     category="system",
 )
 def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseToolResult:
@@ -420,7 +420,7 @@ def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseTo
 @tool(
     name="directory_explore",
     description="递进式探索指定目录结构，返回受 depth 和 max_entries 控制的目录/文件摘要。",
-    group="context",
+    group="file",
     category="system",
 )
 def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
@@ -526,7 +526,7 @@ def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
 @tool(
     name="file_name_search",
     description="按文件名关键词、文件名正则、相对路径 glob 或扩展名在指定目录下定位候选文件/目录。",
-    group="context",
+    group="file",
     category="system",
 )
 def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
@@ -635,7 +635,7 @@ def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
 @tool(
     name="text_search",
     description="在指定目录内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行和可选上下文行。",
-    group="context",
+    group="file",
     category="system",
 )
 def text_search(request: TextSearchRequest) -> BaseToolResult:
