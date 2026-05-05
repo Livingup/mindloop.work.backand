@@ -14,8 +14,8 @@ from dataclasses import dataclass
 # name 最大长度。
 _NAME_MAX_LENGTH = 50
 
-# category 合法字符：字母、数字、下划线、连字符。
-_CATEGORY_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
+# category 合法字符：中文、字母、数字、下划线、连字符。
+_CATEGORY_PATTERN = re.compile(r"^[\u4e00-\u9fffA-Za-z0-9_\-]+$")
 
 # category 最大长度。
 _CATEGORY_MAX_LENGTH = 50
@@ -30,7 +30,7 @@ class PromptSnippet:
 
     业务规则（不变量，在实体创建时校验）：
     - name：非空，长度不超过 50，不含路径分隔符。
-    - category：默认 "default"，仅允许字母、数字、下划线、连字符，长度不超过 50，
+    - category：默认 "default"，仅允许中文、字母、数字、下划线、连字符，长度不超过 50，
       不允许路径穿越（如 '..'）。
 
     业务行为方法：
@@ -71,7 +71,7 @@ class PromptSnippet:
             )
         if not _CATEGORY_PATTERN.match(self.category):
             raise ValueError(
-                "分类目录仅允许字母、数字、下划线和连字符。"
+                "分类目录仅允许中文、字母、数字、下划线和连字符。"
                 f"当前值: '{self.category}'。",
             )
 
