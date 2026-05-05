@@ -18,6 +18,7 @@ from agent_runtime.llm_model_registry.llm_model_registry_factory import (
 )
 from agent_runtime.mcp.mcp_client.mcp_client_factory import McpClientFactory
 from agent_runtime.prompt_template import PromptTemplateFactory
+from agent_runtime.skill.skill_factory import SkillFactory
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
 
 
@@ -93,6 +94,9 @@ class AgentExecutionFactory:
             llm_registry_gateway=LlmModelRegistryFactory.create(),
             conversation_repository=conversation_repository,
             prompt_snippet_gateway=PromptTemplateFactory.create(),
+            local_tool_gateway=local_tool_gateway,
+            mcp_client_gateway=mcp_gateway,
+            skill_gateway=SkillFactory.create(),
             llm_request_service=LlmClientFactory.create(_LazyFileResourceResolver()),
             tool_dispatcher=tool_dispatcher,
             trace_recorder=trace_recorder,

@@ -24,6 +24,8 @@ class CreateTaskWithRootAgentInstanceRequest:
     # 所属线程 ID。线程用于区分同一任务内不同对话执行上下文。
     thread_id: str
 
+    current_working_directory: str
+
     # 静态 Agent 定义 ID，对应 agent_definition 模块的 AgentDefinition.agent_id。
     agent_definition_id: str
 
@@ -61,6 +63,8 @@ class CreateChildAgentInstanceRequest:
 
     # 子实例所属线程 ID。
     thread_id: str
+
+    current_working_directory: str
 
     # 子实例引用的静态 Agent 定义 ID。
     agent_definition_id: str

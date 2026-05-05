@@ -101,6 +101,8 @@ class AgentInstance:
     # 所属线程 ID。线程用于区分同一任务内不同对话执行上下文。
     thread_id: str
 
+    current_working_directory: str
+
     # 静态 Agent 定义 ID，对应 agent_definition 模块中的 AgentDefinition.agent_id。
     agent_definition_id: str
 
@@ -145,6 +147,7 @@ class AgentInstance:
         _require_non_blank(self.instance_id, "instance_id")
         _require_non_blank(self.task_id, "task_id")
         _require_non_blank(self.thread_id, "thread_id")
+        _require_non_blank(self.current_working_directory, "current_working_directory")
         _require_non_blank(self.agent_definition_id, "agent_definition_id")
         _require_non_blank(self.llm_provider_id, "llm_provider_id")
         _require_non_blank(self.llm_model_binding_id, "llm_model_binding_id")

@@ -2,7 +2,10 @@
 """Agent 执行循环引擎。"""
 from __future__ import annotations
 
+import os
+import platform
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agent_runtime.agent.agent_instance import AgentInstance
@@ -32,9 +35,12 @@ from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelRegistryGateway,
 )
+from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import McpClientGateway
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import (
     PromptSnippetNorthGateway,
 )
+from agent_runtime.skill.north_gateway.skill_contracts import SkillGateway
+from agent_runtime.tool.north_gateway.local_tool_contracts import LocalToolGateway
 from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecision
 
 
@@ -47,6 +53,8 @@ class AgentExecutionRequest:
 
     # 所属线程 ID。线程用于隔离同一任务内不同对话上下文。
     thread_id: str
+
+    current_working_directory: str
 
     # 根 Agent 静态定义 ID。
     agent_definition_id: str
@@ -83,6 +91,7 @@ class AgentExecutionRequest:
         cls,
         *,
         thread_id: str,
+        current_working_directory: str,
         agent_definition_id: str,
         llm_provider_id: str,
         llm_model_binding_id: str,
@@ -96,6 +105,7 @@ class AgentExecutionRequest:
         """创建纯文本用户输入的执行请求。"""
         return cls(
             thread_id=thread_id,
+            current_working_directory=current_working_directory,
             agent_definition_id=agent_definition_id,
             llm_provider_id=llm_provider_id,
             llm_model_binding_id=llm_model_binding_id,
@@ -144,6 +154,9 @@ class AgentExecutionEngine:
         llm_registry_gateway: LlmModelRegistryGateway,
         conversation_repository: ConversationRepository,
         prompt_snippet_gateway: PromptSnippetNorthGateway,
+        local_tool_gateway: LocalToolGateway,
+        mcp_client_gateway: McpClientGateway | None,
+        skill_gateway: SkillGateway | None,
         llm_request_service: LlmRequestService,
         tool_dispatcher: AgentToolDispatcher,
         trace_recorder: AgentTraceRecorder,
@@ -158,6 +171,9 @@ class AgentExecutionEngine:
         self._conversation_repository = conversation_repository
         # Prompt Snippet 网关，用于解析 AgentDefinition.system_prompt 中的 template_id。
         self._prompt_snippet_gateway = prompt_snippet_gateway
+        self._local_tool_gateway = local_tool_gateway
+        self._mcp_client_gateway = mcp_client_gateway
+        self._skill_gateway = skill_gateway
         # 通用 LLM 请求服务，负责真实请求和响应归一化。
         self._llm_request_service = llm_request_service
         # 工具调度器，负责工具 schema 构建和工具调用执行。
@@ -170,6 +186,7 @@ class AgentExecutionEngine:
         task, instance = self._runtime_gateway.create_task_with_root_agent_instance(
             CreateTaskWithRootAgentInstanceRequest(
                 thread_id=request.thread_id,
+                current_working_directory=request.current_working_directory,
                 agent_definition_id=request.agent_definition_id,
                 llm_provider_id=request.llm_provider_id,
                 llm_model_binding_id=request.llm_model_binding_id,
@@ -182,7 +199,6 @@ class AgentExecutionEngine:
         try:
             self._runtime_gateway.start_task(task.task_id)
             self._runtime_gateway.start_agent_instance(instance.instance_id)
-            agent_definition = self._load_agent_definition(instance.agent_definition_id)
             conversation = await self._load_or_create_conversation(instance, request)
 
             conversation.add_user_message(list(request.user_parts), list(request.user_parts_meta))
@@ -190,18 +206,23 @@ class AgentExecutionEngine:
             await self._conversation_repository.save(conversation)
             self._trace_recorder.record_user_message(trace_path, user_message)
 
-            system_prompt = self._render_system_prompt(agent_definition, request.render_options)
             resolved_model = self._llm_registry_gateway.resolve_provider_model(
                 instance.llm_provider_id,
                 instance.llm_model_binding_id,
             )
-            tools = await self._tool_dispatcher.build_llm_tools(
-                agent_definition=agent_definition,
-                sdk_platform=resolved_model.sdk_platform,
-            )
 
             plain_text_fallback_count = 0
             while True:
+                agent_definition = self._load_agent_definition(instance.agent_definition_id)
+                system_prompt = self._render_system_prompt(
+                    agent_definition,
+                    instance.current_working_directory,
+                    request.render_options,
+                )
+                tools = await self._tool_dispatcher.build_llm_tools(
+                    agent_definition=agent_definition,
+                    sdk_platform=resolved_model.sdk_platform,
+                )
                 llm_response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
                         conversation=conversation,
@@ -309,6 +330,7 @@ class AgentExecutionEngine:
     def _render_system_prompt(
         self,
         definition: AgentDefinition,
+        current_working_directory: str,
         render_options: dict[str, Any],
     ) -> str | None:
         """按 AgentDefinition.system_prompt 顺序拼接最终系统提示词。"""
@@ -320,8 +342,89 @@ class AgentExecutionEngine:
                 snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
+        runtime_context_prompt = _build_runtime_context_prompt(current_working_directory)
+        mcp_services_prompt = self._build_mcp_services_prompt(definition)
+        skills_prompt = self._build_skills_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
-        return "\n\n".join(item for item in (text, lifecycle_prompt) if item.strip()) or None
+        lifecycle_tool_notice = self._build_lifecycle_tool_notice(definition)
+        return "\n\n".join(
+            item
+            for item in (
+                text,
+                runtime_context_prompt,
+                mcp_services_prompt,
+                skills_prompt,
+                lifecycle_prompt,
+                lifecycle_tool_notice,
+            )
+            if item.strip()
+        ) or None
+
+    def _build_mcp_services_prompt(self, definition: AgentDefinition) -> str:
+        if not definition.mcp_tools or self._mcp_client_gateway is None:
+            return ""
+        service_ids = []
+        for binding in definition.mcp_tools:
+            if binding.service_id not in service_ids:
+                service_ids.append(binding.service_id)
+        services = {
+            item.service_id: item
+            for item in self._mcp_client_gateway.list_services()
+        }
+        lines = [
+            "# Agent 可用的 MCP 服务",
+            "以下只列出当前 Agent 可用的 MCP 服务，不列出具体 MCP 工具权限。",
+        ]
+        for service_id in service_ids:
+            service = services.get(service_id)
+            if service is None:
+                lines.append(f"- `{service_id}`：未找到服务配置。")
+                continue
+            description = service.description or ""
+            lines.append(
+                f"- `{service.service_id}`：name=`{service.name}`；description=`{description}`；"
+                f"enabled=`{service.enabled}`；connection_status=`{service.connection_status}`；"
+                f"group=`{service.group}`。"
+            )
+        return "\n".join(lines)
+
+    def _build_skills_prompt(self, definition: AgentDefinition) -> str:
+        if not definition.skill_ids or self._skill_gateway is None:
+            return ""
+        skills = {
+            item.skill_id: item
+            for item in self._skill_gateway.list_skills()
+        }
+        lines = [
+            "# Agent 可用的 Skills",
+            "以下只列出 Skill 描述和目录路径；如需详细说明，Agent 应根据需要读取对应目录下的 SKILL.md 和相关资源。",
+        ]
+        for skill_id in definition.skill_ids:
+            skill = skills.get(skill_id)
+            if skill is None:
+                lines.append(f"- `{skill_id}`：未找到 Skill。")
+                continue
+            lines.append(
+                f"- `{skill.skill_id}`：name=`{skill.name}`；description=`{skill.description}`；"
+                f"directory_path=`{skill.directory_path}`。"
+            )
+        return "\n".join(lines)
+
+    def _build_lifecycle_tool_notice(self, definition: AgentDefinition) -> str:
+        tools = self._local_tool_gateway.list_tools(public_only=False, group_by=False)
+        lifecycle_tool_names = [
+            item.tool_name
+            for item in tools
+            if item.category == "lifecycle"
+            and (item.always_enabled or item.tool_name in definition.tool_ids)
+        ]
+        if not lifecycle_tool_names:
+            return ""
+        names = "，".join(lifecycle_tool_names)
+        return (
+            "# 工具调用注意事项\n"
+            f"- 禁止并发调用“{names}”这些工具，这些工具只能单独调用！这些工具只能单独调用！这些工具只能单独调用！"
+        )
 
     async def _execute_tool_uses(
         self,
@@ -378,6 +481,55 @@ class AgentExecutionEngine:
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
     """从 assistant 消息中提取工具调用。"""
     return [part for part in message.content if isinstance(part, ToolUsePart)]
+
+
+def _build_runtime_context_prompt(current_working_directory: str) -> str:
+    working_directory = Path(current_working_directory).expanduser()
+    resolved_working_directory = working_directory.resolve(strict=False)
+    lines = [
+        "# Runtime 执行环境",
+        f"- Current working directory: `{resolved_working_directory}`",
+        f"- Operating system: `{platform.system()}`",
+        f"- OS release: `{platform.release()}`",
+        f"- OS version: `{platform.version()}`",
+        f"- Machine: `{platform.machine()}`",
+        f"- Python platform: `{platform.platform()}`",
+    ]
+    git_roots = _discover_git_roots_under(resolved_working_directory)
+    if git_roots:
+        lines.append("")
+        lines.append("# 当前工作目录下的 Git 仓库根目录")
+        for git_root in git_roots:
+            lines.append(f"- `{git_root}`")
+    return "\n".join(lines)
+
+
+def _discover_git_roots_under(root: Path) -> list[str]:
+    if not root.exists() or not root.is_dir():
+        return []
+    discovered: list[str] = []
+    for current_root, dir_names, _file_names in os.walk(root):
+        current_path = Path(current_root)
+        if ".git" in dir_names:
+            discovered.append(str(current_path))
+            dir_names.remove(".git")
+        excluded = {
+            ".hg",
+            ".svn",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            "node_modules",
+            ".venv",
+            "venv",
+        }
+        dir_names[:] = [
+            name
+            for name in dir_names
+            if name not in excluded
+        ]
+    return sorted(discovered)
 
 
 def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
