@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import locale
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -72,7 +74,7 @@ ALWAYS_EXCLUDED_NAMES = {
 }
 
 
-CONTEXT_DOCUMENT_NAMES = {"AGENTS.md", "AGENT.md"}
+CONTEXT_DOCUMENT_NAME = "AGENTS.md"
 EXCLUDED_REPORT_LIMIT = 50
 SKIPPED_REPORT_LIMIT = 20
 
@@ -175,6 +177,178 @@ def _matches_path_globs(path: Path, root: Path, path_globs: list[str], case_sens
         if fnmatch.fnmatchcase(comparable_path, comparable_pattern):
             return True
     return False
+
+
+def _matches_text_search_filters(
+    path: Path,
+    root: Path,
+    request: TextSearchRequest,
+    extensions: set[str],
+    exclude_names: set[str],
+) -> bool:
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    if any(part in exclude_names for part in relative_parts):
+        return False
+    if not request.include_hidden and any(part.startswith(".") for part in relative_parts):
+        return False
+    if extensions and path.suffix.lower().lstrip(".") not in extensions:
+        return False
+    return _matches_path_globs(path, root, request.path_globs, request.case_sensitive)
+
+
+def _read_match_context(path: Path, line_number: int, context_lines: int) -> tuple[list[str], list[str]]:
+    if context_lines <= 0:
+        return [], []
+    start_line = max(1, line_number - context_lines)
+    end_line = line_number + context_lines
+    for encoding in _encoding_candidates(None):
+        before: list[str] = []
+        after: list[str] = []
+        try:
+            with path.open("r", encoding=encoding, errors="strict") as file:
+                for current_line_number, raw_line in enumerate(file, start=1):
+                    if current_line_number < start_line:
+                        continue
+                    if current_line_number > end_line:
+                        break
+                    if current_line_number == line_number:
+                        continue
+                    line = raw_line.rstrip("\n")
+                    if current_line_number < line_number:
+                        before.append(line)
+                    else:
+                        after.append(line)
+            return before, after
+        except (OSError, UnicodeDecodeError, LookupError):
+            continue
+    return [], []
+
+
+def _text_from_ripgrep_json_field(value: dict[str, Any]) -> str:
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResult | None:
+    rg_path = shutil.which("rg")
+    if rg_path is None:
+        return None
+
+    command = [
+        rg_path,
+        "--json",
+        "--line-number",
+        "--color",
+        "never",
+        "--glob",
+        "!.git/**",
+    ]
+    if not request.regex:
+        command.append("--fixed-strings")
+    if not request.case_sensitive:
+        command.append("--ignore-case")
+    if request.include_hidden:
+        command.append("--hidden")
+    if not request.respect_gitignore:
+        command.append("--no-ignore")
+    command.extend(["--", request.query, "."])
+
+    extensions = _normalize_extensions(request.extensions)
+    exclude_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
+    matches: list[dict[str, Any]] = []
+    seen_count = 0
+    has_more = False
+    warnings: list[str] = []
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+
+    assert process.stdout is not None
+    for raw_output_line in process.stdout:
+        try:
+            event = json.loads(raw_output_line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "match":
+            continue
+        data = event.get("data", {})
+        path_text = _text_from_ripgrep_json_field(data.get("path", {}))
+        if not path_text:
+            continue
+        path = (root / path_text).resolve()
+        if not _matches_text_search_filters(path, root, request, extensions, exclude_names):
+            continue
+        seen_count += 1
+        if seen_count <= request.offset:
+            continue
+        if len(matches) >= request.limit:
+            has_more = True
+            process.terminate()
+            break
+        line_number = data.get("line_number")
+        if not isinstance(line_number, int):
+            continue
+        line = _text_from_ripgrep_json_field(data.get("lines", {})).rstrip("\r\n")
+        before, after = _read_match_context(path, line_number, request.context_lines)
+        matches.append(
+            {
+                "path": str(path),
+                "line_number": line_number,
+                "line": line,
+                "before": before,
+                "after": after,
+            }
+        )
+
+    stderr = ""
+    if process.stderr is not None:
+        stderr = process.stderr.read().strip()
+    return_code = process.wait()
+    if return_code == 2 and not has_more:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="RipgrepSearchError",
+            error_message=stderr or "ripgrep 搜索失败。",
+            output={"search_root": str(root), "query": request.query, "backend": "ripgrep"},
+        )
+    if stderr:
+        warnings.append(stderr)
+
+    return BaseToolResult(
+        output={
+            "search_root": str(root),
+            "query": request.query,
+            "regex": request.regex,
+            "case_sensitive": request.case_sensitive,
+            "matches": matches,
+            "limit": request.limit,
+            "offset": request.offset,
+            "returned_count": len(matches),
+            "has_more": has_more,
+            "next_offset": request.offset + request.limit if has_more else None,
+            "skipped_files": [],
+            "skipped_count": 0,
+            "skipped_truncated": False,
+            "backend": "ripgrep",
+            "warnings": warnings,
+        }
+    )
 
 
 def _encoding_candidates(encoding: str | None) -> list[str]:
@@ -410,7 +584,7 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
 
 @tool(
     name="context_document_discover",
-    description="给定项目根目录，返回该项目内所有 AGENTS.md / AGENT.md 上下文文档的绝对路径列表。",
+    description="给定项目根目录，返回该项目内所有 AGENTS.md 上下文文档的绝对路径列表。",
     group="file",
     category="system",
 )
@@ -442,7 +616,7 @@ def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseTo
         exclude_names=ALWAYS_EXCLUDED_NAMES,
         respect_gitignore=True,
     ):
-        if entry.is_file() and entry.name in CONTEXT_DOCUMENT_NAMES:
+        if entry.is_file() and entry.name == CONTEXT_DOCUMENT_NAME:
             documents.append(str(entry))
 
     documents.sort(key=lambda value: (value.count("\\") + value.count("/"), value.lower()))
@@ -701,6 +875,10 @@ def text_search(request: TextSearchRequest) -> BaseToolResult:
             output=output_base,
         )
 
+    ripgrep_result = _ripgrep_text_search(root, request)
+    if ripgrep_result is not None:
+        return ripgrep_result
+
     compiled_regex = None
     if request.regex:
         flags = 0 if request.case_sensitive else re.IGNORECASE
@@ -783,6 +961,7 @@ def text_search(request: TextSearchRequest) -> BaseToolResult:
             "skipped_files": skipped_files,
             "skipped_count": skipped_count,
             "skipped_truncated": skipped_count > len(skipped_files),
+            "backend": "python",
             "warnings": [],
         }
     )
