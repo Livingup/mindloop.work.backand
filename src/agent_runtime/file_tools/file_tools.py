@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import locale
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -33,6 +34,7 @@ class DirectoryExploreRequest(BaseToolRequest):
     include_hidden: bool = Field(default=False, description="是否包含隐藏文件或隐藏目录。")
     exclude_names: list[str] = Field(default_factory=list, description="额外排除的文件名或目录名。")
     follow_symlinks: bool = Field(default=False, description="是否跟随符号链接目录。")
+    respect_gitignore: bool = Field(default=True, description="是否按项目 .gitignore 规则过滤遍历路径。")
 
 
 class FileNameSearchRequest(BaseToolRequest):
@@ -47,6 +49,7 @@ class FileNameSearchRequest(BaseToolRequest):
     offset: int = Field(default=0, ge=0, description="结果分页偏移。")
     exclude_names: list[str] = Field(default_factory=list, description="额外排除的文件名或目录名。")
     include_hidden: bool = Field(default=False, description="是否包含隐藏文件或隐藏目录。")
+    respect_gitignore: bool = Field(default=True, description="是否按项目 .gitignore 规则过滤遍历路径。")
 
 
 class TextSearchRequest(BaseToolRequest):
@@ -60,29 +63,12 @@ class TextSearchRequest(BaseToolRequest):
     limit: int = Field(default=50, ge=1, le=200, description="本次最多返回的命中数量。")
     offset: int = Field(default=0, ge=0, description="命中结果分页偏移。")
     exclude_names: list[str] = Field(default_factory=list, description="额外排除的文件名或目录名。")
+    include_hidden: bool = Field(default=False, description="是否包含隐藏文件或隐藏目录。")
+    respect_gitignore: bool = Field(default=True, description="是否按项目 .gitignore 规则过滤遍历路径。")
 
 
-DEFAULT_EXCLUDED_NAMES = {
+ALWAYS_EXCLUDED_NAMES = {
     ".git",
-    "node_modules",
-    ".venv",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    "target",
-    "coverage",
-    "__pycache__",
-    ".next",
-    ".nuxt",
-    ".cache",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".idea",
-    "logs",
-    "tmp",
-    "temp",
 }
 
 
@@ -105,7 +91,61 @@ def _normalize_extensions(extensions: list[str]) -> set[str]:
     }
 
 
-def _iter_entries(root: Path, *, include_hidden: bool, exclude_names: set[str]) -> Iterator[Path]:
+class GitIgnoreMatcher:
+    def __init__(self, root: Path, enabled: bool) -> None:
+        self.root = root
+        self.enabled = enabled and self._is_inside_git_work_tree()
+        self._cache: dict[str, bool] = {}
+
+    def _is_inside_git_work_tree(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.root), "rev-parse", "--is-inside-work-tree"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
+    def is_ignored(self, path: Path) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            relative_path = path.relative_to(self.root).as_posix()
+        except ValueError:
+            return False
+        if not relative_path:
+            return False
+        cached = self._cache.get(relative_path)
+        if cached is not None:
+            return cached
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(self.root), "check-ignore", "--quiet", "--", relative_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            self.enabled = False
+            return False
+        ignored = result.returncode == 0
+        self._cache[relative_path] = ignored
+        return ignored
+
+
+def _iter_entries(
+    root: Path,
+    *,
+    include_hidden: bool,
+    exclude_names: set[str],
+    respect_gitignore: bool,
+) -> Iterator[Path]:
+    gitignore_matcher = GitIgnoreMatcher(root, respect_gitignore)
     stack = [root]
     while stack:
         directory = stack.pop()
@@ -117,6 +157,8 @@ def _iter_entries(root: Path, *, include_hidden: bool, exclude_names: set[str]) 
             if not include_hidden and child.name.startswith("."):
                 continue
             if child.name in exclude_names:
+                continue
+            if gitignore_matcher.is_ignored(child):
                 continue
             yield child
             if child.is_dir():
@@ -394,24 +436,14 @@ def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseTo
         )
 
     documents: list[str] = []
-    stack = [project_root]
-    while stack:
-        directory = stack.pop()
-        if directory != project_root and (directory / ".git").exists():
-            continue
-
-        try:
-            children = sorted(directory.iterdir(), key=lambda path: (path.is_file(), path.name.lower()))
-        except OSError:
-            continue
-
-        for child in children:
-            if child.is_dir():
-                if child.name in DEFAULT_EXCLUDED_NAMES:
-                    continue
-                stack.append(child)
-            elif child.is_file() and child.name in CONTEXT_DOCUMENT_NAMES:
-                documents.append(str(child))
+    for entry in _iter_entries(
+        project_root,
+        include_hidden=True,
+        exclude_names=ALWAYS_EXCLUDED_NAMES,
+        respect_gitignore=True,
+    ):
+        if entry.is_file() and entry.name in CONTEXT_DOCUMENT_NAMES:
+            documents.append(str(entry))
 
     documents.sort(key=lambda value: (value.count("\\") + value.count("/"), value.lower()))
     return BaseToolResult(output={"project_root": str(project_root), "documents": documents})
@@ -444,12 +476,13 @@ def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
             output=output_base,
         )
 
-    excluded_names = DEFAULT_EXCLUDED_NAMES | set(request.exclude_names)
+    excluded_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
     entries: list[dict[str, Any]] = []
     excluded: list[dict[str, str]] = []
     truncated = False
     warnings: list[str] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
+    gitignore_matcher = GitIgnoreMatcher(root, request.respect_gitignore)
 
     while stack and not truncated:
         directory, current_depth = stack.pop()
@@ -474,6 +507,10 @@ def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
             if child.name in excluded_names:
                 if len(excluded) < EXCLUDED_REPORT_LIMIT:
                     excluded.append({"path": str(child), "reason": "excluded_name"})
+                continue
+            if gitignore_matcher.is_ignored(child):
+                if len(excluded) < EXCLUDED_REPORT_LIMIT:
+                    excluded.append({"path": str(child), "reason": "gitignore"})
                 continue
             if child.is_symlink() and not request.follow_symlinks:
                 if len(excluded) < EXCLUDED_REPORT_LIMIT:
@@ -574,12 +611,17 @@ def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
 
     query = request.name_query if request.case_sensitive else request.name_query.lower() if request.name_query else None
     extensions = _normalize_extensions(request.extensions)
-    excluded_names = DEFAULT_EXCLUDED_NAMES | set(request.exclude_names)
+    excluded_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
     matches: list[dict[str, Any]] = []
     seen_count = 0
     has_more = False
 
-    for entry in _iter_entries(root, include_hidden=request.include_hidden, exclude_names=excluded_names):
+    for entry in _iter_entries(
+        root,
+        include_hidden=request.include_hidden,
+        exclude_names=excluded_names,
+        respect_gitignore=request.respect_gitignore,
+    ):
         if request.entry_type == "file" and not entry.is_file():
             continue
         if request.entry_type == "directory" and not entry.is_dir():
@@ -674,14 +716,19 @@ def text_search(request: TextSearchRequest) -> BaseToolResult:
             )
 
     extensions = _normalize_extensions(request.extensions)
-    excluded_names = DEFAULT_EXCLUDED_NAMES | set(request.exclude_names)
+    excluded_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
     matches: list[dict[str, Any]] = []
     skipped_files: list[dict[str, str]] = []
     skipped_count = 0
     total_seen_matches = 0
     has_more = False
 
-    for entry in _iter_entries(root, include_hidden=False, exclude_names=excluded_names):
+    for entry in _iter_entries(
+        root,
+        include_hidden=request.include_hidden,
+        exclude_names=excluded_names,
+        respect_gitignore=request.respect_gitignore,
+    ):
         if has_more:
             break
         if not entry.is_file():
