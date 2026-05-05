@@ -227,6 +227,11 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.agent_definition.north_gateway.agent_definition_rest_adapter import (
         create_agent_definition_router,
     )
+    from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
+    from agent_runtime.agent.north_gateway.agent_runtime_rest_adapter import (
+        create_agent_runtime_router,
+    )
+    from agent_runtime.agent.agent_execution_factory import AgentExecutionFactory
     from agent_runtime.llm_model_registry.llm_model_registry_factory import (
         LlmModelRegistryFactory,
     )
@@ -239,6 +244,7 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.system_settings.north_gateway.system_settings_rest_adapter import (
         create_system_settings_router,
     )
+    from agent_runtime.file_tools.workspace_rest_adapter import create_workspace_router
     from agent_runtime.communication.communication_factory import CommunicationFactory
     from agent_runtime.communication.north_gateway.communication_rest_adapter import (
         create_communication_router,
@@ -249,7 +255,9 @@ def serve(host: str | None, port: int | None) -> None:
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
+    agent_runtime_gateway = AgentRuntimeFactory.create()
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
+    agent_execution_engine = AgentExecutionFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
     communication_gateway = CommunicationFactory.create()
 
@@ -309,6 +317,15 @@ def serve(host: str | None, port: int | None) -> None:
         tags=["Agent 定义"],
     )
     app.include_router(
+        create_agent_runtime_router(
+            agent_runtime_gateway,
+            llm_model_registry_gateway,
+            agent_execution_engine,
+        ),
+        prefix="/api/agent-runtime",
+        tags=["Agent 运行态"],
+    )
+    app.include_router(
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
@@ -317,6 +334,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_system_settings_router(system_settings_gateway),
         prefix="/api/system-settings",
         tags=["系统设置"],
+    )
+    app.include_router(
+        create_workspace_router(),
+        prefix="/api/workspaces",
+        tags=["工作目录"],
     )
     app.include_router(
         create_communication_router(communication_gateway),

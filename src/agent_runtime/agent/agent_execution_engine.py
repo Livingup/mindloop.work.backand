@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.agent.agent_instance import AgentInstance
+from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
@@ -220,6 +221,45 @@ class AgentExecutionEngine:
                 conversation_id=request.conversation_id,
             )
         )
+        return await self._run_agent_instance(task, instance, request)
+
+    async def run_agent_instance_message(
+        self,
+        *,
+        agent_instance_id: str,
+        user_text: str,
+        render_options: dict[str, Any] | None = None,
+        request_overrides: dict[str, Any] | None = None,
+        communication_stream_id: str | None = None,
+    ) -> AgentExecutionResult:
+        instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+        task = self._runtime_gateway.get_task(instance.task_id)
+        if task.is_terminal:
+            raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+        if instance.is_terminal:
+            raise ValueError(f"Agent 实例已结束，不能继续对话: {instance.instance_id}")
+        request = AgentExecutionRequest.from_text(
+            thread_id=instance.thread_id,
+            current_working_directory=instance.current_working_directory,
+            agent_definition_id=instance.agent_definition_id,
+            llm_provider_id=instance.llm_provider_id,
+            llm_model_binding_id=instance.llm_model_binding_id,
+            user_text=user_text,
+            task_id=task.task_id,
+            root_instance_id=instance.instance_id,
+            conversation_id=instance.conversation_id,
+            render_options=render_options,
+            request_overrides=request_overrides,
+            communication_stream_id=communication_stream_id,
+        )
+        return await self._run_agent_instance(task, instance, request)
+
+    async def _run_agent_instance(
+        self,
+        task: AgentTask,
+        instance: AgentInstance,
+        request: AgentExecutionRequest,
+    ) -> AgentExecutionResult:
         communication_context = self._build_communication_context(request, task.task_id, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         try:
