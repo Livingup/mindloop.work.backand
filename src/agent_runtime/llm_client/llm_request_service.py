@@ -12,6 +12,11 @@ from agent_runtime.conversation_message.message.operations import (
     ingest_response,
     render_messages,
 )
+from agent_runtime.conversation_message.message.models import ThinkingPart, ToolUsePart
+from agent_runtime.communication.runtime_event_publisher import (
+    NoopRuntimeEventPublisher,
+    RuntimeEventPublisher,
+)
 from agent_runtime.llm_client.llm_protocol_clients import (
     LlmHttpRequestError,
     LlmProtocolClient,
@@ -35,12 +40,20 @@ class LlmRequestService:
     - 将成功响应通过 ingest_response 写回统一 Conversation。
     """
 
-    def __init__(self, protocol_clients: tuple[LlmProtocolClient, ...], resource_resolver: Any) -> None:
+    def __init__(
+        self,
+        protocol_clients: tuple[LlmProtocolClient, ...],
+        resource_resolver: Any,
+        event_publisher: RuntimeEventPublisher | None = None,
+    ) -> None:
         # 具体 API 协议客户端表。key 是 api_format，如 openai_responses。
         self._protocol_clients = {client.api_format: client for client in protocol_clients}
 
         # 多模态资源解析器。文本对话不会触发资源读取；图片/PDF 渲染时才会使用。
         self._resource_resolver = resource_resolver
+
+        # 运行时事件发布器。用于把 LLM 请求关键节点推送到通用通信流。
+        self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
 
     async def send_prompt(self, request: LlmPromptRequest) -> LlmPromptResponse:
         """发送一次 LLM 请求，并把 assistant 响应追加到 Conversation。"""
@@ -63,6 +76,22 @@ class LlmRequestService:
         if not api_keys:
             api_keys = [None]
 
+        await self._event_publisher.publish(
+            request.communication_context,
+            "llm.request.started",
+            {
+                "provider_id": resolved.provider_id,
+                "binding_id": resolved.binding_id,
+                "model_id": resolved.model_id,
+                "model_alias": resolved.model_alias,
+                "api_format": resolved.api_format,
+                "tool_count": len(tool_schemas),
+                "api_key_count": len(api_keys),
+            },
+            source="llm_client",
+            metadata={"conversation_id": request.conversation.id},
+        )
+
         attempt_count = 0
         last_error: Exception | None = None
         for key_index, api_key in enumerate(api_keys):
@@ -70,6 +99,20 @@ class LlmRequestService:
             for retry_index in range(max_retries + 1):
                 attempt_count += 1
                 try:
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.attempt.started",
+                        {
+                            "provider_id": resolved.provider_id,
+                            "binding_id": resolved.binding_id,
+                            "model_alias": resolved.model_alias,
+                            "api_key_index": key_index,
+                            "retry_index": retry_index,
+                            "attempt_count": attempt_count,
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
                     raw_response = await client.request(
                         resolved_model=resolved,
                         rendered_messages=rendered_messages,
@@ -89,6 +132,35 @@ class LlmRequestService:
                         raw_response,
                         {**request.render_options, "vendor": resolved.provider_id},
                     )
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.completed",
+                        {
+                            "provider_id": resolved.provider_id,
+                            "binding_id": resolved.binding_id,
+                            "model_alias": resolved.model_alias,
+                            "api_key_index": key_index,
+                            "attempt_count": attempt_count,
+                            "assistant_part_count": len(assistant_message.content),
+                            "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                            "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
+                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.thinking.received",
+                            {
+                                "provider_id": resolved.provider_id,
+                                "binding_id": resolved.binding_id,
+                                "model_alias": resolved.model_alias,
+                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                            },
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
                     return LlmPromptResponse(
                         raw_response=raw_response,
                         assistant_message=assistant_message,
@@ -97,12 +169,56 @@ class LlmRequestService:
                     )
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
                     last_error = exc
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.attempt.failed",
+                        {
+                            "provider_id": resolved.provider_id,
+                            "binding_id": resolved.binding_id,
+                            "model_alias": resolved.model_alias,
+                            "api_key_index": key_index,
+                            "retry_index": retry_index,
+                            "attempt_count": attempt_count,
+                            "error_type": exc.__class__.__name__,
+                            "error_message": str(exc),
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
                     if not _should_retry(exc, resolved.retry.retryable_status_codes):
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.request.failed",
+                            {
+                                "provider_id": resolved.provider_id,
+                                "binding_id": resolved.binding_id,
+                                "model_alias": resolved.model_alias,
+                                "attempt_count": attempt_count,
+                                "error_type": exc.__class__.__name__,
+                                "error_message": str(exc),
+                            },
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
                         raise
                     if retry_index >= max_retries:
                         break
                     await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
         if last_error is not None:
+            await self._event_publisher.publish(
+                request.communication_context,
+                "llm.request.failed",
+                {
+                    "provider_id": resolved.provider_id,
+                    "binding_id": resolved.binding_id,
+                    "model_alias": resolved.model_alias,
+                    "attempt_count": attempt_count,
+                    "error_type": last_error.__class__.__name__,
+                    "error_message": str(last_error),
+                },
+                source="llm_client",
+                metadata={"conversation_id": request.conversation.id},
+            )
             raise last_error
         raise RuntimeError("LLM 请求未执行。")
 
@@ -167,3 +283,8 @@ def _resolve_api_key(key: str) -> str:
     if default is not None:
         return default
     raise ValueError(f"LLM API Key 环境变量未设置: {env_key}")
+
+
+def _count_parts(parts: Any, part_type: type) -> int:
+    """统计 assistant 响应中指定类型内容片段数量。"""
+    return sum(1 for part in parts if isinstance(part, part_type))

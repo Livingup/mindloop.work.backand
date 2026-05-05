@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_runtime.conversation_message.message.models import Conversation, UniMessage
+from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
 )
@@ -60,6 +61,9 @@ class LlmPromptRequest:
 
     # 本轮请求额外参数，会覆盖 registry 中 custom_request_params 的同名字段。
     request_overrides: dict[str, Any] = field(default_factory=dict)
+
+    # 可选运行时通信上下文。LLM 请求服务在关键节点通过该上下文发布实时事件。
+    communication_context: RuntimeCommunicationContext | None = None
 
 
 @dataclass(frozen=True, slots=True)

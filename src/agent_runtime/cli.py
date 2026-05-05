@@ -239,6 +239,10 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.system_settings.north_gateway.system_settings_rest_adapter import (
         create_system_settings_router,
     )
+    from agent_runtime.communication.communication_factory import CommunicationFactory
+    from agent_runtime.communication.north_gateway.communication_rest_adapter import (
+        create_communication_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -247,6 +251,7 @@ def serve(host: str | None, port: int | None) -> None:
     agent_definition_gateway = AgentDefinitionFactory.create()
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
+    communication_gateway = CommunicationFactory.create()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -312,6 +317,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_system_settings_router(system_settings_gateway),
         prefix="/api/system-settings",
         tags=["系统设置"],
+    )
+    app.include_router(
+        create_communication_router(communication_gateway),
+        prefix="/api/communication",
+        tags=["通用通信"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。

@@ -12,11 +12,15 @@
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；除 `config init` 外，`spread-ai serve` 和所有 CLI 管理命令都固定加载这一个初始化后的运行配置文件，不再支持 `--config` / `SPREAD_AI_CONFIG`，也不再从包内 defaults 模板自动生成配置。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；除 `config init` 外，`spread-ai serve` 和所有 CLI 管理命令都固定加载这一个初始化后的运行配置文件，不再支持 `--config` / `SPREAD_AI_CONFIG`，也不再从包内 defaults 模板自动生成配置。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
 
 ### 会话消息模块（conversation_message）
 
 统一历史对话消息管理，建立支持多平台（OpenAI / Claude / Gemini）的统一历史消息列表模型。包括统一消息模型、协议适配器、会话状态管理。不关心 LLM 调用本身，只关注消息的统一表示和协议转换。会话聚合根的持久化支持 InMemory 内存实现和 SQLite + JSONL 混合持久化实现，仓储接口定义在领域层（conversation_repository.py），实现类位于基础设施层（infrastructure/）。会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id。
+
+### 通用通信模块（communication）
+
+提供业务无关的逻辑通信流、通信消息、消息日志持久化和后端主动推送接入能力。核心模型包括 `CommunicationStream`（逻辑 stream_id，不绑定 SSE/WebSocket 物理连接）和 `CommunicationMessage`（统一消息信封，字段含 stream_id、seq、type、topic、payload、metadata）。通信消息通过 SQLite 仓储持久化，开启 WAL 并按 stream 内递增 seq 支持断线后按 `after_seq` 恢复读取；进程内实时分发由 `InMemoryCommunicationMessageBus` 完成。北向网关提供创建/关闭流、发布消息、读取历史和订阅消息能力；REST adapter 暴露 `/api/communication/streams`、`/messages` 和 `/events` SSE。运行链路通过 `RuntimeCommunicationContext` 透传逻辑流 ID，并通过 `RuntimeEventPublisher` 发布 Agent、LLM、Tool 关键节点事件，底层运行对象不感知具体前端连接。
 
 ### 提示词模板服务（prompt_template）
 

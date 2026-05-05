@@ -72,6 +72,10 @@ agent_runtime:
   # 每个 Agent 实例会将自己的对话执行过程保存为 Markdown trace 文件。
   trace_dir: "~/.spread-ai/agent-traces"
 
+communication:
+  # 通用通信流与消息日志 SQLite 数据目录。
+  data_dir: "~/.spread-ai/communication"
+
 prompt_template:
   # 提示词片段 YAML 文件存储根目录。
   snippets_dir: "~/.spread-ai/prompt-snippets"

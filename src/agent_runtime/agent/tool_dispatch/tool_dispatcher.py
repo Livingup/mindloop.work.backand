@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, McpToolBinding
+from agent_runtime.communication.runtime_event_publisher import (
+    NoopRuntimeEventPublisher,
+    RuntimeCommunicationContext,
+    RuntimeEventPublisher,
+)
 from agent_runtime.conversation_message.message.models import ToolResultPart, ToolUsePart
 from agent_runtime.llm_api_protocol import (
     SDK_PLATFORM_ANTHROPIC,
@@ -59,12 +64,16 @@ class AgentToolDispatcher:
         *,
         local_tool_gateway: LocalToolGateway,
         mcp_client_gateway: McpClientGateway | None = None,
+        event_publisher: RuntimeEventPublisher | None = None,
     ) -> None:
         # 本地工具北向网关。用于读取本地工具 schema 和执行本地工具函数。
         self._local_tool_gateway = local_tool_gateway
 
         # MCP 客户端北向网关。AgentDefinition 声明 mcp_tools 时必须配置该网关。
         self._mcp_client_gateway = mcp_client_gateway
+
+        # 运行时事件发布器。用于把工具调用生命周期推送到通用通信流。
+        self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
 
     async def build_llm_tools(
         self,
@@ -117,24 +126,85 @@ class AgentToolDispatcher:
         *,
         agent_definition: AgentDefinition,
         tool_use: ToolUsePart,
+        communication_context: RuntimeCommunicationContext | None = None,
     ) -> ToolDispatchResult:
         """执行 LLM 返回的一次工具调用，并返回可写入会话的 ToolResultPart。"""
-        if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX):
-            return await self._dispatch_mcp_tool(agent_definition, tool_use)
-        return await self._dispatch_local_tool(agent_definition, tool_use)
+        source = "mcp" if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX) else "local"
+        tool_call_id = _tool_use_ref(tool_use)
+        await self._event_publisher.publish(
+            communication_context,
+            "tool.call.started",
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_use.name,
+                "source": source,
+                "input": tool_use.input,
+            },
+            source="tool_dispatcher",
+            correlation_id=tool_call_id,
+        )
+        try:
+            if source == "mcp":
+                result = await self._dispatch_mcp_tool(agent_definition, tool_use)
+            else:
+                result = await self._dispatch_local_tool(agent_definition, tool_use, communication_context)
+        except Exception as exc:
+            await self._event_publisher.publish(
+                communication_context,
+                "tool.call.failed",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_use.name,
+                    "source": source,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                },
+                source="tool_dispatcher",
+                correlation_id=tool_call_id,
+            )
+            raise
+        await self._event_publisher.publish(
+            communication_context,
+            "tool.call.completed",
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": result.tool_name,
+                "source": result.source,
+                "success": result.tool_result.success,
+                "execution_status": result.tool_result.execution_status,
+                "loop_decision": result.tool_result.loop_decision,
+                "error_code": result.tool_result.error_code,
+                "error_message": result.tool_result.error_message,
+            },
+            source="tool_dispatcher",
+            correlation_id=tool_call_id,
+        )
+        return result
 
     async def _dispatch_local_tool(
         self,
         agent_definition: AgentDefinition,
         tool_use: ToolUsePart,
+        communication_context: RuntimeCommunicationContext | None,
     ) -> ToolDispatchResult:
         """执行本地工具调用。"""
         detail = self._local_tool_gateway.get_tool(tool_use.name)
         if tool_use.name not in agent_definition.tool_ids and not detail.always_enabled:
             raise PermissionError(f"Agent {agent_definition.agent_id} 无权调用本地工具: {tool_use.name}")
         params = _ensure_dict_arguments(tool_use.input)
+        metadata = communication_context.metadata if communication_context is not None else {}
         result = await self._local_tool_gateway.execute_tool(
-            ToolExecuteRequest(tool_name=tool_use.name, params=params),
+            ToolExecuteRequest(
+                tool_name=tool_use.name,
+                params=params,
+                request_id=_tool_use_ref(tool_use),
+                task_id=metadata.get("task_id"),
+                agent_instance_id=metadata.get("agent_instance_id"),
+                trace_id=communication_context.trace_id if communication_context is not None else None,
+                communication_stream_id=(
+                    communication_context.stream_id if communication_context is not None else None
+                ),
+            ),
         )
         return ToolDispatchResult(
             tool_name=tool_use.name,

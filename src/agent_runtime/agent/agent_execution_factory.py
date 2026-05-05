@@ -7,6 +7,8 @@ from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
 from agent_runtime.agent.agent_trace_recorder import AgentTraceRecorder
 from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
 from agent_runtime.agent_definition.agent_definition_factory import AgentDefinitionFactory
+from agent_runtime.communication.communication_factory import CommunicationFactory
+from agent_runtime.communication.runtime_event_publisher import CommunicationRuntimeEventPublisher
 from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceMeta,
@@ -79,11 +81,14 @@ class AgentExecutionFactory:
         conversation_repository = SqliteConversationRepository(
             config.conversation_repository.data_dir,
         )
+        communication_gateway = CommunicationFactory.create()
+        event_publisher = CommunicationRuntimeEventPublisher(communication_gateway)
         local_tool_gateway = LocalToolFactory.create()
         mcp_gateway = McpClientFactory.create()
         tool_dispatcher = AgentToolDispatcher(
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
+            event_publisher=event_publisher,
         )
         trace_recorder = AgentTraceRecorder(
             trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
@@ -97,7 +102,12 @@ class AgentExecutionFactory:
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
             skill_gateway=SkillFactory.create(),
-            llm_request_service=LlmClientFactory.create(_LazyFileResourceResolver()),
+            llm_request_service=LlmClientFactory.create(
+                _LazyFileResourceResolver(),
+                event_publisher=event_publisher,
+            ),
             tool_dispatcher=tool_dispatcher,
             trace_recorder=trace_recorder,
+            communication_gateway=communication_gateway,
+            event_publisher=event_publisher,
         )

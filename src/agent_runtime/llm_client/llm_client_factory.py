@@ -7,6 +7,7 @@ from typing import Any
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceMeta,
 )
+from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
 from agent_runtime.llm_client.llm_protocol_clients import (
     AnthropicMessagesProtocolClient,
     GeminiGenerateContentProtocolClient,
@@ -38,7 +39,10 @@ class LlmClientFactory:
     """
 
     @staticmethod
-    def create(resource_resolver: Any | None = None) -> LlmRequestService:
+    def create(
+        resource_resolver: Any | None = None,
+        event_publisher: RuntimeEventPublisher | None = None,
+    ) -> LlmRequestService:
         """创建通用 LLM 请求服务。"""
         resolver = resource_resolver or _TextOnlyResourceResolver()
         return LlmRequestService(
@@ -48,4 +52,5 @@ class LlmClientFactory:
                 GeminiGenerateContentProtocolClient(),
             ),
             resource_resolver=resolver,
+            event_publisher=event_publisher,
         )

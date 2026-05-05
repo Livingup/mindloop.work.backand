@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,15 @@ from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatche
 from agent_runtime.agent_definition.agent_definition import AgentDefinition
 from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import (
     AgentDefinitionNorthGateway,
+)
+from agent_runtime.communication.north_gateway.communication_contracts import (
+    CommunicationGateway,
+    CreateCommunicationStreamRequest,
+)
+from agent_runtime.communication.runtime_event_publisher import (
+    NoopRuntimeEventPublisher,
+    RuntimeCommunicationContext,
+    RuntimeEventPublisher,
 )
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import (
@@ -45,6 +55,7 @@ from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecisio
 
 
 _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD = 5
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +97,9 @@ class AgentExecutionRequest:
     # LLM 请求额外覆盖参数。
     request_overrides: dict[str, Any] = field(default_factory=dict)
 
+    # 可选通信流 ID。前端或 CLI UI 可先创建/订阅该流，执行器将实时事件发布到该逻辑流。
+    communication_stream_id: str | None = None
+
     @classmethod
     def from_text(
         cls,
@@ -101,6 +115,7 @@ class AgentExecutionRequest:
         conversation_id: str | None = None,
         render_options: dict[str, Any] | None = None,
         request_overrides: dict[str, Any] | None = None,
+        communication_stream_id: str | None = None,
     ) -> "AgentExecutionRequest":
         """创建纯文本用户输入的执行请求。"""
         return cls(
@@ -116,6 +131,7 @@ class AgentExecutionRequest:
             conversation_id=conversation_id,
             render_options=render_options or {},
             request_overrides=request_overrides or {},
+            communication_stream_id=communication_stream_id,
         )
 
 
@@ -137,6 +153,9 @@ class AgentExecutionResult:
 
     # 最后一条 assistant 消息。
     assistant_message: UniMessage | None
+
+    # 本次执行关联的逻辑通信流 ID。前端/CLI UI 通过该 ID 订阅实时事件。
+    communication_stream_id: str | None = None
 
 
 class AgentExecutionEngine:
@@ -160,6 +179,8 @@ class AgentExecutionEngine:
         llm_request_service: LlmRequestService,
         tool_dispatcher: AgentToolDispatcher,
         trace_recorder: AgentTraceRecorder,
+        communication_gateway: CommunicationGateway | None = None,
+        event_publisher: RuntimeEventPublisher | None = None,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -180,6 +201,10 @@ class AgentExecutionEngine:
         self._tool_dispatcher = tool_dispatcher
         # Agent 实例 Markdown Trace 记录器。
         self._trace_recorder = trace_recorder
+        # 通用通信网关。用于在未传 communication_stream_id 时自动创建 agent.task 逻辑流。
+        self._communication_gateway = communication_gateway
+        # 运行时事件发布器。所有 Agent/LLM/Tool 关键节点都通过逻辑 stream_id 发布。
+        self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
 
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
@@ -195,16 +220,32 @@ class AgentExecutionEngine:
                 conversation_id=request.conversation_id,
             )
         )
+        communication_context = self._build_communication_context(request, task.task_id, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         try:
             self._runtime_gateway.start_task(task.task_id)
             self._runtime_gateway.start_agent_instance(instance.instance_id)
+            await self._publish_task_status(
+                communication_context,
+                "agent.task.started",
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+            )
             conversation = await self._load_or_create_conversation(instance, request)
+            communication_context = communication_context.with_metadata(conversation_id=conversation.id)
 
             conversation.add_user_message(list(request.user_parts), list(request.user_parts_meta))
             user_message = conversation.messages[-1]
             await self._conversation_repository.save(conversation)
             self._trace_recorder.record_user_message(trace_path, user_message)
+            await self._event_publisher.publish(
+                communication_context,
+                "user.message.received",
+                {
+                    "part_count": len(user_message.content),
+                },
+                source="agent_execution_engine",
+            )
 
             resolved_model = self._llm_registry_gateway.resolve_provider_model(
                 instance.llm_provider_id,
@@ -231,11 +272,24 @@ class AgentExecutionEngine:
                         tools=tools,
                         render_options=request.render_options,
                         request_overrides=request.request_overrides,
+                        communication_context=communication_context.with_actor(
+                            actor_type="llm_client",
+                            actor_id=instance.instance_id,
+                        ),
                     )
                 )
                 assistant_message = llm_response.assistant_message
                 await self._conversation_repository.save(conversation)
                 self._trace_recorder.record_llm_response(trace_path, assistant_message)
+                await self._event_publisher.publish(
+                    communication_context,
+                    "agent.assistant.message.received",
+                    {
+                        "part_count": len(assistant_message.content),
+                        "tool_use_count": len(_extract_tool_uses(assistant_message)),
+                    },
+                    source="agent_execution_engine",
+                )
 
                 tool_uses = _extract_tool_uses(assistant_message)
                 if not tool_uses:
@@ -256,12 +310,24 @@ class AgentExecutionEngine:
                             "instance_paused",
                             "普通文本 fallback 连续达到阈值，Runtime 主动暂停任务。",
                         )
+                        await self._event_publisher.publish(
+                            communication_context,
+                            "agent.task.paused",
+                            {
+                                "task_id": task.task_id,
+                                "agent_instance_id": instance.instance_id,
+                                "reason": "plain_text_fallback_threshold_reached",
+                                "fallback_count": plain_text_fallback_count,
+                            },
+                            source="agent_execution_engine",
+                        )
                         return AgentExecutionResult(
                             task_id=task.task_id,
                             instance_id=instance.instance_id,
                             conversation_id=conversation.id,
                             trace_file_path=str(trace_path),
                             assistant_message=assistant_message,
+                            communication_stream_id=communication_context.stream_id,
                         )
                     continue
                 plain_text_fallback_count = 0
@@ -269,18 +335,20 @@ class AgentExecutionEngine:
                 tool_result_message, tool_results = await self._execute_tool_uses(
                     agent_definition,
                     tool_uses,
+                    communication_context,
                 )
                 conversation.append_message(tool_result_message)
                 await self._conversation_repository.save(conversation)
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
                 if loop_decision != "continue":
-                    self._apply_loop_decision(
+                    await self._apply_loop_decision(
                         loop_decision=loop_decision,
                         task_id=task.task_id,
                         instance_id=instance.instance_id,
                         trace_path=trace_path,
                         tool_results=tool_results,
+                        communication_context=communication_context,
                     )
                     return AgentExecutionResult(
                         task_id=task.task_id,
@@ -288,6 +356,7 @@ class AgentExecutionEngine:
                         conversation_id=conversation.id,
                         trace_file_path=str(trace_path),
                         assistant_message=assistant_message,
+                        communication_stream_id=communication_context.stream_id,
                     )
 
             raise RuntimeError("Agent 执行循环异常结束。")
@@ -296,7 +365,112 @@ class AgentExecutionEngine:
             self._runtime_gateway.fail_agent_instance(instance.instance_id, failure_message)
             self._runtime_gateway.fail_task(task.task_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)
+            await self._event_publisher.publish(
+                communication_context,
+                "agent.task.failed",
+                {
+                    "task_id": task.task_id,
+                    "agent_instance_id": instance.instance_id,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": failure_message,
+                },
+                source="agent_execution_engine",
+            )
             raise
+
+    def _build_communication_context(
+        self,
+        request: AgentExecutionRequest,
+        task_id: str,
+        instance: AgentInstance,
+    ) -> RuntimeCommunicationContext:
+        """构建当前 Agent 执行链路透传的通信上下文。"""
+        stream_id = request.communication_stream_id
+        if stream_id is None:
+            if self._communication_gateway is None:
+                stream_id = f"stream-agent-task-{task_id}"
+            else:
+                stream_id = f"stream-agent-task-{task_id}"
+                try:
+                    stream_id = self._ensure_communication_stream(
+                        stream_id=stream_id,
+                        task_id=task_id,
+                        instance=instance,
+                    )
+                except Exception:
+                    logger.exception("创建 Agent 通信流失败，执行流程将继续: stream_id=%s", stream_id)
+        elif self._communication_gateway is not None:
+            try:
+                stream_id = self._ensure_communication_stream(
+                    stream_id=stream_id,
+                    task_id=task_id,
+                    instance=instance,
+                )
+            except Exception:
+                logger.exception("确认 Agent 通信流失败，执行流程将继续: stream_id=%s", stream_id)
+        return RuntimeCommunicationContext(
+            stream_id=stream_id,
+            actor_type="agent_instance",
+            actor_id=instance.instance_id,
+            trace_id=instance.trace_id,
+            metadata={
+                "task_id": task_id,
+                "thread_id": instance.thread_id,
+                "agent_instance_id": instance.instance_id,
+                "agent_definition_id": instance.agent_definition_id,
+            },
+        )
+
+    def _ensure_communication_stream(
+        self,
+        *,
+        stream_id: str,
+        task_id: str,
+        instance: AgentInstance,
+    ) -> str:
+        """确保当前 Agent 执行关联的逻辑通信流存在。"""
+        if self._communication_gateway is None:
+            return stream_id
+        try:
+            stream = self._communication_gateway.get_stream(stream_id)
+        except KeyError:
+            try:
+                stream = self._communication_gateway.create_stream(
+                    CreateCommunicationStreamRequest(
+                        stream_id=stream_id,
+                        topic="agent.task",
+                        owner_id=instance.agent_definition_id,
+                        metadata={
+                            "task_id": task_id,
+                            "thread_id": instance.thread_id,
+                            "agent_instance_id": instance.instance_id,
+                            "agent_definition_id": instance.agent_definition_id,
+                            "trace_id": instance.trace_id,
+                        },
+                    )
+                )
+            except ValueError:
+                stream = self._communication_gateway.get_stream(stream_id)
+        return stream.stream_id
+
+    async def _publish_task_status(
+        self,
+        communication_context: RuntimeCommunicationContext,
+        event_type: str,
+        *,
+        task_id: str,
+        instance_id: str,
+    ) -> None:
+        """发布任务和根 Agent 实例状态事件。"""
+        await self._event_publisher.publish(
+            communication_context,
+            event_type,
+            {
+                "task_id": task_id,
+                "agent_instance_id": instance_id,
+            },
+            source="agent_execution_engine",
+        )
 
     def _load_agent_definition(self, agent_definition_id: str) -> AgentDefinition:
         """加载并校验 Agent 静态定义。"""
@@ -430,6 +604,7 @@ class AgentExecutionEngine:
         self,
         definition: AgentDefinition,
         tool_uses: list[ToolUsePart],
+        communication_context: RuntimeCommunicationContext,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
         result_parts = []
@@ -438,12 +613,16 @@ class AgentExecutionEngine:
             result = await self._tool_dispatcher.dispatch_tool_call(
                 agent_definition=definition,
                 tool_use=tool_use,
+                communication_context=communication_context.with_actor(
+                    actor_type="tool_dispatcher",
+                    actor_id=tool_use.name,
+                ),
             )
             result_parts.append(result.result_part)
             tool_results.append(result.tool_result)
         return UniMessage(role=ROLE_TOOL, content=result_parts), tool_results
 
-    def _apply_loop_decision(
+    async def _apply_loop_decision(
         self,
         *,
         loop_decision: LoopDecision,
@@ -451,6 +630,7 @@ class AgentExecutionEngine:
         instance_id: str,
         trace_path: Any,
         tool_results: list[BaseToolResult],
+        communication_context: RuntimeCommunicationContext,
     ) -> None:
         """根据统一工具结果中的 loop_decision 更新运行态。"""
         details = [result.to_serializable_dict() for result in tool_results]
@@ -458,24 +638,88 @@ class AgentExecutionEngine:
             self._runtime_gateway.pause_agent_instance(instance_id)
             self._runtime_gateway.pause_task(task_id)
             self._trace_recorder.record_event(trace_path, "instance_paused", details)
+            await self._publish_loop_decision_event(
+                communication_context,
+                "agent.task.paused",
+                task_id=task_id,
+                instance_id=instance_id,
+                loop_decision=loop_decision,
+                tool_results=tool_results,
+            )
             return
         if loop_decision == "complete":
             self._runtime_gateway.complete_agent_instance(instance_id)
             self._runtime_gateway.complete_task(task_id)
             self._trace_recorder.record_completed(trace_path)
+            await self._publish_loop_decision_event(
+                communication_context,
+                "agent.task.completed",
+                task_id=task_id,
+                instance_id=instance_id,
+                loop_decision=loop_decision,
+                tool_results=tool_results,
+            )
             return
         if loop_decision == "terminate":
             self._runtime_gateway.cancel_agent_instance(instance_id)
             self._runtime_gateway.cancel_task(task_id)
             self._trace_recorder.record_event(trace_path, "instance_terminated", details)
+            await self._publish_loop_decision_event(
+                communication_context,
+                "agent.task.cancelled",
+                task_id=task_id,
+                instance_id=instance_id,
+                loop_decision=loop_decision,
+                tool_results=tool_results,
+            )
             return
         if loop_decision == "fail":
             failure_message = _failure_message_from_tool_results(tool_results)
             self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
             self._runtime_gateway.fail_task(task_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)
+            await self._publish_loop_decision_event(
+                communication_context,
+                "agent.task.failed",
+                task_id=task_id,
+                instance_id=instance_id,
+                loop_decision=loop_decision,
+                tool_results=tool_results,
+                failure_message=failure_message,
+            )
             return
         raise ValueError(f"未知循环决策: {loop_decision}")
+
+    async def _publish_loop_decision_event(
+        self,
+        communication_context: RuntimeCommunicationContext,
+        event_type: str,
+        *,
+        task_id: str,
+        instance_id: str,
+        loop_decision: LoopDecision,
+        tool_results: list[BaseToolResult],
+        failure_message: str | None = None,
+    ) -> None:
+        """发布工具结果驱动的 Agent 循环决策事件。"""
+        frontend_messages = [
+            result.frontend_message.model_dump(mode="json")
+            for result in tool_results
+            if result.frontend_message is not None
+        ]
+        await self._event_publisher.publish(
+            communication_context,
+            event_type,
+            {
+                "task_id": task_id,
+                "agent_instance_id": instance_id,
+                "loop_decision": loop_decision,
+                "tool_result_count": len(tool_results),
+                "frontend_messages": frontend_messages,
+                "failure_message": failure_message,
+            },
+            source="agent_execution_engine",
+        )
 
 
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:

@@ -44,6 +44,7 @@ from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.conversation_message.config import ConversationRepositoryConfig
 from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
+from agent_runtime.communication.communication_config import CommunicationConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -104,6 +105,11 @@ class AgentRuntimeConfig:
     # Agent 运行态管理配置。
     agent_runtime: AgentRuntimeStateConfig = field(
         default_factory=AgentRuntimeStateConfig,
+    )
+
+    # 通用通信模块配置。
+    communication: CommunicationConfig = field(
+        default_factory=CommunicationConfig,
     )
 
     # LLM 服务商与模型注册模块配置。
@@ -330,6 +336,17 @@ class ConfigRegistry:
             "llm_model_registry", _build_llm_model_registry_config,
         )
 
+    @property
+    def communication(self) -> CommunicationConfig:
+        """实时读取通用通信模块配置（通信流与消息日志数据目录等）。"""
+        if self._config is not None:
+            return self._config.communication
+        if self._raw_config_data is not None and "communication" not in self._raw_config_data:
+            return CommunicationConfig()
+        return self._get_section_config(
+            "communication", _build_communication_config,
+        )
+
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
 
@@ -515,6 +532,13 @@ def _build_llm_model_registry_config(data: dict[str, Any]) -> LlmModelRegistryCo
     """从 YAML 字典构建 LLM 服务商与模型注册模块配置。"""
     return LlmModelRegistryConfig(
         registry_dir=str(data["registry_dir"]),
+    )
+
+
+def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
+    """从 YAML 字典构建通用通信模块配置。"""
+    return CommunicationConfig(
+        data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
     )
 
 
