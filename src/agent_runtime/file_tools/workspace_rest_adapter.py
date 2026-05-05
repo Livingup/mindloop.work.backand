@@ -15,6 +15,7 @@ class WorkspaceTreeRequest(BaseModel):
 
 class WorkspaceTreeNodeResponse(BaseModel):
     name: str
+    path: str
     type: Literal["folder", "file"]
     children: list["WorkspaceTreeNodeResponse"] = Field(default_factory=list)
 
@@ -86,6 +87,7 @@ def _read_children(
             nodes.append(
                 WorkspaceTreeNodeResponse(
                     name=entry.name,
+                    path=str(entry),
                     type="folder",
                     children=_read_children(
                         entry,
@@ -96,5 +98,5 @@ def _read_children(
                 ),
             )
         elif entry.is_file():
-            nodes.append(WorkspaceTreeNodeResponse(name=entry.name, type="file"))
+            nodes.append(WorkspaceTreeNodeResponse(name=entry.name, path=str(entry), type="file"))
     return nodes
