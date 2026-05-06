@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent_runtime.agent.agent_instance import AgentInstance
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
@@ -34,6 +34,10 @@ class CreateTaskWithRootAgentInstanceRequest:
 
     # 本根实例执行时使用的服务商模型接入项 ID。
     llm_model_binding_id: str
+
+    llm_policy_group_id: str | None = None
+
+    llm_policy_snapshot_json: dict[str, Any] | None = None
 
     # 可选任务 ID。不传时由领域服务生成。
     task_id: str | None = None
@@ -74,6 +78,10 @@ class CreateChildAgentInstanceRequest:
 
     # 子实例执行时使用的服务商模型接入项 ID。
     llm_model_binding_id: str
+
+    llm_policy_group_id: str | None = None
+
+    llm_policy_snapshot_json: dict[str, Any] | None = None
 
     # 可选子实例 ID。不传时由领域服务生成。
     child_instance_id: str | None = None
@@ -177,4 +185,15 @@ class AgentRuntimeGateway(Protocol):
         conversation_id: str,
     ) -> AgentInstance:
         """为 Agent 实例绑定历史会话 ID。"""
+        ...
+
+    def switch_agent_instance_llm_policy(
+        self,
+        instance_id: str,
+        *,
+        llm_policy_group_id: str,
+        llm_policy_snapshot_json: dict[str, Any],
+        llm_provider_id: str,
+        llm_model_binding_id: str,
+    ) -> AgentInstance:
         ...

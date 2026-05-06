@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
+from agent_runtime.llm_model_registry.llm_execution_policy import (
+    LlmExecutionFailurePolicy,
+    LlmExecutionPolicy,
+)
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_repository import (
     LlmModelRegistryRepository,
@@ -114,6 +118,42 @@ class ResolvedLlmProviderModel:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedLlmExecutionPolicyCandidate:
+    candidate_id: str
+    provider_id: str
+    model_binding_id: str
+    resolved_model: ResolvedLlmProviderModel
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "provider_id": self.provider_id,
+            "model_binding_id": self.model_binding_id,
+            "resolved_model": self.resolved_model.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedLlmExecutionPolicy:
+    policy_group_id: str
+    name: str | None
+    description: str | None
+    strategy: str
+    failure_policy: LlmExecutionFailurePolicy
+    candidates: tuple[ResolvedLlmExecutionPolicyCandidate, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "policy_group_id": self.policy_group_id,
+            "name": self.name,
+            "description": self.description,
+            "strategy": self.strategy,
+            "failure_policy": self.failure_policy.to_dict(),
+            "candidates": [item.to_dict() for item in self.candidates],
+        }
+
+
 class LlmModelRegistryService:
     """LLM 服务商与模型注册领域服务。
 
@@ -201,8 +241,70 @@ class LlmModelRegistryService:
 
     def delete_provider(self, provider_id: str) -> None:
         """删除服务商定义；不存在时静默跳过，便于幂等清理。"""
+        referenced_by = [
+            policy.policy_group_id
+            for policy in self._repository.find_all_execution_policies()
+            if any(candidate.provider_id == provider_id for candidate in policy.candidates)
+        ]
+        if referenced_by:
+            raise ValueError(
+                f"LLM 服务商 '{provider_id}' 正被执行策略组引用，不能删除: "
+                + ", ".join(referenced_by)
+            )
         if self._repository.delete_provider(provider_id):
             logger.info("删除 LLM 服务商定义: %s", provider_id)
+
+    # ── 执行策略组管理 ──────────────────────────────────────
+
+    def list_execution_policies(self) -> list[LlmExecutionPolicy]:
+        return self._repository.find_all_execution_policies()
+
+    def get_execution_policy(self, policy_group_id: str) -> LlmExecutionPolicy:
+        policy = self._repository.find_execution_policy_by_id(policy_group_id)
+        if policy is None:
+            raise KeyError(f"LLM 执行策略组不存在: {policy_group_id}")
+        return policy
+
+    def save_execution_policy(self, policy: LlmExecutionPolicy) -> LlmExecutionPolicy:
+        self._validate_execution_policy_references(policy)
+        self._repository.save_execution_policy(policy)
+        logger.info("保存 LLM 执行策略组: %s", policy.policy_group_id)
+        return policy
+
+    def delete_execution_policy(self, policy_group_id: str) -> None:
+        if self._repository.delete_execution_policy(policy_group_id):
+            logger.info("删除 LLM 执行策略组: %s", policy_group_id)
+
+    def resolve_execution_policy(
+        self,
+        policy_group_id: str,
+    ) -> ResolvedLlmExecutionPolicy:
+        policy = self.get_execution_policy(policy_group_id)
+        if not policy.enabled:
+            raise ValueError(f"LLM 执行策略组已禁用: {policy_group_id}")
+        candidates = policy.enabled_candidates()
+        if not candidates:
+            raise ValueError(f"LLM 执行策略组没有可用候选项: {policy_group_id}")
+        resolved_candidates = tuple(
+            ResolvedLlmExecutionPolicyCandidate(
+                candidate_id=candidate.id,
+                provider_id=candidate.provider_id,
+                model_binding_id=candidate.model_binding_id,
+                resolved_model=self.resolve_provider_model(
+                    candidate.provider_id,
+                    candidate.model_binding_id,
+                ),
+            )
+            for candidate in candidates
+        )
+        return ResolvedLlmExecutionPolicy(
+            policy_group_id=policy.policy_group_id,
+            name=policy.name,
+            description=policy.description,
+            strategy=policy.strategy,
+            failure_policy=policy.failure_policy,
+            candidates=resolved_candidates,
+        )
 
     # ── 服务商模型接入项查询与解析 ────────────────────────────
 
@@ -255,3 +357,24 @@ class LlmModelRegistryService:
             supports_structured_output=metadata.supports_structured_output,
             supported_input_modalities=metadata.supported_input_modalities,
         )
+
+    def _validate_execution_policy_references(self, policy: LlmExecutionPolicy) -> None:
+        missing_candidates: list[str] = []
+        for candidate in policy.candidates:
+            provider = self._repository.find_provider_by_id(candidate.provider_id)
+            if provider is None:
+                missing_candidates.append(
+                    f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
+                )
+                continue
+            if not any(binding.id == candidate.model_binding_id for binding in provider.models):
+                missing_candidates.append(
+                    f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
+                )
+        if missing_candidates:
+            raise ValueError(
+                "LLM 执行策略组候选项引用了不存在的服务商模型接入项: "
+                + ", ".join(missing_candidates)
+            )
+        if policy.enabled and not policy.enabled_candidates():
+            raise ValueError("启用状态的 LLM 执行策略组至少需要一个启用候选项。")

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
+from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     LlmModelRegistryService,
+    ResolvedLlmExecutionPolicy,
     ResolvedLlmProviderModel,
 )
 from agent_runtime.llm_model_registry.llm_provider_definition import (
@@ -12,6 +14,7 @@ from agent_runtime.llm_model_registry.llm_provider_definition import (
     LlmProviderModelBinding,
 )
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
+    LlmExecutionPolicySaveRequest,
     LlmModelMetadataSaveRequest,
     LlmProviderSaveRequest,
 )
@@ -67,6 +70,29 @@ class LlmModelRegistryGatewayImpl:
     def delete_provider(self, provider_id: str) -> None:
         """删除服务商定义。不存在时静默跳过。"""
         self._service.delete_provider(provider_id)
+
+    # ── 执行策略组管理 ──────────────────────────────────────
+
+    def list_execution_policies(self) -> list[LlmExecutionPolicy]:
+        return self._service.list_execution_policies()
+
+    def get_execution_policy(self, policy_group_id: str) -> LlmExecutionPolicy:
+        return self._service.get_execution_policy(policy_group_id)
+
+    def save_execution_policy(
+        self,
+        request: LlmExecutionPolicySaveRequest,
+    ) -> LlmExecutionPolicy:
+        return self._service.save_execution_policy(request.to_policy())
+
+    def delete_execution_policy(self, policy_group_id: str) -> None:
+        self._service.delete_execution_policy(policy_group_id)
+
+    def resolve_execution_policy(
+        self,
+        policy_group_id: str,
+    ) -> ResolvedLlmExecutionPolicy:
+        return self._service.resolve_execution_policy(policy_group_id)
 
     # ── 服务商模型接入项查询与解析 ────────────────────────────
 

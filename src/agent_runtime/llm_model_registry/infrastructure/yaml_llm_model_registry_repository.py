@@ -4,6 +4,7 @@
 用户自定义注册数据按类型拆分为独立 YAML 文件：
   ~/.spread-ai/llm-model-registry/models/{model_id}.yaml
   ~/.spread-ai/llm-model-registry/providers/{provider_id}.yaml
+  ~/.spread-ai/llm-model-registry/execution-policies/{policy_group_id}.yaml
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from typing import Callable
 import yaml
 
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
+from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
 from agent_runtime.llm_model_registry.llm_provider_definition import LlmProviderDefinition
 from agent_runtime.llm_model_registry.llm_registry_validation import validate_registry_id
 
@@ -34,6 +36,7 @@ class YamlLlmModelRegistryRepository:
         self._registry_dir_accessor = registry_dir_accessor
         self._models_dir.mkdir(parents=True, exist_ok=True)
         self._providers_dir.mkdir(parents=True, exist_ok=True)
+        self._execution_policies_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def _registry_dir(self) -> Path:
@@ -49,6 +52,10 @@ class YamlLlmModelRegistryRepository:
     def _providers_dir(self) -> Path:
         """服务商定义 YAML 文件目录。"""
         return self._registry_dir / "providers"
+
+    @property
+    def _execution_policies_dir(self) -> Path:
+        return self._registry_dir / "execution-policies"
 
     # ── 模型元数据集合 ──────────────────────────────────────
 
@@ -144,6 +151,46 @@ class YamlLlmModelRegistryRepository:
         """判断服务商定义文件是否存在。"""
         return self._get_provider_file_path(provider_id).exists()
 
+    # ── 执行策略组集合 ──────────────────────────────────────
+
+    def find_all_execution_policies(self) -> list[LlmExecutionPolicy]:
+        policies: list[LlmExecutionPolicy] = []
+        if not self._execution_policies_dir.exists():
+            return policies
+        for yaml_file in sorted(self._execution_policies_dir.glob("*.yaml")):
+            policy = self._load_execution_policy_file(yaml_file.stem, yaml_file)
+            if policy is not None:
+                policies.append(policy)
+        return policies
+
+    def find_execution_policy_by_id(self, policy_group_id: str) -> LlmExecutionPolicy | None:
+        yaml_file = self._get_execution_policy_file_path(policy_group_id)
+        if not yaml_file.exists():
+            return None
+        return self._load_execution_policy_file(policy_group_id, yaml_file)
+
+    def save_execution_policy(self, policy: LlmExecutionPolicy) -> None:
+        self._execution_policies_dir.mkdir(parents=True, exist_ok=True)
+        yaml_file = self._get_execution_policy_file_path(policy.policy_group_id)
+        with open(yaml_file, "w", encoding="utf-8") as f:
+            yaml.dump(
+                policy.to_dict(),
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+
+    def delete_execution_policy(self, policy_group_id: str) -> bool:
+        yaml_file = self._get_execution_policy_file_path(policy_group_id)
+        if yaml_file.exists():
+            yaml_file.unlink()
+            return True
+        return False
+
+    def contains_execution_policy(self, policy_group_id: str) -> bool:
+        return self._get_execution_policy_file_path(policy_group_id).exists()
+
     # ── 内部方法 ──────────────────────────────────────────────
 
     def _get_model_file_path(self, model_id: str) -> Path:
@@ -155,6 +202,10 @@ class YamlLlmModelRegistryRepository:
         """获取服务商定义文件路径，并执行文件名安全校验。"""
         validate_registry_id(provider_id, "provider_id")
         return self._providers_dir / f"{provider_id}.yaml"
+
+    def _get_execution_policy_file_path(self, policy_group_id: str) -> Path:
+        validate_registry_id(policy_group_id, "policy_group_id")
+        return self._execution_policies_dir / f"{policy_group_id}.yaml"
 
     def _load_model_file(
         self,
@@ -194,3 +245,21 @@ class YamlLlmModelRegistryRepository:
             return provider
         except Exception:
             return None
+
+    def _load_execution_policy_file(
+        self,
+        policy_group_id: str,
+        yaml_file: Path,
+    ) -> LlmExecutionPolicy | None:
+        try:
+            with open(yaml_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return None
+            policy = LlmExecutionPolicy.from_dict(policy_group_id, data)
+            if policy.policy_group_id != policy_group_id:
+                return None
+            return policy
+        except Exception:
+            return None
+

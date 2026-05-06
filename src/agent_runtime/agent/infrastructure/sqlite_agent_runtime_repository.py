@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS agent_instances (
     agent_definition_id  TEXT NOT NULL,
     llm_provider_id      TEXT NOT NULL,
     llm_model_binding_id TEXT NOT NULL,
+    llm_policy_group_id  TEXT,
+    llm_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
     conversation_id      TEXT,
     trace_id             TEXT NOT NULL,
     status               TEXT NOT NULL,
@@ -190,10 +192,11 @@ class SqliteAgentRuntimeRepository:
                 """
                 INSERT OR REPLACE INTO agent_instances (
                     instance_id, task_id, thread_id, current_working_directory, agent_definition_id,
-                    llm_provider_id, llm_model_binding_id, conversation_id, trace_id,
+                    llm_provider_id, llm_model_binding_id, llm_policy_group_id,
+                    llm_policy_snapshot_json, conversation_id, trace_id,
                     status, created_at, updated_at, started_at, paused_at,
                     finished_at, failed_at, failure_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     instance.instance_id,
@@ -203,6 +206,8 @@ class SqliteAgentRuntimeRepository:
                     instance.agent_definition_id,
                     instance.llm_provider_id,
                     instance.llm_model_binding_id,
+                    instance.llm_policy_group_id,
+                    json.dumps(instance.llm_policy_snapshot_json, ensure_ascii=False),
                     instance.conversation_id,
                     instance.trace_id,
                     instance.status,
@@ -273,6 +278,16 @@ class SqliteAgentRuntimeRepository:
                 "ADD COLUMN current_working_directory TEXT NOT NULL "
                 "DEFAULT '__legacy_missing_current_working_directory__'"
             )
+        if "llm_policy_group_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE agent_instances "
+                "ADD COLUMN llm_policy_group_id TEXT"
+            )
+        if "llm_policy_snapshot_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE agent_instances "
+                "ADD COLUMN llm_policy_snapshot_json TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def _load_task_relations(self, task_id: str) -> tuple[AgentParentChildRelation, ...]:
         """加载指定 task 的父子关系树边集合。"""
@@ -333,7 +348,8 @@ class SqliteAgentRuntimeRepository:
 
 _INSTANCE_SELECT_SQL = """
 SELECT instance_id, task_id, thread_id, current_working_directory, agent_definition_id,
-       llm_provider_id, llm_model_binding_id, conversation_id, trace_id,
+       llm_provider_id, llm_model_binding_id, llm_policy_group_id, llm_policy_snapshot_json,
+       conversation_id, trace_id,
        status, created_at, updated_at, started_at, paused_at,
        finished_at, failed_at, failure_message
 FROM agent_instances
@@ -372,16 +388,18 @@ def _row_to_instance(row: sqlite3.Row | tuple) -> AgentInstance:
         agent_definition_id=row[4],
         llm_provider_id=row[5],
         llm_model_binding_id=row[6],
-        conversation_id=row[7],
-        trace_id=row[8],
-        status=row[9],
-        created_at=_text_to_datetime(row[10]),
-        updated_at=_text_to_datetime(row[11]),
-        started_at=_optional_text_to_datetime(row[12]),
-        paused_at=_optional_text_to_datetime(row[13]),
-        finished_at=_optional_text_to_datetime(row[14]),
-        failed_at=_optional_text_to_datetime(row[15]),
-        failure_message=row[16],
+        llm_policy_group_id=row[7],
+        llm_policy_snapshot_json=json.loads(row[8] or "{}"),
+        conversation_id=row[9],
+        trace_id=row[10],
+        status=row[11],
+        created_at=_text_to_datetime(row[12]),
+        updated_at=_text_to_datetime(row[13]),
+        started_at=_optional_text_to_datetime(row[14]),
+        paused_at=_optional_text_to_datetime(row[15]),
+        finished_at=_optional_text_to_datetime(row[16]),
+        failed_at=_optional_text_to_datetime(row[17]),
+        failure_message=row[18],
     )
 
 

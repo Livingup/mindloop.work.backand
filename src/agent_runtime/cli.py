@@ -321,6 +321,7 @@ def serve(host: str | None, port: int | None) -> None:
             agent_runtime_gateway,
             llm_model_registry_gateway,
             agent_execution_engine,
+            agent_definition_gateway,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],

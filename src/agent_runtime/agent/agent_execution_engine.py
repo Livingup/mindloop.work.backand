@@ -43,8 +43,12 @@ from agent_runtime.conversation_message.message.models import (
     ROLE_TOOL,
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
-from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
+from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
+from agent_runtime.llm_client.llm_protocol_clients import LlmHttpRequestError
+from agent_runtime.llm_model_registry.llm_model_registry_service import (
+    ResolvedLlmProviderModel,
+)
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelRegistryGateway,
 )
@@ -367,36 +371,19 @@ class AgentExecutionEngine:
                 source="agent_execution_engine",
             )
 
-            resolved_model = self._llm_registry_gateway.resolve_provider_model(
-                instance.llm_provider_id,
-                instance.llm_model_binding_id,
-            )
-
             plain_text_fallback_count = 0
             while True:
+                instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
-                system_prompt = self._render_system_prompt(
-                    agent_definition,
-                    instance.current_working_directory,
-                    request.render_options,
-                )
-                tools = await self._tool_dispatcher.build_llm_tools(
+                llm_response = await self._send_prompt_with_policy_failover(
+                    conversation=conversation,
                     agent_definition=agent_definition,
-                    sdk_platform=resolved_model.sdk_platform,
-                )
-                llm_response = await self._llm_request_service.send_prompt(
-                    LlmPromptRequest(
-                        conversation=conversation,
-                        resolved_model=resolved_model,
-                        system_prompt=system_prompt,
-                        tools=tools,
-                        render_options=request.render_options,
-                        request_overrides=request.request_overrides,
-                        communication_context=communication_context.with_actor(
-                            actor_type="llm_client",
-                            actor_id=instance.instance_id,
-                        ),
-                    )
+                    instance=instance,
+                    resolved_candidates=resolved_candidates,
+                    render_options=request.render_options,
+                    request_overrides=request.request_overrides,
+                    communication_context=communication_context,
                 )
                 assistant_message = llm_response.assistant_message
                 await self._conversation_repository.save(conversation)
@@ -598,6 +585,116 @@ class AgentExecutionEngine:
         if definition.disabled:
             raise ValueError(f"Agent 定义已禁用，不能执行: {agent_definition_id}")
         return definition
+
+    def _resolve_instance_llm_candidates(
+        self,
+        instance: AgentInstance,
+    ) -> tuple[ResolvedLlmProviderModel, ...]:
+        candidates = instance.llm_policy_snapshot_json.get("candidates")
+        if isinstance(candidates, list) and candidates:
+            resolved: list[ResolvedLlmProviderModel] = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                provider_id = candidate.get("provider_id")
+                model_binding_id = candidate.get("model_binding_id")
+                if not provider_id or not model_binding_id:
+                    continue
+                resolved.append(
+                    self._llm_registry_gateway.resolve_provider_model(
+                        str(provider_id),
+                        str(model_binding_id),
+                    )
+                )
+            if resolved:
+                return tuple(resolved)
+        return (
+            self._llm_registry_gateway.resolve_provider_model(
+                instance.llm_provider_id,
+                instance.llm_model_binding_id,
+            ),
+        )
+
+    async def _send_prompt_with_policy_failover(
+        self,
+        *,
+        conversation: Any,
+        agent_definition: AgentDefinition,
+        instance: AgentInstance,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
+        render_options: dict[str, Any],
+        request_overrides: dict[str, Any],
+        communication_context: RuntimeCommunicationContext,
+    ) -> LlmPromptResponse:
+        last_error: Exception | None = None
+        failure_policy = instance.llm_policy_snapshot_json.get("failure_policy") or {}
+        max_candidates = int(failure_policy.get("max_candidates_per_request") or 0)
+        candidates = resolved_candidates[:max_candidates] if max_candidates > 0 else resolved_candidates
+        for candidate_index, resolved_model in enumerate(candidates):
+            system_prompt = self._render_system_prompt(
+                agent_definition,
+                instance.current_working_directory,
+                render_options,
+            )
+            tools = await self._tool_dispatcher.build_llm_tools(
+                agent_definition=agent_definition,
+                sdk_platform=resolved_model.sdk_platform,
+            )
+            try:
+                return await self._llm_request_service.send_prompt(
+                    LlmPromptRequest(
+                        conversation=conversation,
+                        resolved_model=resolved_model,
+                        system_prompt=system_prompt,
+                        tools=tools,
+                        render_options=render_options,
+                        request_overrides=request_overrides,
+                        communication_context=communication_context.with_actor(
+                            actor_type="llm_client",
+                            actor_id=instance.instance_id,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                last_error = exc
+                can_failover = (
+                    candidate_index < len(candidates) - 1
+                    and _should_failover_llm_candidate(exc, failure_policy)
+                )
+                await self._event_publisher.publish(
+                    communication_context,
+                    "llm.policy.candidate.failed",
+                    {
+                        "policy_group_id": instance.llm_policy_group_id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "will_failover": can_failover,
+                    },
+                    source="agent_execution_engine",
+                )
+                if not can_failover:
+                    raise
+                next_model = candidates[candidate_index + 1]
+                await self._event_publisher.publish(
+                    communication_context,
+                    "llm.policy.failover",
+                    {
+                        "policy_group_id": instance.llm_policy_group_id,
+                        "from_provider_id": resolved_model.provider_id,
+                        "from_binding_id": resolved_model.binding_id,
+                        "to_provider_id": next_model.provider_id,
+                        "to_binding_id": next_model.binding_id,
+                        "reason": exc.__class__.__name__,
+                    },
+                    source="agent_execution_engine",
+                )
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM 执行策略组没有可用候选项。")
 
     async def _load_or_create_conversation(
         self,
@@ -990,6 +1087,68 @@ def _format_render_option_values(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value)
     return str(value)
+
+
+def _should_failover_llm_candidate(
+    exc: Exception,
+    failure_policy: dict[str, Any],
+) -> bool:
+    status_codes = {
+        int(item)
+        for item in failure_policy.get(
+            "failover_on_status_codes",
+            [408, 429, 500, 502, 503, 504],
+        )
+    }
+    error_types = {
+        str(item)
+        for item in failure_policy.get(
+            "failover_on_error_types",
+            ["TimeoutError", "LlmHttpRequestError"],
+        )
+    }
+    text = str(exc).lower()
+    if isinstance(exc, LlmHttpRequestError):
+        if exc.status_code in status_codes:
+            return True
+        if failure_policy.get("failover_on_auth_error", True) and exc.status_code in {401, 403}:
+            return True
+        text = f"{exc.response_text}\n{text}".lower()
+    if exc.__class__.__name__ in error_types:
+        return True
+    if failure_policy.get("failover_on_auth_error", True) and _looks_like_auth_error(text):
+        return True
+    if failure_policy.get("failover_on_context_length_error", True) and _looks_like_context_length_error(text):
+        return True
+    return False
+
+
+def _looks_like_auth_error(text: str) -> bool:
+    return any(
+        keyword in text
+        for keyword in (
+            "unauthorized",
+            "forbidden",
+            "invalid api key",
+            "invalid_api_key",
+            "authentication",
+            "permission denied",
+        )
+    )
+
+
+def _looks_like_context_length_error(text: str) -> bool:
+    return any(
+        keyword in text
+        for keyword in (
+            "context length",
+            "context_length",
+            "maximum context",
+            "token limit",
+            "too many tokens",
+            "input is too long",
+        )
+    )
 
 
 def _trace_identity(instance: AgentInstance) -> AgentTraceIdentity:

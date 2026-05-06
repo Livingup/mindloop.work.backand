@@ -7,9 +7,9 @@ Agent 静态模板数据由 agent_definition 模块维护，本文件中的 Agen
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Final, TypeAlias
+from typing import Any, Final, TypeAlias
 
 
 AgentInstanceStatus: TypeAlias = str
@@ -118,6 +118,10 @@ class AgentInstance:
     # 执行日志 trace 标识。日志系统可用该字段把实例运行过程与日志链路关联起来。
     trace_id: str
 
+    llm_policy_group_id: str | None = None
+
+    llm_policy_snapshot_json: dict[str, Any] = field(default_factory=dict)
+
     # 当前实例状态。状态流转由领域服务显式触发。
     status: AgentInstanceStatus = AGENT_INSTANCE_STATUS_CREATED
 
@@ -151,6 +155,10 @@ class AgentInstance:
         _require_non_blank(self.agent_definition_id, "agent_definition_id")
         _require_non_blank(self.llm_provider_id, "llm_provider_id")
         _require_non_blank(self.llm_model_binding_id, "llm_model_binding_id")
+        if self.llm_policy_group_id is not None:
+            _require_non_blank(self.llm_policy_group_id, "llm_policy_group_id")
+        if not isinstance(self.llm_policy_snapshot_json, dict):
+            raise ValueError("llm_policy_snapshot_json 必须是对象。")
         _require_non_blank(self.trace_id, "trace_id")
         if self.conversation_id is not None:
             _require_non_blank(self.conversation_id, "conversation_id")
@@ -188,6 +196,29 @@ class AgentInstance:
         if self.conversation_id is not None:
             raise ValueError("Agent 实例已经绑定其他 conversation_id，不能覆盖。")
         return replace(self, conversation_id=conversation_id, updated_at=at or _utc_now())
+
+    def switch_llm_policy(
+        self,
+        *,
+        llm_policy_group_id: str,
+        llm_policy_snapshot_json: dict[str, Any],
+        llm_provider_id: str,
+        llm_model_binding_id: str,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        _require_non_blank(llm_policy_group_id, "llm_policy_group_id")
+        _require_non_blank(llm_provider_id, "llm_provider_id")
+        _require_non_blank(llm_model_binding_id, "llm_model_binding_id")
+        if not isinstance(llm_policy_snapshot_json, dict):
+            raise ValueError("llm_policy_snapshot_json 必须是对象。")
+        return replace(
+            self,
+            llm_policy_group_id=llm_policy_group_id,
+            llm_policy_snapshot_json=dict(llm_policy_snapshot_json),
+            llm_provider_id=llm_provider_id,
+            llm_model_binding_id=llm_model_binding_id,
+            updated_at=at or _utc_now(),
+        )
 
     def transition_to(
         self,

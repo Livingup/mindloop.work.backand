@@ -36,6 +36,8 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             agent_definition_id=request.agent_definition_id,
             llm_provider_id=request.llm_provider_id,
             llm_model_binding_id=request.llm_model_binding_id,
+            llm_policy_group_id=request.llm_policy_group_id,
+            llm_policy_snapshot_json=request.llm_policy_snapshot_json,
             conversation_id=request.conversation_id,
             trace_id=request.trace_id,
         )
@@ -54,6 +56,8 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             agent_definition_id=request.agent_definition_id,
             llm_provider_id=request.llm_provider_id,
             llm_model_binding_id=request.llm_model_binding_id,
+            llm_policy_group_id=request.llm_policy_group_id,
+            llm_policy_snapshot_json=request.llm_policy_snapshot_json,
             conversation_id=request.conversation_id,
             trace_id=request.trace_id,
             relation_id=request.relation_id,
@@ -155,4 +159,21 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         return self._service.bind_agent_instance_conversation(
             instance_id,
             conversation_id,
+        )
+
+    def switch_agent_instance_llm_policy(
+        self,
+        instance_id: str,
+        *,
+        llm_policy_group_id: str,
+        llm_policy_snapshot_json: dict,
+        llm_provider_id: str,
+        llm_model_binding_id: str,
+    ) -> AgentInstance:
+        return self._service.switch_agent_instance_llm_policy(
+            instance_id,
+            llm_policy_group_id=llm_policy_group_id,
+            llm_policy_snapshot_json=llm_policy_snapshot_json,
+            llm_provider_id=llm_provider_id,
+            llm_model_binding_id=llm_model_binding_id,
         )

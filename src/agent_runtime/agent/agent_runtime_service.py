@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from threading import RLock
+from typing import Any
 from uuid import uuid4
 
 from agent_runtime.agent.agent_instance import (
@@ -66,6 +67,8 @@ class AgentRuntimeService:
         agent_definition_id: str,
         llm_provider_id: str,
         llm_model_binding_id: str,
+        llm_policy_group_id: str | None = None,
+        llm_policy_snapshot_json: dict[str, Any] | None = None,
         task_id: str | None = None,
         root_instance_id: str | None = None,
         conversation_id: str | None = None,
@@ -95,6 +98,8 @@ class AgentRuntimeService:
                 llm_model_binding_id=llm_model_binding_id,
                 conversation_id=conversation_id,
                 trace_id=actual_trace_id,
+                llm_policy_group_id=llm_policy_group_id,
+                llm_policy_snapshot_json=llm_policy_snapshot_json or {},
             )
             task = AgentTask(
                 task_id=actual_task_id,
@@ -120,6 +125,8 @@ class AgentRuntimeService:
         agent_definition_id: str,
         llm_provider_id: str,
         llm_model_binding_id: str,
+        llm_policy_group_id: str | None = None,
+        llm_policy_snapshot_json: dict[str, Any] | None = None,
         child_instance_id: str | None = None,
         conversation_id: str | None = None,
         trace_id: str | None = None,
@@ -157,6 +164,8 @@ class AgentRuntimeService:
                 llm_model_binding_id=llm_model_binding_id,
                 conversation_id=conversation_id,
                 trace_id=actual_trace_id,
+                llm_policy_group_id=llm_policy_group_id,
+                llm_policy_snapshot_json=llm_policy_snapshot_json or {},
             )
             updated_task = task.add_child_relation(
                 child_instance_id=actual_child_instance_id,
@@ -293,6 +302,28 @@ class AgentRuntimeService:
         with self._lock:
             instance = self._get_required_instance(instance_id)
             updated = instance.bind_conversation(conversation_id)
+            self._repository.save_agent_instance(updated)
+            return updated
+
+    def switch_agent_instance_llm_policy(
+        self,
+        instance_id: str,
+        *,
+        llm_policy_group_id: str,
+        llm_policy_snapshot_json: dict[str, Any],
+        llm_provider_id: str,
+        llm_model_binding_id: str,
+    ) -> AgentInstance:
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            if instance.is_terminal:
+                raise ValueError(f"Agent 实例已结束，不能切换 LLM 执行策略组: {instance_id}")
+            updated = instance.switch_llm_policy(
+                llm_policy_group_id=llm_policy_group_id,
+                llm_policy_snapshot_json=llm_policy_snapshot_json,
+                llm_provider_id=llm_provider_id,
+                llm_model_binding_id=llm_model_binding_id,
+            )
             self._repository.save_agent_instance(updated)
             return updated
 

@@ -55,6 +55,8 @@ class AgentDefinitionResponse(BaseModel):
     mcp_tools: list[dict[str, Any]] = Field(default_factory=list)
     skill_ids: list[str] = Field(default_factory=list)
     available_sub_agent_ids: list[str] = Field(default_factory=list)
+    default_llm_policy_group_id: str | None = None
+    allowed_llm_policy_group_ids: list[str] = Field(default_factory=list)
     builtin_background_agent: bool = False
     disabled: bool = False
 
@@ -71,6 +73,8 @@ class AgentDefinitionCreateBody(BaseModel):
     mcp_tools: list[McpToolBindingBody] = Field(default_factory=list)
     skill_ids: list[str] = Field(default_factory=list)
     available_sub_agent_ids: list[str] = Field(default_factory=list)
+    default_llm_policy_group_id: str | None = None
+    allowed_llm_policy_group_ids: list[str] = Field(default_factory=list)
     builtin_background_agent: bool = False
     disabled: bool = False
 
@@ -89,6 +93,8 @@ class AgentDefinitionUpdateBody(BaseModel):
     mcp_tools: list[McpToolBindingBody] | None = None
     skill_ids: list[str] | None = None
     available_sub_agent_ids: list[str] | None = None
+    default_llm_policy_group_id: str | None = None
+    allowed_llm_policy_group_ids: list[str] | None = None
     builtin_background_agent: bool | None = None
     disabled: bool | None = None
 
@@ -216,6 +222,8 @@ def _body_to_create_request(
         ),
         skill_ids=tuple(body.skill_ids),
         available_sub_agent_ids=tuple(body.available_sub_agent_ids),
+        default_llm_policy_group_id=body.default_llm_policy_group_id,
+        allowed_llm_policy_group_ids=tuple(body.allowed_llm_policy_group_ids),
         builtin_background_agent=body.builtin_background_agent,
         disabled=body.disabled,
     )
@@ -225,6 +233,7 @@ def _body_to_update_request(
     body: AgentDefinitionUpdateBody,
 ) -> AgentDefinitionUpdateRequest:
     """将 REST 更新请求体转换为北向更新请求。"""
+    body_fields_set = getattr(body, "model_fields_set", getattr(body, "__fields_set__", set()))
     return AgentDefinitionUpdateRequest(
         name=body.name,
         description=body.description,
@@ -245,6 +254,12 @@ def _body_to_update_request(
         available_sub_agent_ids=(
             tuple(body.available_sub_agent_ids)
             if body.available_sub_agent_ids is not None else None
+        ),
+        default_llm_policy_group_id=body.default_llm_policy_group_id,
+        update_default_llm_policy_group_id="default_llm_policy_group_id" in body_fields_set,
+        allowed_llm_policy_group_ids=(
+            tuple(body.allowed_llm_policy_group_ids)
+            if body.allowed_llm_policy_group_ids is not None else None
         ),
         builtin_background_agent=body.builtin_background_agent,
         disabled=body.disabled,

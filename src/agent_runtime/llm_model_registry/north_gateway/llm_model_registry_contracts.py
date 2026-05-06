@@ -10,8 +10,14 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT
+from agent_runtime.llm_model_registry.llm_execution_policy import (
+    LlmExecutionFailurePolicy,
+    LlmExecutionPolicy,
+    LlmExecutionPolicyCandidate,
+)
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
+    ResolvedLlmExecutionPolicy,
     ResolvedLlmProviderModel,
 )
 from agent_runtime.llm_model_registry.llm_provider_definition import (
@@ -136,6 +142,43 @@ class LlmProviderSaveRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LlmExecutionPolicySaveRequest:
+    policy_group_id: str
+    name: str | None = None
+    description: str | None = None
+    group: str = "default"
+    enabled: bool = True
+    strategy: str = "ordered_failover"
+    failure_policy: LlmExecutionFailurePolicy = field(default_factory=LlmExecutionFailurePolicy)
+    candidates: tuple[LlmExecutionPolicyCandidate, ...] = field(default_factory=tuple)
+
+    def to_policy(self) -> LlmExecutionPolicy:
+        return LlmExecutionPolicy(
+            policy_group_id=self.policy_group_id,
+            name=self.name,
+            description=self.description,
+            group=self.group,
+            enabled=self.enabled,
+            strategy=self.strategy,
+            failure_policy=self.failure_policy,
+            candidates=self.candidates,
+        )
+
+    @classmethod
+    def from_policy(cls, policy: LlmExecutionPolicy) -> LlmExecutionPolicySaveRequest:
+        return cls(
+            policy_group_id=policy.policy_group_id,
+            name=policy.name,
+            description=policy.description,
+            group=policy.group,
+            enabled=policy.enabled,
+            strategy=policy.strategy,
+            failure_policy=policy.failure_policy,
+            candidates=policy.candidates,
+        )
+
+
 class LlmModelRegistryGateway(Protocol):
     """LLM 服务商与模型注册模块北向网关接口。
 
@@ -180,6 +223,29 @@ class LlmModelRegistryGateway(Protocol):
 
     def delete_provider(self, provider_id: str) -> None:
         """删除服务商定义。不存在时静默跳过。"""
+        ...
+
+    # ── 执行策略组管理 ──────────────────────────────────────
+
+    def list_execution_policies(self) -> list[LlmExecutionPolicy]:
+        ...
+
+    def get_execution_policy(self, policy_group_id: str) -> LlmExecutionPolicy:
+        ...
+
+    def save_execution_policy(
+        self,
+        request: LlmExecutionPolicySaveRequest,
+    ) -> LlmExecutionPolicy:
+        ...
+
+    def delete_execution_policy(self, policy_group_id: str) -> None:
+        ...
+
+    def resolve_execution_policy(
+        self,
+        policy_group_id: str,
+    ) -> ResolvedLlmExecutionPolicy:
         ...
 
     # ── 服务商模型接入项查询与解析 ────────────────────────────

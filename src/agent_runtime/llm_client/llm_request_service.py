@@ -73,7 +73,7 @@ class LlmRequestService:
         )
         request_params = _merge_request_params(request)
         tool_schemas = tuple(tool.schema for tool in request.tools)
-        api_keys = [_resolve_api_key(item.key) for item in resolved.api_keys]
+        api_keys: list[str | None] = [item.key for item in resolved.api_keys]
         if not api_keys:
             api_keys = [None]
 
@@ -96,7 +96,28 @@ class LlmRequestService:
 
         attempt_count = 0
         last_error: Exception | None = None
-        for key_index, api_key in enumerate(api_keys):
+        for key_index, raw_api_key in enumerate(api_keys):
+            try:
+                api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
+            except Exception as exc:
+                last_error = exc
+                await self._event_publisher.publish(
+                    request.communication_context,
+                    "llm.request.api_key.failed",
+                    {
+                        "provider_id": resolved.provider_id,
+                        "binding_id": resolved.binding_id,
+                        "model_alias": resolved.model_alias,
+                        "api_key_index": key_index,
+                        "attempt_count": attempt_count,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "will_try_next_key": key_index < len(api_keys) - 1,
+                    },
+                    source="llm_client",
+                    metadata={"conversation_id": request.conversation.id},
+                )
+                continue
             max_retries = resolved.retry.max_retries_per_key
             for retry_index in range(max_retries + 1):
                 attempt_count += 1
@@ -191,20 +212,38 @@ class LlmRequestService:
                     if not _should_retry(exc, resolved.retry.retryable_status_codes):
                         await self._event_publisher.publish(
                             request.communication_context,
-                            "llm.request.failed",
+                            "llm.request.api_key.failed",
                             {
                                 "provider_id": resolved.provider_id,
                                 "binding_id": resolved.binding_id,
                                 "model_alias": resolved.model_alias,
+                                "api_key_index": key_index,
                                 "attempt_count": attempt_count,
                                 "error_type": exc.__class__.__name__,
                                 "error_message": str(exc),
+                                "will_try_next_key": key_index < len(api_keys) - 1,
                             },
                             source="llm_client",
                             metadata={"conversation_id": request.conversation.id},
                         )
-                        raise
+                        break
                     if retry_index >= max_retries:
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.request.api_key.failed",
+                            {
+                                "provider_id": resolved.provider_id,
+                                "binding_id": resolved.binding_id,
+                                "model_alias": resolved.model_alias,
+                                "api_key_index": key_index,
+                                "attempt_count": attempt_count,
+                                "error_type": exc.__class__.__name__,
+                                "error_message": str(exc),
+                                "will_try_next_key": key_index < len(api_keys) - 1,
+                            },
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
                         break
                     await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
         if last_error is not None:

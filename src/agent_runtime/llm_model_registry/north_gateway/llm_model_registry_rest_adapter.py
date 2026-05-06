@@ -13,8 +13,14 @@ from pydantic import BaseModel, Field
 
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
 from agent_runtime.llm_api_protocol import SUPPORTED_LLM_API_FORMATS
+from agent_runtime.llm_model_registry.llm_execution_policy import (
+    LlmExecutionFailurePolicy,
+    LlmExecutionPolicy,
+    LlmExecutionPolicyCandidate,
+)
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
+    ResolvedLlmExecutionPolicy,
     ResolvedLlmProviderModel,
 )
 from agent_runtime.llm_model_registry.llm_provider_definition import (
@@ -24,6 +30,7 @@ from agent_runtime.llm_model_registry.llm_provider_definition import (
     LlmRetryPolicy,
 )
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
+    LlmExecutionPolicySaveRequest,
     LlmModelMetadataSaveRequest,
     LlmModelRegistryGateway,
     LlmProviderSaveRequest,
@@ -118,6 +125,52 @@ class LlmProviderResponse(BaseModel):
     api_keys: list[dict[str, Any]] = Field(default_factory=list)
     retry: dict[str, Any]
     models: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class LlmExecutionPolicyCandidateBody(BaseModel):
+    id: str
+    provider_id: str
+    model_binding_id: str
+    enabled: bool = True
+    priority: int = 0
+
+
+class LlmExecutionFailurePolicyBody(BaseModel):
+    failover_on_status_codes: list[int] = Field(default_factory=lambda: [408, 429, 500, 502, 503, 504])
+    failover_on_error_types: list[str] = Field(default_factory=lambda: ["TimeoutError", "LlmHttpRequestError"])
+    failover_on_auth_error: bool = True
+    failover_on_context_length_error: bool = True
+    max_candidates_per_request: int = 0
+
+
+class LlmExecutionPolicyBody(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    group: str = "default"
+    enabled: bool = True
+    strategy: str = "ordered_failover"
+    failure_policy: LlmExecutionFailurePolicyBody = Field(default_factory=LlmExecutionFailurePolicyBody)
+    candidates: list[LlmExecutionPolicyCandidateBody] = Field(default_factory=list)
+
+
+class LlmExecutionPolicyResponse(BaseModel):
+    policy_group_id: str
+    name: str | None = None
+    description: str | None = None
+    group: str = "default"
+    enabled: bool = True
+    strategy: str = "ordered_failover"
+    failure_policy: dict[str, Any]
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ResolvedLlmExecutionPolicyResponse(BaseModel):
+    policy_group_id: str
+    name: str | None = None
+    description: str | None = None
+    strategy: str = "ordered_failover"
+    failure_policy: dict[str, Any]
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ResolvedLlmProviderModelResponse(BaseModel):
@@ -235,7 +288,52 @@ def create_llm_model_registry_router(
     @router.delete("/providers/{provider_id}", status_code=204)
     def delete_provider(provider_id: str) -> None:
         """删除 LLM 服务商定义。不存在时静默返回 204。"""
-        gateway.delete_provider(provider_id)
+        try:
+            gateway.delete_provider(provider_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    @router.get("/execution-policies", response_model=list[LlmExecutionPolicyResponse])
+    def list_execution_policies() -> list[LlmExecutionPolicyResponse]:
+        return [_execution_policy_to_response(item) for item in gateway.list_execution_policies()]
+
+    @router.get("/execution-policies/{policy_group_id}", response_model=LlmExecutionPolicyResponse)
+    def get_execution_policy(policy_group_id: str) -> LlmExecutionPolicyResponse:
+        try:
+            policy = gateway.get_execution_policy(policy_group_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"LLM 执行策略组不存在: {policy_group_id}")
+        return _execution_policy_to_response(policy)
+
+    @router.put("/execution-policies/{policy_group_id}", response_model=LlmExecutionPolicyResponse)
+    def save_execution_policy(
+        policy_group_id: str,
+        body: LlmExecutionPolicyBody,
+    ) -> LlmExecutionPolicyResponse:
+        try:
+            policy = gateway.save_execution_policy(
+                _body_to_execution_policy_request(policy_group_id, body)
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _execution_policy_to_response(policy)
+
+    @router.delete("/execution-policies/{policy_group_id}", status_code=204)
+    def delete_execution_policy(policy_group_id: str) -> None:
+        gateway.delete_execution_policy(policy_group_id)
+
+    @router.get(
+        "/execution-policies/{policy_group_id}/resolved",
+        response_model=ResolvedLlmExecutionPolicyResponse,
+    )
+    def resolve_execution_policy(policy_group_id: str) -> ResolvedLlmExecutionPolicyResponse:
+        try:
+            resolved = gateway.resolve_execution_policy(policy_group_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"LLM 执行策略组不存在: {policy_group_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _resolved_execution_policy_to_response(resolved)
 
     @router.get("/providers/{provider_id}/models", response_model=list[dict[str, Any]])
     def list_provider_model_bindings(provider_id: str) -> list[dict[str, Any]]:
@@ -277,11 +375,21 @@ def _provider_to_response(provider: LlmProviderDefinition) -> LlmProviderRespons
     return LlmProviderResponse(**provider.to_dict())
 
 
+def _execution_policy_to_response(policy: LlmExecutionPolicy) -> LlmExecutionPolicyResponse:
+    return LlmExecutionPolicyResponse(**policy.to_dict())
+
+
 def _resolved_to_response(
     resolved: ResolvedLlmProviderModel,
 ) -> ResolvedLlmProviderModelResponse:
     """将解析后的服务商模型调用配置转换为 REST 响应模型。"""
     return ResolvedLlmProviderModelResponse(**resolved.to_dict())
+
+
+def _resolved_execution_policy_to_response(
+    resolved: ResolvedLlmExecutionPolicy,
+) -> ResolvedLlmExecutionPolicyResponse:
+    return ResolvedLlmExecutionPolicyResponse(**resolved.to_dict())
 
 
 def _body_to_model_request(
@@ -317,6 +425,22 @@ def _body_to_provider_request(
     )
 
 
+def _body_to_execution_policy_request(
+    policy_group_id: str,
+    body: LlmExecutionPolicyBody,
+) -> LlmExecutionPolicySaveRequest:
+    return LlmExecutionPolicySaveRequest(
+        policy_group_id=policy_group_id,
+        name=body.name,
+        description=body.description,
+        group=body.group,
+        enabled=body.enabled,
+        strategy=body.strategy,
+        failure_policy=_body_to_execution_failure_policy(body.failure_policy),
+        candidates=tuple(_body_to_execution_policy_candidate(item) for item in body.candidates),
+    )
+
+
 def _body_to_api_key(body: LlmApiKeyBody) -> LlmApiKey:
     """将 API Key 请求体转换为领域值对象。"""
     return LlmApiKey(key=body.key, name=body.name)
@@ -329,6 +453,30 @@ def _body_to_retry_policy(body: LlmRetryPolicyBody) -> LlmRetryPolicy:
         initial_delay_seconds=body.initial_delay_seconds,
         max_delay_seconds=body.max_delay_seconds,
         retryable_status_codes=tuple(body.retryable_status_codes),
+    )
+
+
+def _body_to_execution_failure_policy(
+    body: LlmExecutionFailurePolicyBody,
+) -> LlmExecutionFailurePolicy:
+    return LlmExecutionFailurePolicy(
+        failover_on_status_codes=tuple(body.failover_on_status_codes),
+        failover_on_error_types=tuple(body.failover_on_error_types),
+        failover_on_auth_error=body.failover_on_auth_error,
+        failover_on_context_length_error=body.failover_on_context_length_error,
+        max_candidates_per_request=body.max_candidates_per_request,
+    )
+
+
+def _body_to_execution_policy_candidate(
+    body: LlmExecutionPolicyCandidateBody,
+) -> LlmExecutionPolicyCandidate:
+    return LlmExecutionPolicyCandidate(
+        id=body.id,
+        provider_id=body.provider_id,
+        model_binding_id=body.model_binding_id,
+        enabled=body.enabled,
+        priority=body.priority,
     )
 
 

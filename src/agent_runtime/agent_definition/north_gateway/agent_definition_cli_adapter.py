@@ -88,6 +88,12 @@ def _update_request_from_yaml(data: dict[str, Any]) -> AgentDefinitionUpdateRequ
         available_sub_agent_ids=_parse_string_list(
             data["available_sub_agent_ids"], "available_sub_agent_ids"
         ) if "available_sub_agent_ids" in data else None,
+        default_llm_policy_group_id=data.get("default_llm_policy_group_id")
+        if "default_llm_policy_group_id" in data else None,
+        update_default_llm_policy_group_id="default_llm_policy_group_id" in data,
+        allowed_llm_policy_group_ids=_parse_string_list(
+            data["allowed_llm_policy_group_ids"], "allowed_llm_policy_group_ids"
+        ) if "allowed_llm_policy_group_ids" in data else None,
         builtin_background_agent=bool(data["builtin_background_agent"])
         if "builtin_background_agent" in data else None,
         disabled=bool(data["disabled"]) if "disabled" in data else None,

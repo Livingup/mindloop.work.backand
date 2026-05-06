@@ -144,6 +144,10 @@ class AgentDefinition:
     # 当前 Agent 可调度的子 Agent 定义 ID 列表。
     available_sub_agent_ids: tuple[str, ...] = field(default_factory=tuple)
 
+    default_llm_policy_group_id: str | None = None
+
+    allowed_llm_policy_group_ids: tuple[str, ...] = field(default_factory=tuple)
+
     # Agent 管理分组。用于管理后台按业务域筛选 Agent 定义。
     group: str = "default"
 
@@ -162,6 +166,14 @@ class AgentDefinition:
         _ensure_unique_non_empty_ids(self.tool_ids, "本地工具 ID")
         _ensure_unique_non_empty_ids(self.skill_ids, "Skill ID")
         _ensure_unique_non_empty_ids(self.available_sub_agent_ids, "可用子 Agent ID")
+        _ensure_unique_non_empty_ids(self.allowed_llm_policy_group_ids, "允许 LLM 执行策略组 ID")
+        if self.default_llm_policy_group_id is not None:
+            _ensure_unique_non_empty_ids((self.default_llm_policy_group_id,), "默认 LLM 执行策略组 ID")
+            if (
+                self.allowed_llm_policy_group_ids
+                and self.default_llm_policy_group_id not in self.allowed_llm_policy_group_ids
+            ):
+                raise ValueError("默认 LLM 执行策略组必须包含在允许 LLM 执行策略组列表中。")
         for sub_agent_id in self.available_sub_agent_ids:
             _validate_agent_id(sub_agent_id)
         if self.agent_id in self.available_sub_agent_ids:
@@ -178,9 +190,12 @@ class AgentDefinition:
             "mcp_tools": [binding.to_dict() for binding in self.mcp_tools],
             "skill_ids": list(self.skill_ids),
             "available_sub_agent_ids": list(self.available_sub_agent_ids),
+            "allowed_llm_policy_group_ids": list(self.allowed_llm_policy_group_ids),
             "builtin_background_agent": self.builtin_background_agent,
             "disabled": self.disabled,
         }
+        if self.default_llm_policy_group_id is not None:
+            data["default_llm_policy_group_id"] = self.default_llm_policy_group_id
         if self.name is not None:
             data["name"] = self.name
         if self.description is not None:
@@ -225,6 +240,11 @@ class AgentDefinition:
             skill_ids=_to_str_tuple(data.get("skill_ids", []), "skill_ids"),
             available_sub_agent_ids=_to_str_tuple(
                 data.get("available_sub_agent_ids", []), "available_sub_agent_ids"
+            ),
+            default_llm_policy_group_id=data.get("default_llm_policy_group_id"),
+            allowed_llm_policy_group_ids=_to_str_tuple(
+                data.get("allowed_llm_policy_group_ids", []),
+                "allowed_llm_policy_group_ids",
             ),
             builtin_background_agent=bool(data.get("builtin_background_agent", False)),
             disabled=bool(data.get("disabled", False)),

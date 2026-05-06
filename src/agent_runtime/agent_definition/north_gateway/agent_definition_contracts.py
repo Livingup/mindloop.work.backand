@@ -50,6 +50,10 @@ class AgentDefinitionCreateRequest:
     # 可用子 Agent 定义 ID 列表。
     available_sub_agent_ids: tuple[str, ...] = field(default_factory=tuple)
 
+    default_llm_policy_group_id: str | None = None
+
+    allowed_llm_policy_group_ids: tuple[str, ...] = field(default_factory=tuple)
+
     # 是否为系统内置后台 Agent。
     builtin_background_agent: bool = False
 
@@ -68,6 +72,8 @@ class AgentDefinitionCreateRequest:
             mcp_tools=self.mcp_tools,
             skill_ids=self.skill_ids,
             available_sub_agent_ids=self.available_sub_agent_ids,
+            default_llm_policy_group_id=self.default_llm_policy_group_id,
+            allowed_llm_policy_group_ids=self.allowed_llm_policy_group_ids,
             builtin_background_agent=self.builtin_background_agent,
             disabled=self.disabled,
         )
@@ -85,6 +91,8 @@ class AgentDefinitionCreateRequest:
             mcp_tools=definition.mcp_tools,
             skill_ids=definition.skill_ids,
             available_sub_agent_ids=definition.available_sub_agent_ids,
+            default_llm_policy_group_id=definition.default_llm_policy_group_id,
+            allowed_llm_policy_group_ids=definition.allowed_llm_policy_group_ids,
             builtin_background_agent=definition.builtin_background_agent,
             disabled=definition.disabled,
         )
@@ -121,6 +129,11 @@ class AgentDefinitionUpdateRequest:
     # 新可用子 Agent ID 列表。None 表示不修改，空元组表示清空。
     available_sub_agent_ids: tuple[str, ...] | None = None
 
+    default_llm_policy_group_id: str | None = None
+    update_default_llm_policy_group_id: bool = False
+
+    allowed_llm_policy_group_ids: tuple[str, ...] | None = None
+
     # 新系统内置后台 Agent 标记。None 表示不修改。
     builtin_background_agent: bool | None = None
 
@@ -146,6 +159,16 @@ class AgentDefinitionUpdateRequest:
                 current.available_sub_agent_ids
                 if self.available_sub_agent_ids is None
                 else self.available_sub_agent_ids
+            ),
+            default_llm_policy_group_id=(
+                current.default_llm_policy_group_id
+                if not self.update_default_llm_policy_group_id
+                else self.default_llm_policy_group_id
+            ),
+            allowed_llm_policy_group_ids=(
+                current.allowed_llm_policy_group_ids
+                if self.allowed_llm_policy_group_ids is None
+                else self.allowed_llm_policy_group_ids
             ),
             builtin_background_agent=(
                 current.builtin_background_agent
