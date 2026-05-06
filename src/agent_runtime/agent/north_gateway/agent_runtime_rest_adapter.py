@@ -334,8 +334,6 @@ def _policy_snapshot_without_secrets(
         "policy_group_id": resolved.policy_group_id,
         "name": resolved.name,
         "description": resolved.description,
-        "strategy": resolved.strategy,
-        "failure_policy": resolved.failure_policy.to_dict(),
         "candidates": [
             {
                 "candidate_id": candidate.candidate_id,

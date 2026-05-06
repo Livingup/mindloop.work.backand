@@ -11,7 +11,6 @@ from typing import Protocol
 
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_execution_policy import (
-    LlmExecutionFailurePolicy,
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
 )
@@ -149,8 +148,6 @@ class LlmExecutionPolicySaveRequest:
     description: str | None = None
     group: str = "default"
     enabled: bool = True
-    strategy: str = "ordered_failover"
-    failure_policy: LlmExecutionFailurePolicy = field(default_factory=LlmExecutionFailurePolicy)
     candidates: tuple[LlmExecutionPolicyCandidate, ...] = field(default_factory=tuple)
 
     def to_policy(self) -> LlmExecutionPolicy:
@@ -160,8 +157,6 @@ class LlmExecutionPolicySaveRequest:
             description=self.description,
             group=self.group,
             enabled=self.enabled,
-            strategy=self.strategy,
-            failure_policy=self.failure_policy,
             candidates=self.candidates,
         )
 
@@ -173,8 +168,6 @@ class LlmExecutionPolicySaveRequest:
             description=policy.description,
             group=policy.group,
             enabled=policy.enabled,
-            strategy=policy.strategy,
-            failure_policy=policy.failure_policy,
             candidates=policy.candidates,
         )
 

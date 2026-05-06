@@ -14,7 +14,6 @@ from pydantic import BaseModel, Field
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
 from agent_runtime.llm_api_protocol import SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_execution_policy import (
-    LlmExecutionFailurePolicy,
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
 )
@@ -132,15 +131,6 @@ class LlmExecutionPolicyCandidateBody(BaseModel):
     provider_id: str
     model_binding_id: str
     enabled: bool = True
-    priority: int = 0
-
-
-class LlmExecutionFailurePolicyBody(BaseModel):
-    failover_on_status_codes: list[int] = Field(default_factory=lambda: [408, 429, 500, 502, 503, 504])
-    failover_on_error_types: list[str] = Field(default_factory=lambda: ["TimeoutError", "LlmHttpRequestError"])
-    failover_on_auth_error: bool = True
-    failover_on_context_length_error: bool = True
-    max_candidates_per_request: int = 0
 
 
 class LlmExecutionPolicyBody(BaseModel):
@@ -148,8 +138,6 @@ class LlmExecutionPolicyBody(BaseModel):
     description: str | None = None
     group: str = "default"
     enabled: bool = True
-    strategy: str = "ordered_failover"
-    failure_policy: LlmExecutionFailurePolicyBody = Field(default_factory=LlmExecutionFailurePolicyBody)
     candidates: list[LlmExecutionPolicyCandidateBody] = Field(default_factory=list)
 
 
@@ -159,8 +147,6 @@ class LlmExecutionPolicyResponse(BaseModel):
     description: str | None = None
     group: str = "default"
     enabled: bool = True
-    strategy: str = "ordered_failover"
-    failure_policy: dict[str, Any]
     candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -168,8 +154,6 @@ class ResolvedLlmExecutionPolicyResponse(BaseModel):
     policy_group_id: str
     name: str | None = None
     description: str | None = None
-    strategy: str = "ordered_failover"
-    failure_policy: dict[str, Any]
     candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -435,8 +419,6 @@ def _body_to_execution_policy_request(
         description=body.description,
         group=body.group,
         enabled=body.enabled,
-        strategy=body.strategy,
-        failure_policy=_body_to_execution_failure_policy(body.failure_policy),
         candidates=tuple(_body_to_execution_policy_candidate(item) for item in body.candidates),
     )
 
@@ -456,18 +438,6 @@ def _body_to_retry_policy(body: LlmRetryPolicyBody) -> LlmRetryPolicy:
     )
 
 
-def _body_to_execution_failure_policy(
-    body: LlmExecutionFailurePolicyBody,
-) -> LlmExecutionFailurePolicy:
-    return LlmExecutionFailurePolicy(
-        failover_on_status_codes=tuple(body.failover_on_status_codes),
-        failover_on_error_types=tuple(body.failover_on_error_types),
-        failover_on_auth_error=body.failover_on_auth_error,
-        failover_on_context_length_error=body.failover_on_context_length_error,
-        max_candidates_per_request=body.max_candidates_per_request,
-    )
-
-
 def _body_to_execution_policy_candidate(
     body: LlmExecutionPolicyCandidateBody,
 ) -> LlmExecutionPolicyCandidate:
@@ -476,7 +446,6 @@ def _body_to_execution_policy_candidate(
         provider_id=body.provider_id,
         model_binding_id=body.model_binding_id,
         enabled=body.enabled,
-        priority=body.priority,
     )
 
 

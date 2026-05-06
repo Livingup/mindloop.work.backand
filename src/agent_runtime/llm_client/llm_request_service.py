@@ -96,6 +96,7 @@ class LlmRequestService:
 
         attempt_count = 0
         last_error: Exception | None = None
+        last_service_call_error: Exception | None = None
         for key_index, raw_api_key in enumerate(api_keys):
             try:
                 api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
@@ -144,55 +145,11 @@ class LlmRequestService:
                         request_params=request_params,
                         api_key=api_key,
                     )
-                    _apply_render_side_effects(
-                        request.conversation,
-                        resolved.api_format,
-                        rendered_messages,
-                    )
-                    assistant_message = ingest_response(
-                        request.conversation,
-                        resolved.api_format,
-                        raw_response,
-                        {**request.render_options, "vendor": resolved.provider_id},
-                    )
-                    await self._event_publisher.publish(
-                        request.communication_context,
-                        "llm.request.completed",
-                        {
-                            "provider_id": resolved.provider_id,
-                            "binding_id": resolved.binding_id,
-                            "model_alias": resolved.model_alias,
-                            "api_key_index": key_index,
-                            "attempt_count": attempt_count,
-                            "assistant_part_count": len(assistant_message.content),
-                            "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
-                            "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
-                            "duration_ms": int((time.perf_counter() - request_started_at) * 1000),
-                        },
-                        source="llm_client",
-                        metadata={"conversation_id": request.conversation.id},
-                    )
-                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
-                        await self._event_publisher.publish(
-                            request.communication_context,
-                            "llm.thinking.received",
-                            {
-                                "provider_id": resolved.provider_id,
-                                "binding_id": resolved.binding_id,
-                                "model_alias": resolved.model_alias,
-                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
-                            },
-                            source="llm_client",
-                            metadata={"conversation_id": request.conversation.id},
-                        )
-                    return LlmPromptResponse(
-                        raw_response=raw_response,
-                        assistant_message=assistant_message,
-                        api_key_index=key_index,
-                        attempt_count=attempt_count,
-                    )
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
+                    if not _is_llm_service_call_failure(exc):
+                        raise
                     last_error = exc
+                    last_service_call_error = exc
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.attempt.failed",
@@ -246,6 +203,54 @@ class LlmRequestService:
                         )
                         break
                     await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
+                else:
+                    _apply_render_side_effects(
+                        request.conversation,
+                        resolved.api_format,
+                        rendered_messages,
+                    )
+                    assistant_message = ingest_response(
+                        request.conversation,
+                        resolved.api_format,
+                        raw_response,
+                        {**request.render_options, "vendor": resolved.provider_id},
+                    )
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.completed",
+                        {
+                            "provider_id": resolved.provider_id,
+                            "binding_id": resolved.binding_id,
+                            "model_alias": resolved.model_alias,
+                            "api_key_index": key_index,
+                            "attempt_count": attempt_count,
+                            "assistant_part_count": len(assistant_message.content),
+                            "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                            "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
+                            "duration_ms": int((time.perf_counter() - request_started_at) * 1000),
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
+                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.thinking.received",
+                            {
+                                "provider_id": resolved.provider_id,
+                                "binding_id": resolved.binding_id,
+                                "model_alias": resolved.model_alias,
+                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                            },
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
+                    return LlmPromptResponse(
+                        raw_response=raw_response,
+                        assistant_message=assistant_message,
+                        api_key_index=key_index,
+                        attempt_count=attempt_count,
+                    )
         if last_error is not None:
             await self._event_publisher.publish(
                 request.communication_context,
@@ -261,8 +266,27 @@ class LlmRequestService:
                 source="llm_client",
                 metadata={"conversation_id": request.conversation.id},
             )
+            if last_service_call_error is not None:
+                raise LlmProviderModelServiceUnavailable(
+                    provider_id=resolved.provider_id,
+                    binding_id=resolved.binding_id,
+                    attempt_count=attempt_count,
+                    cause=last_service_call_error,
+                ) from last_service_call_error
             raise last_error
         raise RuntimeError("LLM 请求未执行。")
+
+
+class LlmProviderModelServiceUnavailable(RuntimeError):
+    def __init__(self, *, provider_id: str, binding_id: str, attempt_count: int, cause: Exception) -> None:
+        self.provider_id = provider_id
+        self.binding_id = binding_id
+        self.attempt_count = attempt_count
+        self.cause = cause
+        super().__init__(
+            f"LLM 服务商模型调用未成功响应: provider={provider_id}, binding={binding_id}, "
+            f"attempt_count={attempt_count}, cause={cause.__class__.__name__}: {cause}"
+        )
 
 
 def _merge_request_params(request: LlmPromptRequest) -> dict[str, Any]:
@@ -302,6 +326,10 @@ def _should_retry(exc: Exception, retryable_status_codes: tuple[int, ...]) -> bo
     if isinstance(exc, LlmHttpRequestError):
         return exc.status_code in retryable_status_codes
     return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+
+def _is_llm_service_call_failure(exc: Exception) -> bool:
+    return isinstance(exc, (LlmHttpRequestError, TimeoutError, ConnectionError, OSError))
 
 
 def _retry_delay(initial: float, maximum: float, retry_index: int) -> float:

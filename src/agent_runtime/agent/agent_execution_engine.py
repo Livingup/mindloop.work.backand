@@ -44,8 +44,10 @@ from agent_runtime.conversation_message.message.models import (
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
-from agent_runtime.llm_client.llm_request_service import LlmRequestService
-from agent_runtime.llm_client.llm_protocol_clients import LlmHttpRequestError
+from agent_runtime.llm_client.llm_request_service import (
+    LlmProviderModelServiceUnavailable,
+    LlmRequestService,
+)
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
 )
@@ -627,10 +629,7 @@ class AgentExecutionEngine:
         communication_context: RuntimeCommunicationContext,
     ) -> LlmPromptResponse:
         last_error: Exception | None = None
-        failure_policy = instance.llm_policy_snapshot_json.get("failure_policy") or {}
-        max_candidates = int(failure_policy.get("max_candidates_per_request") or 0)
-        candidates = resolved_candidates[:max_candidates] if max_candidates > 0 else resolved_candidates
-        for candidate_index, resolved_model in enumerate(candidates):
+        for candidate_index, resolved_model in enumerate(resolved_candidates):
             system_prompt = self._render_system_prompt(
                 agent_definition,
                 instance.current_working_directory,
@@ -658,8 +657,8 @@ class AgentExecutionEngine:
             except Exception as exc:
                 last_error = exc
                 can_failover = (
-                    candidate_index < len(candidates) - 1
-                    and _should_failover_llm_candidate(exc, failure_policy)
+                    candidate_index < len(resolved_candidates) - 1
+                    and isinstance(exc, LlmProviderModelServiceUnavailable)
                 )
                 await self._event_publisher.publish(
                     communication_context,
@@ -678,7 +677,7 @@ class AgentExecutionEngine:
                 )
                 if not can_failover:
                     raise
-                next_model = candidates[candidate_index + 1]
+                next_model = resolved_candidates[candidate_index + 1]
                 await self._event_publisher.publish(
                     communication_context,
                     "llm.policy.failover",
@@ -1087,68 +1086,6 @@ def _format_render_option_values(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return ", ".join(str(item) for item in value)
     return str(value)
-
-
-def _should_failover_llm_candidate(
-    exc: Exception,
-    failure_policy: dict[str, Any],
-) -> bool:
-    status_codes = {
-        int(item)
-        for item in failure_policy.get(
-            "failover_on_status_codes",
-            [408, 429, 500, 502, 503, 504],
-        )
-    }
-    error_types = {
-        str(item)
-        for item in failure_policy.get(
-            "failover_on_error_types",
-            ["TimeoutError", "LlmHttpRequestError"],
-        )
-    }
-    text = str(exc).lower()
-    if isinstance(exc, LlmHttpRequestError):
-        if exc.status_code in status_codes:
-            return True
-        if failure_policy.get("failover_on_auth_error", True) and exc.status_code in {401, 403}:
-            return True
-        text = f"{exc.response_text}\n{text}".lower()
-    if exc.__class__.__name__ in error_types:
-        return True
-    if failure_policy.get("failover_on_auth_error", True) and _looks_like_auth_error(text):
-        return True
-    if failure_policy.get("failover_on_context_length_error", True) and _looks_like_context_length_error(text):
-        return True
-    return False
-
-
-def _looks_like_auth_error(text: str) -> bool:
-    return any(
-        keyword in text
-        for keyword in (
-            "unauthorized",
-            "forbidden",
-            "invalid api key",
-            "invalid_api_key",
-            "authentication",
-            "permission denied",
-        )
-    )
-
-
-def _looks_like_context_length_error(text: str) -> bool:
-    return any(
-        keyword in text
-        for keyword in (
-            "context length",
-            "context_length",
-            "maximum context",
-            "token limit",
-            "too many tokens",
-            "input is too long",
-        )
-    )
 
 
 def _trace_identity(instance: AgentInstance) -> AgentTraceIdentity:

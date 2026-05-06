@@ -10,10 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
-from agent_runtime.llm_model_registry.llm_execution_policy import (
-    LlmExecutionFailurePolicy,
-    LlmExecutionPolicy,
-)
+from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_repository import (
     LlmModelRegistryRepository,
@@ -139,8 +136,6 @@ class ResolvedLlmExecutionPolicy:
     policy_group_id: str
     name: str | None
     description: str | None
-    strategy: str
-    failure_policy: LlmExecutionFailurePolicy
     candidates: tuple[ResolvedLlmExecutionPolicyCandidate, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,8 +143,6 @@ class ResolvedLlmExecutionPolicy:
             "policy_group_id": self.policy_group_id,
             "name": self.name,
             "description": self.description,
-            "strategy": self.strategy,
-            "failure_policy": self.failure_policy.to_dict(),
             "candidates": [item.to_dict() for item in self.candidates],
         }
 
@@ -301,8 +294,6 @@ class LlmModelRegistryService:
             policy_group_id=policy.policy_group_id,
             name=policy.name,
             description=policy.description,
-            strategy=policy.strategy,
-            failure_policy=policy.failure_policy,
             candidates=resolved_candidates,
         )
 
