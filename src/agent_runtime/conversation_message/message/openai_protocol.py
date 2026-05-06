@@ -2,8 +2,8 @@
 
 该模块实现 OpenAI Responses API 的 ProviderAdapter，负责：
 - 归一化：将 OpenAI 原始响应 → UniMessage（公共语义层 + providerExtras.raw）
-- 渲染：将 Conversation.messages[] → OpenAI 请求体（input + checkpoint 相关字段）
-- 状态更新：API 成功后记录 checkpoint（lastResponseId / lastMessageIndex / promptCacheKey）
+- 渲染：将 Conversation.messages[] → OpenAI Responses stateless input
+- 状态更新：API 成功后记录 stateless 模式和 prompt_cache_key
 
 渲染决策树：
 - user 消息：通过 ResourceResolver 将 resourceId → data URI / input_file
@@ -11,10 +11,8 @@
 - assistant 消息（跨平台）：合成一条 assistant message item（降级）
 - tool 消息：展开为顶层 function_call_output item
 
-stored 参数由调用方传入，决定本次请求是否走 checkpoint 模式：
-- stored=true 且有 checkpoint：带 previous_response_id，只发 gap 消息
-- stored=true 但无 checkpoint（首次）：全量展开
-- stored=false：全量展开，忽略 checkpoint
+OpenAI Responses 采用 stateless 路径，不依赖 previous_response_id / store=true。
+每次请求都全量展开历史消息，并用 conversation id 作为 prompt_cache_key。
 """
 from __future__ import annotations
 
@@ -42,19 +40,19 @@ from agent_runtime.conversation_message.south_gateway.resource_resolver.contract
 class OpenAIRenderResult:
     """OpenAI 渲染结果。
 
-    包含渲染后的 input 数组和 checkpoint 相关字段。
-    调用方在此基础上合并 model、instructions、reasoning、store 等参数后发送请求。
+    包含渲染后的 input 数组和 prompt_cache_key。
+    调用方在此基础上合并 model、instructions、reasoning 等参数后发送请求。
 
-    注意：store / instructions 不在此处，由调用方自行决定并合并。
+    注意：store / instructions 不在此处；请求客户端会强制 store=false。
     """
 
     # OpenAI Responses API 的 input 数组。
     input: list[Any]
 
-    # stored=true 且有 checkpoint 时带上，走 gap 模式。
+    # OpenAI Responses stateless 路径不使用 previous_response_id。
     previous_response_id: str | None = None
 
-    # 上次记录的 cache key，带上以命中前缀缓存。
+    # 稳定缓存路由 key，默认使用 conversation id。
     prompt_cache_key: str | None = None
 
     # 始终包含，确保 raw 里有 encrypted_content。
@@ -146,31 +144,10 @@ class OpenAIAdapter:
     ) -> OpenAIRenderResult:
         """将会话消息渲染为 OpenAI Responses API 的请求体。
 
-        只产出消息相关字段：input + previous_response_id? + prompt_cache_key? + include。
-        模型名、instructions、reasoning、store 等由调用方合并。
-
-        stored 参数通过 options["stored"] 传入，控制 checkpoint 行为：
-        - stored=True 且有 checkpoint：带 previous_response_id，只发 gap 消息
-        - stored=True 但无 checkpoint / stored=False：全量展开
+        只产出消息相关字段：input + prompt_cache_key + include。
+        模型名、instructions、reasoning、store 等由调用方合并；请求客户端会强制 store=false。
         """
-        opts = options or {}
-        stored = opts.get("stored", False)
-
-        oai_state = conv.provider_state.get(PROVIDER_OPENAI) or {}
-        last_response_id = oai_state.get("last_response_id")
-        last_message_index = oai_state.get("last_message_index")
-        prompt_cache_key = oai_state.get("prompt_cache_key")
-
-        # stored=True 且有记录的 checkpoint 才走 gap 模式
-        use_checkpoint = (
-            stored
-            and last_response_id is not None
-            and last_message_index is not None
-        )
-
-        # 决定从哪条消息开始发送
-        start_index = (last_message_index + 1) if use_checkpoint else 0
-        message_slice = conv.messages[start_index:]
+        message_slice = conv.messages
 
         input_items: list[Any] = []
         for m in message_slice:
@@ -191,8 +168,8 @@ class OpenAIAdapter:
 
         return OpenAIRenderResult(
             input=input_items,
-            previous_response_id=last_response_id if use_checkpoint else None,
-            prompt_cache_key=prompt_cache_key if prompt_cache_key else None,
+            previous_response_id=None,
+            prompt_cache_key=conv.id,
         )
 
     # ── 预检 ─────────────────────────────────────────────────────
@@ -208,25 +185,13 @@ class OpenAIAdapter:
         raw_response: Any,
         options: dict[str, Any] | None = None,
     ) -> None:
-        """OpenAI store=true 时记录 checkpoint。
-
-        将响应中的 id（作为 last_response_id）、当前消息索引
-        （作为 last_message_index）和 prompt_cache_key 写入
-        provider_state["openai_responses"]，供下次 store=true 渲染时走 gap 模式。
-
-        store=false 时不更新 checkpoint。
-        """
-        opts = options or {}
-        stored = opts.get("stored", False)
-        if not stored:
-            return
-
-        conv.provider_state[PROVIDER_OPENAI] = {
-            **(conv.provider_state.get(PROVIDER_OPENAI) or {}),
-            "last_response_id": raw_response.get("id"),
-            "last_message_index": len(conv.messages) - 1,
-            "prompt_cache_key": raw_response.get("prompt_cache_key"),
-        }
+        """记录 OpenAI Responses stateless 模式运行态。"""
+        provider_state = dict(conv.provider_state.get(PROVIDER_OPENAI) or {})
+        provider_state.pop("last_response_id", None)
+        provider_state.pop("last_message_index", None)
+        provider_state["prompt_cache_key"] = conv.id
+        provider_state["stateless"] = True
+        conv.provider_state[PROVIDER_OPENAI] = provider_state
 
 
 # ── 渲染内部函数 ─────────────────────────────────────────────────

@@ -25,6 +25,7 @@ from typing import Any
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeAdapter
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiAdapter
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
+from agent_runtime.conversation_message.message.zhipu_protocol import ZhipuChatAdapter
 from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
@@ -51,6 +52,7 @@ _ADAPTERS: list[ProviderAdapter] = [
     ClaudeAdapter(),
     GeminiAdapter(),
     OpenAIAdapter(),
+    ZhipuChatAdapter(),
 ]
 
 _adapter_registry: dict[str, ProviderAdapter] = {
@@ -110,7 +112,7 @@ async def render_messages(
 ) -> Any:
     """渲染消息 → 目标平台请求体（仅消息相关字段）。
 
-    通过 adapter 注册表动态分发，内置三家和第三方走同一条路径。
+    通过 adapter 注册表动态分发，内置协议和第三方协议走同一条路径。
     渲染前会调用 adapter 的 preflight 进行预检校验。
 
     返回值的具体类型由各 adapter 定义（如 ClaudeRenderResult、
@@ -121,7 +123,6 @@ async def render_messages(
     - target: 目标协议标识 / api_format（如 "anthropic_messages" / "openai_responses"）
     - resolver: 资源解析器，按需将 resourceId → base64/URL
     - options: 透传给 adapter.render()，各 adapter 自定义
-      （如 OpenAI 的 {"stored": True}）
     """
     adapter = _get_adapter(target)
 
@@ -145,14 +146,14 @@ def ingest_response(
     1. adapter.normalize_response：将原始响应归一化为 UniMessage
     2. 设置 source_vendor（如有）
     3. append_message：追加到会话并增量更新派生状态
-    4. adapter.update_state：更新 providerState（如 OpenAI 记录 checkpoint）
+    4. adapter.update_state：更新 providerState（如协议缓存或思考续接状态）
 
     参数说明：
     - provider: 响应来源协议标识 / api_format（如 "anthropic_messages" / "openai_responses"）
     - raw_response: LLM API 原始响应（JSON 解析后的 dict）
     - options: 可选参数，支持：
       - vendor: 实际服务商标识（如 "openrouter"），记录到 source_vendor
-      - 其他字段透传给 adapter.update_state（如 OpenAI 的 {"stored": True}）
+      - 其他字段透传给 adapter.update_state
     """
     adapter = _get_adapter(provider)
 
@@ -167,7 +168,7 @@ def ingest_response(
     # Delegate to aggregate root
     conv.append_message(msg)
 
-    # 调用 adapter 的状态更新（如 OpenAI 记录 checkpoint）
+    # 调用 adapter 的状态更新
     adapter.update_state(conv, raw_response, options)
 
     return msg

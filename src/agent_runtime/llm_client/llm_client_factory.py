@@ -13,6 +13,7 @@ from agent_runtime.llm_client.llm_protocol_clients import (
     AnthropicMessagesProtocolClient,
     GeminiGenerateContentProtocolClient,
     OpenAIResponsesProtocolClient,
+    ZhipuChatCompletionsProtocolClient,
 )
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 
@@ -40,8 +41,8 @@ class _TextOnlyResourceResolver:
 class LlmClientFactory:
     """通用 LLM 请求客户端工厂。
 
-    工厂装配当前已支持的三类 API 协议客户端：OpenAI Responses、Anthropic Messages、
-    Gemini generateContent。OpenAI Chat Completions 和智谱 Chat Completions 需要先补齐
+    工厂装配当前已支持的四类 API 协议客户端：OpenAI Responses、Anthropic Messages、
+    Gemini generateContent、智谱 Chat Completions。OpenAI Chat Completions 需要先补齐
     conversation_message 适配器后再接入。
     """
 
@@ -57,6 +58,7 @@ class LlmClientFactory:
                 OpenAIResponsesProtocolClient(),
                 AnthropicMessagesProtocolClient(),
                 GeminiGenerateContentProtocolClient(),
+                ZhipuChatCompletionsProtocolClient(),
             ),
             resource_resolver=resolver,
             event_publisher=event_publisher,

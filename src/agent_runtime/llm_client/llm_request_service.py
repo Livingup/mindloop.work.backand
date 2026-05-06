@@ -66,13 +66,17 @@ class LlmRequestService:
                 f"当前 LLM 请求客户端不支持 api_format={resolved.api_format}。"
             )
 
+        request_params = _merge_request_params(request)
+        render_options = {
+            **request.render_options,
+            "request_params": request_params,
+        }
         rendered_messages = await render_messages(
             request.conversation,
             resolved.api_format,
             self._resource_resolver,
-            request.render_options,
+            render_options,
         )
-        request_params = _merge_request_params(request)
         tool_schemas = tuple(tool.schema for tool in request.tools)
         api_keys: list[str | None] = [item.key for item in resolved.api_keys]
         if not api_keys:
@@ -214,7 +218,7 @@ class LlmRequestService:
                         request.conversation,
                         resolved.api_format,
                         raw_response,
-                        {**request.render_options, "vendor": resolved.provider_id},
+                        {**render_options, "vendor": resolved.provider_id},
                     )
                     await self._event_publisher.publish(
                         request.communication_context,

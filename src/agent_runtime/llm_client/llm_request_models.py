@@ -56,7 +56,7 @@ class LlmPromptRequest:
     # 当前 AgentDefinition 允许暴露给 LLM 的工具声明。
     tools: tuple[LlmToolDefinition, ...] = field(default_factory=tuple)
 
-    # render_messages 的可选参数，如 OpenAI Responses 的 stored。
+    # render_messages 的可选参数，如协议适配器自定义的渲染开关。
     render_options: dict[str, Any] = field(default_factory=dict)
 
     # 本轮请求额外参数，会覆盖 registry 中 custom_request_params 的同名字段。

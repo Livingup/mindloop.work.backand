@@ -16,6 +16,7 @@ from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_RESPONSES,
+    API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
 )
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
@@ -70,12 +71,13 @@ class OpenAIResponsesProtocolClient:
             "include": rendered_messages.include,
             **request_params,
         }
+        body["store"] = False
+        body["include"] = _ensure_include_item(body.get("include"), "reasoning.encrypted_content")
         if system_prompt:
             body.setdefault("instructions", system_prompt)
-        if rendered_messages.previous_response_id:
-            body.setdefault("previous_response_id", rendered_messages.previous_response_id)
+        body.pop("previous_response_id", None)
         if rendered_messages.prompt_cache_key:
-            body.setdefault("prompt_cache_key", rendered_messages.prompt_cache_key)
+            body["prompt_cache_key"] = rendered_messages.prompt_cache_key
         if tools:
             body.setdefault("tools", list(tools))
         url = _join_url(resolved_model.api_base_url, "responses")
@@ -164,6 +166,48 @@ class GeminiGenerateContentProtocolClient:
         return await _post_json(url, headers, body)
 
 
+class ZhipuChatCompletionsProtocolClient:
+    """智谱 GLM Chat Completions API 请求客户端。"""
+
+    @property
+    def api_format(self) -> str:
+        return API_FORMAT_ZHIPU_CHAT_COMPLETIONS
+
+    async def request(
+        self,
+        *,
+        resolved_model: ResolvedLlmProviderModel,
+        rendered_messages: Any,
+        system_prompt: str | None,
+        tools: tuple[dict[str, Any], ...],
+        request_params: dict[str, Any],
+        api_key: str | None,
+    ) -> Any:
+        from agent_runtime.conversation_message.message.zhipu_protocol import (
+            ZhipuChatRenderResult,
+        )
+
+        if not isinstance(rendered_messages, ZhipuChatRenderResult):
+            raise TypeError("zhipu_chat_completions 渲染结果类型不正确。")
+        messages = list(rendered_messages.messages)
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        body: dict[str, Any] = {
+            "model": resolved_model.model_alias,
+            "messages": messages,
+            "max_tokens": resolved_model.max_output_tokens,
+            **request_params,
+        }
+        body.setdefault("thinking", {"type": "enabled", "clear_thinking": False})
+        if tools:
+            body.setdefault("tools", list(tools))
+        url = _join_url(resolved_model.api_base_url, "chat/completions")
+        headers = _json_headers(resolved_model.custom_headers)
+        if api_key:
+            headers.setdefault("Authorization", f"Bearer {api_key}")
+        return await _post_json(url, headers, body)
+
+
 def serialize_render_result(value: Any) -> dict[str, Any]:
     """把协议渲染结果转换为普通字典，用于调试和 Trace 事件记录。"""
     if is_dataclass(value):
@@ -171,6 +215,23 @@ def serialize_render_result(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {"value": str(value)}
+
+
+def _ensure_include_item(value: Any, required_item: str) -> list[Any]:
+    """确保 OpenAI Responses include 参数包含 stateless reasoning 回灌必需项。"""
+    if value is None:
+        return [required_item]
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = list(value)
+    elif isinstance(value, tuple):
+        items = list(value)
+    else:
+        items = [value]
+    if required_item not in items:
+        items.append(required_item)
+    return items
 
 
 def _json_headers(custom_headers: dict[str, str]) -> dict[str, str]:

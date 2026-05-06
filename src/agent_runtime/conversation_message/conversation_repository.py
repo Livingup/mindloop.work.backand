@@ -64,7 +64,7 @@ class ConversationRepository(Protocol):
     async def save_provider_state(
         self, conversation_id: str, provider: str, state: Any,
     ) -> None:
-        """新增或更新单个 LLM 供应商的会话状态（如 OpenAI checkpoint）。"""
+        """新增或更新单个 LLM 供应商的会话状态（如缓存路由、缓存断点或思考续接状态）。"""
         ...
 
     # ── 层级查询 ─────────────────────────────────────────────────

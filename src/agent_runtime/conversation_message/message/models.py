@@ -322,7 +322,8 @@ class Conversation:
     #
     # 内置示例：
     #   anthropic_messages:        {"cache_breakpoint_indexes": [int, ...]}
-    #   openai_responses:          {"last_response_id": str, "last_message_index": int, "prompt_cache_key": str}
+    #   openai_responses:          {"prompt_cache_key": str, "stateless": bool}
+    #   zhipu_chat_completions:    {"preserved_thinking": bool, "clear_thinking": bool, "cached_tokens": int | None}
     #   gemini_generate_content:   {"cached_content": str}
     provider_state: dict[str, Any] = field(default_factory=dict)
 
@@ -436,7 +437,7 @@ class ProviderAdapter(Protocol):
     ) -> None:
         """可选：API 成功后更新 provider_state[self.provider]。
 
-        例：OpenAI 记录 last_response_id，Claude 记录 cache_breakpoint_indexes。
+        例：OpenAI 记录 prompt_cache_key，Claude 记录 cache_breakpoint_indexes。
         默认不维护任何会话态。
         """
         ...
