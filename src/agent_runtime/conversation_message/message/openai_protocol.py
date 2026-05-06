@@ -34,6 +34,7 @@ from agent_runtime.conversation_message.message.models import (
 )
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
+    resolve_resource_access,
 )
 
 
@@ -245,20 +246,36 @@ async def _build_openai_user(
         if p.kind == "text":
             content.append({"type": "input_text", "text": p.text})
         elif p.kind == "image":
-            meta = await resolver.get_resource_meta(p.resource_id)
-            data = await resolver.get_base64(p.resource_id)
+            resource = await resolve_resource_access(resolver, p.resource_id)
+            image_url = resource.object_storage_url
+            if not image_url:
+                data = _require_base64(resource.base64_content, p.resource_id)
+                image_url = f"data:{resource.mime_type};base64,{data}"
             content.append({
                 "type": "input_image",
-                "image_url": f"data:{meta.mime_type};base64,{data}",
+                "image_url": image_url,
             })
         elif p.kind == "pdf":
-            data = await resolver.get_base64(p.resource_id)
-            content.append({
-                "type": "input_file",
-                "file_data": f"data:application/pdf;base64,{data}",
-            })
+            resource = await resolve_resource_access(resolver, p.resource_id)
+            if resource.object_storage_url:
+                content.append({
+                    "type": "input_file",
+                    "file_url": resource.object_storage_url,
+                })
+            else:
+                data = _require_base64(resource.base64_content, p.resource_id)
+                content.append({
+                    "type": "input_file",
+                    "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
+                })
 
     return {"role": "user", "content": content}
+
+
+def _require_base64(base64_content: str | None, resource_id: str) -> str:
+    if not base64_content:
+        raise ValueError(f"资源缺少公网 URL 和 Base64 内容: {resource_id}")
+    return base64_content
 
 
 def _build_openai_assistant(msg: UniMessage) -> list[Any]:

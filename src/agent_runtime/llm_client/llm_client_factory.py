@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
+    ResolvedResource,
     ResourceMeta,
 )
 from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
@@ -26,8 +27,14 @@ class _TextOnlyResourceResolver:
     async def get_base64(self, resource_id: str) -> str:
         raise RuntimeError(f"未配置文件资源解析器，无法读取资源: {resource_id}")
 
+    async def get_public_url(self, resource_id: str) -> str | None:
+        raise RuntimeError(f"未配置文件资源解析器，无法读取资源: {resource_id}")
+
     async def get_resource_meta(self, resource_id: str) -> ResourceMeta:
         raise RuntimeError(f"未配置文件资源解析器，无法读取资源元数据: {resource_id}")
+
+    async def resolve_resource(self, resource_id: str) -> ResolvedResource:
+        raise RuntimeError(f"未配置文件资源解析器，无法读取资源: {resource_id}")
 
 
 class LlmClientFactory:

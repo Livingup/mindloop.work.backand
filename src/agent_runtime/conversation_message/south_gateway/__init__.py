@@ -4,11 +4,15 @@
 - resource_resolver/: 文件资源解析（依赖统一文件资源服务）
 """
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
+    ResolvedResource,
     ResourceMeta,
     ResourceResolver,
+    resolve_resource_access,
 )
 
 __all__ = [
+    "ResolvedResource",
     "ResourceMeta",
     "ResourceResolver",
+    "resolve_resource_access",
 ]

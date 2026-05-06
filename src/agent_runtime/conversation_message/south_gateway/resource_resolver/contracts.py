@@ -27,6 +27,25 @@ class ResourceMeta:
     # 资源类别（"image" / "pdf"）。
     resource_category: str
 
+    size_in_bytes: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    pdf_page_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedResource:
+    resource_id: str
+    mime_type: str
+    resource_category: str
+    object_storage_url: str | None
+    base64_content: str | None
+    local_storage_path: str | None
+    size_in_bytes: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    pdf_page_count: int | None = None
+
 
 class ResourceResolver(Protocol):
     """文件资源解析南向网关接口。
@@ -44,6 +63,9 @@ class ResourceResolver(Protocol):
         """
         ...
 
+    async def get_public_url(self, resource_id: str) -> str | None:
+        ...
+
     async def get_resource_meta(self, resource_id: str) -> ResourceMeta:
         """按资源标识获取资源元数据。
 
@@ -51,3 +73,31 @@ class ResourceResolver(Protocol):
         以构建正确的目标平台消息体。
         """
         ...
+
+    async def resolve_resource(self, resource_id: str) -> ResolvedResource:
+        ...
+
+
+async def resolve_resource_access(
+    resolver: ResourceResolver,
+    resource_id: str,
+) -> ResolvedResource:
+    resolve_resource = getattr(resolver, "resolve_resource", None)
+    if resolve_resource is not None:
+        return await resolve_resource(resource_id)
+
+    meta = await resolver.get_resource_meta(resource_id)
+    get_public_url = getattr(resolver, "get_public_url", None)
+    public_url = await get_public_url(resource_id) if get_public_url is not None else None
+    return ResolvedResource(
+        resource_id=resource_id,
+        mime_type=meta.mime_type,
+        resource_category=meta.resource_category,
+        object_storage_url=public_url,
+        base64_content=await resolver.get_base64(resource_id),
+        local_storage_path=None,
+        size_in_bytes=meta.size_in_bytes,
+        image_width=meta.image_width,
+        image_height=meta.image_height,
+        pdf_page_count=meta.pdf_page_count,
+    )

@@ -11,6 +11,7 @@ from agent_runtime.communication.communication_factory import CommunicationFacto
 from agent_runtime.communication.runtime_event_publisher import CommunicationRuntimeEventPublisher
 from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
+    ResolvedResource,
     ResourceMeta,
 )
 from agent_runtime.file_resource import FileResourceServiceFactory
@@ -37,21 +38,39 @@ class _LazyFileResourceResolver:
 
     async def get_base64(self, resource_id: str) -> str:
         """按资源标识获取 Base64 编码内容。"""
-        results = self._service().get_resources([resource_id])
-        result = results[0]
-        if result is None:
-            raise ValueError(f"资源不存在: {resource_id}")
-        return result.resource_base64_content
+        return (await self.resolve_resource(resource_id)).base64_content or ""
+
+    async def get_public_url(self, resource_id: str) -> str | None:
+        return (await self.resolve_resource(resource_id)).object_storage_url
 
     async def get_resource_meta(self, resource_id: str) -> ResourceMeta:
         """按资源标识获取 MIME 类型和资源类别。"""
+        resource = await self.resolve_resource(resource_id)
+        return ResourceMeta(
+            mime_type=resource.mime_type,
+            resource_category=resource.resource_category,
+            size_in_bytes=resource.size_in_bytes,
+            image_width=resource.image_width,
+            image_height=resource.image_height,
+            pdf_page_count=resource.pdf_page_count,
+        )
+
+    async def resolve_resource(self, resource_id: str) -> ResolvedResource:
         results = self._service().get_resources([resource_id])
         result = results[0]
         if result is None:
             raise ValueError(f"资源不存在: {resource_id}")
-        return ResourceMeta(
+        metadata = result.resource_metadata
+        return ResolvedResource(
+            resource_id=result.resource_id,
             mime_type=result.resource_mime_type,
-            resource_category=result.resource_metadata.resource_category,
+            resource_category=metadata.resource_category,
+            object_storage_url=result.object_storage_url,
+            base64_content=result.resource_base64_content,
+            local_storage_path=result.local_storage_path,
+            image_width=getattr(metadata, "image_width", None),
+            image_height=getattr(metadata, "image_height", None),
+            pdf_page_count=getattr(metadata, "pdf_page_count", None),
         )
 
     def _service(self):

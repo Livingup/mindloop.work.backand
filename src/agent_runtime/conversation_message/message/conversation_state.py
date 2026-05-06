@@ -50,7 +50,7 @@ async def recompute_state(
                 modalities.add(MODALITY_PDF)
                 meta = await resolver.get_resource_meta(p.resource_id)
                 if meta is not None and meta.resource_category == "pdf":
-                    pdf_page_count += meta.pdf_page_count
+                    pdf_page_count += meta.pdf_page_count or 0
             # thinking / tool_* 不计入模态或配额
 
     state.providers = list(providers)
