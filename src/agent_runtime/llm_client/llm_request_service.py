@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from dataclasses import replace
 from typing import Any
 
 from agent_runtime.conversation_message.message.operations import (
@@ -58,7 +59,7 @@ class LlmRequestService:
 
     async def send_prompt(self, request: LlmPromptRequest) -> LlmPromptResponse:
         """发送一次 LLM 请求，并把 assistant 响应追加到 Conversation。"""
-        resolved = request.resolved_model
+        resolved = _with_default_relay_session_header(request)
         client = self._protocol_clients.get(resolved.api_format)
         if client is None:
             raise ValueError(
@@ -298,6 +299,13 @@ def _merge_request_params(request: LlmPromptRequest) -> dict[str, Any]:
     _merge_json_field(merged, resolved.tool_choice, "tool_choice")
     merged.update(request.request_overrides)
     return merged
+
+
+def _with_default_relay_session_header(request: LlmPromptRequest):
+    headers = dict(request.resolved_model.custom_headers)
+    if not any(key.lower() == "x-relay-session-id" for key in headers):
+        headers["x-relay-session-id"] = request.conversation.id
+    return replace(request.resolved_model, custom_headers=headers)
 
 
 def _merge_json_field(target: dict[str, Any], json_text: str | None, fallback_key: str) -> None:
