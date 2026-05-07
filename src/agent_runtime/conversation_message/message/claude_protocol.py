@@ -9,20 +9,28 @@
 渲染决策树：
 - user 消息：通过 ResourceResolver 将 resourceId → base64 inline
 - assistant 消息（同平台）：原样回灌 providerExtras.claude.raw（含 signature，无损）
-- assistant 消息（跨平台）：公共层降级，只取 text part 合并
-- tool 消息：转为 Claude 的 tool_result 格式，合并进 user role
+- assistant 消息（跨平台）：公共层降级，保留 text 和 tool_use
+- tool 消息：转为 Claude 的 user/tool_result 消息
 
 关键约束：
 - messages[0].role 必须是 "user"；首条非 user 时插占位
-- user/assistant 严格交替；相邻同 role 合并 content
+- 不主动合并相邻同 role 消息，保持客户端消息边界
 - 跨平台降级空 text 用 "(empty)" 占位
 - 缓存断点（cache_control）不进 raw，渲染时动态打
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.conversation_message.message.assistant_projection import (
+    AssistantTextSegment,
+    AssistantToolUseSegment,
+    clone_raw_value,
+    iter_assistant_semantic_segments,
+    serialize_tool_output,
+    should_include_cross_protocol_thinking_text,
+)
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_CLAUDE,
     ROLE_ASSISTANT,
@@ -56,8 +64,11 @@ class ClaudeRenderResult:
     # Claude Messages API 的 messages 数组。
     messages: list[dict[str, Any]]
 
-    # 本次渲染实际应用的缓存断点位置（messages[] 下标列表）。
+    # 本次渲染实际应用的缓存断点位置（Claude messages[] 下标列表）。
     applied_cache_breakpoint_indexes: list[int]
+
+    # 最近一条 Claude assistant 在统一 Conversation.messages 中的下标。
+    last_claude_assistant_message_index: int | None = None
 
 
 class ClaudeAdapter:
@@ -132,26 +143,28 @@ class ClaudeAdapter:
         """
         messages: list[dict[str, Any]] = []
 
-        for m in conv.messages:
+        last_claude_assistant_message_index: int | None = None
+        for source_index, m in enumerate(conv.messages):
             if m.role == "user":
                 messages.append(await _build_claude_user(m, resolver))
             elif m.role == "tool":
                 messages.append(_build_claude_tool(m))
             else:
-                messages.append(_build_claude_assistant(m))
+                if m.source_provider == PROVIDER_CLAUDE:
+                    last_claude_assistant_message_index = source_index
+                messages.append(_build_claude_assistant(m, options))
 
-        # 规范化：确保 messages[0].role == "user"，相邻同 role 合并
-        normalized = _normalize_claude_messages(messages)
+        # 规范化：只保证首条消息满足 Claude 客户端请求约束，不合并相邻同 role。
+        normalized = _ensure_first_claude_message_is_user(messages)
 
-        # 缓存断点策略（动态打，不进 raw）
-        # 累积策略：在历史断点位置 + 新位置都打断点，确保跨平台切换后前缀缓存可复用
-        claude_state = conv.provider_state.get(PROVIDER_CLAUDE) or {}
-        history_breakpoints = claude_state.get("cache_breakpoint_indexes") or []
-        applied_breakpoints = _attach_cache_breakpoints(normalized, history_breakpoints)
+        # 缓存断点策略（动态打，不进 raw）：仅基于本次客户端输出 messages 边界打点。
+        # 不复用历史 messages[] 下标，因为连续 user 消息不合并后，下标不再是稳定缓存锚点。
+        applied_breakpoints = _attach_cache_breakpoints(normalized)
 
         return ClaudeRenderResult(
             messages=normalized,
             applied_cache_breakpoint_indexes=applied_breakpoints,
+            last_claude_assistant_message_index=last_claude_assistant_message_index,
         )
 
     # ── 预检 ─────────────────────────────────────────────────────
@@ -183,9 +196,21 @@ class ClaudeAdapter:
     ) -> None:
         """Claude 的会话状态更新。
 
-        当前 Claude 的缓存断点需要调用方在 API 成功后手动写回
-        （因为断点信息来自 render 结果而非响应），本方法暂不自动维护。
+        render 阶段产生的缓存断点由调用方写回；本方法在 assistant 响应追加后记录
+        最近一次 Claude assistant 在统一消息列表中的位置，供后续缓存锚点策略使用。
         """
+        if not conv.messages:
+            return
+        latest_message_index = len(conv.messages) - 1
+        latest_message = conv.messages[latest_message_index]
+        if latest_message.role != ROLE_ASSISTANT:
+            return
+        if latest_message.source_provider != PROVIDER_CLAUDE:
+            return
+        conv.provider_state[PROVIDER_CLAUDE] = {
+            **(conv.provider_state.get(PROVIDER_CLAUDE) or {}),
+            "last_claude_assistant_message_index": latest_message_index,
+        }
 
 
 # ── 渲染内部函数 ─────────────────────────────────────────────────
@@ -256,43 +281,54 @@ def _build_claude_tool(msg: UniMessage) -> dict[str, Any]:
             content.append({
                 "type": "tool_result",
                 "tool_use_id": p.tool_use_ref,
-                "content": str(p.output),
+                "content": serialize_tool_output(p.output),
             })
 
     return {"role": "user", "content": content}
 
 
-def _build_claude_assistant(msg: UniMessage) -> dict[str, Any]:
+def _build_claude_assistant(
+    msg: UniMessage,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """将 assistant 消息转换为 Claude 格式。
 
     同平台（source_provider == "anthropic_messages"）：原样回灌 raw（无损，含 signature）。
-    跨平台：公共层降级，只合并 text part（丢 thinking / tool_*）。
+    跨平台：公共层降级，保留 text 和 tool_use，不伪造目标协议 thinking。
     """
     # 同平台无损回灌
     if msg.source_provider == PROVIDER_CLAUDE:
         extras = (msg.provider_extras or {}).get(PROVIDER_CLAUDE)
         if extras and extras.get("raw") is not None:
-            return {"role": "assistant", "content": extras["raw"]}
+            return {"role": "assistant", "content": clone_raw_value(extras["raw"])}
 
-    # 跨平台降级：只合并 text part
-    text = "\n".join(
-        p.text for p in msg.content if p.kind == "text" and hasattr(p, "text")
-    )
+    include_thinking_text = should_include_cross_protocol_thinking_text(options)
+    content: list[dict[str, Any]] = []
+    for segment in iter_assistant_semantic_segments(
+        msg,
+        include_thinking_text=include_thinking_text,
+    ):
+        if isinstance(segment, AssistantTextSegment):
+            content.append({"type": "text", "text": segment.text})
+        elif isinstance(segment, AssistantToolUseSegment):
+            content.append({
+                "type": "tool_use",
+                "id": segment.tool_use_ref,
+                "name": segment.name,
+                "input": segment.input,
+            })
+    if not content:
+        content.append({"type": "text", "text": "(empty)"})
     return {
         "role": "assistant",
-        "content": [{"type": "text", "text": text or "(empty)"}],
+        "content": content,
     }
 
 
-def _normalize_claude_messages(
+def _ensure_first_claude_message_is_user(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """规范化 Claude 消息列表。
-
-    确保满足 Claude API 的约束：
-    1. messages[0].role 必须是 "user"
-    2. 相邻同 role 消息合并 content
-    """
+    """确保 Claude 请求 messages 首条为 user，不改变其它客户端消息边界。"""
     if not messages:
         return messages
 
@@ -303,52 +339,28 @@ def _normalize_claude_messages(
             "content": [{"type": "text", "text": "(placeholder)"}],
         })
 
-    # 相邻同 role 合并
-    merged: list[dict[str, Any]] = [messages[0]]
-    for msg in messages[1:]:
-        if msg.get("role") == merged[-1].get("role"):
-            prev_content = merged[-1].get("content", [])
-            curr_content = msg.get("content", [])
-            if isinstance(prev_content, list) and isinstance(curr_content, list):
-                prev_content.extend(curr_content)
-            elif isinstance(prev_content, str) and isinstance(curr_content, str):
-                merged[-1]["content"] = prev_content + "\n" + curr_content
-        else:
-            merged.append(msg)
-
-    return merged
+    return messages
 
 
 def _attach_cache_breakpoints(
     messages: list[dict[str, Any]],
-    history_breakpoints: list[int],
 ) -> list[int]:
     """在消息列表上附加缓存断点。
 
-    累积策略：在历史断点位置 + 新断点位置都打 cache_control，
-    确保跨平台切换后前缀缓存可复用。
-
-    新断点默认打在倒数第二条消息（若存在），使前缀部分尽可能被缓存。
+    当前只在本次请求最新消息末尾打动态断点，并严格限制 messages 内断点数量不超过 4。
+    系统提示词和工具定义的静态缓存断点由请求客户端在对应字段上单独管理。
 
     返回本次实际应用的全部断点位置列表。
     """
     applied: list[int] = []
     msg_count = len(messages)
 
-    # 收集所有需要打断点的位置
-    breakpoint_indexes: set[int] = set()
-
-    # 历史断点
-    for idx in history_breakpoints:
-        if 0 <= idx < msg_count:
-            breakpoint_indexes.add(idx)
-
-    # 新断点：倒数第二条消息（如果有至少两条消息）
-    if msg_count >= 2:
-        breakpoint_indexes.add(msg_count - 2)
+    breakpoint_indexes: list[int] = []
+    if msg_count >= 1:
+        breakpoint_indexes.append(msg_count - 1)
 
     # 在对应位置的最后一个 content block 上打 cache_control
-    for idx in sorted(breakpoint_indexes):
+    for idx in breakpoint_indexes[:4]:
         msg = messages[idx]
         content = msg.get("content")
         if isinstance(content, list) and len(content) > 0:

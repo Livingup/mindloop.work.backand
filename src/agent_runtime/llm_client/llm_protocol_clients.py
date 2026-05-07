@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,10 +12,12 @@ from typing import Any, Protocol
 
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeRenderResult
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiRenderResult
+from agent_runtime.conversation_message.message.openai_chat_protocol import OpenAIChatRenderResult
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
+    API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
     API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
 )
@@ -87,6 +90,43 @@ class OpenAIResponsesProtocolClient:
         return await _post_json(url, headers, body)
 
 
+class OpenAIChatCompletionsProtocolClient:
+    """OpenAI Chat Completions API 请求客户端。"""
+
+    @property
+    def api_format(self) -> str:
+        return API_FORMAT_OPENAI_CHAT_COMPLETIONS
+
+    async def request(
+        self,
+        *,
+        resolved_model: ResolvedLlmProviderModel,
+        rendered_messages: Any,
+        system_prompt: str | None,
+        tools: tuple[dict[str, Any], ...],
+        request_params: dict[str, Any],
+        api_key: str | None,
+    ) -> Any:
+        if not isinstance(rendered_messages, OpenAIChatRenderResult):
+            raise TypeError("openai_chat_completions 渲染结果类型不正确。")
+        messages = list(rendered_messages.messages)
+        if system_prompt:
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        body: dict[str, Any] = {
+            "model": resolved_model.model_alias,
+            "messages": messages,
+            "max_tokens": resolved_model.max_output_tokens,
+            **request_params,
+        }
+        if tools:
+            body.setdefault("tools", list(tools))
+        url = _join_url(resolved_model.api_base_url, "chat/completions")
+        headers = _json_headers(resolved_model.custom_headers)
+        if api_key:
+            headers.setdefault("Authorization", f"Bearer {api_key}")
+        return await _post_json(url, headers, body)
+
+
 class AnthropicMessagesProtocolClient:
     """Anthropic Messages API 请求客户端。"""
 
@@ -113,9 +153,9 @@ class AnthropicMessagesProtocolClient:
             **request_params,
         }
         if system_prompt:
-            body.setdefault("system", system_prompt)
+            body.setdefault("system", _build_claude_cached_system(system_prompt))
         if tools:
-            body.setdefault("tools", list(tools))
+            body.setdefault("tools", _build_claude_cached_tools(tools))
         url = _join_url(resolved_model.api_base_url, "v1/messages")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
@@ -232,6 +272,23 @@ def _ensure_include_item(value: Any, required_item: str) -> list[Any]:
     if required_item not in items:
         items.append(required_item)
     return items
+
+
+def _build_claude_cached_system(system_prompt: str) -> list[dict[str, Any]]:
+    """构建带静态缓存断点的 Claude system 内容块。"""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _build_claude_cached_tools(tools: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    """构建带静态缓存断点的 Claude tools 列表。"""
+    cached_tools = [copy.deepcopy(tool) for tool in tools]
+    if cached_tools:
+        cached_tools[-1]["cache_control"] = {"type": "ephemeral"}
+    return cached_tools
 
 
 def _json_headers(custom_headers: dict[str, str]) -> dict[str, str]:

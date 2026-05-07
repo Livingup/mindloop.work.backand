@@ -24,6 +24,7 @@ from typing import Any
 
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeAdapter
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiAdapter
+from agent_runtime.conversation_message.message.openai_chat_protocol import OpenAIChatAdapter
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
 from agent_runtime.conversation_message.message.zhipu_protocol import ZhipuChatAdapter
 from agent_runtime.conversation_message.message.models import (
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 _ADAPTERS: list[ProviderAdapter] = [
     ClaudeAdapter(),
     GeminiAdapter(),
+    OpenAIChatAdapter(),
     OpenAIAdapter(),
     ZhipuChatAdapter(),
 ]

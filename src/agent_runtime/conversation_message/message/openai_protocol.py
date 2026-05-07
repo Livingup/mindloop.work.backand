@@ -20,6 +20,15 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_runtime.conversation_message.message.assistant_projection import (
+    AssistantTextSegment,
+    AssistantToolUseSegment,
+    clone_raw_value,
+    iter_assistant_semantic_segments,
+    serialize_tool_arguments,
+    serialize_tool_output,
+    should_include_cross_protocol_thinking_text,
+)
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI,
     ROLE_ASSISTANT,
@@ -160,11 +169,11 @@ class OpenAIAdapter:
                         input_items.append({
                             "type": "function_call_output",
                             "call_id": p.tool_use_ref,
-                            "output": str(p.output),
+                            "output": serialize_tool_output(p.output),
                         })
             else:
                 # assistant 消息
-                input_items.extend(_build_openai_assistant(m))
+                input_items.extend(_build_openai_assistant(m, options))
 
         return OpenAIRenderResult(
             input=input_items,
@@ -243,7 +252,10 @@ def _require_base64(base64_content: str | None, resource_id: str) -> str:
     return base64_content
 
 
-def _build_openai_assistant(msg: UniMessage) -> list[Any]:
+def _build_openai_assistant(
+    msg: UniMessage,
+    options: dict[str, Any] | None = None,
+) -> list[Any]:
     """将 assistant 消息转换为 OpenAI Responses API 格式。
 
     同平台（source_provider == "openai_responses"）：展开 output items 到顶层 input
@@ -256,13 +268,40 @@ def _build_openai_assistant(msg: UniMessage) -> list[Any]:
     if msg.source_provider == PROVIDER_OPENAI:
         extras = (msg.provider_extras or {}).get(PROVIDER_OPENAI)
         if extras and extras.get("raw") is not None:
-            return list(extras["raw"])
+            return list(clone_raw_value(extras["raw"]))
 
-    # 跨平台降级：合成一条 assistant message item
-    text = "\n".join(
-        p.text for p in msg.content if p.kind == "text" and hasattr(p, "text")
-    )
+    include_thinking_text = should_include_cross_protocol_thinking_text(options)
+    input_items: list[Any] = []
+    pending_text: list[str] = []
+
+    def flush_text() -> None:
+        if not pending_text:
+            return
+        input_items.append({
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "\n".join(pending_text)}],
+        })
+        pending_text.clear()
+
+    for segment in iter_assistant_semantic_segments(
+        msg,
+        include_thinking_text=include_thinking_text,
+    ):
+        if isinstance(segment, AssistantTextSegment):
+            pending_text.append(segment.text)
+        elif isinstance(segment, AssistantToolUseSegment):
+            flush_text()
+            input_items.append({
+                "type": "function_call",
+                "call_id": segment.tool_use_ref,
+                "name": segment.name,
+                "arguments": serialize_tool_arguments(segment.input),
+            })
+    flush_text()
+
+    if input_items:
+        return input_items
     return [{
         "role": "assistant",
-        "content": [{"type": "output_text", "text": text or "(empty)"}],
+        "content": [{"type": "output_text", "text": "(empty)"}],
     }]

@@ -331,6 +331,16 @@ def _apply_render_side_effects(conversation: Any, api_format: str, rendered_mess
             **(conversation.provider_state.get(api_format) or {}),
             "cache_breakpoint_indexes": list(applied),
         }
+    last_claude_assistant_message_index = getattr(
+        rendered_messages,
+        "last_claude_assistant_message_index",
+        None,
+    )
+    if last_claude_assistant_message_index is not None:
+        conversation.provider_state[api_format] = {
+            **(conversation.provider_state.get(api_format) or {}),
+            "last_claude_assistant_message_index": last_claude_assistant_message_index,
+        }
 
 
 def _should_retry(exc: Exception, retryable_status_codes: tuple[int, ...]) -> bool:

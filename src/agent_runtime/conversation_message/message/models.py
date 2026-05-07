@@ -25,6 +25,7 @@ from agent_runtime.input_modality import (
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
+    API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
     API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
 )
@@ -47,6 +48,7 @@ Role: TypeAlias = str
 # 内置 Provider 常量，方便调用方引用。Provider 取值与 api_format 保持一致。
 PROVIDER_ANTHROPIC_MESSAGES: str = API_FORMAT_ANTHROPIC_MESSAGES
 PROVIDER_GEMINI_GENERATE_CONTENT: str = API_FORMAT_GEMINI_GENERATE_CONTENT
+PROVIDER_OPENAI_CHAT_COMPLETIONS: str = API_FORMAT_OPENAI_CHAT_COMPLETIONS
 PROVIDER_OPENAI_RESPONSES: str = API_FORMAT_OPENAI_RESPONSES
 PROVIDER_ZHIPU_CHAT_COMPLETIONS: str = API_FORMAT_ZHIPU_CHAT_COMPLETIONS
 
@@ -317,11 +319,10 @@ class Conversation:
     state: ConversationState = field(default_factory=ConversationState)
 
     # 各 API 协议格式的会话运行态，render 时读取，API 成功后写回。
-    # key = provider/api_format 标识（如 "anthropic_messages" / "openai_responses"），
-    # value 由各 ProviderAdapter 自定义。
     #
     # 内置示例：
     #   anthropic_messages:        {"cache_breakpoint_indexes": [int, ...]}
+    #   openai_chat_completions:   {}
     #   openai_responses:          {"prompt_cache_key": str, "stateless": bool}
     #   zhipu_chat_completions:    {"preserved_thinking": bool, "clear_thinking": bool, "cached_tokens": int | None}
     #   gemini_generate_content:   {"cached_content": str}

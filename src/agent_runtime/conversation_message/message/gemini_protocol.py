@@ -21,6 +21,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.conversation_message.message.assistant_projection import (
+    AssistantTextSegment,
+    AssistantToolUseSegment,
+    build_tool_name_by_ref,
+    clone_raw_value,
+    iter_assistant_semantic_segments,
+    should_include_cross_protocol_thinking_text,
+    tool_name_for_result,
+)
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_GEMINI,
     ROLE_ASSISTANT,
@@ -91,7 +100,7 @@ class GeminiAdapter:
         parts = (cand.get("content") or {}).get("parts") or []
 
         content: list[UniPart] = []
-        for part in parts:
+        for part_index, part in enumerate(parts):
             if part.get("thought") is True:
                 # 思考块：thought=true 标识的 text part
                 text = part.get("text") if isinstance(part.get("text"), str) else None
@@ -104,7 +113,7 @@ class GeminiAdapter:
                     ToolUsePart(
                         name=fc.get("name", ""),
                         input=fc.get("args"),
-                        tool_use_id=None,
+                        tool_use_id=_build_gemini_tool_use_ref(fc.get("name", ""), part_index),
                     )
                 )
             # inlineData / fileData 仅用户侧出现，响应一般不会
@@ -134,14 +143,15 @@ class GeminiAdapter:
         generationConfig、thinkingConfig、systemInstruction 等由调用方合并。
         """
         contents: list[dict[str, Any]] = []
+        tool_name_by_ref = build_tool_name_by_ref(conv.messages)
 
         for m in conv.messages:
             if m.role == "user":
                 contents.append(await _build_gemini_user(m, resolver))
             elif m.role == "tool":
-                contents.append(_build_gemini_tool(m))
+                contents.append(_build_gemini_tool(m, tool_name_by_ref))
             else:
-                contents.append(_build_gemini_model(m))
+                contents.append(_build_gemini_model(m, options))
 
         # 规范化：确保 contents[0].role == "user"，相邻同 role 合并
         normalized = _normalize_gemini_contents(contents)
@@ -228,7 +238,16 @@ def _require_base64(base64_content: str | None, resource_id: str) -> str:
     return base64_content
 
 
-def _build_gemini_tool(msg: UniMessage) -> dict[str, Any]:
+def _build_gemini_tool_use_ref(name: str, part_index: int) -> str:
+    """为 Gemini functionCall 构造公共工具调用引用，供其它协议切换时使用。"""
+    safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in name)
+    return f"gemini_call_{part_index}_{safe_name or 'tool'}"
+
+
+def _build_gemini_tool(
+    msg: UniMessage,
+    tool_name_by_ref: dict[str, str],
+) -> dict[str, Any]:
     """将 tool 消息转换为 Gemini 格式。
 
     Gemini 的 functionResponse 放在 user role 的 parts 中。
@@ -239,7 +258,7 @@ def _build_gemini_tool(msg: UniMessage) -> dict[str, Any]:
         if p.kind == "tool_result":
             parts.append({
                 "functionResponse": {
-                    "name": p.tool_use_ref,
+                    "name": tool_name_for_result(p.tool_use_ref, tool_name_by_ref),
                     "response": {"result": p.output},
                 },
             })
@@ -247,7 +266,10 @@ def _build_gemini_tool(msg: UniMessage) -> dict[str, Any]:
     return {"role": "user", "parts": parts}
 
 
-def _build_gemini_model(msg: UniMessage) -> dict[str, Any]:
+def _build_gemini_model(
+    msg: UniMessage,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """将 assistant 消息转换为 Gemini 格式。
 
     同平台（source_provider == "gemini_generate_content"）：原样回灌 raw（含 thoughtSignature，无损）。
@@ -257,13 +279,26 @@ def _build_gemini_model(msg: UniMessage) -> dict[str, Any]:
     if msg.source_provider == PROVIDER_GEMINI:
         extras = (msg.provider_extras or {}).get(PROVIDER_GEMINI)
         if extras and extras.get("raw") is not None:
-            return {"role": "model", "parts": extras["raw"]}
+            return {"role": "model", "parts": clone_raw_value(extras["raw"])}
 
-    # 跨平台降级
-    text = "\n".join(
-        p.text for p in msg.content if p.kind == "text" and hasattr(p, "text")
-    )
-    return {"role": "model", "parts": [{"text": text or "(empty)"}]}
+    include_thinking_text = should_include_cross_protocol_thinking_text(options)
+    parts: list[dict[str, Any]] = []
+    for segment in iter_assistant_semantic_segments(
+        msg,
+        include_thinking_text=include_thinking_text,
+    ):
+        if isinstance(segment, AssistantTextSegment):
+            parts.append({"text": segment.text})
+        elif isinstance(segment, AssistantToolUseSegment):
+            parts.append({
+                "functionCall": {
+                    "name": segment.name,
+                    "args": segment.input,
+                },
+            })
+    if not parts:
+        parts.append({"text": "(empty)"})
+    return {"role": "model", "parts": parts}
 
 
 def _normalize_gemini_contents(

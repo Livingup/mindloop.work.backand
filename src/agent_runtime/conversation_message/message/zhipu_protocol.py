@@ -15,6 +15,15 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.conversation_message.message.assistant_projection import (
+    AssistantTextSegment,
+    AssistantToolUseSegment,
+    clone_raw_value,
+    iter_assistant_semantic_segments,
+    serialize_tool_arguments,
+    serialize_tool_output,
+    should_include_cross_protocol_thinking_text,
+)
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_ZHIPU_CHAT_COMPLETIONS,
     ROLE_ASSISTANT,
@@ -122,6 +131,7 @@ class ZhipuChatAdapter:
                     _build_zhipu_assistant(
                         message,
                         preserve_reasoning_content=preserve_reasoning_content,
+                        options=options,
                     )
                 )
 
@@ -193,7 +203,7 @@ def _build_zhipu_tool_messages(msg: UniMessage) -> list[dict[str, Any]]:
                 {
                     "role": "tool",
                     "tool_call_id": part.tool_use_ref,
-                    "content": _serialize_tool_output(part.output),
+                    "content": serialize_tool_output(part.output),
                 }
             )
     return messages
@@ -203,21 +213,43 @@ def _build_zhipu_assistant(
     msg: UniMessage,
     *,
     preserve_reasoning_content: bool,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """将 assistant 消息转换为 GLM Chat Completions 格式。"""
     if msg.source_provider == PROVIDER_ZHIPU_CHAT_COMPLETIONS:
         extras = (msg.provider_extras or {}).get(PROVIDER_ZHIPU_CHAT_COMPLETIONS)
         if extras and extras.get("raw") is not None:
-            raw_message = dict(extras["raw"])
+            raw_message = clone_raw_value(extras["raw"])
             raw_message.setdefault("role", "assistant")
             if not preserve_reasoning_content:
                 raw_message.pop("reasoning_content", None)
             return raw_message
 
-    text = "\n".join(
-        part.text for part in msg.content if part.kind == "text" and hasattr(part, "text")
-    )
-    return {"role": "assistant", "content": text or "(empty)"}
+    include_thinking_text = should_include_cross_protocol_thinking_text(options)
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for segment in iter_assistant_semantic_segments(
+        msg,
+        include_thinking_text=include_thinking_text,
+    ):
+        if isinstance(segment, AssistantTextSegment):
+            text_parts.append(segment.text)
+        elif isinstance(segment, AssistantToolUseSegment):
+            tool_calls.append({
+                "id": segment.tool_use_ref,
+                "type": "function",
+                "function": {
+                    "name": segment.name,
+                    "arguments": serialize_tool_arguments(segment.input),
+                },
+            })
+
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    if not message["content"] and not tool_calls:
+        message["content"] = "(empty)"
+    return message
 
 
 def _should_preserve_reasoning_content(options: dict[str, Any] | None) -> bool:
@@ -230,13 +262,6 @@ def _should_preserve_reasoning_content(options: dict[str, Any] | None) -> bool:
         if thinking.get("clear_thinking") is True:
             return False
     return True
-
-
-def _serialize_tool_output(output: Any) -> str:
-    """将工具执行结果稳定序列化为 tool 消息 content。"""
-    if isinstance(output, str):
-        return output
-    return json.dumps(output, ensure_ascii=False)
 
 
 def _require_base64(base64_content: str | None, resource_id: str) -> str:
