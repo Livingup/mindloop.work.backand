@@ -273,9 +273,16 @@ Z.AI Chat Completion 文档响应 usage 中包含 `prompt_tokens_details.cached_
 当前可确认规则：
 
 - 标准 Chat Completion 请求中没有 Claude 风格 `cache_control` 断点。
-- 客户端主要通过稳定历史前缀、preserved thinking 原样回灌来提高一致性和缓存命中。
+- GLM-5.1 当前接入路径下的缓存由 Z.AI 服务端自动/best-effort 管理；客户端没有显式创建缓存、引用缓存或打缓存断点的字段。
+- 客户端主要通过稳定历史前缀、preserved thinking 原样回灌来提高一致性和服务端自动缓存命中。
 - cached token 命中通过 `usage.prompt_tokens_details.cached_tokens` 观察。
 - preserved thinking 会增加 prompt tokens，但可保持推理连续性，并可能提高长任务/工具任务的上下文一致性。
+
+AgentRuntime 接入策略：
+
+- Z.AI/GLM-5.1 默认采用 Preserved Thinking，即请求体显式设置 `"thinking": {"type": "enabled", "clear_thinking": false}`。
+- 同协议 Z.AI assistant 历史必须原样回灌 `raw.reasoning_content`、`content` 和 `tool_calls`，不能重写或裁剪 reasoning_content。
+- Z.AI 缓存不在统一消息模型中保存显式缓存状态，只在 `provider_state["zhipu_chat_completions"]["cached_tokens"]` 记录最近响应中的命中统计。
 
 默认值与模型差异：
 
@@ -284,6 +291,24 @@ Z.AI Chat Completion 文档响应 usage 中包含 `prompt_tokens_details.cached_
 - `clear_thinking` 默认值是 `true`，表示本次请求忽略/移除历史轮次中的 `reasoning_content`，只保留非 reasoning 上下文。
 - `clear_thinking=false` 才启用 Preserved Thinking；此时必须完整、未修改、顺序正确地回传历史 `reasoning_content`，缺失、截断、重写或乱序都会降低效果或导致 preserved thinking 不生效。
 - `clear_thinking` 只影响跨轮历史 thinking block，不改变当前轮是否生成/返回 thinking。
+
+### 4. GLM-5.1 图片/PDF 输入与文件块降级规则
+
+Z.AI `chat/completions` 总接口支持 text、image、audio、video、file 等多模态输入，但这是接口层能力，不代表每个模型别名都支持全部输入模态。
+
+当前可确认规则：
+
+- 官方 GLM-5.1 文档把 `glm-5.1` 作为 LLM/text 模型介绍，Quick Start 示例均为纯文本 `content`。
+- 官方 Vision Understanding / VLM 示例使用 `glm-4.5v`、`glm-4.6v` 等视觉模型，并通过 `image_url`、`video_url`、`file_url` 传递图片、视频和 PDF/文档。
+- 因此不能把 `glm-5.1` 当作支持图片/PDF的多模态模型；项目中 `glm-5.1` 模型元数据应只声明 `supported_input_modalities=["text"]`。
+
+渲染规则：
+
+- 当目标 Z.AI 模型元数据未声明支持 `image` 或 `pdf` 时，user 消息中的 `ImagePart` / `PdfPart` 不能渲染为 `image_url` / `file_url` block。
+- 这类资源必须降级为普通文本，优先写入统一文件资源服务解析出的本地绝对路径，例如 `[image file: G:\workspace\image.jpg]`、`[pdf file: G:\workspace\doc.pdf]`。
+- tool result 消息中携带的图片/PDF资源也按同一规则拼接到 tool 消息 `content` 文本中。
+- 只有当模型元数据显式声明支持对应模态，例如 VLM 模型声明 `supported_input_modalities=["text","image","pdf"]` 时，Z.AI adapter 才能把 user 图片/PDF渲染为 `image_url` / `file_url` block。
+- 不允许仅根据 `api_format=zhipu_chat_completions` 推断可发送多模态 block；必须以 resolved model 的 `supported_input_modalities` 为准。
 
 需要二次复核：
 

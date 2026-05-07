@@ -70,6 +70,7 @@ class LlmRequestService:
         render_options = {
             **request.render_options,
             "request_params": request_params,
+            "supported_input_modalities": resolved.supported_input_modalities,
         }
         rendered_messages = await render_messages(
             request.conversation,

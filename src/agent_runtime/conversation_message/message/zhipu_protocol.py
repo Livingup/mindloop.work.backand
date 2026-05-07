@@ -15,6 +15,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.input_modality import (
+    INPUT_MODALITY_IMAGE,
+    INPUT_MODALITY_PDF,
+    INPUT_MODALITY_TEXT,
+)
 from agent_runtime.conversation_message.message.assistant_projection import (
     AssistantTextSegment,
     AssistantToolUseSegment,
@@ -123,9 +128,9 @@ class ZhipuChatAdapter:
 
         for message in conv.messages:
             if message.role == "user":
-                messages.append(await _build_zhipu_user(message, resolver))
+                messages.append(await _build_zhipu_user(message, resolver, options))
             elif message.role == "tool":
-                messages.extend(_build_zhipu_tool_messages(message))
+                messages.extend(await _build_zhipu_tool_messages(message, resolver))
             else:
                 messages.append(
                     _build_zhipu_assistant(
@@ -161,11 +166,13 @@ class ZhipuChatAdapter:
 async def _build_zhipu_user(
     msg: UniMessage,
     resolver: ResourceResolver,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """将 user 消息转换为 GLM Chat Completions 格式。"""
     content_blocks: list[dict[str, Any]] = []
     text_parts: list[str] = []
     has_non_text_part = False
+    supported_modalities = _supported_input_modalities(options)
 
     for part in msg.content:
         if part.kind == "text":
@@ -173,16 +180,22 @@ async def _build_zhipu_user(
             text_parts.append(text)
             content_blocks.append({"type": "text", "text": text})
         elif part.kind == "image":
-            has_non_text_part = True
             resource = await resolve_resource_access(resolver, part.resource_id)
+            if INPUT_MODALITY_IMAGE not in supported_modalities:
+                text_parts.append(_resource_path_text("image", resource))
+                continue
+            has_non_text_part = True
             image_url = resource.object_storage_url
             if not image_url:
                 data = _require_base64(resource.base64_content, part.resource_id)
                 image_url = f"data:{resource.mime_type};base64,{data}"
             content_blocks.append({"type": "image_url", "image_url": {"url": image_url}})
         elif part.kind == "pdf":
-            has_non_text_part = True
             resource = await resolve_resource_access(resolver, part.resource_id)
+            if INPUT_MODALITY_PDF not in supported_modalities:
+                text_parts.append(_resource_path_text("pdf", resource))
+                continue
+            has_non_text_part = True
             file_url = resource.object_storage_url
             if not file_url:
                 data = _require_base64(resource.base64_content, part.resource_id)
@@ -194,18 +207,42 @@ async def _build_zhipu_user(
     return {"role": "user", "content": content_blocks}
 
 
-def _build_zhipu_tool_messages(msg: UniMessage) -> list[dict[str, Any]]:
+async def _build_zhipu_tool_messages(
+    msg: UniMessage,
+    resolver: ResourceResolver,
+) -> list[dict[str, Any]]:
     """将统一 tool 消息转换为 GLM Chat Completions tool 消息列表。"""
-    messages: list[dict[str, Any]] = []
+    tool_results: list[dict[str, str]] = []
+    resource_texts: list[str] = []
     for part in msg.content:
         if part.kind == "tool_result":
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": part.tool_use_ref,
-                    "content": serialize_tool_output(part.output),
-                }
-            )
+            tool_results.append({
+                "tool_call_id": part.tool_use_ref,
+                "content": serialize_tool_output(part.output),
+            })
+        elif part.kind == "image":
+            resource = await resolve_resource_access(resolver, part.resource_id)
+            resource_texts.append(_resource_path_text("image", resource))
+        elif part.kind == "pdf":
+            resource = await resolve_resource_access(resolver, part.resource_id)
+            resource_texts.append(_resource_path_text("pdf", resource))
+
+    messages: list[dict[str, Any]] = []
+    for result in tool_results:
+        content = result["content"]
+        if resource_texts:
+            content = "\n".join([content, *resource_texts])
+        messages.append({
+            "role": "tool",
+            "tool_call_id": result["tool_call_id"],
+            "content": content,
+        })
+    if resource_texts and not tool_results:
+        messages.append({
+            "role": "tool",
+            "tool_call_id": "",
+            "content": "\n".join(resource_texts),
+        })
     return messages
 
 
@@ -262,6 +299,18 @@ def _should_preserve_reasoning_content(options: dict[str, Any] | None) -> bool:
         if thinking.get("clear_thinking") is True:
             return False
     return True
+
+
+def _supported_input_modalities(options: dict[str, Any] | None) -> set[str]:
+    modalities = (options or {}).get("supported_input_modalities")
+    if modalities is None:
+        return {INPUT_MODALITY_TEXT}
+    return {str(item) for item in modalities}
+
+
+def _resource_path_text(resource_type: str, resource: Any) -> str:
+    path = resource.local_storage_path or resource.object_storage_url or resource.resource_id
+    return f"[{resource_type} file: {path}]"
 
 
 def _require_base64(base64_content: str | None, resource_id: str) -> str:
