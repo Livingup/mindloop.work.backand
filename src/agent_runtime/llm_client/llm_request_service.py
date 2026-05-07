@@ -8,7 +8,7 @@ import os
 import re
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
 from agent_runtime.conversation_message.message.operations import (
     ingest_response,
@@ -143,6 +143,20 @@ class LlmRequestService:
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    stream_event_handler = _build_stream_event_handler(
+                        publisher=self._event_publisher,
+                        context=request.communication_context,
+                        event_loop=asyncio.get_running_loop(),
+                        conversation_id=request.conversation.id,
+                        provider_id=resolved.provider_id,
+                        binding_id=resolved.binding_id,
+                        model_id=resolved.model_id,
+                        model_alias=resolved.model_alias,
+                        api_format=resolved.api_format,
+                        api_key_index=key_index,
+                        retry_index=retry_index,
+                        attempt_count=attempt_count,
+                    )
                     raw_response = await client.request(
                         resolved_model=resolved,
                         rendered_messages=rendered_messages,
@@ -150,6 +164,7 @@ class LlmRequestService:
                         tools=tool_schemas,
                         request_params=request_params,
                         api_key=api_key,
+                        stream_event_handler=stream_event_handler,
                     )
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
                     if not _is_llm_service_call_failure(exc):
@@ -303,6 +318,7 @@ def _merge_request_params(request: LlmPromptRequest) -> dict[str, Any]:
     _merge_json_field(merged, resolved.thinking, "thinking")
     _merge_json_field(merged, resolved.tool_choice, "tool_choice")
     merged.update(request.request_overrides)
+    merged["stream"] = True
     return merged
 
 
@@ -322,6 +338,52 @@ def _merge_json_field(target: dict[str, Any], json_text: str | None, fallback_ke
         target.update(value)
     else:
         target[fallback_key] = value
+
+
+def _build_stream_event_handler(
+    *,
+    publisher: RuntimeEventPublisher,
+    context: Any,
+    event_loop: asyncio.AbstractEventLoop,
+    conversation_id: str,
+    provider_id: str,
+    binding_id: str,
+    model_id: str,
+    model_alias: str,
+    api_format: str,
+    api_key_index: int,
+    retry_index: int,
+    attempt_count: int,
+) -> Callable[[dict[str, Any]], None]:
+    def handle(event: dict[str, Any]) -> None:
+        event_type = str(event.get("event_type") or "llm.response.stream.event")
+        payload = {
+            "provider_id": provider_id,
+            "binding_id": binding_id,
+            "model_id": model_id,
+            "model_alias": model_alias,
+            "api_format": api_format,
+            "api_key_index": api_key_index,
+            "retry_index": retry_index,
+            "attempt_count": attempt_count,
+            **dict(event.get("payload") or {}),
+        }
+        future = asyncio.run_coroutine_threadsafe(
+            publisher.publish(
+                context,
+                event_type,
+                payload,
+                source="llm_client",
+                metadata={"conversation_id": conversation_id},
+            ),
+            event_loop,
+        )
+        try:
+            future.result()
+        except Exception:
+            pass
+
+    return handle
 
 
 def _apply_render_side_effects(conversation: Any, api_format: str, rendered_messages: Any) -> None:

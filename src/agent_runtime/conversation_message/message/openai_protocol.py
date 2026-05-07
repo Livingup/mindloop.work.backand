@@ -243,7 +243,7 @@ async def _build_openai_user(
                     "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
                 })
 
-    return {"role": "user", "content": content}
+    return {"type": "message", "role": "user", "content": content}
 
 
 def _require_base64(base64_content: str | None, resource_id: str) -> str:
@@ -278,6 +278,7 @@ def _build_openai_assistant(
         if not pending_text:
             return
         input_items.append({
+            "type": "message",
             "role": "assistant",
             "content": [{"type": "output_text", "text": "\n".join(pending_text)}],
         })
@@ -302,6 +303,7 @@ def _build_openai_assistant(
     if input_items:
         return input_items
     return [{
+        "type": "message",
         "role": "assistant",
         "content": [{"type": "output_text", "text": "(empty)"}],
     }]
