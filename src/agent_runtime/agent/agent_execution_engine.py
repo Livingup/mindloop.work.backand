@@ -48,6 +48,10 @@ from agent_runtime.llm_client.llm_request_service import (
     LlmProviderModelServiceUnavailable,
     LlmRequestService,
 )
+from agent_runtime.llm_model_registry.llm_execution_policy import (
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE,
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
+)
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
 )
@@ -629,7 +633,32 @@ class AgentExecutionEngine:
         communication_context: RuntimeCommunicationContext,
     ) -> LlmPromptResponse:
         last_error: Exception | None = None
+        skipped_for_modalities = False
+        unsupported_modality_strategy = _unsupported_input_modality_strategy(instance)
         for candidate_index, resolved_model in enumerate(resolved_candidates):
+            missing_modalities = _missing_input_modalities(conversation, resolved_model)
+            if (
+                missing_modalities
+                and unsupported_modality_strategy == UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE
+            ):
+                await self._event_publisher.publish(
+                    communication_context,
+                    "llm.policy.candidate.skipped",
+                    {
+                        "policy_group_id": instance.llm_policy_group_id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "reason": "unsupported_input_modalities",
+                        "conversation_modalities": list(getattr(conversation.state, "modalities", [])),
+                        "supported_input_modalities": list(resolved_model.supported_input_modalities),
+                        "missing_input_modalities": missing_modalities,
+                    },
+                    source="agent_execution_engine",
+                )
+                skipped_for_modalities = True
+                continue
             system_prompt = self._render_system_prompt(
                 agent_definition,
                 instance.current_working_directory,
@@ -693,6 +722,8 @@ class AgentExecutionEngine:
                 )
         if last_error is not None:
             raise last_error
+        if skipped_for_modalities:
+            raise RuntimeError("LLM 执行策略组没有支持当前会话输入模态的可用候选项。")
         raise RuntimeError("LLM 执行策略组没有可用候选项。")
 
     async def _load_or_create_conversation(
@@ -988,6 +1019,29 @@ class AgentExecutionEngine:
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
     """从 assistant 消息中提取工具调用。"""
     return [part for part in message.content if isinstance(part, ToolUsePart)]
+
+
+def _unsupported_input_modality_strategy(instance: AgentInstance) -> str:
+    strategy = instance.llm_policy_snapshot_json.get("unsupported_input_modality_strategy")
+    if not strategy:
+        return UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
+    strategy_text = str(strategy)
+    if strategy_text == UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE:
+        return strategy_text
+    return UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
+
+
+def _missing_input_modalities(
+    conversation: Any,
+    resolved_model: ResolvedLlmProviderModel,
+) -> list[str]:
+    conversation_modalities = getattr(getattr(conversation, "state", None), "modalities", [])
+    supported_modalities = set(resolved_model.supported_input_modalities)
+    return sorted(
+        str(modality)
+        for modality in conversation_modalities
+        if str(modality) not in supported_modalities
+    )
 
 
 def _message_text(message: UniMessage) -> str:

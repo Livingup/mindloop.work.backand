@@ -13,6 +13,7 @@ from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_execution_policy import (
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE,
 )
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
@@ -148,6 +149,7 @@ class LlmExecutionPolicySaveRequest:
     description: str | None = None
     group: str = "default"
     enabled: bool = True
+    unsupported_input_modality_strategy: str = UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
     candidates: tuple[LlmExecutionPolicyCandidate, ...] = field(default_factory=tuple)
 
     def to_policy(self) -> LlmExecutionPolicy:
@@ -157,6 +159,7 @@ class LlmExecutionPolicySaveRequest:
             description=self.description,
             group=self.group,
             enabled=self.enabled,
+            unsupported_input_modality_strategy=self.unsupported_input_modality_strategy,
             candidates=self.candidates,
         )
 
@@ -168,6 +171,7 @@ class LlmExecutionPolicySaveRequest:
             description=policy.description,
             group=policy.group,
             enabled=policy.enabled,
+            unsupported_input_modality_strategy=policy.unsupported_input_modality_strategy,
             candidates=policy.candidates,
         )
 

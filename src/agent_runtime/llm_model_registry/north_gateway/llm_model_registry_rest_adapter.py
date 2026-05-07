@@ -16,6 +16,8 @@ from agent_runtime.llm_api_protocol import SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_execution_policy import (
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
+    SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES,
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE,
 )
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
@@ -138,6 +140,7 @@ class LlmExecutionPolicyBody(BaseModel):
     description: str | None = None
     group: str = "default"
     enabled: bool = True
+    unsupported_input_modality_strategy: str = UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
     candidates: list[LlmExecutionPolicyCandidateBody] = Field(default_factory=list)
 
 
@@ -147,6 +150,7 @@ class LlmExecutionPolicyResponse(BaseModel):
     description: str | None = None
     group: str = "default"
     enabled: bool = True
+    unsupported_input_modality_strategy: str = UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
     candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -154,6 +158,7 @@ class ResolvedLlmExecutionPolicyResponse(BaseModel):
     policy_group_id: str
     name: str | None = None
     description: str | None = None
+    unsupported_input_modality_strategy: str = UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
     candidates: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -184,6 +189,7 @@ class ResolvedLlmProviderModelResponse(BaseModel):
 class LlmRegistryMetadataResponse(BaseModel):
     api_formats: list[str] = Field(default_factory=list)
     input_modalities: list[str] = Field(default_factory=list)
+    unsupported_input_modality_strategies: list[str] = Field(default_factory=list)
 
 
 # ── 路由工厂 ─────────────────────────────────────────────────────
@@ -207,6 +213,9 @@ def create_llm_model_registry_router(
         return LlmRegistryMetadataResponse(
             api_formats=list(SUPPORTED_LLM_API_FORMATS),
             input_modalities=sorted(SUPPORTED_INPUT_MODALITIES),
+            unsupported_input_modality_strategies=sorted(
+                SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES
+            ),
         )
 
     @router.get("/models", response_model=list[LlmModelMetadataResponse])
@@ -419,6 +428,7 @@ def _body_to_execution_policy_request(
         description=body.description,
         group=body.group,
         enabled=body.enabled,
+        unsupported_input_modality_strategy=body.unsupported_input_modality_strategy,
         candidates=tuple(_body_to_execution_policy_candidate(item) for item in body.candidates),
     )
 

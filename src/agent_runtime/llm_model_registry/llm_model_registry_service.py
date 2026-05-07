@@ -136,6 +136,7 @@ class ResolvedLlmExecutionPolicy:
     policy_group_id: str
     name: str | None
     description: str | None
+    unsupported_input_modality_strategy: str
     candidates: tuple[ResolvedLlmExecutionPolicyCandidate, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +144,7 @@ class ResolvedLlmExecutionPolicy:
             "policy_group_id": self.policy_group_id,
             "name": self.name,
             "description": self.description,
+            "unsupported_input_modality_strategy": self.unsupported_input_modality_strategy,
             "candidates": [item.to_dict() for item in self.candidates],
         }
 
@@ -294,6 +296,7 @@ class LlmModelRegistryService:
             policy_group_id=policy.policy_group_id,
             name=policy.name,
             description=policy.description,
+            unsupported_input_modality_strategy=policy.unsupported_input_modality_strategy,
             candidates=resolved_candidates,
         )
 

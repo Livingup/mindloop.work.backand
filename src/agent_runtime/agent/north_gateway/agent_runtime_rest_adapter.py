@@ -334,6 +334,7 @@ def _policy_snapshot_without_secrets(
         "policy_group_id": resolved.policy_group_id,
         "name": resolved.name,
         "description": resolved.description,
+        "unsupported_input_modality_strategy": resolved.unsupported_input_modality_strategy,
         "candidates": [
             {
                 "candidate_id": candidate.candidate_id,

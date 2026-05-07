@@ -11,6 +11,14 @@ from agent_runtime.llm_model_registry.llm_registry_validation import (
 )
 
 
+UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE = "degrade"
+UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE = "skip_candidate"
+SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES = frozenset({
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE,
+    UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
+})
+
+
 @dataclass(frozen=True, slots=True)
 class LlmExecutionPolicyCandidate:
     id: str
@@ -48,6 +56,7 @@ class LlmExecutionPolicy:
     description: str | None = None
     group: str = "default"
     enabled: bool = True
+    unsupported_input_modality_strategy: str = UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
     candidates: tuple[LlmExecutionPolicyCandidate, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
@@ -55,10 +64,17 @@ class LlmExecutionPolicy:
         validate_optional_text(self.name, "execution_policy.name")
         validate_optional_text(self.description, "execution_policy.description")
         validate_optional_text(self.group, "execution_policy.group")
+        strategy = self.unsupported_input_modality_strategy.strip()
+        if strategy not in SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES:
+            raise ValueError(
+                "execution_policy.unsupported_input_modality_strategy 必须是 "
+                + ", ".join(sorted(SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES))
+            )
         if not self.candidates:
             raise ValueError("execution_policy.candidates 不能为空。")
         validate_unique_registry_ids((item.id for item in self.candidates), "candidate.id")
         object.__setattr__(self, "group", self.group.strip())
+        object.__setattr__(self, "unsupported_input_modality_strategy", strategy)
         object.__setattr__(self, "candidates", tuple(self.candidates))
 
     def enabled_candidates(self) -> tuple[LlmExecutionPolicyCandidate, ...]:
@@ -69,6 +85,7 @@ class LlmExecutionPolicy:
             "policy_group_id": self.policy_group_id,
             "group": self.group,
             "enabled": self.enabled,
+            "unsupported_input_modality_strategy": self.unsupported_input_modality_strategy,
             "candidates": [item.to_dict() for item in self.candidates],
         }
         if self.name is not None:
@@ -91,6 +108,10 @@ class LlmExecutionPolicy:
             description=data.get("description"),
             group=str(data.get("group") or "default"),
             enabled=bool(data.get("enabled", True)),
+            unsupported_input_modality_strategy=str(
+                data.get("unsupported_input_modality_strategy")
+                or UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
+            ),
             candidates=tuple(
                 LlmExecutionPolicyCandidate.from_dict(_require_dict(item, "execution_policy.candidates 元素"))
                 for item in candidate_items
