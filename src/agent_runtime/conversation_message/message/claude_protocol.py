@@ -35,6 +35,8 @@ from agent_runtime.conversation_message.message.models import (
     PROVIDER_CLAUDE,
     ROLE_ASSISTANT,
     Conversation,
+    ImagePart,
+    PdfPart,
     TextPart,
     ThinkingPart,
     ToolUsePart,
@@ -148,7 +150,7 @@ class ClaudeAdapter:
             if m.role == "user":
                 messages.append(await _build_claude_user(m, resolver))
             elif m.role == "tool":
-                messages.append(_build_claude_tool(m))
+                messages.append(await _build_claude_tool(m, resolver))
             else:
                 if m.source_provider == PROVIDER_CLAUDE:
                     last_claude_assistant_message_index = source_index
@@ -269,22 +271,79 @@ def _require_base64(base64_content: str | None, resource_id: str) -> str:
     return base64_content
 
 
-def _build_claude_tool(msg: UniMessage) -> dict[str, Any]:
+async def _build_claude_tool(
+    msg: UniMessage,
+    resolver: ResourceResolver,
+) -> dict[str, Any]:
     """将 tool 消息转换为 Claude 格式。
 
     Claude API 中 tool_result 必须放在 user role 的 content 中。
+    支持原生 is_error 字段和多模态 content blocks（text + image + document）。
     """
     content: list[dict[str, Any]] = []
 
     for p in msg.content:
-        if p.kind == "tool_result":
-            content.append({
-                "type": "tool_result",
-                "tool_use_id": p.tool_use_ref,
-                "content": serialize_tool_output(p.output),
-            })
+        if p.kind != "tool_result":
+            continue
+        tool_result_block: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": p.tool_use_ref,
+            "content": await _build_claude_tool_result_content(p.output, resolver),
+        }
+        if p.is_error:
+            tool_result_block["is_error"] = True
+        content.append(tool_result_block)
 
     return {"role": "user", "content": content}
+
+
+async def _build_claude_tool_result_content(
+    output: Any,
+    resolver: ResourceResolver,
+) -> str | list[dict[str, Any]]:
+    """构造 Claude tool_result.content。
+
+    支持三种形态的 output：
+    - str: 直接作为字符串内容
+    - list[UniPart]: 多模态内容块列表（TextPart + ImagePart + PdfPart），
+      多模态资源优先使用 object_storage_url，无则降级到 base64
+    - dict/其他: 序列化为 JSON 字符串
+    """
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list) and all(
+        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
+    ):
+        blocks: list[dict[str, Any]] = []
+        for item in output:
+            if isinstance(item, TextPart):
+                blocks.append({"type": "text", "text": item.text})
+            elif isinstance(item, ImagePart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                if resource.object_storage_url:
+                    source = {"type": "url", "url": resource.object_storage_url}
+                else:
+                    data = _require_base64(resource.base64_content, item.resource_id)
+                    source = {
+                        "type": "base64",
+                        "media_type": resource.mime_type,
+                        "data": data,
+                    }
+                blocks.append({"type": "image", "source": source})
+            elif isinstance(item, PdfPart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                if resource.object_storage_url:
+                    source = {"type": "url", "url": resource.object_storage_url}
+                else:
+                    data = _require_base64(resource.base64_content, item.resource_id)
+                    source = {
+                        "type": "base64",
+                        "media_type": resource.mime_type or "application/pdf",
+                        "data": data,
+                    }
+                blocks.append({"type": "document", "source": source})
+        return blocks
+    return serialize_tool_output(output)
 
 
 def _build_claude_assistant(

@@ -52,7 +52,12 @@ def _part_to_dict(part: UniPart) -> dict[str, Any]:
             data["tool_use_id"] = part.tool_use_id
         return data
     if isinstance(part, ToolResultPart):
-        return {"kind": "tool_result", "tool_use_ref": part.tool_use_ref, "output": part.output}
+        return {
+            "kind": "tool_result",
+            "tool_use_ref": part.tool_use_ref,
+            "is_error": part.is_error,
+            "output": part.output,
+        }
     raise TypeError(f"Unknown part type: {type(part)}")
 
 
@@ -74,7 +79,11 @@ def _dict_to_part(d: dict[str, Any]) -> UniPart:
             tool_use_id=d.get("tool_use_id"),
         )
     if kind == "tool_result":
-        return ToolResultPart(tool_use_ref=d["tool_use_ref"], output=d["output"])
+        return ToolResultPart(
+            tool_use_ref=d["tool_use_ref"],
+            is_error=bool(d.get("is_error", False)),
+            output=d["output"],
+        )
     raise ValueError(f"Unknown part kind: {kind}")
 
 

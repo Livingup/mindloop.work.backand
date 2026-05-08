@@ -33,6 +33,8 @@ from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI,
     ROLE_ASSISTANT,
     Conversation,
+    ImagePart,
+    PdfPart,
     TextPart,
     ThinkingPart,
     ToolUsePart,
@@ -169,7 +171,9 @@ class OpenAIAdapter:
                         input_items.append({
                             "type": "function_call_output",
                             "call_id": p.tool_use_ref,
-                            "output": serialize_tool_output(p.output),
+                            "output": await _build_openai_tool_result_output(
+                                p.output, p.is_error, resolver,
+                            ),
                         })
             else:
                 # assistant 消息
@@ -250,6 +254,52 @@ def _require_base64(base64_content: str | None, resource_id: str) -> str:
     if not base64_content:
         raise ValueError(f"资源缺少公网 URL 和 Base64 内容: {resource_id}")
     return base64_content
+
+
+async def _build_openai_tool_result_output(
+    output: Any,
+    is_error: bool,
+    resolver: ResourceResolver,
+) -> str | list[dict[str, Any]]:
+    """构造 OpenAI Responses function_call_output 的 output 字段。
+
+    OpenAI Responses 没有原生 is_error 字段，错误以文本标记编码进 output 内容。
+    多模态资源优先使用 object_storage_url，无则降级到 base64 data URI。
+    """
+    if isinstance(output, list) and all(
+        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
+    ):
+        items: list[dict[str, Any]] = []
+        if is_error:
+            items.append({"type": "input_text", "text": "[ERROR] Tool execution failed."})
+        for item in output:
+            if isinstance(item, TextPart):
+                items.append({"type": "input_text", "text": item.text})
+            elif isinstance(item, ImagePart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                image_url = resource.object_storage_url
+                if not image_url:
+                    data = _require_base64(resource.base64_content, item.resource_id)
+                    image_url = f"data:{resource.mime_type};base64,{data}"
+                items.append({"type": "input_image", "image_url": image_url})
+            elif isinstance(item, PdfPart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                if resource.object_storage_url:
+                    items.append({
+                        "type": "input_file",
+                        "file_url": resource.object_storage_url,
+                    })
+                else:
+                    data = _require_base64(resource.base64_content, item.resource_id)
+                    items.append({
+                        "type": "input_file",
+                        "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
+                    })
+        return items
+    text = serialize_tool_output(output)
+    if is_error:
+        return f"[ERROR] {text}"
+    return text
 
 
 def _build_openai_assistant(

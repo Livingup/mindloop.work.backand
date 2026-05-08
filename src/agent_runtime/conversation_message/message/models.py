@@ -150,15 +150,25 @@ class ToolUsePart:
 
 @dataclass(slots=True)
 class ToolResultPart:
-    """工具执行结果内容块（预留，当前不实现）。
+    """工具执行结果内容块。
 
-    tool 消息是纯通用 POJO，不存 raw。
+    tool 消息是纯通用 POJO，不存 raw。各协议适配器根据本结构生成目标平台的 tool_result 消息。
     """
 
     # 关联 assistant 消息里 tool_use 的标识。
     tool_use_ref: str
 
-    # 工具执行结果（字符串或结构化对象）。
+    # 工具是否执行失败。各协议适配器自己决定如何编码：
+    # - Claude: 映射到原生 is_error 字段
+    # - Gemini: 编码为 response.error key
+    # - OpenAI Responses/Chat、Zhipu: 在 content 文本里加错误标记
+    is_error: bool
+
+    # 工具结果内容。支持三种形态：
+    # - str: 纯文本结果（所有协议都能直接使用）
+    # - list[UniPart]: 多模态内容块（TextPart + ImagePart + PdfPart，
+    #   ImagePart/PdfPart 内部只存 resource_id，渲染时由 ResourceResolver 按平台支持转 URL/base64/路径）
+    # - dict / 任意 JSON: 结构化对象（Gemini 原生支持，其他协议序列化为 JSON 字符串）
     output: Any
 
     # 内容块类型标识，固定为 "tool_result"。

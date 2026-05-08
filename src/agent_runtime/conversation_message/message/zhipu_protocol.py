@@ -33,6 +33,8 @@ from agent_runtime.conversation_message.message.models import (
     PROVIDER_ZHIPU_CHAT_COMPLETIONS,
     ROLE_ASSISTANT,
     Conversation,
+    ImagePart,
+    PdfPart,
     TextPart,
     ThinkingPart,
     ToolUsePart,
@@ -211,14 +213,22 @@ async def _build_zhipu_tool_messages(
     msg: UniMessage,
     resolver: ResourceResolver,
 ) -> list[dict[str, Any]]:
-    """将统一 tool 消息转换为 GLM Chat Completions tool 消息列表。"""
-    tool_results: list[dict[str, str]] = []
+    """将统一 tool 消息转换为 GLM Chat Completions tool 消息列表。
+
+    Zhipu tool 消息 content 只支持文本，多模态需降级为文本描述。
+    is_error 通过在 content 前加 [ERROR] 标记表达。
+    会顺带附带在 tool 消息中的外层 image / pdf part，作为文本引用拼接到首个 tool_result 后面。
+    """
+    tool_results: list[dict[str, Any]] = []
     resource_texts: list[str] = []
     for part in msg.content:
         if part.kind == "tool_result":
+            text_content = await _build_zhipu_tool_result_text(part.output, resolver)
+            if part.is_error:
+                text_content = f"[ERROR] {text_content}"
             tool_results.append({
                 "tool_call_id": part.tool_use_ref,
-                "content": serialize_tool_output(part.output),
+                "content": text_content,
             })
         elif part.kind == "image":
             resource = await resolve_resource_access(resolver, part.resource_id)
@@ -244,6 +254,31 @@ async def _build_zhipu_tool_messages(
             "content": "\n".join(resource_texts),
         })
     return messages
+
+
+async def _build_zhipu_tool_result_text(
+    output: Any,
+    resolver: ResourceResolver,
+) -> str:
+    """构造 Zhipu tool 消息的文本内容。
+
+    多模态资源降级为 [<type> file: <路径或URL>] 文本引用。
+    """
+    if isinstance(output, list) and all(
+        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
+    ):
+        text_pieces: list[str] = []
+        for item in output:
+            if isinstance(item, TextPart):
+                text_pieces.append(item.text)
+            elif isinstance(item, ImagePart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                text_pieces.append(_resource_path_text("image", resource))
+            elif isinstance(item, PdfPart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                text_pieces.append(_resource_path_text("pdf", resource))
+        return "\n".join(text_pieces)
+    return serialize_tool_output(output)
 
 
 def _build_zhipu_assistant(

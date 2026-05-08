@@ -18,6 +18,8 @@ from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI_CHAT_COMPLETIONS,
     ROLE_ASSISTANT,
     Conversation,
+    ImagePart,
+    PdfPart,
     TextPart,
     ThinkingPart,
     ToolUsePart,
@@ -105,7 +107,7 @@ class OpenAIChatAdapter:
             if message.role == "user":
                 messages.append(await _build_openai_chat_user(message, resolver))
             elif message.role == "tool":
-                messages.extend(_build_openai_chat_tool_messages(message))
+                messages.extend(await _build_openai_chat_tool_messages(message, resolver))
             else:
                 messages.append(_build_openai_chat_assistant(message, options))
         return OpenAIChatRenderResult(messages=messages)
@@ -157,17 +159,58 @@ async def _build_openai_chat_user(
     return {"role": "user", "content": content_blocks}
 
 
-def _build_openai_chat_tool_messages(msg: UniMessage) -> list[dict[str, Any]]:
-    """将统一 tool 消息转换为 OpenAI Chat Completions tool 消息。"""
+async def _build_openai_chat_tool_messages(
+    msg: UniMessage,
+    resolver: ResourceResolver,
+) -> list[dict[str, Any]]:
+    """将统一 tool 消息转换为 OpenAI Chat Completions tool 消息。
+
+    OpenAI Chat tool 消息 content 只支持文本，多模态需降级为文本描述。
+    is_error 通过在 content 前加 [ERROR] 标记表达。
+    """
     messages: list[dict[str, Any]] = []
     for part in msg.content:
-        if part.kind == "tool_result":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": part.tool_use_ref,
-                "content": serialize_tool_output(part.output),
-            })
+        if part.kind != "tool_result":
+            continue
+        text_content = await _build_openai_chat_tool_result_text(part.output, resolver)
+        if part.is_error:
+            text_content = f"[ERROR] {text_content}"
+        messages.append({
+            "role": "tool",
+            "tool_call_id": part.tool_use_ref,
+            "content": text_content,
+        })
     return messages
+
+
+async def _build_openai_chat_tool_result_text(
+    output: Any,
+    resolver: ResourceResolver,
+) -> str:
+    """构造 OpenAI Chat tool 消息的文本内容。
+
+    多模态资源降级为 [<type> file: <路径或URL>] 文本引用。
+    """
+    if isinstance(output, list) and all(
+        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
+    ):
+        text_pieces: list[str] = []
+        for item in output:
+            if isinstance(item, TextPart):
+                text_pieces.append(item.text)
+            elif isinstance(item, ImagePart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                text_pieces.append(_resource_path_text("image", resource))
+            elif isinstance(item, PdfPart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                text_pieces.append(_resource_path_text("pdf", resource))
+        return "\n".join(text_pieces)
+    return serialize_tool_output(output)
+
+
+def _resource_path_text(resource_type: str, resource: Any) -> str:
+    path = resource.local_storage_path or resource.object_storage_url or resource.resource_id
+    return f"[{resource_type} file: {path}]"
 
 
 def _build_openai_chat_assistant(

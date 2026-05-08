@@ -34,6 +34,8 @@ from agent_runtime.conversation_message.message.models import (
     PROVIDER_GEMINI,
     ROLE_ASSISTANT,
     Conversation,
+    ImagePart,
+    PdfPart,
     TextPart,
     ThinkingPart,
     ToolUsePart,
@@ -149,7 +151,7 @@ class GeminiAdapter:
             if m.role == "user":
                 contents.append(await _build_gemini_user(m, resolver))
             elif m.role == "tool":
-                contents.append(_build_gemini_tool(m, tool_name_by_ref))
+                contents.append(await _build_gemini_tool(m, tool_name_by_ref, resolver))
             else:
                 contents.append(_build_gemini_model(m, options))
 
@@ -244,26 +246,111 @@ def _build_gemini_tool_use_ref(name: str, part_index: int) -> str:
     return f"gemini_call_{part_index}_{safe_name or 'tool'}"
 
 
-def _build_gemini_tool(
+async def _build_gemini_tool(
     msg: UniMessage,
     tool_name_by_ref: dict[str, str],
+    resolver: ResourceResolver,
 ) -> dict[str, Any]:
     """将 tool 消息转换为 Gemini 格式。
 
     Gemini 的 functionResponse 放在 user role 的 parts 中。
+    is_error 编码为 response.error key，多模态资源走 functionResponse.parts。
     """
     parts: list[dict[str, Any]] = []
 
     for p in msg.content:
-        if p.kind == "tool_result":
-            parts.append({
-                "functionResponse": {
-                    "name": tool_name_for_result(p.tool_use_ref, tool_name_by_ref),
-                    "response": {"result": p.output},
-                },
-            })
+        if p.kind != "tool_result":
+            continue
+        function_response = await _build_gemini_function_response(
+            p.tool_use_ref, p.is_error, p.output, tool_name_by_ref, resolver,
+        )
+        parts.append({"functionResponse": function_response})
 
     return {"role": "user", "parts": parts}
+
+
+async def _build_gemini_function_response(
+    tool_use_ref: str,
+    is_error: bool,
+    output: Any,
+    tool_name_by_ref: dict[str, str],
+    resolver: ResourceResolver,
+) -> dict[str, Any]:
+    """构造 Gemini functionResponse 对象。
+
+    Gemini 约定 response 中使用 "output" key 表达输出，"error" key 表达错误。
+    多模态资源优先 fileData (公网 URL)，无则降级到 inlineData (base64)。
+    """
+    response: dict[str, Any] = {}
+    media_parts: list[dict[str, Any]] = []
+
+    if isinstance(output, list) and all(
+        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
+    ):
+        text_pieces: list[str] = []
+        for item in output:
+            if isinstance(item, TextPart):
+                text_pieces.append(item.text)
+            elif isinstance(item, ImagePart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                media_parts.append(_build_gemini_media_part(
+                    resource, item.resource_id, default_mime=resource.mime_type,
+                ))
+            elif isinstance(item, PdfPart):
+                resource = await resolve_resource_access(resolver, item.resource_id)
+                media_parts.append(_build_gemini_media_part(
+                    resource, item.resource_id, default_mime="application/pdf",
+                ))
+        text_content = "\n".join(text_pieces) if text_pieces else None
+        if is_error:
+            response["error"] = text_content or "Tool execution failed."
+        elif text_content is not None:
+            response["output"] = text_content
+    elif isinstance(output, dict):
+        if is_error:
+            response["error"] = output
+        else:
+            response = dict(output)
+    else:
+        text = serialize_tool_output(output)
+        if is_error:
+            response["error"] = text
+        else:
+            response["output"] = text
+
+    function_response: dict[str, Any] = {
+        "name": tool_name_for_result(tool_use_ref, tool_name_by_ref),
+        "response": response,
+    }
+    if media_parts:
+        function_response["parts"] = media_parts
+    return function_response
+
+
+def _build_gemini_media_part(
+    resource: Any,
+    resource_id: str,
+    default_mime: str | None,
+) -> dict[str, Any]:
+    """构造 Gemini functionResponse.parts 中的单个多模态 part。
+
+    优先使用 fileData (公网 URL)，无则降级到 inlineData (base64)。
+    """
+    mime_type = resource.mime_type or default_mime
+    if resource.object_storage_url:
+        return {
+            "fileData": {
+                "mimeType": mime_type,
+                "fileUri": resource.object_storage_url,
+            }
+        }
+    data = _require_base64(resource.base64_content, resource_id)
+    return {
+        "inlineData": {
+            "mimeType": mime_type,
+            "data": data,
+        }
+    }
 
 
 def _build_gemini_model(
