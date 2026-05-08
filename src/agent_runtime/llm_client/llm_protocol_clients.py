@@ -88,6 +88,8 @@ class OpenAIResponsesProtocolClient:
             body["prompt_cache_key"] = rendered_messages.prompt_cache_key
         if tools:
             body.setdefault("tools", list(tools))
+            # 应用层默认启用并发工具调用；provider 通过 request_params.parallel_tool_calls=False 可显式关闭。
+            body.setdefault("parallel_tool_calls", True)
         url = _join_url(resolved_model.api_base_url, "responses")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
@@ -132,6 +134,8 @@ class OpenAIChatCompletionsProtocolClient:
         }
         if tools:
             body.setdefault("tools", list(tools))
+            # 应用层默认启用并发工具调用；provider 通过 request_params.parallel_tool_calls=False 可显式关闭。
+            body.setdefault("parallel_tool_calls", True)
         url = _join_url(resolved_model.api_base_url, "chat/completions")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
@@ -175,6 +179,8 @@ class AnthropicMessagesProtocolClient:
             body.setdefault("system", _build_claude_cached_system(system_prompt))
         if tools:
             body.setdefault("tools", _build_claude_cached_tools(tools))
+            # Anthropic Messages 协议默认开启并发工具调用，无需主动写字段；如需关闭，
+            # provider 在 request_params 中设置 tool_choice = {"type": "auto", "disable_parallel_tool_use": True}。
         url = _join_url(resolved_model.api_base_url, "v1/messages")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
@@ -220,6 +226,8 @@ class GeminiGenerateContentProtocolClient:
             body.setdefault("cachedContent", rendered_messages.cached_content)
         if tools:
             body.setdefault("tools", [{"functionDeclarations": list(tools)}])
+            # Gemini generateContent 默认支持并发 functionCall（响应里多个 functionCall part 会平铺到 candidates[0].content.parts），
+            # 协议未提供并发开关，无字段可设；如需限制为单工具调用需在 system prompt 中要求模型每轮只输出一个 functionCall。
         method_name = "streamGenerateContent" if stream_requested else "generateContent"
         url = _join_url(
             resolved_model.api_base_url,
@@ -280,6 +288,9 @@ class ZhipuChatCompletionsProtocolClient:
         body.setdefault("thinking", {"type": "enabled", "clear_thinking": False})
         if tools:
             body.setdefault("tools", list(tools))
+            # 智谱 GLM 兼容 OpenAI Chat Completions 字段，应用层默认启用并发工具调用；
+            # provider 通过 request_params.parallel_tool_calls=False 可显式关闭。
+            body.setdefault("parallel_tool_calls", True)
         url = _join_url(resolved_model.api_base_url, "chat/completions")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
