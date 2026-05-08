@@ -19,6 +19,13 @@ from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
 )
+from agent_runtime.llm_api_protocol import (
+    API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_GEMINI_GENERATE_CONTENT,
+    API_FORMAT_OPENAI_CHAT_COMPLETIONS,
+    API_FORMAT_OPENAI_RESPONSES,
+    API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
+)
 from agent_runtime.llm_client.llm_protocol_clients import (
     LlmHttpRequestError,
     LlmProtocolClient,
@@ -249,6 +256,7 @@ class LlmRequestService:
                             source="llm_client",
                             metadata={"conversation_id": request.conversation.id},
                         )
+                    token_usage = _extract_token_usage(resolved.api_format, raw_response)
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.completed",
@@ -262,6 +270,8 @@ class LlmRequestService:
                             "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
                             "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
                             "duration_ms": int((time.perf_counter() - request_started_at) * 1000),
+                            "token_usage": token_usage,
+                            "context_window_max": resolved.context_window,
                         },
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
@@ -443,3 +453,104 @@ def _resolve_api_key(key: str) -> str:
 def _count_parts(parts: Any, part_type: type) -> int:
     """统计 assistant 响应中指定类型内容片段数量。"""
     return sum(1 for part in parts if isinstance(part, part_type))
+
+
+def _extract_token_usage(api_format: str, raw_response: Any) -> dict[str, int]:
+    """按协议归一化抽取 token 用量。
+
+    各协议字段差异：
+    - OpenAI Responses：usage.input_tokens / output_tokens / total_tokens；
+      input_tokens_details.cached_tokens、output_tokens_details.reasoning_tokens。
+    - OpenAI Chat Completions：usage.prompt_tokens / completion_tokens / total_tokens；
+      prompt_tokens_details.cached_tokens。
+    - Anthropic Messages：usage.input_tokens / output_tokens；
+      cache_read_input_tokens（命中缓存）、cache_creation_input_tokens（写入缓存）。
+    - Gemini generateContent：usageMetadata.promptTokenCount / candidatesTokenCount /
+      totalTokenCount / cachedContentTokenCount / thoughtsTokenCount。
+    - 智谱 GLM：兼容 OpenAI Chat Completions 字段，部分版本含 prompt_cache_hit_tokens。
+
+    统一返回：input_tokens / output_tokens / total_tokens / cached_tokens（缺失为 0），
+    可选 reasoning_tokens、cache_creation_tokens 用于补充展示，缺失时省略。
+    """
+    if not isinstance(raw_response, dict):
+        return {}
+    if api_format in (API_FORMAT_OPENAI_CHAT_COMPLETIONS, API_FORMAT_ZHIPU_CHAT_COMPLETIONS):
+        usage = raw_response.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        cached_tokens = 0
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached_tokens = int(details.get("cached_tokens") or 0)
+        if cached_tokens == 0:
+            cached_tokens = int(usage.get("prompt_cache_hit_tokens") or 0)
+        return {
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+        }
+    if api_format == API_FORMAT_OPENAI_RESPONSES:
+        usage = raw_response.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (input_tokens + output_tokens))
+        cached_tokens = 0
+        input_details = usage.get("input_tokens_details")
+        if isinstance(input_details, dict):
+            cached_tokens = int(input_details.get("cached_tokens") or 0)
+        reasoning_tokens = 0
+        output_details = usage.get("output_tokens_details")
+        if isinstance(output_details, dict):
+            reasoning_tokens = int(output_details.get("reasoning_tokens") or 0)
+        result = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+        }
+        if reasoning_tokens:
+            result["reasoning_tokens"] = reasoning_tokens
+        return result
+    if api_format == API_FORMAT_ANTHROPIC_MESSAGES:
+        usage = raw_response.get("usage")
+        if not isinstance(usage, dict):
+            return {}
+        base_input = int(usage.get("input_tokens") or 0)
+        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        input_tokens_total = base_input + cache_creation + cache_read
+        result = {
+            "input_tokens": input_tokens_total,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens_total + output_tokens,
+            "cached_tokens": cache_read,
+        }
+        if cache_creation:
+            result["cache_creation_tokens"] = cache_creation
+        return result
+    if api_format == API_FORMAT_GEMINI_GENERATE_CONTENT:
+        usage = raw_response.get("usageMetadata")
+        if not isinstance(usage, dict):
+            return {}
+        prompt_tokens = int(usage.get("promptTokenCount") or 0)
+        candidates_tokens = int(usage.get("candidatesTokenCount") or 0)
+        total_tokens = int(usage.get("totalTokenCount") or (prompt_tokens + candidates_tokens))
+        cached_tokens = int(usage.get("cachedContentTokenCount") or 0)
+        thoughts_tokens = int(usage.get("thoughtsTokenCount") or 0)
+        result = {
+            "input_tokens": prompt_tokens,
+            "output_tokens": candidates_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+        }
+        if thoughts_tokens:
+            result["reasoning_tokens"] = thoughts_tokens
+        return result
+    return {}
