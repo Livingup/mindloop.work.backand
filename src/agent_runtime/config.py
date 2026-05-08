@@ -41,6 +41,7 @@ from agent_runtime.file_resource.config import (
 from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
 from agent_runtime.prompt_template.prompt_template_config import PromptTemplateConfig
 from agent_runtime.skill.skill_config import SkillConfig
+from agent_runtime.scene.scene_config import SceneConfig
 from agent_runtime.conversation_message.config import ConversationRepositoryConfig
 from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
@@ -110,6 +111,11 @@ class AgentRuntimeConfig:
     # 通用通信模块配置。
     communication: CommunicationConfig = field(
         default_factory=CommunicationConfig,
+    )
+
+    # Scene 模块配置（项目与场景）。
+    scene: SceneConfig = field(
+        default_factory=SceneConfig,
     )
 
     # LLM 服务商与模型注册模块配置。
@@ -347,6 +353,17 @@ class ConfigRegistry:
             "communication", _build_communication_config,
         )
 
+    @property
+    def scene(self) -> SceneConfig:
+        """实时读取 Scene 模块配置（项目与场景 SQLite 数据目录）。"""
+        if self._config is not None:
+            return self._config.scene
+        if self._raw_config_data is not None and "scene" not in self._raw_config_data:
+            return SceneConfig()
+        return self._get_section_config(
+            "scene", _build_scene_config,
+        )
+
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
 
@@ -539,6 +556,13 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
     """从 YAML 字典构建通用通信模块配置。"""
     return CommunicationConfig(
         data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
+    )
+
+
+def _build_scene_config(data: dict[str, Any]) -> SceneConfig:
+    """从 YAML 字典构建 Scene 模块配置。"""
+    return SceneConfig(
+        data_dir=str(data.get("data_dir", "~/.spread-ai/scene")),
     )
 
 

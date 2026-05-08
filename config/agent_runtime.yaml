@@ -76,6 +76,10 @@ communication:
   # 通用通信流与消息日志 SQLite 数据目录。
   data_dir: "~/.spread-ai/communication"
 
+scene:
+  # Scene 模块（项目与场景）SQLite 数据目录。每个项目（workspace）和其下的场景（长期任务上下文）落盘在 scene.db。
+  data_dir: "~/.spread-ai/scene"
+
 prompt_template:
   # 提示词片段 YAML 文件存储根目录。
   snippets_dir: "~/.spread-ai/prompt-snippets"
