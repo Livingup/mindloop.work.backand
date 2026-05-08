@@ -236,6 +236,19 @@ class LlmRequestService:
                         raw_response,
                         {**render_options, "vendor": resolved.provider_id},
                     )
+                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.thinking.received",
+                            {
+                                "provider_id": resolved.provider_id,
+                                "binding_id": resolved.binding_id,
+                                "model_alias": resolved.model_alias,
+                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                            },
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.completed",
@@ -253,19 +266,6 @@ class LlmRequestService:
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
-                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
-                        await self._event_publisher.publish(
-                            request.communication_context,
-                            "llm.thinking.received",
-                            {
-                                "provider_id": resolved.provider_id,
-                                "binding_id": resolved.binding_id,
-                                "model_alias": resolved.model_alias,
-                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
-                            },
-                            source="llm_client",
-                            metadata={"conversation_id": request.conversation.id},
-                        )
                     return LlmPromptResponse(
                         raw_response=raw_response,
                         assistant_message=assistant_message,
