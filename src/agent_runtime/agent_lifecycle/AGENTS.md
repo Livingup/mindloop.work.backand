@@ -4,87 +4,98 @@
 
 ## 模块定位
 
-`agent_lifecycle` 是独立业务模块，不把生命周期动作硬编码在 `AgentExecutionEngine` 中。它通过普通本地工具注册机制提供 `agent_lifecycle` 工具，并依赖 `tool` 模块中的 `BaseToolRequest` / `BaseToolResult` / `LoopControl` / `FrontendMessage` 协议表达执行状态、前端消息和下一步循环决策。
+`agent_lifecycle` 是独立业务模块，不把生命周期动作硬编码在 `AgentExecutionEngine` 中。它通过普通本地工具注册机制提供 4 个独立的生命周期工具，并依赖 `tool` 模块中的 `BaseToolRequest` / `BaseToolResult` / `LoopControl` / `FrontendMessage` 协议表达执行状态、前端消息和下一步循环决策。
 
-## 对外能力
+按"单一职责 + LLM 语义清晰"原则，生命周期能力拆分为 4 个独立工具而不是一个聚合的工具：语义清晰，LLM 选择容易，每个工具的 `allowed_loop_decisions` 只包含该工具实际产出的决策。沟通与生命周期决策严格分离：`message_user` 只负责“发消息”，`pause_task` / `end_task` / `fail_task` 负责生命周期决策，不交叉。
 
-1. **用户沟通** — 通过 `notify` 和 `ask_user` 向用户或前端发送消息。
-2. **任务暂停** — 通过 `ask_user` 或 `pause` 返回 `loop_control.decision="pause"`，让 Runtime 暂停实例和任务等待后续唤醒。
-3. **任务完成** — 通过 `complete` 返回 `loop_control.decision="complete"`，让 Runtime 完成实例和任务。
-4. **任务终止** — 通过 `terminate` 返回 `loop_control.decision="terminate"`，让 Runtime 取消当前任务。
-5. **任务失败** — 通过 `fail` 返回 `loop_control.decision="fail"`，让 Runtime 标记任务失败并记录原因。
+## 四个独立工具
 
-## 生命周期动作
+### 1. `message_user` — 向用户发送消息
+
+向用户发送消息的统一工具。设计原则是“一个工具 + 两种行为模式”——只区分“是否需要等用户回复”，不把“消息语义”（提问/审核/汇报等）装进 action，语义由 message 文本本身表达。
 
 | action | loop decision | 使用场景 |
 |---|---|---|
-| `notify` | `continue` | 向用户同步进度、提醒重要信息，但不阻塞后续执行 |
-| `ask_user` | `pause` | 向用户提问、请求确认、请求选择，等待用户反馈后继续 |
-| `pause` | `pause` | 主动暂停任务，等待用户、系统或其他 Agent 唤醒 |
-| `complete` | `complete` | 任务完成后汇报结果并结束当前执行循环 |
-| `terminate` | `terminate` | 用户要求结束或系统提示词允许主动终止任务 |
-| `fail` | `fail` | 遇到不可恢复错误、死循环或无法继续的问题 |
+| `notify` | `continue` | 单向同步消息，不阻塞。适用：阶段性进度报告、重要发现告知、耗时操作预告、关键状态广播 |
+| `request_response` | `pause` | 发消息并阻塞等用户回复。覆盖所有需要用户回应的场景：提问、请求确认、请求选择、汇报成果等待审核、危险操作前人工确认、向用户求助等 |
 
-## 请求模型
-
-`AgentLifecycleRequest` 继承 `BaseToolRequest`，包含以下业务字段：
+请求模型 `MessageUserRequest`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `action` | Literal | 生命周期动作，支持 `notify` / `ask_user` / `pause` / `complete` / `terminate` / `fail` |
-| `message` | str | 需要展示给用户或记录到生命周期事件中的文本内容 |
-| `text_format` | `plain_text` / `markdown` / `json` | `message` 的文本格式声明，前端按该字段渲染 |
-| `options` | list[`AgentLifecycleOption`] | `ask_user` 使用的结构化选项数组 |
-| `channel` | str 或 None | 目标前端通道，例如 web、cli |
-| `metadata` | dict | 生命周期事件附加元数据 |
+| `action` | Literal | `notify` / `request_response` |
+| `message` | str | 需要展示给用户的文本内容 |
+| `text_format` | `plain_text` / `markdown` / `json` | 文本格式声明，前端按该字段渲染 |
+| `options` | list[`MessageOption`] | `request_response` 使用的结构化选项数组，每项含 `id` / `label` / `description` |
+| `channel` | str \| None | 目标前端通道，例如 web、cli，一般留空默认沿用会话流 |
+| `metadata` | dict | 附加元数据 |
 
-`AgentLifecycleOption` 是结构化选项对象，字段包括：
+注册元数据：`name="message_user"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("continue", "pause")`。
+
+### 2. `pause_task` — 暂停任务等待外部事件
+
+被动等待型暂停工具，不向用户发送消息。适用于"等待其他 Agent 消息""等待系统事件""等待外部回调"等场景。与 `message_user(action=request_response)` 的区别在于：`request_response` 是主动向用户发问/请求回应并暂停，`pause_task` 不发消息，只暂停等外部事件。
+
+请求模型 `PauseTaskRequest`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | str | 稳定选项标识，供前端回传用户选择 |
-| `label` | str | 展示给用户的选项文本 |
-| `description` | str 或 None | 可选的选项补充说明 |
+| `reason` | str | 暂停原因，说明在等待什么事件或消息 |
+
+注册元数据：`name="pause_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("pause",)`。
+
+### 3. `end_task` — 结束任务并退出（成功终止）
+
+结束当前任务并关闭任务会话，仅用于任务成功完成。通常在用户确认任务已完成后调用（前面先用 `message_user(action=request_response)` 汇报成果等待验收）。任务失败请使用 `fail_task`，不要用 `end_task`。
+
+请求模型 `EndTaskRequest`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `summary` | str | 任务最终总结，简要说明完成情况和关键交付物 |
+
+注册元数据：`name="end_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("complete",)`。
+
+### 4. `fail_task` — 报告不可恢复失败并终止任务
+
+宣告 Agent 自身无法继续推进任务并终止当前循环。与 `end_task` 平行，但表达完全不同的任务终态（失败 vs 成功）。适用：缺必需的工具/权限、输入数据严重不一致、连续多次尝试均失败且无法决策下一步。注意：常规工具异常会被框架自动捕获包装，不需要主动 `fail_task`。推荐先用 `message_user(action=notify)` 告知用户失败原因和已尝试的方案，再调用 `fail_task`。
+
+请求模型 `FailTaskRequest`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `reason` | str | 任务失败的根本原因和已尝试过的方案，会被记录到 trace |
+
+注册元数据：`name="fail_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("fail",)`。
 
 ## 返回模型
 
-`agent_lifecycle` 返回 `BaseToolResult`：
+所有生命周期工具都返回 `BaseToolResult`：
 
-- `success=True`
-- `execution_status="success"`
-- `output` 包含 action、message、text_format、options、channel、metadata
-- `loop_control.decision` 由 action 映射得到
-- `frontend_message` 包含前端可直接展示的 text、text_format、channel 和结构化 metadata
+- `success=True`、`execution_status="success"`
+- `output` 是简短的业务状态文本（如 `"Message delivered to user."`、`"Task paused, waiting for external event."`、`<summary>`）
+- `loop_control.decision` 固定由工具语义决定（不依赖请求参数拼装）
+- `message_user` 额外填充 `frontend_message`，包含前端可直接展示的 text、text_format、channel，以及 metadata 中的 action、options 结构化字段
 - `metadata.lifecycle_action` 记录当前生命周期动作
 
 Runtime 只消费 `BaseToolResult.loop_control.decision` 控制循环，不根据工具名或 action 硬编码分支。
 
 ## 工具注册规则
 
-`agent_lifecycle` 使用 `@tool` 注册为本地工具：
-
-- `name="agent_lifecycle"`
-- `group="agent_lifecycle"`
-- `category="lifecycle"`
-- `always_enabled=True`
-- `allowed_loop_decisions=("continue", "pause", "complete", "terminate", "fail")`
-
-`LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool` 触发注册，确保 Agent 执行器创建本地工具网关时该工具已默认可用。`AgentToolDispatcher` 会把 `always_enabled=True` 的本地工具加入每个 Agent 的 LLM 工具列表，不要求每个 `AgentDefinition.tool_ids` 显式声明。
+四个工具都通过 `@tool` 装饰器注册为本地工具，共用 `group="agent_lifecycle"` 便于分组展示。`LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool` 触发注册，确保 Agent 执行器创建本地工具网关时这四个工具默认可用。`AgentToolDispatcher` 会把 `always_enabled=True` 的本地工具加入每个 Agent 的 LLM 工具列表，不要求每个 `AgentDefinition.tool_ids` 显式声明。
 
 ## Runtime 协作规则
 
 `AgentExecutionEngine` 会在系统提示词中注入 Runtime lifecycle tool policy，要求 LLM：
 
-1. 面向用户的沟通优先调用 `agent_lifecycle`，不要依赖普通 assistant 文本。
-2. 使用 `notify` 做非阻塞进度同步。
-3. 使用 `ask_user` 做问题、确认、审核、选择等需要用户反馈的交互。
-4. 使用 `pause` 等待外部唤醒。
-5. 使用 `complete` 汇报完成。
-6. 使用 `terminate` 表示任务取消。
-7. 使用 `fail` 表示不可恢复失败。
-8. 不要在同一 assistant turn 中混用生命周期沟通工具和业务工具，除非用户明确要求。
-9. 必须显式设置 `text_format`，不要返回 HTML。
-10. `ask_user.options` 必须是包含 `id`、`label`、可选 `description` 的对象数组。
+1. 面向用户的沟通必须调用 `message_user`，不要依赖普通 assistant 文本。
+2. `message_user(action=notify)` 做非阻塞同步（进度报告、重要发现告知）；`message_user(action=request_response)` 做问题、确认、审核、选择、求助等需要用户回复的交互。不要用 notify 提问或表达“等用户回复”。
+3. `pause_task` 等待其他 Agent 消息或系统事件（不发消息）；遇到需要用户回复用 `message_user(action=request_response)`，不要用 pause_task。
+4. 任务成功完成后用 `message_user(action=request_response)` 汇报成果并等待用户验收，得到明确肯定后再 `end_task`。未经用户确认不要直接 `end_task`。
+5. 不可恢复失败用 `fail_task` 报告（不是 `end_task`）。推荐先 `message_user(action=notify)` 告知失败原因和已尝试的方案，再 `fail_task`。常规工具异常框架会自动包装，不需要主动 `fail_task`。
+6. 不要在同一 assistant turn 中混用生命周期工具和业务工具，除非用户明确要求。
+7. 必须显式设置 `text_format`，不要返回 HTML。
+8. `request_response.options` 必须是包含 `id`、`label`、可选 `description` 的对象数组。
 
 如果 LLM 连续返回普通文本而没有工具调用，Runtime 会把它视为 plain text fallback；连续达到 `_PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD` 后暂停实例和任务，避免无限循环。
 
@@ -93,6 +104,6 @@ Runtime 只消费 `BaseToolResult.loop_control.decision` 控制循环，不根�
 ```text
 agent_lifecycle/
 ├── __init__.py                    # 模块包入口
-├── agent_lifecycle_tool.py        # agent_lifecycle 内置工具实现
+├── agent_lifecycle_tool.py        # 四个生命周期工具的实现（message_user / pause_task / end_task / fail_task）
 └── AGENTS.md                      # 模块说明文档
 ```

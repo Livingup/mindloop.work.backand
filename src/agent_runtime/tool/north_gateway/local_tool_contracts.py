@@ -105,10 +105,25 @@ class ToolWikiItem:
 
 
 class ToolExecuteRequest(BaseToolRequest):
-    """工具执行请求。"""
+    """工具执行请求（网关层调用入口）。
+
+    携带工具名、业务参数，以及 Runtime 调度需要的上下文元数据
+    （request_id / task_id / agent_instance_id / trace_id / communication_stream_id）。
+    这些上下文字段由 Runtime 调度器（如 AgentToolDispatcher）注入，REST / CLI 入口
+    可只填 tool_name + params。
+
+    注意：本模型是网关层执行请求，**不会**进 LLM 工具 schema，因此 Runtime 字段
+    在这里声明是安全的，不会污染 LLM 上下文。
+    """
 
     tool_name: str = PydanticField(description="工具名称。")
     params: dict[str, Any] = PydanticField(default_factory=dict, description="传给工具函数的参数字典。")
+
+    request_id: str | None = PydanticField(default=None, description="工具调用请求标识。")
+    task_id: str | None = PydanticField(default=None, description="所属 Agent 任务标识。")
+    agent_instance_id: str | None = PydanticField(default=None, description="所属 Agent 运行时实例标识。")
+    trace_id: str | None = PydanticField(default=None, description="执行链路追踪标识。")
+    communication_stream_id: str | None = PydanticField(default=None, description="所属通信流标识。")
 
     def __init__(
         self,

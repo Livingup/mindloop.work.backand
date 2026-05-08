@@ -16,11 +16,16 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from agent_runtime.tool.infrastructure._pydantic_model_builder import (
+    collect_business_parameters,
+    find_runtime_context_parameter_name,
+)
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
 from agent_runtime.tool.local_tool_repository import LocalToolRepository
 from agent_runtime.tool.tool_schema_cache import ToolSchemaCache
 from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
+    ToolRuntimeContext,
     build_tool_error_result,
     wrap_tool_output,
 )
@@ -98,26 +103,32 @@ class LocalToolService:
         self,
         tool_name: str,
         params: dict[str, Any],
+        *,
+        runtime_context: ToolRuntimeContext | None = None,
     ) -> BaseToolResult:
         """执行指定工具。
 
         支持同步和异步工具函数：同步函数直接调用，异步函数自动 await。
+        若工具函数签名中声明了 ToolRuntimeContext 类型的参数，框架会注入
+        runtime_context 实参（None 时使用空 ToolRuntimeContext()）。
 
         Args:
             tool_name: 工具名称。
-            params: 传给工具函数的参数字典。
+            params: 传给工具函数的业务参数字典（来自 LLM 或 REST 调用方）。
+            runtime_context: Runtime 上下文，由调度链路注入。工具未声明
+                ToolRuntimeContext 参数时本字段不会传给工具函数。
 
         Returns:
             统一工具执行结果。旧工具返回普通值时会自动包装为成功结果。
 
         Raises:
             KeyError: 工具不存在。
-            KeyError: 工具不存在。
         """
         tool_def = self._repo.get_by_name(tool_name)
         logger.info("执行本地工具: %s, 参数: %s", tool_name, params)
         try:
-            result = tool_def.fn(**_build_tool_call_kwargs(tool_def.fn, params))
+            kwargs = _build_tool_call_kwargs(tool_def.fn, params, runtime_context)
+            result = tool_def.fn(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
@@ -194,27 +205,44 @@ class LocalToolService:
         }
 
 
-def _build_tool_call_kwargs(fn: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """根据工具函数签名构建调用参数。"""
-    sig = inspect.signature(fn)
-    call_params = [
-        (name, parameter)
-        for name, parameter in sig.parameters.items()
-        if name not in ("self", "cls")
-    ]
-    if len(call_params) != 1:
-        return params
+def _build_tool_call_kwargs(
+    fn: Any,
+    params: dict[str, Any],
+    runtime_context: ToolRuntimeContext | None,
+) -> dict[str, Any]:
+    """根据工具函数签名构建调用参数。
 
-    param_name, _ = call_params[0]
-    annotation = typing.get_type_hints(fn).get(param_name)
-    if not isinstance(annotation, type) or not issubclass(annotation, BaseModel):
-        return params
+    处理流程：
+    1. 用 collect_business_parameters 拿到剔除 ctx 后的业务参数列表。
+    2. 业务参数若是单一 Pydantic 子类，构造该模型实例作为单参；否则按简单
+       参数字典直接展开。
+    3. 用 find_runtime_context_parameter_name 检测函数是否声明了 ctx 参数，
+       若有则注入 runtime_context（None 时构造一个空 ToolRuntimeContext()）。
+    """
+    business_params = collect_business_parameters(fn)
+    kwargs: dict[str, Any] = {}
 
-    value = params.get(param_name)
-    if isinstance(value, annotation):
-        request_model = value
-    elif isinstance(value, dict):
-        request_model = annotation(**value)
+    if (
+        len(business_params) == 1
+        and isinstance(business_params[0][2], type)
+        and issubclass(business_params[0][2], BaseModel)
+    ):
+        param_name, _, annotation = business_params[0]
+        value = params.get(param_name)
+        if isinstance(value, annotation):
+            request_model = value
+        elif isinstance(value, dict):
+            request_model = annotation(**value)
+        else:
+            request_model = annotation(**params)
+        kwargs[param_name] = request_model
     else:
-        request_model = annotation(**params)
-    return {param_name: request_model}
+        # 多个简单参数 → 按 params 字典展开（只取业务参数名，避免泄漏额外字段）。
+        business_names = {name for name, _, _ in business_params}
+        kwargs.update({k: v for k, v in params.items() if k in business_names})
+
+    ctx_param_name = find_runtime_context_parameter_name(fn)
+    if ctx_param_name is not None:
+        kwargs[ctx_param_name] = runtime_context if runtime_context is not None else ToolRuntimeContext()
+
+    return kwargs

@@ -15,9 +15,11 @@ from agent_runtime.communication.runtime_event_publisher import (
 )
 from agent_runtime.conversation_message.message.models import ToolResultPart, ToolUsePart
 from agent_runtime.llm_api_protocol import (
-    SDK_PLATFORM_ANTHROPIC,
-    SDK_PLATFORM_GEMINI,
-    SDK_PLATFORM_OPENAI,
+    API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_GEMINI_GENERATE_CONTENT,
+    API_FORMAT_OPENAI_CHAT_COMPLETIONS,
+    API_FORMAT_OPENAI_RESPONSES,
+    API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
 )
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import McpClientGateway
@@ -80,15 +82,15 @@ class AgentToolDispatcher:
         self,
         *,
         agent_definition: AgentDefinition,
-        sdk_platform: str,
+        api_format: str,
     ) -> tuple[LlmToolDefinition, ...]:
         """根据 AgentDefinition 能力边界构建本轮 LLM 可见工具定义。"""
         tools: list[LlmToolDefinition] = []
         for tool_name in self._visible_local_tool_names(agent_definition):
             detail = self._local_tool_gateway.get_tool(tool_name)
-            schema = detail.schemas.get(sdk_platform)
+            schema = detail.schemas.get(api_format)
             if schema is None:
-                raise ValueError(f"本地工具 {tool_name} 缺少 {sdk_platform} 平台 schema。")
+                raise ValueError(f"本地工具 {tool_name} 缺少 {api_format} 协议格式 schema。")
             tools.append(LlmToolDefinition(name=tool_name, schema=schema, source="local"))
 
         if agent_definition.mcp_tools:
@@ -106,7 +108,7 @@ class AgentToolDispatcher:
                         raise KeyError(f"MCP 工具不存在: {binding.service_id}/{tool_name}")
                     exposed_name = build_mcp_exposed_tool_name(binding.service_id, tool_name)
                     schema = _build_mcp_tool_schema(
-                        sdk_platform=sdk_platform,
+                        api_format=api_format,
                         exposed_name=exposed_name,
                         description=detail.description,
                         input_schema=detail.input_schema,
@@ -220,7 +222,8 @@ class AgentToolDispatcher:
             source="local",
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
-                output=result.to_serializable_dict(),
+                is_error=not result.success,
+                output=_extract_llm_visible_output(result),
             ),
             tool_result=result,
         )
@@ -256,7 +259,8 @@ class AgentToolDispatcher:
             source="mcp",
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
-                output=tool_result.to_serializable_dict(),
+                is_error=not tool_result.success,
+                output=_extract_llm_visible_output(tool_result),
             ),
             tool_result=tool_result,
         )
@@ -290,14 +294,22 @@ def parse_mcp_exposed_tool_name(exposed_name: str) -> tuple[str, str]:
 
 def _build_mcp_tool_schema(
     *,
-    sdk_platform: str,
+    api_format: str,
     exposed_name: str,
     description: str | None,
     input_schema: dict[str, Any],
 ) -> dict[str, Any]:
-    """把 MCP inputSchema 转为目标 SDK 平台工具 schema。"""
+    """把 MCP inputSchema 转为目标协议格式的工具 schema。"""
     parameters = input_schema or {"type": "object", "properties": {}}
-    if sdk_platform == SDK_PLATFORM_OPENAI:
+    if api_format == API_FORMAT_OPENAI_RESPONSES:
+        return {
+            "type": "function",
+            "name": exposed_name,
+            "description": description or "",
+            "parameters": parameters,
+            "strict": False,
+        }
+    if api_format == API_FORMAT_OPENAI_CHAT_COMPLETIONS:
         return {
             "type": "function",
             "function": {
@@ -306,19 +318,28 @@ def _build_mcp_tool_schema(
                 "parameters": parameters,
             },
         }
-    if sdk_platform == SDK_PLATFORM_ANTHROPIC:
+    if api_format == API_FORMAT_ANTHROPIC_MESSAGES:
         return {
             "name": exposed_name,
             "description": description or "",
             "input_schema": parameters,
         }
-    if sdk_platform == SDK_PLATFORM_GEMINI:
+    if api_format == API_FORMAT_GEMINI_GENERATE_CONTENT:
         return {
             "name": exposed_name,
             "description": description or "",
             "parameters": parameters,
         }
-    raise ValueError(f"当前工具调度器不支持 sdk_platform={sdk_platform} 的工具 schema。")
+    if api_format == API_FORMAT_ZHIPU_CHAT_COMPLETIONS:
+        return {
+            "type": "function",
+            "function": {
+                "name": exposed_name,
+                "description": description or "",
+                "parameters": parameters,
+            },
+        }
+    raise ValueError(f"当前工具调度器不支持 api_format={api_format} 的工具 schema。")
 
 
 def _ensure_mcp_tool_allowed(bindings: tuple[McpToolBinding, ...], service_id: str, tool_name: str) -> None:
@@ -349,6 +370,22 @@ def _ensure_dict_arguments(value: Any) -> dict[str, Any]:
 def _tool_use_ref(tool_use: ToolUsePart) -> str:
     """确定工具结果要关联的工具调用引用。"""
     return tool_use.tool_use_id or tool_use.name
+
+
+def _extract_llm_visible_output(result: BaseToolResult) -> Any:
+    """从 BaseToolResult 中提取 LLM 可见的业务输出。
+
+    Runtime 内部控制字段（loop_control / frontend_message / metadata 等）不暴露给 LLM。
+    成功时返回业务输出 result.output；失败时返回错误信息文本（必要时附带 partial output）。
+    """
+    if result.success:
+        return result.output
+    error_text = result.error_message or "Tool execution failed."
+    if result.output is None:
+        return error_text
+    if isinstance(result.output, str):
+        return f"{error_text}\n\nPartial output: {result.output}"
+    return {"error_message": error_text, "partial_output": result.output}
 
 
 def _preview_arguments(value: Any) -> dict[str, Any]:

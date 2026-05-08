@@ -666,7 +666,7 @@ class AgentExecutionEngine:
             )
             tools = await self._tool_dispatcher.build_llm_tools(
                 agent_definition=agent_definition,
-                sdk_platform=resolved_model.sdk_platform,
+                api_format=resolved_model.api_format,
             )
             try:
                 return await self._llm_request_service.send_prompt(
@@ -883,7 +883,7 @@ class AgentExecutionEngine:
         if tool_result.frontend_message is None:
             return
         action = tool_result.metadata.get("lifecycle_action")
-        if action == "ask_user":
+        if action == "request_response":
             message = tool_result.frontend_message
             await self._event_publisher.publish(
                 communication_context,
@@ -948,19 +948,6 @@ class AgentExecutionEngine:
             await self._publish_loop_decision_event(
                 communication_context,
                 "agent.task.completed",
-                task_id=task_id,
-                instance_id=instance_id,
-                loop_decision=loop_decision,
-                tool_results=tool_results,
-            )
-            return
-        if loop_decision == "terminate":
-            self._runtime_gateway.cancel_agent_instance(instance_id)
-            self._runtime_gateway.cancel_task(task_id)
-            self._trace_recorder.record_event(trace_path, "instance_terminated", details)
-            await self._publish_loop_decision_event(
-                communication_context,
-                "agent.task.cancelled",
                 task_id=task_id,
                 instance_id=instance_id,
                 loop_decision=loop_decision,
@@ -1120,17 +1107,35 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
     )
     return (
         "## Runtime lifecycle tool policy\n"
-        "- Use the `agent_lifecycle` tool for all user-facing communication instead of plain assistant text.\n"
-        "- Use `notify` for non-blocking progress updates, `ask_user` for questions/confirmation/selection, "
-        "`pause` to wait, `complete` when the task is finished, `terminate` when the task should be cancelled, "
-        "and `fail` when execution cannot recover.\n"
-        "- Do not call lifecycle communication tools in the same assistant turn as business tools unless the "
+        "- Use lifecycle tools for all user-facing communication instead of plain assistant text.\n"
+        "- `message_user` has two behavior modes via `action` field: "
+        "`notify` (non-blocking, send-and-continue) for progress updates, important findings, "
+        "or pre-announcing long-running operations; "
+        "`request_response` (blocks until user replies) covering ALL scenarios that need user "
+        "input — questions, confirmation, selection, reporting completion for review, "
+        "dangerous operation approval, asking for help, etc. "
+        "Do NOT use `notify` to ask questions or to wait for user reply.\n"
+        "- `pause_task` tool: pause execution and wait for external events (other Agent messages "
+        "or system events) — does NOT send a message. For waiting on user reply use "
+        "`message_user(action=request_response)`, not `pause_task`.\n"
+        "- `end_task` tool: end task session for SUCCESSFUL completion. Required sequence: "
+        "first call `message_user(action=request_response)` to report results and wait for "
+        "user verification; only after explicit user approval should you call `end_task`. "
+        "For task failure use `fail_task` instead.\n"
+        "- `fail_task` tool: declare unrecoverable failure and terminate the loop. Use only when "
+        "you as the Agent judge that the task cannot proceed (missing required tool/permission, "
+        "severely inconsistent input, repeated failures with no path forward). Routine tool "
+        "exceptions are wrapped automatically by the framework — do not call `fail_task` for them. "
+        "Recommended: first `message_user(action=notify)` to inform user of failure cause and "
+        "attempted approaches, then call `fail_task`.\n"
+        "- Do not call lifecycle tools in the same assistant turn as business tools unless the "
         "user explicitly requires it.\n"
         f"- Current frontend channel: `{channel}`.\n"
         f"- Supported text formats: `{supported_formats}`.\n"
         f"- Preferred text format: `{preferred_format}`.\n"
         "- Set `text_format` explicitly and do not return HTML.\n"
-        "- `ask_user.options` must be objects with `id`, `label`, and optional `description`."
+        "- `message_user` with `request_response`: `options` must be objects with `id`, `label`, "
+        "and optional `description`."
     )
 
 
@@ -1159,8 +1164,7 @@ def _select_loop_decision(tool_results: list[BaseToolResult]) -> LoopDecision:
         "continue": 0,
         "pause": 1,
         "complete": 2,
-        "terminate": 3,
-        "fail": 4,
+        "fail": 3,
     }
     selected: LoopDecision = "continue"
     for result in tool_results:

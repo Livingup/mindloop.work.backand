@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 ToolExecutionStatus = Literal["success", "failed", "skipped"]
-LoopDecision = Literal["continue", "pause", "complete", "terminate", "fail"]
+LoopDecision = Literal["continue", "pause", "complete", "fail"]
 TextFormat = Literal["plain_text", "markdown", "json"]
 ToolCategory = Literal["business", "lifecycle", "system"]
 
@@ -33,14 +33,43 @@ class LoopControl(BaseModel):
 
 
 class BaseToolRequest(BaseModel):
-    """所有工具请求模型的统一基类。"""
+    """所有工具请求模型的统一基类。
+
+    只承载工具业务参数的语义，不携带 Runtime 调度元数据（如 request_id / task_id /
+    agent_instance_id / trace_id）。这些 Runtime 上下文不属于 LLM 可见的工具参数，
+    不应出现在工具 JSON Schema 里污染 LLM 上下文，也不应让 LLM 自己填值。
+
+    如果工具需要 Runtime 上下文（如当前 task / agent_instance / 跟踪链路），应通过
+    `ToolRuntimeContext` 显式声明在工具函数签名上，由框架自动注入。
+    """
 
     model_config = ConfigDict(extra="allow")
 
-    request_id: str | None = Field(default=None, description="工具调用请求标识。")
+
+class ToolRuntimeContext(BaseModel):
+    """工具 Runtime 上下文，由 Agent 调度链路注入工具实现函数。
+
+    工具函数若需要访问当前调用的 Runtime 上下文（task / agent_instance / trace 等），
+    可在签名中声明类型为 ToolRuntimeContext 的参数（推荐命名 `ctx`）：
+
+    ```python
+    @tool(name="end_task", ...)
+    def end_task(request: EndTaskRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+        logger.info("ending task=%s instance=%s", ctx.task_id, ctx.agent_instance_id)
+        ...
+    ```
+
+    框架会自动识别签名中的 ToolRuntimeContext 参数，从工具 JSON Schema 中跳过该参数
+    （不暴露给 LLM），并在执行时注入实参。不声明该参数的工具完全不受影响。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    request_id: str | None = Field(default=None, description="本次工具调用的请求标识。")
     task_id: str | None = Field(default=None, description="所属 Agent 任务标识。")
     agent_instance_id: str | None = Field(default=None, description="所属 Agent 运行时实例标识。")
     trace_id: str | None = Field(default=None, description="执行链路追踪标识。")
+    communication_stream_id: str | None = Field(default=None, description="所属通信流标识。")
 
 
 class BaseToolResult(BaseModel):

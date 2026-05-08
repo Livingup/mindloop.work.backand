@@ -81,17 +81,26 @@ def advanced_search(params: SearchParams) -> str:
 3. **新工具可返回 `BaseToolResult`** — 需要表达执行状态、错误信息、前端展示消息或循环控制时，工具应直接返回 `BaseToolResult` 或兼容子类。
 4. **异常会被结构化封装** — 工具抛出的异常会由 `LocalToolService` 转换为 `success=False`、`execution_status="failed"` 的结构化结果；工具内部仍可按业务需要自行捕获并返回更友好的 `BaseToolResult`。
 5. **循环决策必须被授权** — 普通业务工具默认只允许 `continue`，只有在 `allowed_loop_decisions` 中声明的决策才能返回。生命周期工具可声明 `pause`、`complete`、`terminate`、`fail`。
-6. **单参数 Pydantic 请求模型优先用于复杂工具** — 如果工具函数只有一个参数且参数类型是 Pydantic `BaseModel` 子类，服务会把调用 params 构造成该请求模型实例，适合继承 `BaseToolRequest` 表达 task、agent_instance、trace 等上下文。
+6. **单参数 Pydantic 请求模型优先用于复杂工具** — 如果工具函数只有一个参数且参数类型是 Pydantic `BaseModel` 子类，服务会把调用 params 构造成该请求模型实例。请求模型只承载工具业务参数语义，Runtime 上下文（task / agent_instance / trace 等）走独立的上下文注入机制，不混在 LLM 可见的请求模型里。
+7. **工具需要 Runtime 上下文时显式声明 `ToolRuntimeContext` 参数** — 在函数签名里新增一个类型为 `ToolRuntimeContext` 的参数（推荐命名 `ctx`），框架会自动在执行时注入该参数，同时从 JSON Schema 中跳过该参数不暴露给 LLM。工具函数不声明 ctx 则完全不受影响。
+
+```python
+@tool(name="end_task", ...)
+def end_task(request: EndTaskRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    logger.info("ending task=%s instance=%s", ctx.task_id, ctx.agent_instance_id)
+    ...
+```
 
 ### 统一工具执行协议
 
 `tool_execution_models.py` 定义统一协议：
 
-1. **`BaseToolRequest`** — 所有工具请求模型的统一基类，包含 `request_id`、`task_id`、`agent_instance_id`、`trace_id` 等可选上下文，并允许扩展字段。
+1. **`BaseToolRequest`** — 所有工具请求模型的统一基类，只承载工具业务参数，不携带 Runtime 调度元数据，避免在 JSON Schema 中暴露给 LLM 造成上下文污染。允许扩展业务字段。
 2. **`BaseToolResult`** — 所有工具执行结果的统一基类，包含 `success`、`execution_status`、`error_code`、`error_message`、`output`、`loop_control`、`frontend_message`、`metadata`。
 3. **`LoopControl`** — 工具对 Agent 执行循环表达下一步决策，`decision` 支持 `continue`、`pause`、`complete`、`terminate`、`fail`。
 4. **`FrontendMessage`** — 工具需要前端展示消息时使用，显式声明 `text`、`text_format`、`channel` 和渲染元数据。
 5. **`ToolResultEnvelope` / `ToolExecuteResult`** — 网关层带 `tool_name` 的执行结果信封，`result` 是 `output` 的兼容别名。
+6. **`ToolRuntimeContext`** — Runtime 上下文注入载体，携带 `request_id` / `task_id` / `agent_instance_id` / `trace_id` / `communication_stream_id`。网关层（`LocalToolGatewayImpl`）从 `ToolExecuteRequest` 提取字段构造，领域服务（`LocalToolService`）按工具函数签名决定是否注入。该模型不会进入 LLM JSON Schema。
 
 ## 工具注册机制
 

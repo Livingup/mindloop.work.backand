@@ -15,6 +15,7 @@ from agent_runtime.tool.north_gateway.local_tool_contracts import (
     ToolSummary,
     ToolWikiItem,
 )
+from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
 
 
 class LocalToolGatewayImpl:
@@ -61,8 +62,23 @@ class LocalToolGatewayImpl:
         )
 
     async def execute_tool(self, request: ToolExecuteRequest) -> ToolExecuteResult:
-        """执行工具。"""
-        result = await self._service.execute_tool(request.tool_name, request.params)
+        """执行工具。
+
+        从请求中提取 Runtime 元数据构造 ToolRuntimeContext 注入给领域服务，
+        领域服务再按工具签名决定是否注入到工具实现函数。
+        """
+        runtime_context = ToolRuntimeContext(
+            request_id=request.request_id,
+            task_id=request.task_id,
+            agent_instance_id=request.agent_instance_id,
+            trace_id=request.trace_id,
+            communication_stream_id=request.communication_stream_id,
+        )
+        result = await self._service.execute_tool(
+            request.tool_name,
+            request.params,
+            runtime_context=runtime_context,
+        )
         payload = result.model_dump(mode="python")
         payload.pop("tool_name", None)
         return ToolExecuteResult(

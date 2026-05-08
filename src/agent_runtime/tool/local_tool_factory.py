@@ -11,8 +11,14 @@ from agent_runtime.tool.infrastructure.claude_schema_generator import (
 from agent_runtime.tool.infrastructure.gemini_schema_generator import (
     GeminiSchemaGenerator,
 )
+from agent_runtime.tool.infrastructure.openai_responses_schema_generator import (
+    OpenAIResponsesSchemaGenerator,
+)
 from agent_runtime.tool.infrastructure.openai_schema_generator import (
-    OpenAISchemaGenerator,
+    OpenAIChatCompletionsSchemaGenerator,
+)
+from agent_runtime.tool.infrastructure.zhipu_schema_generator import (
+    ZhipuChatCompletionsSchemaGenerator,
 )
 from agent_runtime.tool.local_tool_service import LocalToolService
 from agent_runtime.tool.north_gateway.local_tool_gateway_impl import (
@@ -24,7 +30,7 @@ from agent_runtime.tool.tool_schema_cache import ToolSchemaCache
 class LocalToolFactory:
     """本地工具模块工厂。
 
-    组装全局仓储、Schema 缓存（含三个平台生成器）、领域服务和北向网关。
+    组装全局仓储、Schema 缓存（含各协议格式生成器）、领域服务和北向网关。
     """
 
     @staticmethod
@@ -33,7 +39,7 @@ class LocalToolFactory:
     ) -> LocalToolGatewayImpl:
         """创建本地工具北向网关实例。
 
-        自动注册 OpenAI / Claude / Gemini 三个平台的 Schema 生成器。
+        自动注册各协议格式的 Schema 生成器。
 
         Args:
             schema_cache: Schema 缓存管理器。为 None 时创建默认缓存并注册所有平台生成器。
@@ -47,9 +53,11 @@ class LocalToolFactory:
         repository = get_global_repository()
         if schema_cache is None:
             schema_cache = ToolSchemaCache()
-            # 注册所有平台的 Schema 生成器。
-            schema_cache.register_generator(OpenAISchemaGenerator())
+            # 注册各协议格式的 Schema 生成器。
+            schema_cache.register_generator(OpenAIResponsesSchemaGenerator())
+            schema_cache.register_generator(OpenAIChatCompletionsSchemaGenerator())
             schema_cache.register_generator(ClaudeSchemaGenerator())
             schema_cache.register_generator(GeminiSchemaGenerator())
+            schema_cache.register_generator(ZhipuChatCompletionsSchemaGenerator())
         service = LocalToolService(repository=repository, schema_cache=schema_cache)
         return LocalToolGatewayImpl(service=service)
