@@ -40,6 +40,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             llm_policy_snapshot_json=request.llm_policy_snapshot_json,
             conversation_id=request.conversation_id,
             trace_id=request.trace_id,
+            scene_id=request.scene_id,
         )
 
     def create_child_agent_instance(

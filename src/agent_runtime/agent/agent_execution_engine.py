@@ -316,7 +316,7 @@ class AgentExecutionEngine:
             communication_stream_id=communication_stream_id,
             client_message_id=client_message_id,
         )
-        communication_context = self._build_communication_context(request, task.task_id, instance)
+        communication_context = self._build_communication_context(request, task, instance)
         if request.communication_stream_id != communication_context.stream_id:
             request = replace(request, communication_stream_id=communication_context.stream_id)
         self._active_instance_ids.add(instance.instance_id)
@@ -347,7 +347,7 @@ class AgentExecutionEngine:
         instance: AgentInstance,
         request: AgentExecutionRequest,
     ) -> AgentExecutionResult:
-        communication_context = self._build_communication_context(request, task.task_id, instance)
+        communication_context = self._build_communication_context(request, task, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         try:
             self._runtime_gateway.start_task(task.task_id)
@@ -494,20 +494,25 @@ class AgentExecutionEngine:
     def _build_communication_context(
         self,
         request: AgentExecutionRequest,
-        task_id: str,
+        task: AgentTask,
         instance: AgentInstance,
     ) -> RuntimeCommunicationContext:
-        """构建当前 Agent 执行链路透传的通信上下文。"""
+        """构建当前 Agent 执行链路透传的通信上下文。
+
+        stream_id 选择优先级：
+        1. request.communication_stream_id 显式指定时优先复用，保留调用方控制能力；
+        2. task.scene_id 非空时默认使用 stream-scene-{scene_id}，同一 scene 下多个 task 共享同一通信流；
+        3. 其他情况沿用 stream-agent-task-{task_id}，保证未挂场景的以往任务进程内以及升级后的 task.scene_id=null 考古代码路径仍然可用。
+        """
+        task_id = task.task_id
         stream_id = request.communication_stream_id
         if stream_id is None:
-            if self._communication_gateway is None:
-                stream_id = f"stream-agent-task-{task_id}"
-            else:
-                stream_id = f"stream-agent-task-{task_id}"
+            stream_id = self._default_stream_id_for_task(task)
+            if self._communication_gateway is not None:
                 try:
                     stream_id = self._ensure_communication_stream(
                         stream_id=stream_id,
-                        task_id=task_id,
+                        task=task,
                         instance=instance,
                     )
                 except Exception:
@@ -516,7 +521,7 @@ class AgentExecutionEngine:
             try:
                 stream_id = self._ensure_communication_stream(
                     stream_id=stream_id,
-                    task_id=task_id,
+                    task=task,
                     instance=instance,
                 )
             except Exception:
@@ -528,33 +533,47 @@ class AgentExecutionEngine:
             trace_id=instance.trace_id,
             metadata={
                 "task_id": task_id,
+                "scene_id": task.scene_id,
                 "thread_id": instance.thread_id,
                 "agent_instance_id": instance.instance_id,
                 "agent_definition_id": instance.agent_definition_id,
             },
         )
 
+    @staticmethod
+    def _default_stream_id_for_task(task: AgentTask) -> str:
+        """根据 task 计算默认通信流 ID。
+
+        scene_id 非空：stream-scene-{scene_id}，同一 scene 下跨 task 共享。
+        scene_id 为 None：stream-agent-task-{task_id}，保留以往语义以适配未迁移的旧任务。
+        """
+        if task.scene_id:
+            return f"stream-scene-{task.scene_id}"
+        return f"stream-agent-task-{task.task_id}"
+
     def _ensure_communication_stream(
         self,
         *,
         stream_id: str,
-        task_id: str,
+        task: AgentTask,
         instance: AgentInstance,
     ) -> str:
-        """确保当前 Agent 执行关联的逻辑通信流存在。"""
+        """确保当前 Agent 执行关联的逻辑通信流存在；不存在则创建。"""
         if self._communication_gateway is None:
             return stream_id
         try:
             stream = self._communication_gateway.get_stream(stream_id)
         except KeyError:
             try:
+                topic = "agent.scene" if task.scene_id else "agent.task"
                 stream = self._communication_gateway.create_stream(
                     CreateCommunicationStreamRequest(
                         stream_id=stream_id,
-                        topic="agent.task",
+                        topic=topic,
                         owner_id=instance.agent_definition_id,
                         metadata={
-                            "task_id": task_id,
+                            "task_id": task.task_id,
+                            "scene_id": task.scene_id,
                             "thread_id": instance.thread_id,
                             "agent_instance_id": instance.instance_id,
                             "agent_definition_id": instance.agent_definition_id,

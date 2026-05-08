@@ -51,6 +51,10 @@ class CreateTaskWithRootAgentInstanceRequest:
     # 可选执行日志 trace ID。不传时由领域服务生成。
     trace_id: str | None = None
 
+    # 可选场景 ID（scene 模块聚合根）。同一 scene 下多 task 共享同一通信流。
+    # 为 None 表示任务未挂到任何场景，执行引擎将沿用旧的 stream-agent-task-{task_id} 通信流。
+    scene_id: str | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class CreateChildAgentInstanceRequest:

@@ -40,6 +40,7 @@ class CreateRootAgentInstanceBody(BaseModel):
     root_instance_id: str | None = None
     conversation_id: str | None = None
     trace_id: str | None = None
+    scene_id: str | None = None
 
 
 class AgentRuntimeTaskResponse(BaseModel):
@@ -49,6 +50,7 @@ class AgentRuntimeTaskResponse(BaseModel):
     status: str
     created_at: str
     updated_at: str
+    scene_id: str | None = None
 
 
 class AgentInstanceResponse(BaseModel):
@@ -141,6 +143,7 @@ def create_agent_runtime_router(
                     root_instance_id=body.root_instance_id,
                     conversation_id=body.conversation_id,
                     trace_id=body.trace_id,
+                    scene_id=body.scene_id,
                 ),
             )
         except ValueError as e:
@@ -358,6 +361,7 @@ def _task_response(task: AgentTask) -> AgentRuntimeTaskResponse:
         status=task.status,
         created_at=_datetime_text(task.created_at),
         updated_at=_datetime_text(task.updated_at),
+        scene_id=task.scene_id,
     )
 
 

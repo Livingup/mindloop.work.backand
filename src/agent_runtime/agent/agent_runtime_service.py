@@ -73,6 +73,7 @@ class AgentRuntimeService:
         root_instance_id: str | None = None,
         conversation_id: str | None = None,
         trace_id: str | None = None,
+        scene_id: str | None = None,
     ) -> tuple[AgentTask, AgentInstance]:
         """创建任务并同时创建唯一根 Agent 实例。
 
@@ -105,6 +106,7 @@ class AgentRuntimeService:
                 task_id=actual_task_id,
                 root_agent_instance_id=actual_root_instance_id,
                 agent_instance_ids=(actual_root_instance_id,),
+                scene_id=scene_id,
             )
             self._repository.save_task(task)
             self._repository.save_agent_instance(root_instance)

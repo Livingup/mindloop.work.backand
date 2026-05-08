@@ -249,6 +249,8 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.communication.north_gateway.communication_rest_adapter import (
         create_communication_router,
     )
+    from agent_runtime.scene.scene_factory import SceneFactory
+    from agent_runtime.scene.north_gateway.scene_rest_adapter import create_scene_router
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -260,6 +262,7 @@ def serve(host: str | None, port: int | None) -> None:
     agent_execution_engine = AgentExecutionFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
     communication_gateway = CommunicationFactory.create()
+    scene_gateway = SceneFactory.create()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -345,6 +348,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_communication_router(communication_gateway),
         prefix="/api/communication",
         tags=["通用通信"],
+    )
+    # Scene REST router 本身已声明 prefix=/api/scene，这里只补充 OpenAPI tag。
+    app.include_router(
+        create_scene_router(scene_gateway),
+        tags=["Scene 项目与场景"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。

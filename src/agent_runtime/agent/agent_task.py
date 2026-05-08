@@ -154,6 +154,12 @@ class AgentTask:
     # 失败原因摘要。仅 failed 状态要求有值。
     failure_message: str | None = None
 
+    # 任务所属场景 ID（scene 模块聚合根）。可选；为 None 表示该任务尚未挂到任何场景。
+    # 通信流 ID 由 scene_id 派生（stream-scene-{scene_id}），同一 scene 下多个 task 共享同一通信流，
+    # 前端 tab 与 scene 一一对应，刷新页面后通过 scene_id + after_seq 即可恢复完整对话事件流。
+    # 兼容性：scene_id 为 None 时执行引擎沿用旧的 stream-agent-task-{task_id} 形式。
+    scene_id: str | None = None
+
     def __post_init__(self) -> None:
         """校验任务内部实例集合与父子关系树的一致性。"""
         _require_non_blank(self.task_id, "task_id")
@@ -164,6 +170,8 @@ class AgentTask:
             _require_non_blank(self.failure_message or "", "failure_message")
         if self.failure_message is not None and not self.failure_message.strip():
             raise ValueError("failure_message 不能是空白字符串。")
+        if self.scene_id is not None:
+            _require_non_blank(self.scene_id, "scene_id")
         if not self.agent_instance_ids:
             raise ValueError("agent_instance_ids 至少需要包含根 Agent 实例。")
         seen_instances: set[str] = set()

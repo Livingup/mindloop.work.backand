@@ -24,9 +24,13 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     paused_at              TEXT,
     finished_at            TEXT,
     failed_at              TEXT,
-    failure_message        TEXT
+    failure_message        TEXT,
+    scene_id               TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status);
+-- idx_agent_tasks_scene 索引依赖 scene_id 列，统一由 _migrate_schema 在确认列存在后创建，
+-- 这里不放在初始 schema，避免历史 DB（agent_tasks 表先于本次新增已存在）执行 schema 时
+-- 报 "no such column: scene_id"。
 
 CREATE TABLE IF NOT EXISTS agent_instances (
     instance_id          TEXT PRIMARY KEY,
@@ -103,8 +107,8 @@ class SqliteAgentRuntimeRepository:
                 INSERT OR REPLACE INTO agent_tasks (
                     task_id, root_agent_instance_id, agent_instance_ids, status,
                     created_at, updated_at, started_at, paused_at, finished_at,
-                    failed_at, failure_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    failed_at, failure_message, scene_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -118,6 +122,7 @@ class SqliteAgentRuntimeRepository:
                     _optional_datetime_to_text(task.finished_at),
                     _optional_datetime_to_text(task.failed_at),
                     task.failure_message,
+                    task.scene_id,
                 ),
             )
             self._conn.executemany(
@@ -146,7 +151,7 @@ class SqliteAgentRuntimeRepository:
                 """
                 SELECT task_id, root_agent_instance_id, agent_instance_ids, status,
                        created_at, updated_at, started_at, paused_at, finished_at,
-                       failed_at, failure_message
+                       failed_at, failure_message, scene_id
                 FROM agent_tasks WHERE task_id = ?
                 """,
                 (task_id,),
@@ -169,7 +174,7 @@ class SqliteAgentRuntimeRepository:
                 """
                 SELECT task_id, root_agent_instance_id, agent_instance_ids, status,
                        created_at, updated_at, started_at, paused_at, finished_at,
-                       failed_at, failure_message
+                       failed_at, failure_message, scene_id
                 FROM agent_tasks ORDER BY created_at ASC
                 """
             ).fetchall()
@@ -288,6 +293,17 @@ class SqliteAgentRuntimeRepository:
                 "ALTER TABLE agent_instances "
                 "ADD COLUMN llm_policy_snapshot_json TEXT NOT NULL DEFAULT '{}'"
             )
+        # 读取 agent_tasks 表列集，补齐以往版本未包含的 scene_id 列（允许 NULL，表示旧任务未挂到场景）。
+        task_columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(agent_tasks)").fetchall()
+        }
+        if "scene_id" not in task_columns:
+            self._conn.execute("ALTER TABLE agent_tasks ADD COLUMN scene_id TEXT")
+        # 列存在后再确保索引创建成功（IF NOT EXISTS 保证幂等）。
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_tasks_scene ON agent_tasks(scene_id)"
+        )
 
     def _load_task_relations(self, task_id: str) -> tuple[AgentParentChildRelation, ...]:
         """加载指定 task 的父子关系树边集合。"""
@@ -361,7 +377,15 @@ def _row_to_task(
     relations: tuple[AgentParentChildRelation, ...],
     instance_ids: tuple[str, ...],
 ) -> AgentTask:
-    """将 SQLite task 行还原为 AgentTask 聚合根。"""
+    """将 SQLite task 行还原为 AgentTask 聚合根。
+
+    行列顺序（1-based）：
+        0 task_id, 1 root_agent_instance_id, 2 agent_instance_ids, 3 status,
+        4 created_at, 5 updated_at, 6 started_at, 7 paused_at,
+        8 finished_at, 9 failed_at, 10 failure_message, 11 scene_id
+    scene_id 列为以往版本补加，可能为 None。
+    """
+    scene_id = row[11] if len(row) > 11 else None
     return AgentTask(
         task_id=row[0],
         root_agent_instance_id=row[1],
@@ -374,6 +398,7 @@ def _row_to_task(
         finished_at=_optional_text_to_datetime(row[8]),
         failed_at=_optional_text_to_datetime(row[9]),
         failure_message=row[10],
+        scene_id=scene_id,
         parent_child_relations=relations,
     )
 
