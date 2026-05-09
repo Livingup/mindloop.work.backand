@@ -89,6 +89,12 @@ class InMemoryAgentRuntimeRepository(AgentRuntimeRepository):
             ]
             return sorted(instances, key=lambda item: item.created_at)
 
+    def list_tasks_by_scene_id(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序（最近在前）。"""
+        with self._lock:
+            tasks = [task for task in self._tasks.values() if task.scene_id == scene_id]
+            return sorted(tasks, key=lambda item: item.created_at, reverse=True)
+
     def contains_task(self, task_id: str) -> bool:
         """判断任务是否存在。"""
         with self._lock:

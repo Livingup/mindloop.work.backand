@@ -20,6 +20,7 @@ from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import (
 from agent_runtime.agent.north_gateway.agent_runtime_gateway_impl import (
     AgentRuntimeGatewayImpl,
 )
+from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
 
 class AgentRuntimeFactory:
@@ -29,6 +30,8 @@ class AgentRuntimeFactory:
     装配进程内内存仓储或 SQLite 共享仓储，并返回进程内共享的北向网关实例。
     当 repository_type=sqlite 时，多个 FastAPI worker / Python 进程可以通过同一个 SQLite
     数据库共享 task、Agent 实例和父子关系树运行态。
+
+    可选传入 scene_gateway：传入后网关支持 attach_scene 编排（前端进入 scene 的统一入口）。
     """
 
     _lock = RLock()
@@ -36,15 +39,25 @@ class AgentRuntimeFactory:
     _repository_signature: tuple[str, str] | None = None
 
     @classmethod
-    def create(cls) -> AgentRuntimeGatewayImpl:
-        """创建或返回进程内共享的 Agent 运行时北向网关。"""
+    def create(
+        cls,
+        scene_gateway: SceneGateway | None = None,
+    ) -> AgentRuntimeGatewayImpl:
+        """创建或返回进程内共享的 Agent 运行时北向网关。
+
+        scene_gateway 注入仅在首次创建网关或仓储签名变更时生效；后续调用会复用已缓存
+        的网关。组合根 (cli.py serve) 应在首次调用时传入 scene_gateway。
+        """
         with cls._lock:
             config = cls._read_config()
             signature = (config.repository_type, config.data_dir)
             if cls._gateway is None or cls._repository_signature != signature:
                 repository = cls._create_repository(config)
                 service = AgentRuntimeService(repository)
-                cls._gateway = AgentRuntimeGatewayImpl(service)
+                cls._gateway = AgentRuntimeGatewayImpl(
+                    service,
+                    scene_gateway=scene_gateway,
+                )
                 cls._repository_signature = signature
             return cls._gateway
 

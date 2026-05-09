@@ -36,6 +36,14 @@ class AgentRuntimeRepository(Protocol):
     def list_agent_instances_by_thread(self, thread_id: str) -> list[AgentInstance]:
         """列出某个线程下的全部 Agent 实例。"""
 
+    def list_tasks_by_scene_id(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序（最近在前）。
+
+        供 attach 编排层查找 scene 下「最近一条 root agent instance」以查询活跃运行与 LLM 继承。
+        仓储应依赖 agent_tasks.scene_id 列上的索引（SQLite 已创建 idx_agent_tasks_scene）。
+        没有任何任务时返回空列表，不抛错。
+        """
+
     def contains_task(self, task_id: str) -> bool:
         """判断任务是否存在。"""
 

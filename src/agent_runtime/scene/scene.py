@@ -44,7 +44,12 @@ class Scene:
     - scene_id 全局唯一；非空且无首尾空白。
     - project_id 必须存在；引用关系由领域服务层校验，仓储层不强制外键以便回填灵活。
     - status 仅限 'active' / 'archived'；archived 场景不允许创建新 task（领域服务拒绝）。
-    - default_* 字段允许为空，前端创建 task 时可覆盖；保存为场景级默认仅作为前端 UI 的便捷项。
+    - bound_agent_definition_id 永久绑定主 Agent 定义；scene 创建时必填且**不可修改**，
+      所有运行实例（含跨 instance 重建）都使用同一 agent 定义；变更 Agent 等价于新建 scene。
+    - bound_root_conversation_id 是 scene 持有的对话上下文，首次在该 scene 下创建 root instance 时
+      由编排层回填；后续 instance 重建时复用以延续 LLM 历史。
+    - LLM 策略不与 scene 绑定，只属于 agent 实例（见 AgentInstance.llm_*）。重建实例时 LLM 策略
+      由编排层从该 scene 下最近一条 instance 拷贝；scene 模型本身不存任何 LLM 字段。
     - 状态流转：active <-> archived 可双向切换；不允许直接删除（删除是仓储级硬删除）。
     """
 
@@ -63,23 +68,19 @@ class Scene:
     # 场景当前状态：active / archived。
     status: SceneStatus
 
+    # 永久绑定的主 Agent 定义 ID。创建后不可修改。
+    bound_agent_definition_id: str
+
     # 创建时间。
     created_at: datetime = None  # type: ignore[assignment]
 
     # 最近一次活动时间（发送消息、收到事件、状态切换等都会更新）。前端按此倒序排列。
     last_active_at: datetime = None  # type: ignore[assignment]
 
-    # 场景级默认 Agent 定义 ID（创建 task 时若不指定则用此默认值）。允许 None。
-    default_agent_definition_id: str | None = None
-
-    # 场景级默认 LLM 执行策略组 ID。
-    default_llm_policy_group_id: str | None = None
-
-    # 场景级默认 LLM provider ID（与 policy_group_id 互斥）。
-    default_llm_provider_id: str | None = None
-
-    # 场景级默认 LLM model binding ID（与 provider_id 配对）。
-    default_llm_model_binding_id: str | None = None
+    # 该 scene 持有的对话上下文 ID。首次创建 root instance 时由编排层回填；
+    # 后续 instance 重建时把它作为 conversation_id 复用，确保 LLM 历史连续。
+    # None 表示该 scene 还未被任何 instance 绑定过对话上下文。
+    bound_root_conversation_id: str | None = None
 
     # 预留扩展字段。
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -89,6 +90,7 @@ class Scene:
         _require_non_blank(self.scene_id, "scene_id")
         _require_non_blank(self.project_id, "project_id")
         _require_non_blank(self.name, "name")
+        _require_non_blank(self.bound_agent_definition_id, "bound_agent_definition_id")
         # description 允许空字符串（用户没填具体描述也可以创建场景），但不允许 None；
         # 上层若传入 None 应在网关层归一化为空串。
         if self.description is None:
@@ -137,16 +139,14 @@ class Scene:
         *,
         name: str | None = None,
         description: str | None = None,
-        default_agent_definition_id: str | None = None,
-        default_llm_policy_group_id: str | None = None,
-        default_llm_provider_id: str | None = None,
-        default_llm_model_binding_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> "Scene":
         """更新场景的可变元数据，返回新副本。
 
-        所有参数都是 None 表示不变；如需清空 default_* 字段，需要传入空字符串然后由上层处理，
-        因为 None 在本方法语义中表示"保持原值"。
+        bound_agent_definition_id 永久绑定不可修改；如需更换 Agent 请新建 scene。
+        bound_root_conversation_id 通过专用方法 ``with_bound_root_conversation_id`` 设置，
+        语义上由编排层在首次创建 root instance 时回填，不属于"用户可改的元数据"。
+        所有参数都是 None 表示不变。
         """
         values: dict[str, Any] = {}
         if name is not None:
@@ -154,16 +154,28 @@ class Scene:
             values["name"] = name
         if description is not None:
             values["description"] = description
-        if default_agent_definition_id is not None:
-            values["default_agent_definition_id"] = default_agent_definition_id or None
-        if default_llm_policy_group_id is not None:
-            values["default_llm_policy_group_id"] = default_llm_policy_group_id or None
-        if default_llm_provider_id is not None:
-            values["default_llm_provider_id"] = default_llm_provider_id or None
-        if default_llm_model_binding_id is not None:
-            values["default_llm_model_binding_id"] = default_llm_model_binding_id or None
         if metadata is not None:
             values["metadata"] = dict(metadata)
         if not values:
             return self
         return replace(self, **values)
+
+    def with_bound_root_conversation_id(self, conversation_id: str) -> "Scene":
+        """回填 bound_root_conversation_id，返回新副本。
+
+        由编排层在 scene 下首次创建 root agent instance 后调用，把新 instance 的
+        conversation_id 持久化到 scene；此后所有重建的 instance 都会复用这个 conversation_id
+        以保证 LLM 历史不丢失。
+
+        Raises:
+            ValueError: conversation_id 为空或当前 scene 已绑定其它 conversation_id。
+        """
+        _require_non_blank(conversation_id, "conversation_id")
+        if self.bound_root_conversation_id is not None and self.bound_root_conversation_id != conversation_id:
+            raise ValueError(
+                f"scene {self.scene_id} 已绑定 conversation {self.bound_root_conversation_id}，"
+                f"不能再绑定到 {conversation_id}。"
+            )
+        if self.bound_root_conversation_id == conversation_id:
+            return self
+        return replace(self, bound_root_conversation_id=conversation_id)

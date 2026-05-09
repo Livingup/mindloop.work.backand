@@ -57,6 +57,59 @@ class CreateTaskWithRootAgentInstanceRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class AttachSceneRequest:
+    """连接（attach）到 scene 的请求。
+
+    attach 是 scene 维度的统一入口：
+    - 若 scene 下当前有活跃 root agent instance → 返回 mode="resumed"，复用 instance；
+    - 否则若 scene 下有上一条 root agent instance → 继承其 LLM 策略与 conversation_id 重建，返回 mode="recreated"；
+    - 否则首次创建 → 使用本请求中的 fallback LLM 信息创建首个 root instance，返回 mode="created"。
+
+    Fallback LLM 字段仅在「mode=created」时实际生效；其余路径忽略本请求中的 LLM 字段，
+    以保证 RuntimePolicySwitcher 在运行中调整过的 LLM 策略不会被前端 attach 调用回滚。
+    LLM 字段应在 REST 层解析为已绑定 provider/model 后传入；不在网关层做 policy_group 解析。
+    """
+
+    # Fallback：本根实例执行时使用的 LLM 服务商 ID。仅 mode=created 时使用。
+    fallback_llm_provider_id: str | None = None
+
+    # Fallback：本根实例执行时使用的服务商模型接入项 ID。仅 mode=created 时使用。
+    fallback_llm_model_binding_id: str | None = None
+
+    # Fallback：策略组 ID。仅 mode=created 时使用。
+    fallback_llm_policy_group_id: str | None = None
+
+    # Fallback：策略组解析快照（不含密钥）。仅 mode=created 时使用。
+    fallback_llm_policy_snapshot_json: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AttachSceneResponse:
+    """attach scene 的响应。
+
+    mode 取值：
+    - "resumed"：复用已有活跃 root instance，未创建新实例；
+    - "recreated"：旧实例已终态，按 scene 绑定 + 上一条 instance 的 LLM 重建新实例；
+    - "created"：scene 下首次创建 root instance。
+    """
+
+    # attach 结果：resumed / recreated / created
+    mode: str
+
+    # 当前 scene 持有的 root agent instance 任务（可能是新创建的）。
+    task: AgentTask
+
+    # 当前 scene 持有的 root agent instance（可能是新创建的）。
+    instance: AgentInstance
+
+    # 通信流 ID：固定 stream-scene-{scene_id}。
+    communication_stream_id: str
+
+    # SSE 事件流地址：/api/communication/streams/{stream_id}/events。
+    event_stream_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class CreateChildAgentInstanceRequest:
     """创建子 Agent 实例请求。
 
@@ -148,6 +201,25 @@ class AgentRuntimeGateway(Protocol):
     def pause_task(self, task_id: str) -> AgentTask:
         """将任务状态流转为 paused。"""
 
+
+    def attach_scene(
+        self,
+        scene_id: str,
+        request: AttachSceneRequest,
+    ) -> AttachSceneResponse:
+        """连接（attach）到 scene，自动恢复 / 重建 / 首次创建 root agent instance。
+
+        本方法是前端进入 scene 后的唯一入口，编排了：
+        - SceneGateway：读取 bound_agent_definition_id、bound_root_conversation_id、project.workspace_path；
+        - AgentRuntimeRepository：按 scene 查活跃和最近 root instance；
+        - 必要时回写 scene.bound_root_conversation_id。
+
+        Raises:
+            KeyError: scene 不存在。
+            ValueError: scene 已 archived 或首次创建缺少 fallback LLM 信息。
+            RuntimeError: 网关装配未注入 SceneGateway。
+        """
+        ...
     def resume_task(self, task_id: str) -> AgentTask:
         """将任务状态从 paused 恢复为 running。"""
 

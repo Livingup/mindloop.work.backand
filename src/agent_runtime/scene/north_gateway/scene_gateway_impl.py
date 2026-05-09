@@ -71,15 +71,12 @@ class SceneGatewayImpl:
     # ── Scene ──────────────────────────────────────────────────────
 
     def create_scene(self, request: CreateSceneRequest) -> SceneInfo:
-        """创建场景。"""
+        """创建场景（不含 instance 创建，instance 创建由 attach 编排层负责）。"""
         scene = self._service.create_scene(
             project_id=request.project_id,
             name=request.name,
+            bound_agent_definition_id=request.bound_agent_definition_id,
             description=request.description,
-            default_agent_definition_id=request.default_agent_definition_id,
-            default_llm_policy_group_id=request.default_llm_policy_group_id,
-            default_llm_provider_id=request.default_llm_provider_id,
-            default_llm_model_binding_id=request.default_llm_model_binding_id,
             metadata=request.metadata,
         )
         return _scene_to_info(scene)
@@ -93,18 +90,19 @@ class SceneGatewayImpl:
         return [_scene_to_info(s) for s in self._service.list_scenes_by_project(project_id)]
 
     def update_scene(self, scene_id: str, request: UpdateSceneRequest) -> SceneInfo:
-        """更新场景。"""
+        """更新场景。bound_agent_definition_id / bound_root_conversation_id 不可通过本接口修改。"""
         scene = self._service.update_scene(
             scene_id,
             name=request.name,
             description=request.description,
             status=request.status,
-            default_agent_definition_id=request.default_agent_definition_id,
-            default_llm_policy_group_id=request.default_llm_policy_group_id,
-            default_llm_provider_id=request.default_llm_provider_id,
-            default_llm_model_binding_id=request.default_llm_model_binding_id,
             metadata=request.metadata,
         )
+        return _scene_to_info(scene)
+
+    def set_bound_root_conversation_id(self, scene_id: str, conversation_id: str) -> SceneInfo:
+        """在 scene 下首次创建 root instance 后回填 conversation_id。"""
+        scene = self._service.set_bound_root_conversation_id(scene_id, conversation_id)
         return _scene_to_info(scene)
 
     def touch_scene_active(self, scene_id: str) -> SceneInfo:
@@ -139,11 +137,9 @@ def _scene_to_info(scene: Scene) -> SceneInfo:
         name=scene.name,
         description=scene.description,
         status=scene.status,
+        bound_agent_definition_id=scene.bound_agent_definition_id,
         created_at=scene.created_at,
         last_active_at=scene.last_active_at,
-        default_agent_definition_id=scene.default_agent_definition_id,
-        default_llm_policy_group_id=scene.default_llm_policy_group_id,
-        default_llm_provider_id=scene.default_llm_provider_id,
-        default_llm_model_binding_id=scene.default_llm_model_binding_id,
+        bound_root_conversation_id=scene.bound_root_conversation_id,
         metadata=dict(scene.metadata),
     )

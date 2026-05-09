@@ -46,7 +46,11 @@ class ProjectResponse(BaseModel):
 
 
 class SceneResponse(BaseModel):
-    """场景响应模型。"""
+    """场景响应模型。
+
+    bound_agent_definition_id：scene 创建时选定、永久绑定不可变的主 Agent 定义。
+    bound_root_conversation_id：scene 首次创建 root instance 后由后端 attach 编排层回填，跨 instance 重建复用以延续 LLM 历史。
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -55,12 +59,10 @@ class SceneResponse(BaseModel):
     name: str
     description: str
     status: str
+    bound_agent_definition_id: str
     created_at: datetime
     last_active_at: datetime
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
+    bound_root_conversation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -86,28 +88,31 @@ class UpdateProjectBody(BaseModel):
 
 
 class CreateSceneBody(BaseModel):
-    """创建场景请求体。"""
+    """创建场景请求体。
+
+    bound_agent_definition_id 必填且创建后不可修改；LLM 策略不在 scene 维度存储。
+    首个 instance 的 LLM 策略由 POST /api/agent-runtime/scenes/{scene_id}/attach 接口决定。
+    """
 
     project_id: str = Field(..., description="所属项目 ID。")
     name: str = Field(..., description="场景可读名。")
+    bound_agent_definition_id: str = Field(
+        ...,
+        description="永久绑定的主 Agent 定义 ID，创建后不可修改。",
+    )
     description: str = Field("", description="场景长描述。")
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
     metadata: dict[str, Any] | None = None
 
 
 class UpdateSceneBody(BaseModel):
-    """更新场景请求体。"""
+    """更新场景请求体。
+
+    bound_agent_definition_id / bound_root_conversation_id 不允许修改，本请求体不提供这些字段。
+    """
 
     name: str | None = None
     description: str | None = None
     status: str | None = Field(None, description="active / archived")
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -131,12 +136,10 @@ def _scene_info_to_response(info: SceneInfo) -> SceneResponse:
         name=info.name,
         description=info.description,
         status=info.status,
+        bound_agent_definition_id=info.bound_agent_definition_id,
         created_at=info.created_at,
         last_active_at=info.last_active_at,
-        default_agent_definition_id=info.default_agent_definition_id,
-        default_llm_policy_group_id=info.default_llm_policy_group_id,
-        default_llm_provider_id=info.default_llm_provider_id,
-        default_llm_model_binding_id=info.default_llm_model_binding_id,
+        bound_root_conversation_id=info.bound_root_conversation_id,
         metadata=dict(info.metadata),
     )
 
@@ -241,17 +244,18 @@ def create_scene_router(gateway: SceneGateway) -> APIRouter:
 
     @router.post("/scenes", response_model=SceneResponse, status_code=status.HTTP_201_CREATED)
     def create_scene(body: CreateSceneBody) -> SceneResponse:
-        """创建场景。"""
+        """创建场景。
+
+        仅创建 scene 记录并绑定主 Agent 定义；instance 创建与连接交由
+        POST /api/agent-runtime/scenes/{scene_id}/attach 负责。
+        """
         try:
             info = gateway.create_scene(
                 CreateSceneRequest(
                     project_id=body.project_id,
                     name=body.name,
+                    bound_agent_definition_id=body.bound_agent_definition_id,
                     description=body.description,
-                    default_agent_definition_id=body.default_agent_definition_id,
-                    default_llm_policy_group_id=body.default_llm_policy_group_id,
-                    default_llm_provider_id=body.default_llm_provider_id,
-                    default_llm_model_binding_id=body.default_llm_model_binding_id,
                     metadata=body.metadata,
                 ),
             )
@@ -272,7 +276,7 @@ def create_scene_router(gateway: SceneGateway) -> APIRouter:
 
     @router.patch("/scenes/{scene_id}", response_model=SceneResponse)
     def update_scene(scene_id: str, body: UpdateSceneBody) -> SceneResponse:
-        """更新场景。"""
+        """更新场景（仅 name / description / status / metadata）。绑定字段不允许修改。"""
         try:
             info = gateway.update_scene(
                 scene_id,
@@ -280,10 +284,6 @@ def create_scene_router(gateway: SceneGateway) -> APIRouter:
                     name=body.name,
                     description=body.description,
                     status=body.status,
-                    default_agent_definition_id=body.default_agent_definition_id,
-                    default_llm_policy_group_id=body.default_llm_policy_group_id,
-                    default_llm_provider_id=body.default_llm_provider_id,
-                    default_llm_model_binding_id=body.default_llm_model_binding_id,
                     metadata=body.metadata,
                 ),
             )

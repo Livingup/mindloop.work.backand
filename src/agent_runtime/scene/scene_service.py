@@ -151,17 +151,18 @@ class SceneService:
         *,
         project_id: str,
         name: str,
+        bound_agent_definition_id: str,
         description: str = "",
-        default_agent_definition_id: str | None = None,
-        default_llm_policy_group_id: str | None = None,
-        default_llm_provider_id: str | None = None,
-        default_llm_model_binding_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Scene:
         """在指定项目下创建场景。
 
+        bound_agent_definition_id 永久绑定主 Agent 定义，创建后不可修改。
+        LLM 策略不与 scene 绑定，由编排层（attach 用例）在创建首个 instance 时决定。
+
         Raises:
             KeyError: project_id 不存在。
+            ValueError: bound_agent_definition_id 为空。
         """
         # 显式校验 project 存在并刷新打开时间，便于"创建场景时项目自动浮起"。
         self.get_project(project_id)
@@ -171,10 +172,7 @@ class SceneService:
             name=name,
             description=description,
             status=SCENE_STATUS_ACTIVE,
-            default_agent_definition_id=default_agent_definition_id or None,
-            default_llm_policy_group_id=default_llm_policy_group_id or None,
-            default_llm_provider_id=default_llm_provider_id or None,
-            default_llm_model_binding_id=default_llm_model_binding_id or None,
+            bound_agent_definition_id=bound_agent_definition_id,
             metadata=dict(metadata) if metadata else {},
         )
         created = self._repo.create_scene(scene)
@@ -208,14 +206,12 @@ class SceneService:
         name: str | None = None,
         description: str | None = None,
         status: str | None = None,
-        default_agent_definition_id: str | None = None,
-        default_llm_policy_group_id: str | None = None,
-        default_llm_provider_id: str | None = None,
-        default_llm_model_binding_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Scene:
         """更新场景的可变字段。
 
+        bound_agent_definition_id 永久绑定不可变；如需更换 Agent 请新建 scene。
+        bound_root_conversation_id 通过专用方法 ``set_bound_root_conversation_id`` 回填，不在此处更新。
         status 可以传 'active' / 'archived' 触发归档/激活；其他字段值传入即生效。
         所有参数为 None 表示不变。
         """
@@ -228,13 +224,25 @@ class SceneService:
         scene = scene.update_metadata(
             name=name,
             description=description,
-            default_agent_definition_id=default_agent_definition_id,
-            default_llm_policy_group_id=default_llm_policy_group_id,
-            default_llm_provider_id=default_llm_provider_id,
-            default_llm_model_binding_id=default_llm_model_binding_id,
             metadata=metadata,
         )
         return self._repo.save_scene(scene)
+
+    def set_bound_root_conversation_id(self, scene_id: str, conversation_id: str) -> Scene:
+        """回填场景持有的 conversation_id。
+
+        由 attach 编排层在 scene 下首次创建 root agent instance 后调用；同一 scene 不能重复绑定到不同的
+        conversation_id（领域层会拒绝），保证"scene 与对话上下文一对一"业务规则。
+
+        Raises:
+            KeyError: scene 不存在。
+            ValueError: conversation_id 与既有 bound_root_conversation_id 冲突。
+        """
+        scene = self.get_scene(scene_id)
+        updated = scene.with_bound_root_conversation_id(conversation_id)
+        if updated is scene:
+            return scene
+        return self._repo.save_scene(updated)
 
     def delete_scene(self, scene_id: str) -> bool:
         """删除场景。"""

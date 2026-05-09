@@ -31,10 +31,8 @@ CREATE TABLE IF NOT EXISTS scenes (
     status                         TEXT NOT NULL,
     created_at                     TEXT NOT NULL,
     last_active_at                 TEXT NOT NULL,
-    default_agent_definition_id    TEXT,
-    default_llm_policy_group_id    TEXT,
-    default_llm_provider_id        TEXT,
-    default_llm_model_binding_id   TEXT,
+    bound_agent_definition_id      TEXT NOT NULL,
+    bound_root_conversation_id     TEXT,
     metadata_json                  TEXT NOT NULL,
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
@@ -42,6 +40,50 @@ CREATE INDEX IF NOT EXISTS idx_scenes_project_id ON scenes(project_id);
 CREATE INDEX IF NOT EXISTS idx_scenes_last_active_at ON scenes(last_active_at);
 CREATE INDEX IF NOT EXISTS idx_scenes_status ON scenes(status);
 """
+
+# 旧 schema 标记值：迁移时若原 default_agent_definition_id 为 NULL，回填为该哨兵值便于排查。
+_LEGACY_AGENT_DEFINITION_ID = "__legacy_unknown__"
+
+
+def _migrate_scenes_table(conn: sqlite3.Connection) -> None:
+    """将旧版 scenes 表（default_* 列）迁移到新结构（bound_* 列）。
+
+    迁移触发条件：scenes 表存在且含 default_agent_definition_id 列；
+    迁移内容：
+    - default_agent_definition_id → bound_agent_definition_id（NULL 回填为哨兵值）
+    - 删除 default_llm_policy_group_id / default_llm_provider_id / default_llm_model_binding_id
+    - 新增 bound_root_conversation_id（旧数据填 NULL，由 attach 用例首次绑定时回填）
+    迁移幂等：已是新结构（含 bound_agent_definition_id 列）时直接返回。
+    """
+    rows = conn.execute("PRAGMA table_info(scenes)").fetchall()
+    if not rows:
+        return
+    columns = {row[1] for row in rows}
+    if "bound_agent_definition_id" in columns:
+        return  # 已迁移
+    if "default_agent_definition_id" not in columns:
+        return  # 异常结构，跳过迁移避免误操作
+    conn.execute("ALTER TABLE scenes RENAME TO scenes_legacy_v1")
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        f"""
+        INSERT INTO scenes (
+            scene_id, project_id, name, description, status,
+            created_at, last_active_at,
+            bound_agent_definition_id, bound_root_conversation_id,
+            metadata_json
+        )
+        SELECT
+            scene_id, project_id, name, description, status,
+            created_at, last_active_at,
+            COALESCE(NULLIF(default_agent_definition_id, ''), '{_LEGACY_AGENT_DEFINITION_ID}'),
+            NULL,
+            metadata_json
+        FROM scenes_legacy_v1
+        """
+    )
+    conn.execute("DROP TABLE scenes_legacy_v1")
+    conn.commit()
 
 
 class SqliteSceneRepository:
@@ -172,10 +214,9 @@ class SqliteSceneRepository:
                     INSERT INTO scenes (
                         scene_id, project_id, name, description, status,
                         created_at, last_active_at,
-                        default_agent_definition_id, default_llm_policy_group_id,
-                        default_llm_provider_id, default_llm_model_binding_id,
+                        bound_agent_definition_id, bound_root_conversation_id,
                         metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     _scene_to_row(scene),
                 )
@@ -194,10 +235,9 @@ class SqliteSceneRepository:
                 INSERT INTO scenes (
                     scene_id, project_id, name, description, status,
                     created_at, last_active_at,
-                    default_agent_definition_id, default_llm_policy_group_id,
-                    default_llm_provider_id, default_llm_model_binding_id,
+                    bound_agent_definition_id, bound_root_conversation_id,
                     metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scene_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     name = excluded.name,
@@ -205,10 +245,8 @@ class SqliteSceneRepository:
                     status = excluded.status,
                     created_at = excluded.created_at,
                     last_active_at = excluded.last_active_at,
-                    default_agent_definition_id = excluded.default_agent_definition_id,
-                    default_llm_policy_group_id = excluded.default_llm_policy_group_id,
-                    default_llm_provider_id = excluded.default_llm_provider_id,
-                    default_llm_model_binding_id = excluded.default_llm_model_binding_id,
+                    bound_agent_definition_id = excluded.bound_agent_definition_id,
+                    bound_root_conversation_id = excluded.bound_root_conversation_id,
                     metadata_json = excluded.metadata_json
                 """,
                 _scene_to_row(scene),
@@ -223,8 +261,7 @@ class SqliteSceneRepository:
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
-                       default_agent_definition_id, default_llm_policy_group_id,
-                       default_llm_provider_id, default_llm_model_binding_id,
+                       bound_agent_definition_id, bound_root_conversation_id,
                        metadata_json
                 FROM scenes WHERE scene_id = ?
                 """,
@@ -239,8 +276,7 @@ class SqliteSceneRepository:
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
-                       default_agent_definition_id, default_llm_policy_group_id,
-                       default_llm_provider_id, default_llm_model_binding_id,
+                       bound_agent_definition_id, bound_root_conversation_id,
                        metadata_json
                 FROM scenes
                 WHERE project_id = ?
@@ -272,6 +308,8 @@ class SqliteSceneRepository:
         self._conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # 旧版 default_* 列存在则先迁移到 bound_*；幂等。
+        _migrate_scenes_table(self._conn)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._db_path = db_path
@@ -315,10 +353,8 @@ def _scene_to_row(scene: Scene) -> tuple[Any, ...]:
         scene.status,
         _datetime_to_text(scene.created_at),
         _datetime_to_text(scene.last_active_at),
-        scene.default_agent_definition_id,
-        scene.default_llm_policy_group_id,
-        scene.default_llm_provider_id,
-        scene.default_llm_model_binding_id,
+        scene.bound_agent_definition_id,
+        scene.bound_root_conversation_id,
         json.dumps(scene.metadata, ensure_ascii=False),
     )
 
@@ -333,11 +369,9 @@ def _row_to_scene(row: tuple[Any, ...]) -> Scene:
         status=row[4],
         created_at=_text_to_datetime(row[5]),
         last_active_at=_text_to_datetime(row[6]),
-        default_agent_definition_id=row[7],
-        default_llm_policy_group_id=row[8],
-        default_llm_provider_id=row[9],
-        default_llm_model_binding_id=row[10],
-        metadata=json.loads(row[11]) if row[11] else {},
+        bound_agent_definition_id=row[7],
+        bound_root_conversation_id=row[8],
+        metadata=json.loads(row[9]) if row[9] else {},
     )
 
 

@@ -30,19 +30,22 @@ class ProjectInfo:
 
 @dataclass(frozen=True, slots=True)
 class SceneInfo:
-    """场景信息 DTO。"""
+    """场景信息 DTO。
+
+    bound_agent_definition_id 是 scene 永久绑定的主 Agent 定义 ID，创建后不可变。
+    bound_root_conversation_id 是该 scene 持有的对话上下文，首次创建 root instance 后由编排层回填。
+    LLM 策略不与 scene 绑定（属于 instance 维度）。
+    """
 
     scene_id: str
     project_id: str
     name: str
     description: str
     status: str
+    bound_agent_definition_id: str
     created_at: datetime
     last_active_at: datetime
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
+    bound_root_conversation_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -84,29 +87,30 @@ class UpdateProjectRequest:
 
 @dataclass(frozen=True, slots=True)
 class CreateSceneRequest:
-    """创建场景请求。"""
+    """创建场景请求。
+
+    bound_agent_definition_id 必填且创建后不可修改；表示该 scene 永久绑定的主 Agent 定义。
+    LLM 策略不在 scene 维度存储，创建首个 instance 的 LLM 由 attach 接口决定。
+    """
 
     project_id: str
     name: str
+    bound_agent_definition_id: str
     description: str = ""
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
     metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class UpdateSceneRequest:
-    """更新场景请求；任何字段为 None 表示不变。"""
+    """更新场景请求；任何字段为 None 表示不变。
+
+    bound_agent_definition_id 不可变，本请求模型不提供该字段。
+    bound_root_conversation_id 也不能通过本请求修改，由 attach 编排层回填。
+    """
 
     name: str | None = None
     description: str | None = None
     status: str | None = None
-    default_agent_definition_id: str | None = None
-    default_llm_policy_group_id: str | None = None
-    default_llm_provider_id: str | None = None
-    default_llm_model_binding_id: str | None = None
     metadata: dict[str, Any] | None = None
 
 
@@ -167,6 +171,16 @@ class SceneGateway(Protocol):
 
     def update_scene(self, scene_id: str, request: UpdateSceneRequest) -> SceneInfo:
         """更新场景。"""
+        ...
+
+    def set_bound_root_conversation_id(self, scene_id: str, conversation_id: str) -> SceneInfo:
+        """在 scene 下首次创建 root agent instance 后回填该 instance 的 conversation_id。
+
+        由 attach 编排层调用，保证 scene 与 conversation_id 一对一绑定，跨 instance 重建时复用历史对话。
+        Raises:
+            KeyError: scene 不存在。
+            ValueError: 与已绑定的 conversation_id 冲突。
+        """
         ...
 
     def touch_scene_active(self, scene_id: str) -> SceneInfo:

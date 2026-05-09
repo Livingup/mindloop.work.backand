@@ -254,6 +254,33 @@ class SqliteAgentRuntimeRepository:
             ).fetchall()
             return [_row_to_instance(row) for row in rows]
 
+    def list_tasks_by_scene_id(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序（最近在前）。
+
+        利用 idx_agent_tasks_scene 索引；若 scene 下无任务返回空列表。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT task_id, root_agent_instance_id, agent_instance_ids, status,
+                       created_at, updated_at, started_at, paused_at, finished_at,
+                       failed_at, failure_message, scene_id
+                FROM agent_tasks WHERE scene_id = ? ORDER BY created_at DESC
+                """,
+                (scene_id,),
+            ).fetchall()
+            tasks: list[AgentTask] = []
+            for row in rows:
+                relations = self._load_task_relations(row[0])
+                instance_ids = self._load_task_instance_ids(
+                    task_id=row[0],
+                    root_agent_instance_id=row[1],
+                    stored_instance_ids=tuple(json.loads(row[2])),
+                    relations=relations,
+                )
+                tasks.append(_row_to_task(row, relations, instance_ids))
+            return tasks
+
     def contains_task(self, task_id: str) -> bool:
         """判断任务是否存在。"""
         with self._lock:

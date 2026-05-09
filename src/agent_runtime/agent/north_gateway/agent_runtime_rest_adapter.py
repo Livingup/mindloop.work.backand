@@ -16,6 +16,7 @@ from agent_runtime.agent.agent_execution_engine import (
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
+    AttachSceneRequest,
     CreateTaskWithRootAgentInstanceRequest,
 )
 from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import (
@@ -27,6 +28,7 @@ from agent_runtime.llm_model_registry.llm_model_registry_service import (
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelRegistryGateway,
 )
+from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
 
 class CreateRootAgentInstanceBody(BaseModel):
@@ -103,6 +105,34 @@ class AgentMessageSubmissionResponse(BaseModel):
     conversation_id: str | None = None
     communication_stream_id: str
     event_stream_url: str
+class AttachSceneBody(BaseModel):
+    """attach scene 入参。
+
+    Fallback LLM 字段仅在 mode=created（scene 下首次创建 root instance）时使用：
+    - 优先级 1：body 显式提供 llm_policy_group_id 或 llm_provider_id+llm_model_binding_id；
+    - 优先级 2：未提供时回退到 agent_definition.default_llm_policy_group_id；
+    - 都没有 → REST 层 400，前端应在 SceneCreator 时让用户选择策略组。
+    其余 attach 模式（resumed / recreated）忽略所有 LLM 字段。
+    """
+
+    llm_policy_group_id: str | None = None
+    llm_provider_id: str | None = None
+    llm_model_binding_id: str | None = None
+
+
+class AttachSceneResponseModel(BaseModel):
+    """attach scene 响应。
+
+    mode：resumed | recreated | created。
+    """
+
+    mode: str
+    task: AgentRuntimeTaskResponse
+    root_agent_instance: AgentInstanceResponse
+    communication_stream_id: str
+    event_stream_url: str
+
+
 
 
 def create_agent_runtime_router(
@@ -110,6 +140,7 @@ def create_agent_runtime_router(
     llm_registry_gateway: LlmModelRegistryGateway | None = None,
     execution_engine: AgentExecutionEngine | None = None,
     agent_definition_gateway: AgentDefinitionNorthGateway | None = None,
+    scene_gateway: SceneGateway | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -228,6 +259,71 @@ def create_agent_runtime_router(
             raise HTTPException(status_code=409, detail=str(e))
         return _submission_response(result)
 
+    @router.post(
+        "/scenes/{scene_id}/attach",
+        response_model=AttachSceneResponseModel,
+        status_code=200,
+    )
+    def attach_scene(
+        scene_id: str,
+        body: AttachSceneBody,
+    ) -> AttachSceneResponseModel:
+        """前端进入 scene 的统一入口。
+
+        - 返回 mode=resumed：scene 下当前已有活跃 root agent instance，直接复用；
+        - 返回 mode=recreated：旧 instance 已终态，按 scene 绑定 + 上一条 instance LLM 重建；
+        - 返回 mode=created：scene 下首次创建 root instance（需要 fallback LLM）。
+
+        body 中的 LLM 字段仅在 mode=created 时实际生效。REST 层先解析 fallback LLM，
+        然后由 gateway 决策真实 mode；其它路径的 fallback LLM 自动忽略。
+        """
+        if scene_gateway is None:
+            raise HTTPException(
+                status_code=501,
+                detail="Scene 网关未启用，attach 不可用。",
+            )
+        try:
+            scene = scene_gateway.get_scene(scene_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Scene 不存在: {scene_id}")
+
+        try:
+            fallback = _resolve_attach_fallback_llm(
+                body=body,
+                bound_agent_definition_id=scene.bound_agent_definition_id,
+                llm_registry_gateway=llm_registry_gateway,
+                agent_definition_gateway=agent_definition_gateway,
+            )
+        except (KeyError, ValueError) as e:
+            # fallback 解析失败不直接 fail：可能 scene 下已有 instance，attach 走 resumed/recreated 不需要 LLM。
+            # 把异常吞掉转为空 fallback；若 gateway 走 mode=created 路径会在 gateway 层抛 ValueError。
+            fallback = None
+
+        request = AttachSceneRequest(
+            fallback_llm_provider_id=fallback.llm_provider_id if fallback else None,
+            fallback_llm_model_binding_id=fallback.llm_model_binding_id if fallback else None,
+            fallback_llm_policy_group_id=fallback.llm_policy_group_id if fallback else None,
+            fallback_llm_policy_snapshot_json=(
+                fallback.llm_policy_snapshot_json if fallback else None
+            ),
+        )
+        try:
+            response = gateway.attach_scene(scene_id, request)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=501, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+        return AttachSceneResponseModel(
+            mode=response.mode,
+            task=_task_response(response.task),
+            root_agent_instance=_instance_response(response.instance),
+            communication_stream_id=response.communication_stream_id,
+            event_stream_url=response.event_stream_url,
+        )
+
     return router
 
 
@@ -271,6 +367,44 @@ def _resolve_llm_runtime_selection(
         llm_provider_id=llm_provider_id,
         llm_model_binding_id=llm_model_binding_id,
     )
+
+
+def _resolve_attach_fallback_llm(
+    *,
+    body: AttachSceneBody,
+    bound_agent_definition_id: str,
+    llm_registry_gateway: LlmModelRegistryGateway | None,
+    agent_definition_gateway: AgentDefinitionNorthGateway | None,
+) -> _LlmRuntimeSelection | None:
+    """为 attach 接口解析 fallback LLM。
+
+    优先级：body.llm_policy_group_id > body.llm_provider_id+llm_model_binding_id > agent_definition.default_llm_policy_group_id。
+    任一路径都没有可解析信息时返回 None；解析失败抛 ValueError 由调用方处理。
+    """
+    policy_group_id = body.llm_policy_group_id
+    direct_binding_requested = bool(body.llm_provider_id or body.llm_model_binding_id)
+    if (
+        policy_group_id is None
+        and not direct_binding_requested
+        and agent_definition_gateway is not None
+    ):
+        definition = agent_definition_gateway.get_agent_definition(bound_agent_definition_id)
+        policy_group_id = definition.default_llm_policy_group_id
+    if policy_group_id:
+        _ensure_agent_allows_policy_group(
+            bound_agent_definition_id,
+            policy_group_id,
+            agent_definition_gateway,
+        )
+        if llm_registry_gateway is None:
+            raise ValueError("LLM 注册网关未启用，不能解析 LLM 执行策略组。")
+        return _resolve_llm_policy_group(policy_group_id, llm_registry_gateway)
+    if body.llm_provider_id and body.llm_model_binding_id:
+        return _LlmRuntimeSelection(
+            llm_provider_id=body.llm_provider_id,
+            llm_model_binding_id=body.llm_model_binding_id,
+        )
+    return None
 
 
 def _resolve_llm_binding(

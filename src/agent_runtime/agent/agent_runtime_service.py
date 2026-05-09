@@ -207,6 +207,55 @@ class AgentRuntimeService:
         _require_non_blank(thread_id, "thread_id")
         return self._repository.list_agent_instances_by_thread(thread_id)
 
+    def list_tasks_by_scene_id(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序（最近在前）。"""
+        _require_non_blank(scene_id, "scene_id")
+        return self._repository.list_tasks_by_scene_id(scene_id)
+
+    def get_active_root_agent_instance_by_scene(
+        self,
+        scene_id: str,
+    ) -> tuple[AgentTask, AgentInstance] | None:
+        """查询 scene 下当前活跃的 root agent instance。
+
+        判定规则：
+        - 取该 scene 下最近一条 task（created_at DESC），若 task 已终态则视为无活跃；
+        - 再取该 task 的 root_agent_instance_id 对应实例，若实例已终态则视为无活跃；
+        - 两者都非终态时返回 (task, instance)；否则返回 None。
+
+        本方法不抛错，scene 不存在 / 无任务 / 已终态都返回 None。
+        """
+        _require_non_blank(scene_id, "scene_id")
+        tasks = self._repository.list_tasks_by_scene_id(scene_id)
+        if not tasks:
+            return None
+        latest_task = tasks[0]
+        if latest_task.is_terminal:
+            return None
+        instance = self._repository.get_agent_instance(latest_task.root_agent_instance_id)
+        if instance is None or instance.is_terminal:
+            return None
+        return latest_task, instance
+
+    def get_last_root_agent_instance_by_scene(
+        self,
+        scene_id: str,
+    ) -> tuple[AgentTask, AgentInstance] | None:
+        """查询 scene 下最近一条 root agent instance，无论是否终态。
+
+        用于实例终态后重建时继承上一个实例的 LLM 策略与 conversation_id。
+        scene 不存在 / 无任务 / 实例缺失 都返回 None。
+        """
+        _require_non_blank(scene_id, "scene_id")
+        tasks = self._repository.list_tasks_by_scene_id(scene_id)
+        if not tasks:
+            return None
+        latest_task = tasks[0]
+        instance = self._repository.get_agent_instance(latest_task.root_agent_instance_id)
+        if instance is None:
+            return None
+        return latest_task, instance
+
     def list_task_parent_child_relations(
         self,
         task_id: str,

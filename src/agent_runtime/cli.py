@@ -257,12 +257,14 @@ def serve(host: str | None, port: int | None) -> None:
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
-    agent_runtime_gateway = AgentRuntimeFactory.create()
+    # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
+    # 以支持 attach_scene 编排（前端进入 scene 的统一入口）。
+    scene_gateway = SceneFactory.create()
+    agent_runtime_gateway = AgentRuntimeFactory.create(scene_gateway=scene_gateway)
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     agent_execution_engine = AgentExecutionFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
     communication_gateway = CommunicationFactory.create()
-    scene_gateway = SceneFactory.create()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -325,6 +327,7 @@ def serve(host: str | None, port: int | None) -> None:
             llm_model_registry_gateway,
             agent_execution_engine,
             agent_definition_gateway,
+            scene_gateway=scene_gateway,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],
