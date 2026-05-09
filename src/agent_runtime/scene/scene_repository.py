@@ -2,84 +2,64 @@
 """Scene 模块仓储接口（Protocol）。
 
 定义在领域层，实现在基础设施层（依赖反转）。
-单一仓储同时管理 Project 与 Scene 两类聚合根，简化工厂装配；删除 project 由仓储层
-通过 SQLite 外键 ON DELETE CASCADE 自动级联删除关联 scenes。
+
+**重要**：本仓储只负责 Scene 聚合的持久化，**不再管理 Project**；
+Project 身份由 :class:`agent_runtime.scene.project_manifest_repository.ProjectManifestRepository`
+存储到 ``<workspace>/.spread-ai/project.json``。
+
+Scene 数据按 workspace 隔离存储于 ``<workspace>/.spread-ai/scenes.db``，
+所有 CRUD 方法都需要传入 ``workspace_path`` 来路由到正确的物理数据库。
 """
 from __future__ import annotations
 
 from typing import Protocol
 
-from agent_runtime.scene.project import Project
 from agent_runtime.scene.scene import Scene
 
 
 class SceneRepository(Protocol):
-    """Project / Scene 仓储接口。"""
+    """Scene 仓储接口。所有方法以 ``workspace_path`` 路由到对应 workspace 的 scenes.db。"""
 
-    # ── Project ────────────────────────────────────────────────────
+    def ensure_initialized(self, workspace_path: str) -> None:
+        """确保指定 workspace 的 scenes.db 与 schema 已就绪。
 
-    def create_project(self, project: Project) -> Project:
-        """创建项目。
-
-        Raises:
-            ValueError: project_id 已存在或 workspace_path 已被其他项目占用。
+        领域服务在 ``open_or_create_project`` 流程中调用，触发首次连接 + 跑 schema 初始化 +
+        必要的迁移；后续 CRUD 方法可信赖该 workspace 的连接状态正常。
         """
         ...
 
-    def save_project(self, project: Project) -> Project:
-        """保存项目当前状态（upsert 语义）。用于更新 name / last_opened_at / metadata。"""
-        ...
-
-    def get_project(self, project_id: str) -> Project | None:
-        """按 project_id 获取项目；不存在返回 None。"""
-        ...
-
-    def get_project_by_workspace_path(self, workspace_path: str) -> Project | None:
-        """按 workspace_path 查找项目；不存在返回 None。
-
-        前端打开工作区时优先按路径查找，命中则复用，未命中则新建项目。
-        """
-        ...
-
-    def list_projects(self) -> list[Project]:
-        """列出全部项目，按 last_opened_at 倒序。"""
-        ...
-
-    def delete_project(self, project_id: str) -> bool:
-        """删除项目，关联 scenes 通过外键级联删除。
-
-        Returns:
-            True 表示有项目被删除；False 表示项目不存在（幂等）。
-        """
-        ...
-
-    # ── Scene ──────────────────────────────────────────────────────
-
-    def create_scene(self, scene: Scene) -> Scene:
-        """创建场景。
+    def create_scene(self, workspace_path: str, scene: Scene) -> Scene:
+        """在指定 workspace 下创建场景。
 
         Raises:
             ValueError: scene_id 已存在。
-            KeyError: project_id 不存在（外键校验由仓储层负责）。
         """
         ...
 
-    def save_scene(self, scene: Scene) -> Scene:
+    def save_scene(self, workspace_path: str, scene: Scene) -> Scene:
         """保存场景当前状态（upsert 语义）。"""
         ...
 
-    def get_scene(self, scene_id: str) -> Scene | None:
+    def get_scene(self, workspace_path: str, scene_id: str) -> Scene | None:
         """按 scene_id 获取场景；不存在返回 None。"""
         ...
 
-    def list_scenes_by_project(self, project_id: str) -> list[Scene]:
-        """列出指定项目下的全部场景，按 last_active_at 倒序。"""
+    def list_scenes_by_project(self, workspace_path: str, project_id: str) -> list[Scene]:
+        """列出指定 workspace 下属于该项目的全部场景，按 last_active_at 倒序。
+
+        ``project_id`` 在 per-workspace 数据库中冗余（一份 scenes.db 通常只服务一个 project_id），
+        但保留参数以便领域服务做一致性校验：若数据库内出现非该项目的 scene 则视为污染并过滤。
+        """
         ...
 
-    def delete_scene(self, scene_id: str) -> bool:
+    def delete_scene(self, workspace_path: str, scene_id: str) -> bool:
         """删除场景。
 
         Returns:
             True 表示有场景被删除；False 表示场景不存在（幂等）。
         """
+        ...
+
+    def close(self) -> None:
+        """关闭全部连接（进程退出时由组合根调用）。"""
         ...

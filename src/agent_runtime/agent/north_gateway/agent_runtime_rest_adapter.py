@@ -108,6 +108,9 @@ class AgentMessageSubmissionResponse(BaseModel):
 class AttachSceneBody(BaseModel):
     """attach scene 入参。
 
+    ``workspace_path`` 必填：用于路由 SceneGateway 到 ``<workspace>/.spread-ai/`` 下的 manifest 与
+    scenes.db；同时作为 mode=created 时新建任务的工作目录。
+
     Fallback LLM 字段仅在 mode=created（scene 下首次创建 root instance）时使用：
     - 优先级 1：body 显式提供 llm_policy_group_id 或 llm_provider_id+llm_model_binding_id；
     - 优先级 2：未提供时回退到 agent_definition.default_llm_policy_group_id；
@@ -115,6 +118,7 @@ class AttachSceneBody(BaseModel):
     其余 attach 模式（resumed / recreated）忽略所有 LLM 字段。
     """
 
+    workspace_path: str
     llm_policy_group_id: str | None = None
     llm_provider_id: str | None = None
     llm_model_binding_id: str | None = None
@@ -283,9 +287,11 @@ def create_agent_runtime_router(
                 detail="Scene 网关未启用，attach 不可用。",
             )
         try:
-            scene = scene_gateway.get_scene(scene_id)
+            scene = scene_gateway.get_scene(body.workspace_path, scene_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Scene 不存在: {scene_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         try:
             fallback = _resolve_attach_fallback_llm(
@@ -294,12 +300,13 @@ def create_agent_runtime_router(
                 llm_registry_gateway=llm_registry_gateway,
                 agent_definition_gateway=agent_definition_gateway,
             )
-        except (KeyError, ValueError) as e:
+        except (KeyError, ValueError):
             # fallback 解析失败不直接 fail：可能 scene 下已有 instance，attach 走 resumed/recreated 不需要 LLM。
             # 把异常吞掉转为空 fallback；若 gateway 走 mode=created 路径会在 gateway 层抛 ValueError。
             fallback = None
 
         request = AttachSceneRequest(
+            workspace_path=body.workspace_path,
             fallback_llm_provider_id=fallback.llm_provider_id if fallback else None,
             fallback_llm_model_binding_id=fallback.llm_model_binding_id if fallback else None,
             fallback_llm_policy_group_id=fallback.llm_policy_group_id if fallback else None,

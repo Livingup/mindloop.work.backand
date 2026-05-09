@@ -24,24 +24,25 @@ def _require_non_blank(value: str, field_name: str) -> None:
 class Project:
     """项目聚合根。
 
-    一个项目对应一个项目目录（workspace 根，通常是 git 仓库根）。一个项目下可以创建
-    任意数量的场景（Scene），每个场景是该项目内的一个长期任务上下文。
+    一个项目对应 workspace 目录下 `.spread-ai/project.json` 的一份 manifest 文件。
+    project_id 是项目的永久身份凭证，由 manifest 写入目录后跟随目录移动/重命名而不丢失，
+    所有与项目绑定的数据（scenes、conversations 等）都通过 project_id 关联。
+
+    workspace_path **不属于** 项目聚合状态，只作为运行时入参用于定位 manifest 的物理位置；
+    同一 project_id 在不同时间可以对应不同的 workspace_path（用户搬迁目录），但业务关系不变。
 
     业务规则：
-    - project_id 全局唯一；非空且无首尾空白。
-    - workspace_path 必须是绝对路径（保证后端可以无歧义访问）。
-    - name 默认从 workspace_path 的 basename 派生；允许用户自定义可读名。
-    - 同一 workspace_path 在仓储层强制唯一（不允许重复注册同一目录的两个项目）。
+    - project_id 全局唯一；非空；创建时由 uuid4 生成并写入 manifest，后续永久不变。
+    - name 人类可读项目名，默认从 workspace basename 派生，允许用户后续重命名。
+    - created_at / last_opened_at 为项目生命周期时间戳，由 manifest 读写维护。
+    - metadata 预留用户扩展字段（图标、颜色、备注等）。
     """
 
-    # 项目唯一标识。
+    # 项目永久唯一标识，形如 "proj-<uuid4_hex_24>"。
     project_id: str
 
-    # 项目可读名（默认从 workspace_path basename 派生）。
+    # 项目可读名。
     name: str
-
-    # 项目目录绝对路径。所有场景下属于本项目的 task 都以该路径作为 current_working_directory。
-    workspace_path: str
 
     # 创建时间。
     created_at: datetime = None  # type: ignore[assignment]
@@ -49,17 +50,13 @@ class Project:
     # 最近一次"打开"项目的时间。前端列项目时按此倒序。
     last_opened_at: datetime = None  # type: ignore[assignment]
 
-    # 预留扩展字段（图标、颜色、用户备注等）。
+    # 预留扩展字段。
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """校验项目基础字段。"""
         _require_non_blank(self.project_id, "project_id")
         _require_non_blank(self.name, "name")
-        _require_non_blank(self.workspace_path, "workspace_path")
-        # workspace_path 必须是绝对路径；Windows 用 "X:\..." 或 "\\..." 视为绝对。
-        if not _is_absolute_path(self.workspace_path):
-            raise ValueError(f"workspace_path 必须是绝对路径: {self.workspace_path}")
         if self.created_at is None:
             object.__setattr__(self, "created_at", _utc_now())
         if self.last_opened_at is None:
@@ -77,18 +74,6 @@ class Project:
         _require_non_blank(new_name, "name")
         return replace(self, name=new_name)
 
-
-def _is_absolute_path(path: str) -> bool:
-    """判断给定字符串是否表示绝对路径（兼容 Windows 与 POSIX 风格）。"""
-    if not path:
-        return False
-    # POSIX 绝对路径以 / 开头。
-    if path.startswith("/"):
-        return True
-    # Windows UNC 路径 \\server\share 或 \\?\X:\...
-    if path.startswith("\\\\") or path.startswith("//"):
-        return True
-    # Windows 盘符路径 X:\... 或 X:/...
-    if len(path) >= 3 and path[1] == ":" and path[2] in ("\\", "/"):
-        return True
-    return False
+    def with_metadata(self, metadata: dict[str, Any]) -> "Project":
+        """全量替换 metadata，返回新副本。"""
+        return replace(self, metadata=dict(metadata))

@@ -202,7 +202,9 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         """连接 scene 并自动 resume / recreate / create root agent instance。
 
         调用顺序：
-        1. 通过 SceneGateway 读取 scene 与 project（拿 workspace_path、bound_agent_definition_id、bound_root_conversation_id）。
+        1. 通过 SceneGateway（按 ``request.workspace_path`` 路由）读取 scene
+           ——拿 ``bound_agent_definition_id`` 与 ``bound_root_conversation_id``；
+           工作目录直接取 ``request.workspace_path``，不再单独读项目。
         2. 拒绝 archived scene。
         3. 查 scene 下「活跃 root instance」，存在即返回 mode=resumed。
         4. 否则查 scene 下「最近 root instance」：
@@ -215,10 +217,10 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
                 "AgentRuntimeGatewayImpl 未注入 SceneGateway，无法处理 attach_scene。"
             )
 
-        scene = self._scene_gateway.get_scene(scene_id)
+        workspace_path = request.workspace_path
+        scene = self._scene_gateway.get_scene(workspace_path, scene_id)
         if scene.status == "archived":
             raise ValueError(f"Scene 已归档，不允许 attach: {scene_id}")
-        project = self._scene_gateway.get_project(scene.project_id)
 
         stream_id = f"stream-scene-{scene_id}"
         event_stream_url = f"/api/communication/streams/{stream_id}/events"
@@ -266,7 +268,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         new_thread_id = f"thread-{uuid4()}"
         task, instance = self._service.create_task_with_root_agent_instance(
             thread_id=new_thread_id,
-            current_working_directory=project.workspace_path,
+            current_working_directory=workspace_path,
             agent_definition_id=scene.bound_agent_definition_id,
             llm_provider_id=llm_provider_id,
             llm_model_binding_id=llm_model_binding_id,
@@ -281,7 +283,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         #    （由执行引擎首次运行后 bind），所以仅当 instance 已绑定且 scene 未绑定时回写。
         if instance.conversation_id and not scene.bound_root_conversation_id:
             self._scene_gateway.set_bound_root_conversation_id(
-                scene_id, instance.conversation_id
+                workspace_path, scene_id, instance.conversation_id,
             )
 
         return AttachSceneResponse(

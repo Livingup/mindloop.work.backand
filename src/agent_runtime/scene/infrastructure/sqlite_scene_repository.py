@@ -1,28 +1,33 @@
 # -*- coding: utf-8 -*-
-"""Scene 模块 SQLite 仓储实现。"""
+"""Scene 模块 SQLite 仓储实现 — 项目本地（per-workspace）模式。
+
+每个 workspace 在 ``<workspace>/.spread-ai/scenes.db`` 维护一份独立的 SQLite 数据库；
+仓储内部维护 ``dict[str(workspace_path), Connection]`` 连接池，按 workspace_path 路由。
+数据库内不再存 projects 表 — 项目身份由
+:class:`agent_runtime.scene.infrastructure.file_project_manifest_repository.FileProjectManifestRepository`
+管理。
+"""
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable
+from typing import Any
 
-from agent_runtime.scene.project import Project
+from agent_runtime.scene.infrastructure.file_project_manifest_repository import (
+    HIDDEN_DIR_NAME,
+)
 from agent_runtime.scene.scene import Scene
 
-_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS projects (
-    project_id     TEXT PRIMARY KEY,
-    name           TEXT NOT NULL,
-    workspace_path TEXT NOT NULL UNIQUE,
-    created_at     TEXT NOT NULL,
-    last_opened_at TEXT NOT NULL,
-    metadata_json  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_projects_last_opened_at ON projects(last_opened_at);
+logger = logging.getLogger(__name__)
 
+# scenes 数据库文件名（位于 <workspace>/.spread-ai/ 内）。
+SCENES_DB_FILE_NAME = "scenes.db"
+
+_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS scenes (
     scene_id                       TEXT PRIMARY KEY,
     project_id                     TEXT NOT NULL,
@@ -33,26 +38,26 @@ CREATE TABLE IF NOT EXISTS scenes (
     last_active_at                 TEXT NOT NULL,
     bound_agent_definition_id      TEXT NOT NULL,
     bound_root_conversation_id     TEXT,
-    metadata_json                  TEXT NOT NULL,
-    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+    metadata_json                  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_scenes_project_id ON scenes(project_id);
 CREATE INDEX IF NOT EXISTS idx_scenes_last_active_at ON scenes(last_active_at);
 CREATE INDEX IF NOT EXISTS idx_scenes_status ON scenes(status);
 """
 
-# 旧 schema 标记值：迁移时若原 default_agent_definition_id 为 NULL，回填为该哨兵值便于排查。
+# 历史遗留：旧 schema 的 default_agent_definition_id 列在迁移时若为 NULL 回填的哨兵值。
 _LEGACY_AGENT_DEFINITION_ID = "__legacy_unknown__"
 
 
 def _migrate_scenes_table(conn: sqlite3.Connection) -> None:
     """将旧版 scenes 表（default_* 列）迁移到新结构（bound_* 列）。
 
-    迁移触发条件：scenes 表存在且含 default_agent_definition_id 列；
+    迁移触发条件：scenes 表存在且含 default_agent_definition_id 列。
     迁移内容：
-    - default_agent_definition_id → bound_agent_definition_id（NULL 回填为哨兵值）
+    - default_agent_definition_id → bound_agent_definition_id（NULL 回填为哨兵）
     - 删除 default_llm_policy_group_id / default_llm_provider_id / default_llm_model_binding_id
     - 新增 bound_root_conversation_id（旧数据填 NULL，由 attach 用例首次绑定时回填）
+
     迁移幂等：已是新结构（含 bound_agent_definition_id 列）时直接返回。
     """
     rows = conn.execute("PRAGMA table_info(scenes)").fetchall()
@@ -60,9 +65,9 @@ def _migrate_scenes_table(conn: sqlite3.Connection) -> None:
         return
     columns = {row[1] for row in rows}
     if "bound_agent_definition_id" in columns:
-        return  # 已迁移
+        return
     if "default_agent_definition_id" not in columns:
-        return  # 异常结构，跳过迁移避免误操作
+        return
     conn.execute("ALTER TABLE scenes RENAME TO scenes_legacy_v1")
     conn.executescript(_SCHEMA)
     conn.execute(
@@ -87,127 +92,39 @@ def _migrate_scenes_table(conn: sqlite3.Connection) -> None:
 
 
 class SqliteSceneRepository:
-    """Scene 模块 SQLite 仓储。
+    """Scene 模块 SQLite 仓储 — 按 workspace 隔离的连接池实现。
 
-    仓储直接读写 SQLite，不维护应用层缓存；SQLite 开启 WAL 以支持本机多进程读写，
-    开启外键约束用于 project 删除时级联删除其下所有 scene。
+    线程安全：进程内使用 ``RLock`` 保护连接池字典与每条连接上的写入；
+    SQLite 启 WAL 以支持本机多进程并发读写。
+
+    连接池策略：
+    - 进程生命周期内每个 workspace_path 维护一条长连接；
+    - workspace 首次操作触发 ``ensure_initialized`` → 建目录 + schema + 迁移；
+    - ``close()`` 关闭全部连接（进程退出时由组合根调用）。
     """
 
-    def __init__(self, data_dir_accessor: Callable[[], str]) -> None:
-        # 配置目录访问器；每次使用 _connection() 时检查路径，支持配置热更新切换目录。
-        self._data_dir_accessor = data_dir_accessor
-        self._conn: sqlite3.Connection | None = None
-        self._db_path: Path | None = None
+    def __init__(self) -> None:
         self._lock = RLock()
+        self._conns: dict[str, sqlite3.Connection] = {}
 
     def close(self) -> None:
-        """关闭底层 SQLite 连接。"""
+        """关闭全部 SQLite 连接。"""
         with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-                self._db_path = None
+            for conn in self._conns.values():
+                try:
+                    conn.close()
+                except sqlite3.Error as exc:
+                    logger.warning("关闭 scenes.db 连接失败 err=%s", exc)
+            self._conns.clear()
 
-    # ── Project ────────────────────────────────────────────────────
+    def ensure_initialized(self, workspace_path: str) -> None:
+        """确保 workspace 的 scenes.db + schema 已就绪。"""
+        self._connection(workspace_path)
 
-    def create_project(self, project: Project) -> Project:
-        """创建项目；project_id 或 workspace_path 重复时抛出 ValueError。"""
+    def create_scene(self, workspace_path: str, scene: Scene) -> Scene:
+        """在指定 workspace 下创建场景；scene_id 重复时抛 ValueError。"""
         with self._lock:
-            conn = self._connection()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO projects (
-                        project_id, name, workspace_path, created_at, last_opened_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    _project_to_row(project),
-                )
-                conn.commit()
-            except sqlite3.IntegrityError as exc:
-                conn.rollback()
-                raise ValueError(
-                    f"创建项目失败：project_id 或 workspace_path 已存在: "
-                    f"project_id={project.project_id}, workspace_path={project.workspace_path}"
-                ) from exc
-            return project
-
-    def save_project(self, project: Project) -> Project:
-        """保存项目当前状态（upsert）。"""
-        with self._lock:
-            conn = self._connection()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO projects (
-                        project_id, name, workspace_path, created_at, last_opened_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(project_id) DO UPDATE SET
-                        name = excluded.name,
-                        workspace_path = excluded.workspace_path,
-                        created_at = excluded.created_at,
-                        last_opened_at = excluded.last_opened_at,
-                        metadata_json = excluded.metadata_json
-                    """,
-                    _project_to_row(project),
-                )
-                conn.commit()
-            except sqlite3.IntegrityError as exc:
-                conn.rollback()
-                raise ValueError(
-                    f"保存项目失败：workspace_path 已被其他项目占用: {project.workspace_path}"
-                ) from exc
-            return project
-
-    def get_project(self, project_id: str) -> Project | None:
-        """按 project_id 获取项目。"""
-        with self._lock:
-            row = self._connection().execute(
-                "SELECT project_id, name, workspace_path, created_at, last_opened_at, metadata_json "
-                "FROM projects WHERE project_id = ?",
-                (project_id,),
-            ).fetchone()
-            return _row_to_project(row) if row else None
-
-    def get_project_by_workspace_path(self, workspace_path: str) -> Project | None:
-        """按 workspace_path 查找项目。"""
-        with self._lock:
-            row = self._connection().execute(
-                "SELECT project_id, name, workspace_path, created_at, last_opened_at, metadata_json "
-                "FROM projects WHERE workspace_path = ?",
-                (workspace_path,),
-            ).fetchone()
-            return _row_to_project(row) if row else None
-
-    def list_projects(self) -> list[Project]:
-        """列出全部项目，按 last_opened_at 倒序。"""
-        with self._lock:
-            rows = self._connection().execute(
-                "SELECT project_id, name, workspace_path, created_at, last_opened_at, metadata_json "
-                "FROM projects ORDER BY last_opened_at DESC"
-            ).fetchall()
-            return [_row_to_project(row) for row in rows]
-
-    def delete_project(self, project_id: str) -> bool:
-        """删除项目；关联 scenes 通过外键级联删除。"""
-        with self._lock:
-            conn = self._connection()
-            cursor = conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
-            conn.commit()
-            return cursor.rowcount > 0
-
-    # ── Scene ──────────────────────────────────────────────────────
-
-    def create_scene(self, scene: Scene) -> Scene:
-        """创建场景；project_id 不存在时抛 KeyError；scene_id 重复时抛 ValueError。"""
-        with self._lock:
-            conn = self._connection()
-            # 显式校验 project 存在性，提供清晰的错误语义；外键约束会兜底。
-            project_row = conn.execute(
-                "SELECT 1 FROM projects WHERE project_id = ?", (scene.project_id,)
-            ).fetchone()
-            if project_row is None:
-                raise KeyError(f"场景关联的项目不存在: project_id={scene.project_id}")
+            conn = self._connection(workspace_path)
             try:
                 conn.execute(
                     """
@@ -226,10 +143,10 @@ class SqliteSceneRepository:
                 raise ValueError(f"创建场景失败：scene_id 已存在: {scene.scene_id}") from exc
             return scene
 
-    def save_scene(self, scene: Scene) -> Scene:
-        """保存场景当前状态（upsert）。"""
+    def save_scene(self, workspace_path: str, scene: Scene) -> Scene:
+        """upsert 保存场景当前状态。"""
         with self._lock:
-            conn = self._connection()
+            conn = self._connection(workspace_path)
             conn.execute(
                 """
                 INSERT INTO scenes (
@@ -254,10 +171,10 @@ class SqliteSceneRepository:
             conn.commit()
             return scene
 
-    def get_scene(self, scene_id: str) -> Scene | None:
+    def get_scene(self, workspace_path: str, scene_id: str) -> Scene | None:
         """按 scene_id 获取场景。"""
         with self._lock:
-            row = self._connection().execute(
+            row = self._connection(workspace_path).execute(
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
@@ -269,10 +186,10 @@ class SqliteSceneRepository:
             ).fetchone()
             return _row_to_scene(row) if row else None
 
-    def list_scenes_by_project(self, project_id: str) -> list[Scene]:
-        """列出指定项目下的全部场景，按 last_active_at 倒序。"""
+    def list_scenes_by_project(self, workspace_path: str, project_id: str) -> list[Scene]:
+        """列出指定 workspace 下属于该项目的全部场景，按 last_active_at 倒序。"""
         with self._lock:
-            rows = self._connection().execute(
+            rows = self._connection(workspace_path).execute(
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
@@ -286,61 +203,46 @@ class SqliteSceneRepository:
             ).fetchall()
             return [_row_to_scene(row) for row in rows]
 
-    def delete_scene(self, scene_id: str) -> bool:
-        """删除场景。"""
+    def delete_scene(self, workspace_path: str, scene_id: str) -> bool:
+        """删除场景；幂等。"""
         with self._lock:
-            conn = self._connection()
+            conn = self._connection(workspace_path)
             cursor = conn.execute("DELETE FROM scenes WHERE scene_id = ?", (scene_id,))
             conn.commit()
             return cursor.rowcount > 0
 
     # ── 内部连接管理 ─────────────────────────────────────────────────
 
-    def _connection(self) -> sqlite3.Connection:
-        """获取当前配置目录对应的 SQLite 连接，配置路径变化时自动重建连接。"""
-        data_dir = Path(self._data_dir_accessor()).expanduser()
-        data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = data_dir / "scene.db"
-        if self._conn is not None and self._db_path == db_path:
-            return self._conn
-        if self._conn is not None:
-            self._conn.close()
-        self._conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        # 旧版 default_* 列存在则先迁移到 bound_*；幂等。
-        _migrate_scenes_table(self._conn)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        self._db_path = db_path
-        return self._conn
+    def _connection(self, workspace_path: str) -> sqlite3.Connection:
+        """获取或创建指定 workspace 的 SQLite 连接。
+
+        首次访问时创建 ``<workspace>/.spread-ai/scenes.db``、跑 schema 初始化与历史迁移。
+        以规范化后的绝对路径作为连接池 key，避免因路径表示差异创建重复连接。
+        """
+        key = self._normalize_key(workspace_path)
+        with self._lock:
+            existing = self._conns.get(key)
+            if existing is not None:
+                return existing
+            db_path = Path(workspace_path).expanduser() / HIDDEN_DIR_NAME / SCENES_DB_FILE_NAME
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            _migrate_scenes_table(conn)
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            self._conns[key] = conn
+            logger.info("已打开 workspace scenes.db path=%s", db_path)
+            return conn
+
+    @staticmethod
+    def _normalize_key(workspace_path: str) -> str:
+        """将 workspace_path 标准化为绝对路径字符串作为连接池 key。"""
+        return str(Path(workspace_path).expanduser().resolve())
 
 
 # ── 行转换辅助 ─────────────────────────────────────────────────────
-
-
-def _project_to_row(project: Project) -> tuple[Any, ...]:
-    """把 Project 实体转换为 SQLite 行参数。"""
-    return (
-        project.project_id,
-        project.name,
-        project.workspace_path,
-        _datetime_to_text(project.created_at),
-        _datetime_to_text(project.last_opened_at),
-        json.dumps(project.metadata, ensure_ascii=False),
-    )
-
-
-def _row_to_project(row: tuple[Any, ...]) -> Project:
-    """把 SQLite 行还原为 Project 实体。"""
-    return Project(
-        project_id=row[0],
-        name=row[1],
-        workspace_path=row[2],
-        created_at=_text_to_datetime(row[3]),
-        last_opened_at=_text_to_datetime(row[4]),
-        metadata=json.loads(row[5]) if row[5] else {},
-    )
 
 
 def _scene_to_row(scene: Scene) -> tuple[Any, ...]:

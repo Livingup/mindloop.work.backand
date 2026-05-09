@@ -1,7 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Scene 模块依赖装配。"""
+"""Scene 模块依赖装配。
+
+装配链路（自下而上）：
+
+1. :class:`FileProjectManifestRepository` — 读写 ``<workspace>/.spread-ai/project.json``。
+2. :class:`FileRecentWorkspacesIndex`     — 读写全局 ``recent-workspaces.json``。
+3. :class:`SqliteSceneRepository`         — per-workspace ``scenes.db`` 连接池。
+4. :class:`SceneService`                  — 编排上述三层仓储。
+5. :class:`SceneGatewayImpl`              — 暴露北向 Gateway 契约。
+"""
 from __future__ import annotations
 
+from agent_runtime.scene.infrastructure.file_project_manifest_repository import (
+    FileProjectManifestRepository,
+)
+from agent_runtime.scene.infrastructure.file_recent_workspaces_index import (
+    FileRecentWorkspacesIndex,
+)
 from agent_runtime.scene.infrastructure.sqlite_scene_repository import (
     SqliteSceneRepository,
 )
@@ -17,12 +32,17 @@ class SceneFactory:
         """创建 Scene 北向网关实例。
 
         配置通过访问器从 ConfigRegistry 实时读取，不存储配置副本。
-        装配链路：SQLite 仓储 → 领域服务 → 北向网关。
         """
         from agent_runtime.config import ConfigRegistry
 
-        repo = SqliteSceneRepository(
-            data_dir_accessor=lambda: ConfigRegistry.instance().scene.data_dir,
+        manifest_repo = FileProjectManifestRepository()
+        recent_index = FileRecentWorkspacesIndex(
+            index_path_accessor=lambda: ConfigRegistry.instance().scene.recent_workspaces_path,
         )
-        service = SceneService(repo)
+        scene_repo = SqliteSceneRepository()
+        service = SceneService(
+            manifest_repo=manifest_repo,
+            recent_index=recent_index,
+            scene_repo=scene_repo,
+        )
         return SceneGatewayImpl(service)
