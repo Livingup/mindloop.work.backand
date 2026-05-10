@@ -13,6 +13,8 @@ from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AttachSceneResponse,
     CreateChildAgentInstanceRequest,
     CreateTaskWithRootAgentInstanceRequest,
+    DetachSceneRequest,
+    DetachSceneResponse,
 )
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
@@ -82,6 +84,10 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
     def list_tasks(self) -> list[AgentTask]:
         """列出当前运行时内所有任务。"""
         return self._service.list_tasks()
+
+    def list_scene_tasks(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序。"""
+        return self._service.list_tasks_by_scene_id(scene_id)
 
     def get_task(self, task_id: str) -> AgentTask:
         """按 task_id 获取任务。"""
@@ -292,4 +298,41 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             instance=instance,
             communication_stream_id=stream_id,
             event_stream_url=event_stream_url,
+        )
+
+    def detach_scene(
+        self,
+        scene_id: str,
+        request: DetachSceneRequest,
+    ) -> DetachSceneResponse:
+        """断开 scene，取消其下所有非终态 task 和 instance。
+
+        遍历 scene 下全部 task（按 created_at DESC），对每个非终态 task：
+        - 取消该 task 下所有非终态 instance；
+        - 取消 task 本身。
+        已终态的 task/instance 不受影响（幂等）。
+        """
+        tasks = self._service.list_tasks_by_scene_id(scene_id)
+        cancelled_task_count = 0
+        cancelled_instance_count = 0
+
+        for task in tasks:
+            if task.is_terminal:
+                continue
+            # 取消该 task 下所有非终态 instance
+            for instance_id in task.agent_instance_ids:
+                try:
+                    instance = self._service.get_agent_instance(instance_id)
+                except KeyError:
+                    continue
+                if not instance.is_terminal:
+                    self._service.cancel_agent_instance(instance_id)
+                    cancelled_instance_count += 1
+            # 取消 task 本身
+            self._service.cancel_task(task.task_id)
+            cancelled_task_count += 1
+
+        return DetachSceneResponse(
+            cancelled_task_count=cancelled_task_count,
+            cancelled_instance_count=cancelled_instance_count,
         )

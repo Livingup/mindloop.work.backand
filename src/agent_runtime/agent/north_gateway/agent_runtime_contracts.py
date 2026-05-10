@@ -114,6 +114,29 @@ class AttachSceneResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class DetachSceneRequest:
+    """断开（detach）scene 的请求。
+
+    由 SceneSessionRegistry 过期回调或前端显式关闭时触发。
+    detach 将 scene 下所有非终态 task 和 instance 置为 cancelled，释放运行态资源。
+    """
+
+    # 项目目录绝对路径。用于路由 SceneGateway。
+    workspace_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class DetachSceneResponse:
+    """detach scene 的响应。"""
+
+    # 被取消的 task 数量。
+    cancelled_task_count: int
+
+    # 被取消的 agent instance 数量。
+    cancelled_instance_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class CreateChildAgentInstanceRequest:
     """创建子 Agent 实例请求。
 
@@ -175,6 +198,9 @@ class AgentRuntimeGateway(Protocol):
     def list_tasks(self) -> list[AgentTask]:
         """列出当前运行时内所有任务。"""
 
+    def list_scene_tasks(self, scene_id: str) -> list[AgentTask]:
+        """列出指定 scene 下的全部任务，按 created_at 倒序。"""
+
     def get_task(self, task_id: str) -> AgentTask:
         """按 task_id 获取任务。"""
 
@@ -224,6 +250,21 @@ class AgentRuntimeGateway(Protocol):
             RuntimeError: 网关装配未注入 SceneGateway。
         """
         ...
+
+    def detach_scene(
+        self,
+        scene_id: str,
+        request: "DetachSceneRequest",
+    ) -> "DetachSceneResponse":
+        """断开（detach）scene，取消其下所有非终态 task 和 instance。
+
+        条件：scene 下没有正在执行的 agent（由调用方保证或本方法兜底跳过 running instance）。
+        典型触发时机：SceneSessionRegistry 过期回调、前端显式关闭。
+
+        本方法是幂等的：已处于终态的 task / instance 不受影响。
+        """
+        ...
+
     def resume_task(self, task_id: str) -> AgentTask:
         """将任务状态从 paused 恢复为 running。"""
 

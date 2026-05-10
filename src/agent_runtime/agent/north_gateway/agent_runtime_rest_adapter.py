@@ -18,6 +18,7 @@ from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
     AttachSceneRequest,
     CreateTaskWithRootAgentInstanceRequest,
+    DetachSceneRequest,
 )
 from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import (
     AgentDefinitionNorthGateway,
@@ -29,6 +30,7 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
     LlmModelRegistryGateway,
 )
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
+from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
 
 
 class CreateRootAgentInstanceBody(BaseModel):
@@ -137,6 +139,19 @@ class AttachSceneResponseModel(BaseModel):
     event_stream_url: str
 
 
+class DetachSceneBody(BaseModel):
+    """detach scene 入参。"""
+
+    workspace_path: str
+
+
+class DetachSceneResponseModel(BaseModel):
+    """detach scene 响应。"""
+
+    cancelled_task_count: int
+    cancelled_instance_count: int
+
+
 
 
 def create_agent_runtime_router(
@@ -145,6 +160,7 @@ def create_agent_runtime_router(
     execution_engine: AgentExecutionEngine | None = None,
     agent_definition_gateway: AgentDefinitionNorthGateway | None = None,
     scene_gateway: SceneGateway | None = None,
+    session_registry: SceneSessionRegistry | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -323,12 +339,51 @@ def create_agent_runtime_router(
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
+        # 注册 scene session（心跳追踪）
+        if session_registry is not None:
+            session_registry.open_session(scene_id, body.workspace_path)
+
         return AttachSceneResponseModel(
             mode=response.mode,
             task=_task_response(response.task),
             root_agent_instance=_instance_response(response.instance),
             communication_stream_id=response.communication_stream_id,
             event_stream_url=response.event_stream_url,
+        )
+
+    @router.post("/scenes/{scene_id}/heartbeat", status_code=204)
+    def scene_heartbeat(scene_id: str) -> None:
+        """前端定期发送的 scene 心跳，用于维持 session 活跃状态。
+
+        前端应以 stale_timeout / 3 的间隔（默认约 10s）调用本接口。
+        返回 204 表示心跳成功；404 表示 session 不存在，前端应重新 attach。
+        """
+        if session_registry is None:
+            return
+        if not session_registry.heartbeat(scene_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Scene session 不存在，请重新 attach: {scene_id}",
+            )
+
+    @router.post("/scenes/{scene_id}/detach", status_code=200)
+    def detach_scene(
+        scene_id: str,
+        body: DetachSceneBody,
+    ) -> DetachSceneResponseModel:
+        """前端主动断开 scene（关闭 tab / beforeunload 时调用）。
+
+        执行逻辑：移除 session 注册 + 取消 scene 下非终态 task/instances。
+        """
+        # 移除 session 注册
+        if session_registry is not None:
+            session_registry.close_session(scene_id)
+
+        request = DetachSceneRequest(workspace_path=body.workspace_path)
+        response = gateway.detach_scene(scene_id, request)
+        return DetachSceneResponseModel(
+            cancelled_task_count=response.cancelled_task_count,
+            cancelled_instance_count=response.cancelled_instance_count,
         )
 
     return router

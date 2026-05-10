@@ -251,6 +251,7 @@ def serve(host: str | None, port: int | None) -> None:
     )
     from agent_runtime.scene.scene_factory import SceneFactory
     from agent_runtime.scene.north_gateway.scene_rest_adapter import create_scene_router
+    from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -266,9 +267,49 @@ def serve(host: str | None, port: int | None) -> None:
     system_settings_gateway = SystemSettingsFactory.create()
     communication_gateway = CommunicationFactory.create()
 
+    # Scene 会话注册表：追踪前端连接状态，过期时自动 detach scene。
+    from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
+    from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
+
+    def _can_scene_expire(session) -> bool:
+        """判断 scene 是否可以安全过期：scene 下没有 running 状态的 agent instance。"""
+        try:
+            tasks = agent_runtime_gateway.list_scene_tasks(session.scene_id)
+            for task in tasks:
+                if task.is_terminal:
+                    continue
+                for instance_id in task.agent_instance_ids:
+                    try:
+                        instance = agent_runtime_gateway.get_agent_instance(instance_id)
+                        if instance.status == AGENT_INSTANCE_STATUS_RUNNING:
+                            return False
+                    except KeyError:
+                        continue
+            return True
+        except Exception:
+            # 查询异常时允许过期，避免永远无法关闭
+            return True
+
+    def _on_scene_session_expired(session) -> None:
+        """SceneSessionRegistry 过期回调：取消 scene 下非终态 task/instances。"""
+        try:
+            agent_runtime_gateway.detach_scene(
+                session.scene_id,
+                DetachSceneRequest(workspace_path=session.workspace_path),
+            )
+        except Exception:
+            _serve_logger.exception(
+                "Scene 自动关闭失败: scene_id=%s", session.scene_id
+            )
+
+    scene_session_registry = SceneSessionRegistry(
+        on_expired=_on_scene_session_expired,
+        can_expire=_can_scene_expire,
+    )
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        """应用生命周期：启动时自动连接所有已启用的 MCP 服务。"""
+        """应用生命周期：启动时自动连接所有已启用的 MCP 服务，启动 Scene session sweep。"""
         async def auto_connect_mcp_services() -> None:
             _serve_logger.info("正在调度已启用 MCP 服务的后台连接…")
             try:
@@ -280,6 +321,7 @@ def serve(host: str | None, port: int | None) -> None:
             except (Exception, _asyncio.CancelledError) as e:
                 _serve_logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
 
+        scene_session_registry.start()
         auto_connect_task = _asyncio.create_task(auto_connect_mcp_services())
         try:
             yield
@@ -289,6 +331,7 @@ def serve(host: str | None, port: int | None) -> None:
                 with suppress(Exception, _asyncio.CancelledError):
                     await auto_connect_task
             await mcp_gateway.shutdown()
+            scene_session_registry.stop()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
     app.include_router(
@@ -328,6 +371,7 @@ def serve(host: str | None, port: int | None) -> None:
             agent_execution_engine,
             agent_definition_gateway,
             scene_gateway=scene_gateway,
+            session_registry=scene_session_registry,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],
