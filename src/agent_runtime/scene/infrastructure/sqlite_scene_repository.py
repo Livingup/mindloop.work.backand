@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Scene 模块 SQLite 仓储实现 — 项目本地（per-workspace）模式。
+"""Scene 模块 SQLite 仓储实现 — 全局统一数据库模式。
 
-每个 workspace 在 ``<workspace>/.spread-ai/scenes.db`` 维护一份独立的 SQLite 数据库；
-仓储内部维护 ``dict[str(workspace_path), Connection]`` 连接池，按 workspace_path 路由。
-数据库内不再存 projects 表 — 项目身份由
+所有 workspace 共享一份位于 ``SceneConfig.scenes_db_path`` 的全局 SQLite 数据库
+（默认 ``~/.spread-ai/scene/scene.db``）；仓储进程内只维护一条长连接。
+数据库内不存 projects 表 — 项目身份由
 :class:`agent_runtime.scene.infrastructure.file_project_manifest_repository.FileProjectManifestRepository`
-管理。
+管理；scenes 表通过 ``project_id`` 列与 manifest 中的项目身份关联。
 """
 from __future__ import annotations
 
@@ -15,17 +15,11 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
-from agent_runtime.scene.infrastructure.file_project_manifest_repository import (
-    HIDDEN_DIR_NAME,
-)
 from agent_runtime.scene.scene import Scene
 
 logger = logging.getLogger(__name__)
-
-# scenes 数据库文件名（位于 <workspace>/.spread-ai/ 内）。
-SCENES_DB_FILE_NAME = "scenes.db"
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS scenes (
@@ -92,39 +86,44 @@ def _migrate_scenes_table(conn: sqlite3.Connection) -> None:
 
 
 class SqliteSceneRepository:
-    """Scene 模块 SQLite 仓储 — 按 workspace 隔离的连接池实现。
+    """Scene 模块 SQLite 仓储 — 全局统一数据库实现。
 
-    线程安全：进程内使用 ``RLock`` 保护连接池字典与每条连接上的写入；
-    SQLite 启 WAL 以支持本机多进程并发读写。
+    所有 workspace 共享同一物理数据库，进程内仅维护一条长连接；CRUD 通过 ``project_id``
+    或 ``scene_id`` 直接定位行，不再按 workspace 路由。线程安全：使用 ``RLock`` 保护连接
+    创建与每条 SQL 写入；SQLite 启 WAL 以支持本机多进程并发读写。
 
-    连接池策略：
-    - 进程生命周期内每个 workspace_path 维护一条长连接；
-    - workspace 首次操作触发 ``ensure_initialized`` → 建目录 + schema + 迁移；
-    - ``close()`` 关闭全部连接（进程退出时由组合根调用）。
+    连接策略：
+    - DB 路径来自 ``db_path_accessor`` 回调（典型实现读取 ``ConfigRegistry.scene.scenes_db_path``），
+      支持配置热更新场景下 lazy 解析；
+    - 进程生命周期内仅打开一次，并复用；首次访问触发建目录 + schema + 迁移；
+    - ``close()`` 关闭连接（进程退出时由组合根调用），下次访问自动重建。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, db_path_accessor: Callable[[], str]) -> None:
+        self._db_path_accessor = db_path_accessor
         self._lock = RLock()
-        self._conns: dict[str, sqlite3.Connection] = {}
+        self._conn: sqlite3.Connection | None = None
 
     def close(self) -> None:
-        """关闭全部 SQLite 连接。"""
+        """关闭 SQLite 连接。"""
         with self._lock:
-            for conn in self._conns.values():
-                try:
-                    conn.close()
-                except sqlite3.Error as exc:
-                    logger.warning("关闭 scenes.db 连接失败 err=%s", exc)
-            self._conns.clear()
+            if self._conn is None:
+                return
+            try:
+                self._conn.close()
+            except sqlite3.Error as exc:
+                logger.warning("关闭 scene.db 连接失败 err=%s", exc)
+            finally:
+                self._conn = None
 
-    def ensure_initialized(self, workspace_path: str) -> None:
-        """确保 workspace 的 scenes.db + schema 已就绪。"""
-        self._connection(workspace_path)
+    def ensure_initialized(self) -> None:
+        """确保全局 scene 数据库 + schema 已就绪。"""
+        self._connection()
 
-    def create_scene(self, workspace_path: str, scene: Scene) -> Scene:
-        """在指定 workspace 下创建场景；scene_id 重复时抛 ValueError。"""
+    def create_scene(self, scene: Scene) -> Scene:
+        """创建场景；scene_id 重复时抛 ValueError。"""
         with self._lock:
-            conn = self._connection(workspace_path)
+            conn = self._connection()
             try:
                 conn.execute(
                     """
@@ -143,10 +142,10 @@ class SqliteSceneRepository:
                 raise ValueError(f"创建场景失败：scene_id 已存在: {scene.scene_id}") from exc
             return scene
 
-    def save_scene(self, workspace_path: str, scene: Scene) -> Scene:
+    def save_scene(self, scene: Scene) -> Scene:
         """upsert 保存场景当前状态。"""
         with self._lock:
-            conn = self._connection(workspace_path)
+            conn = self._connection()
             conn.execute(
                 """
                 INSERT INTO scenes (
@@ -171,10 +170,10 @@ class SqliteSceneRepository:
             conn.commit()
             return scene
 
-    def get_scene(self, workspace_path: str, scene_id: str) -> Scene | None:
+    def get_scene(self, scene_id: str) -> Scene | None:
         """按 scene_id 获取场景。"""
         with self._lock:
-            row = self._connection(workspace_path).execute(
+            row = self._connection().execute(
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
@@ -186,10 +185,10 @@ class SqliteSceneRepository:
             ).fetchone()
             return _row_to_scene(row) if row else None
 
-    def list_scenes_by_project(self, workspace_path: str, project_id: str) -> list[Scene]:
-        """列出指定 workspace 下属于该项目的全部场景，按 last_active_at 倒序。"""
+    def list_scenes_by_project(self, project_id: str) -> list[Scene]:
+        """列出属于该项目的全部场景，按 last_active_at 倒序。"""
         with self._lock:
-            rows = self._connection(workspace_path).execute(
+            rows = self._connection().execute(
                 """
                 SELECT scene_id, project_id, name, description, status,
                        created_at, last_active_at,
@@ -203,28 +202,26 @@ class SqliteSceneRepository:
             ).fetchall()
             return [_row_to_scene(row) for row in rows]
 
-    def delete_scene(self, workspace_path: str, scene_id: str) -> bool:
+    def delete_scene(self, scene_id: str) -> bool:
         """删除场景；幂等。"""
         with self._lock:
-            conn = self._connection(workspace_path)
+            conn = self._connection()
             cursor = conn.execute("DELETE FROM scenes WHERE scene_id = ?", (scene_id,))
             conn.commit()
             return cursor.rowcount > 0
 
     # ── 内部连接管理 ─────────────────────────────────────────────────
 
-    def _connection(self, workspace_path: str) -> sqlite3.Connection:
-        """获取或创建指定 workspace 的 SQLite 连接。
+    def _connection(self) -> sqlite3.Connection:
+        """获取或创建全局 scene 数据库连接。
 
-        首次访问时创建 ``<workspace>/.spread-ai/scenes.db``、跑 schema 初始化与历史迁移。
-        以规范化后的绝对路径作为连接池 key，避免因路径表示差异创建重复连接。
+        首次访问从 ``db_path_accessor`` 解析路径、创建父目录、建立连接、跑 schema
+        初始化与历史迁移；后续访问直接复用连接。
         """
-        key = self._normalize_key(workspace_path)
         with self._lock:
-            existing = self._conns.get(key)
-            if existing is not None:
-                return existing
-            db_path = Path(workspace_path).expanduser() / HIDDEN_DIR_NAME / SCENES_DB_FILE_NAME
+            if self._conn is not None:
+                return self._conn
+            db_path = Path(self._db_path_accessor()).expanduser()
             db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -232,14 +229,9 @@ class SqliteSceneRepository:
             _migrate_scenes_table(conn)
             conn.executescript(_SCHEMA)
             conn.commit()
-            self._conns[key] = conn
-            logger.info("已打开 workspace scenes.db path=%s", db_path)
+            self._conn = conn
+            logger.info("已打开全局 scene 数据库 path=%s", db_path)
             return conn
-
-    @staticmethod
-    def _normalize_key(workspace_path: str) -> str:
-        """将 workspace_path 标准化为绝对路径字符串作为连接池 key。"""
-        return str(Path(workspace_path).expanduser().resolve())
 
 
 # ── 行转换辅助 ─────────────────────────────────────────────────────

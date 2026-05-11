@@ -98,8 +98,8 @@ class UpdateProjectRequest:
 class CreateSceneRequest:
     """创建场景请求。
 
-    ``workspace_path`` 用于路由到 ``<workspace>/.spread-ai/scenes.db``；
-    ``project_id`` 必须与 manifest 一致，否则抛 KeyError。
+    ``workspace_path`` 用于服务端读 manifest 验证项目身份；scene 详情统一落盘在全局
+    SQLite 库（``SceneConfig.scenes_db_path``）。``project_id`` 必须与 manifest 一致，否则抛 KeyError。
     ``bound_agent_definition_id`` 创建后永久不可变；LLM 策略由 attach 接口决定。
     """
 
@@ -142,7 +142,7 @@ class SceneGateway(Protocol):
     def open_or_create_project(self, request: OpenOrCreateProjectRequest) -> ProjectInfo:
         """打开或创建项目（幂等）。
 
-        无论是首次打开还是后续打开，都会同步：写 manifest、初始化 scenes.db、刷新 recent 索引。
+        无论是首次打开还是后续打开，都会同步：写 manifest、确保全局 scene 数据库已初始化、刷新 recent 索引。
         """
         ...
 
@@ -163,7 +163,7 @@ class SceneGateway(Protocol):
         ...
 
     def forget_workspace(self, workspace_path: str) -> bool:
-        """从 recent 索引中移除该 workspace（不删除 manifest 与 scenes.db）；幂等。"""
+        """从 recent 索引中移除该 workspace（不删除 manifest 与全局 scene 数据库里的场景）；幂等。"""
         ...
 
     # ── Scene ──────────────────────────────────────────────────────

@@ -70,8 +70,8 @@ class AttachSceneRequest:
     LLM 字段应在 REST 层解析为已绑定 provider/model 后传入；不在网关层做 policy_group 解析。
     """
 
-    # 项目目录绝对路径。用于路由 SceneGateway 到 ``<workspace>/.spread-ai/`` 下的 manifest 与
-    # scenes.db；同时作为新建任务的 ``current_working_directory``。
+    # 项目目录绝对路径。服务端以此读取 ``<workspace>/.spread-ai/project.json`` manifest
+    # 获取项目身份并与全局 scene 数据库交叉校验；同时作为新建任务的 ``current_working_directory``。
     workspace_path: str
 
     # Fallback：本根实例执行时使用的 LLM 服务商 ID。仅 mode=created 时使用。

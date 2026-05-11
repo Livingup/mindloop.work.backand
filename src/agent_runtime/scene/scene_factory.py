@@ -5,7 +5,7 @@
 
 1. :class:`FileProjectManifestRepository` — 读写 ``<workspace>/.spread-ai/project.json``。
 2. :class:`FileRecentWorkspacesIndex`     — 读写全局 ``recent-workspaces.json``。
-3. :class:`SqliteSceneRepository`         — per-workspace ``scenes.db`` 连接池。
+3. :class:`SqliteSceneRepository`         — 读写全局 ``scenes_db_path`` 单一 SQLite 数据库。
 4. :class:`SceneService`                  — 编排上述三层仓储。
 5. :class:`SceneGatewayImpl`              — 暴露北向 Gateway 契约。
 """
@@ -39,7 +39,9 @@ class SceneFactory:
         recent_index = FileRecentWorkspacesIndex(
             index_path_accessor=lambda: ConfigRegistry.instance().scene.recent_workspaces_path,
         )
-        scene_repo = SqliteSceneRepository()
+        scene_repo = SqliteSceneRepository(
+            db_path_accessor=lambda: ConfigRegistry.instance().scene.scenes_db_path,
+        )
         service = SceneService(
             manifest_repo=manifest_repo,
             recent_index=recent_index,

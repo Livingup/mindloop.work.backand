@@ -21,7 +21,9 @@ class SceneGatewayImpl:
     """Scene 模块北向网关实现。
 
     将领域服务的返回值转换为北向网关 DTO，请求模型解构为服务层方法参数。
-    所有 Project / Scene 操作以 ``workspace_path`` 路由到对应数据。
+    Project 操作以 ``workspace_path`` 读 manifest 定位项目身份；Scene 详情统一存于
+    全局 SQLite 数据库，服务通过 manifest.project_id 与 scene.project_id 交叉校验
+    保证跨 workspace 隔离。
     """
 
     def __init__(self, service: SceneService) -> None:

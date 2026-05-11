@@ -4,8 +4,10 @@
 挂载 ``/api/scene/projects`` 与 ``/api/scene/scenes`` 两组路由。
 依赖 :class:`SceneGateway` Protocol，不直接依赖具体网关实现。
 
-**workspace_path 透传约定**：项目身份不再以 ``project_id`` 单独定位，所有需要落到磁盘的接口
-都需要传入 ``workspace_path`` 用于路由到 ``<workspace>/.spread-ai/`` 下的 manifest 与 scenes.db。
+**workspace_path 透传约定**：项目身份不再以 ``project_id`` 单独定位；scene 详情位于全局
+统一 SQLite 库（``SceneConfig.scenes_db_path``）。所有需要读写项目/场景的接口仍需要
+``workspace_path`` 参数 — 服务端读 manifest 获得当前项目身份，并与全局 scene 库中的
+``project_id`` 交叉校验，防止跨 workspace 访问。
 - GET / DELETE 类接口：``workspace_path`` 通过 query 参数透传。
 - POST / PATCH 类接口：``workspace_path`` 通过 body 字段透传。
 """
@@ -104,7 +106,7 @@ class CreateSceneBody(BaseModel):
     首个 instance 的 LLM 策略由 ``POST /api/agent-runtime/scenes/{scene_id}/attach`` 决定。
     """
 
-    workspace_path: str = Field(..., description="项目目录绝对路径，用于路由 scenes.db。")
+    workspace_path: str = Field(..., description="项目目录绝对路径，服务端读 manifest 验证项目身份。")
     project_id: str = Field(..., description="所属项目 ID（必须与 manifest 一致）。")
     name: str = Field(..., description="场景可读名。")
     bound_agent_definition_id: str = Field(
@@ -121,7 +123,7 @@ class UpdateSceneBody(BaseModel):
     ``bound_agent_definition_id / bound_root_conversation_id`` 不允许修改，本请求体不提供这些字段。
     """
 
-    workspace_path: str = Field(..., description="项目目录绝对路径，用于路由 scenes.db。")
+    workspace_path: str = Field(..., description="项目目录绝对路径，服务端读 manifest 验证场景归属。")
     name: str | None = None
     description: str | None = None
     status: str | None = Field(None, description="active / archived")
@@ -197,7 +199,7 @@ def create_scene_router(gateway: SceneGateway) -> APIRouter:
 
     @router.post("/projects/open-or-create", response_model=ProjectResponse)
     def open_or_create_project(body: OpenOrCreateProjectBody) -> ProjectResponse:
-        """打开或创建项目（幂等）。同步初始化 scenes.db 与刷新 recent 索引。"""
+        """打开或创建项目（幂等）。同步确保全局 scene 数据库已初始化与刷新 recent 索引。"""
         try:
             info = gateway.open_or_create_project(
                 OpenOrCreateProjectRequest(workspace_path=body.workspace_path, name=body.name),
@@ -258,7 +260,7 @@ def create_scene_router(gateway: SceneGateway) -> APIRouter:
     def forget_workspace(
         workspace_path: str = Query(..., description="项目目录绝对路径。"),
     ) -> None:
-        """从 recent 索引中移除该 workspace（不删除 manifest 与 scenes.db）。"""
+        """从 recent 索引中移除该 workspace（不删除 manifest 与全局 scene 数据库里的场景）。"""
         gateway.forget_workspace(workspace_path)
 
     @router.get("/projects/scenes", response_model=list[SceneResponse])

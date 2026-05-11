@@ -110,8 +110,8 @@ class AgentMessageSubmissionResponse(BaseModel):
 class AttachSceneBody(BaseModel):
     """attach scene 入参。
 
-    ``workspace_path`` 必填：用于路由 SceneGateway 到 ``<workspace>/.spread-ai/`` 下的 manifest 与
-    scenes.db；同时作为 mode=created 时新建任务的工作目录。
+    ``workspace_path`` 必填：服务端以此读取 ``<workspace>/.spread-ai/project.json`` manifest
+    获取项目身份并与全局 scene 数据库交叉校验；同时作为 mode=created 时新建任务的工作目录。
 
     Fallback LLM 字段仅在 mode=created（scene 下首次创建 root instance）时使用：
     - 优先级 1：body 显式提供 llm_policy_group_id 或 llm_provider_id+llm_model_binding_id；

@@ -77,8 +77,10 @@ communication:
   data_dir: "~/.spread-ai/communication"
 
 scene:
-  # Scene 模块（项目与场景）SQLite 数据目录。每个项目（workspace）和其下的场景（长期任务上下文）落盘在 scene.db。
-  data_dir: "~/.spread-ai/scene"
+  # 全局 Scene SQLite 数据库文件路径。所有 workspace 共享该数据库，每条 scene 通过 project_id 归属到项目。
+  scenes_db_path: "~/.spread-ai/scene/scene.db"
+  # 全局最近工作区索引文件路径，前端"最近项目"列表展示用，丢失或损坏不影响业务（项目身份与 scene 数据完整保留）。
+  recent_workspaces_path: "~/.spread-ai/recent-workspaces.json"
 
 prompt_template:
   # 提示词片段 YAML 文件存储根目录。

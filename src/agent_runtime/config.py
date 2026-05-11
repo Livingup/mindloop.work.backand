@@ -562,7 +562,12 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
 def _build_scene_config(data: dict[str, Any]) -> SceneConfig:
     """从 YAML 字典构建 Scene 模块配置。"""
     return SceneConfig(
-        data_dir=str(data.get("data_dir", "~/.spread-ai/scene")),
+        scenes_db_path=str(
+            data.get("scenes_db_path", "~/.spread-ai/scene/scene.db")
+        ),
+        recent_workspaces_path=str(
+            data.get("recent_workspaces_path", "~/.spread-ai/recent-workspaces.json")
+        ),
     )
 
 

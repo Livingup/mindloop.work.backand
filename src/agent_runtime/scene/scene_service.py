@@ -8,12 +8,16 @@
 - :class:`agent_runtime.scene.recent_workspaces.RecentWorkspacesIndex`
   读写 ``~/.spread-ai/recent-workspaces.json`` — 最近打开的 workspace 全局索引。
 - :class:`agent_runtime.scene.scene_repository.SceneRepository`
-  读写 ``<workspace>/.spread-ai/scenes.db`` — 场景数据。
+  读写全局统一 SQLite 数据库（``SceneConfig.scenes_db_path``）— 场景详情数据。
 
 设计原则：
-- 所有需要定位项目的方法都以 ``workspace_path`` 为入参，不再支持"按 project_id 查项目"。
-- 项目数据随 workspace 目录走；recent-workspaces 是纯展示辅助索引，丢失不影响业务。
-- 创建/更新场景时校验 ``manifest.project_id == scene.project_id``，避免误写到错误数据库。
+- 服务对外接口仍以 ``workspace_path`` 为入参来读取 manifest、定位当前项目身份；
+  不再支持"按 project_id 查项目"。
+- 仓储层不再接收 ``workspace_path``；场景访问统一走全局 SQLite 库，服务使用 manifest
+  中的 ``project_id`` 与 scene 记录实体上的 ``project_id`` 交叉校验，严格隔离跨 workspace
+  访问。
+- 项目身份随 workspace 目录走；recent-workspaces 是纯展示辅助索引，丢失不影响业务。
+- 创建/更新场景时校验 ``manifest.project_id == scene.project_id``，避免跨项目误操作。
 """
 from __future__ import annotations
 
@@ -113,7 +117,7 @@ class SceneService:
 
         - 如果 ``<workspace>/.spread-ai/project.json`` 已存在 → 读出 + touch_opened + 写回；
         - 否则生成新 project_id 并写入 manifest。
-        - 无论哪条路径都会确保 scenes.db 已初始化、recent-workspaces 索引已更新。
+        - 无论哪条路径都会确保全局 scene 数据库已初始化、recent-workspaces 索引已更新。
         """
         _require_absolute_workspace(workspace_path)
         existing = self._manifest_repo.read(workspace_path)
@@ -129,7 +133,7 @@ class SceneService:
                 project.project_id, workspace_path,
             )
         self._manifest_repo.write(workspace_path, project)
-        self._scene_repo.ensure_initialized(workspace_path)
+        self._scene_repo.ensure_initialized()
         self._sync_recent_index(workspace_path, project)
         return project
 
@@ -170,13 +174,13 @@ class SceneService:
         return project
 
     def forget_workspace(self, workspace_path: str) -> bool:
-        """从 recent 索引中移除该 workspace（不删除 manifest 与 scenes.db）。
+        """从 recent 索引中移除该 workspace（不删除 manifest 与全局 scene 数据库里的场景）。
 
-        前端"从最近列表中移除"按钮可调本方法；项目本身的数据仍保留在目录下。
+        前端"从最近列表中移除"按钮可调本方法；项目本身的数据（manifest 与 scene）仍然保留。
         """
         return self._recent_index.remove(workspace_path)
 
-    # ── Scene 用例（按 workspace_path 路由）─────────────────────────
+    # ── Scene 用例（按 workspace_path 读 manifest，跨项目隔离校验）──────────────────────────
 
     def create_scene(
         self,
@@ -207,17 +211,27 @@ class SceneService:
             bound_agent_definition_id=bound_agent_definition_id,
             metadata=dict(metadata) if metadata else {},
         )
-        created = self._scene_repo.create_scene(workspace_path, scene)
+        created = self._scene_repo.create_scene(scene)
         # 创建场景视为项目活跃事件，刷新项目 last_opened_at。
         self.touch_project_opened(workspace_path)
         return created
 
     def get_scene(self, workspace_path: str, scene_id: str) -> Scene:
-        """按 scene_id 获取场景；不存在抛 KeyError。"""
-        _require_absolute_workspace(workspace_path)
-        scene = self._scene_repo.get_scene(workspace_path, scene_id)
+        """按 scene_id 获取场景。
+
+        全局 scene 数据库下需验证 scene.project_id 与该 workspace 的 manifest.project_id 一致，
+        避免跨项目访问。场景不存在或不属于该 workspace 都报 KeyError。
+        """
+        project = self.get_project_by_workspace_path(workspace_path)
+        scene = self._scene_repo.get_scene(scene_id)
         if scene is None:
             raise KeyError(f"场景不存在: {scene_id}")
+        if scene.project_id != project.project_id:
+            raise KeyError(
+                f"场景与 workspace 不匹配: scene_id={scene_id} "
+                f"scene.project_id={scene.project_id} "
+                f"workspace_project_id={project.project_id}"
+            )
         return scene
 
     def list_scenes_by_project(
@@ -230,12 +244,12 @@ class SceneService:
         会校验 manifest.project_id 与传入参数一致；不一致抛 KeyError 防止误读。
         """
         self._require_project_match(workspace_path, project_id)
-        return self._scene_repo.list_scenes_by_project(workspace_path, project_id)
+        return self._scene_repo.list_scenes_by_project(project_id)
 
     def touch_scene_active(self, workspace_path: str, scene_id: str) -> Scene:
         """更新场景 last_active_at 时间戳。"""
         scene = self.get_scene(workspace_path, scene_id).touch_active()
-        return self._scene_repo.save_scene(workspace_path, scene)
+        return self._scene_repo.save_scene(scene)
 
     def update_scene(
         self,
@@ -264,7 +278,7 @@ class SceneService:
             description=description,
             metadata=metadata,
         )
-        return self._scene_repo.save_scene(workspace_path, scene)
+        return self._scene_repo.save_scene(scene)
 
     def set_bound_root_conversation_id(
         self,
@@ -285,12 +299,21 @@ class SceneService:
         updated = scene.with_bound_root_conversation_id(conversation_id)
         if updated is scene:
             return scene
-        return self._scene_repo.save_scene(workspace_path, updated)
+        return self._scene_repo.save_scene(updated)
 
     def delete_scene(self, workspace_path: str, scene_id: str) -> bool:
-        """删除场景。"""
-        _require_absolute_workspace(workspace_path)
-        return self._scene_repo.delete_scene(workspace_path, scene_id)
+        """删除场景。全局数据库下必须先验证场景属于该 workspace 对应项目才能删除。"""
+        project = self.get_project_by_workspace_path(workspace_path)
+        scene = self._scene_repo.get_scene(scene_id)
+        if scene is None:
+            return False
+        if scene.project_id != project.project_id:
+            raise KeyError(
+                f"场景与 workspace 不匹配: scene_id={scene_id} "
+                f"scene.project_id={scene.project_id} "
+                f"workspace_project_id={project.project_id}"
+            )
+        return self._scene_repo.delete_scene(scene_id)
 
     # ── 内部辅助 ────────────────────────────────────────────────────
 
