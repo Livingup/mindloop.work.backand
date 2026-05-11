@@ -203,6 +203,11 @@ def serve(host: str | None, port: int | None) -> None:
     import uvicorn
     from fastapi import FastAPI
 
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     _serve_logger = _logging.getLogger("agent_runtime.serve")
 
     # 各模块网关通过无参工厂创建，配置由工厂内部从 ConfigRegistry 实时读取。

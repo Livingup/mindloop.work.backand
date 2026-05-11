@@ -2,7 +2,10 @@
 """Agent 运行时任务与实例管理北向网关实现。"""
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from agent_runtime.agent.agent_instance import AgentInstance
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
@@ -332,6 +335,14 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             self._service.cancel_task(task.task_id)
             cancelled_task_count += 1
 
+        logger.info(
+            "detach_scene 完成: scene_id=%s, workspace=%s, "
+            "cancelled_tasks=%d, cancelled_instances=%d",
+            scene_id,
+            request.workspace_path,
+            cancelled_task_count,
+            cancelled_instance_count,
+        )
         return DetachSceneResponse(
             cancelled_task_count=cancelled_task_count,
             cancelled_instance_count=cancelled_instance_count,
