@@ -20,6 +20,9 @@ from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import (
 from agent_runtime.agent.north_gateway.agent_runtime_gateway_impl import (
     AgentRuntimeGatewayImpl,
 )
+from agent_runtime.communication.north_gateway.communication_contracts import (
+    CommunicationGateway,
+)
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
 
@@ -42,6 +45,7 @@ class AgentRuntimeFactory:
     def create(
         cls,
         scene_gateway: SceneGateway | None = None,
+        communication_gateway: CommunicationGateway | None = None,
     ) -> AgentRuntimeGatewayImpl:
         """创建或返回进程内共享的 Agent 运行时北向网关。
 
@@ -57,6 +61,7 @@ class AgentRuntimeFactory:
                 cls._gateway = AgentRuntimeGatewayImpl(
                     service,
                     scene_gateway=scene_gateway,
+                    communication_gateway=communication_gateway,
                 )
                 cls._repository_signature = signature
             return cls._gateway

@@ -19,6 +19,10 @@ from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     DetachSceneRequest,
     DetachSceneResponse,
 )
+from agent_runtime.communication.north_gateway.communication_contracts import (
+    CommunicationGateway,
+    CreateCommunicationStreamRequest,
+)
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
 
@@ -36,12 +40,14 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         self,
         service: AgentRuntimeService,
         scene_gateway: SceneGateway | None = None,
+        communication_gateway: CommunicationGateway | None = None,
     ) -> None:
         # Agent 运行时领域服务。负责维护任务、实例状态和任务内父子关系树。
         self._service = service
         # Scene 北向网关。attach_scene 用其读取 bound_agent_definition_id /
         # bound_root_conversation_id / project.workspace_path 以及回写 conversation 绑定。
         self._scene_gateway = scene_gateway
+        self._communication_gateway = communication_gateway
 
     def create_task_with_root_agent_instance(
         self,
@@ -238,6 +244,13 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         active = self._service.get_active_root_agent_instance_by_scene(scene_id)
         if active is not None:
             task, instance = active
+            self._ensure_scene_communication_stream(
+                stream_id=stream_id,
+                scene_id=scene_id,
+                workspace_path=workspace_path,
+                task=task,
+                instance=instance,
+            )
             return AttachSceneResponse(
                 mode="resumed",
                 task=task,
@@ -295,6 +308,14 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
                 workspace_path, scene_id, instance.conversation_id,
             )
 
+        self._ensure_scene_communication_stream(
+            stream_id=stream_id,
+            scene_id=scene_id,
+            workspace_path=workspace_path,
+            task=task,
+            instance=instance,
+        )
+
         return AttachSceneResponse(
             mode=mode,
             task=task,
@@ -302,6 +323,42 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             communication_stream_id=stream_id,
             event_stream_url=event_stream_url,
         )
+
+    def _ensure_scene_communication_stream(
+        self,
+        *,
+        stream_id: str,
+        scene_id: str,
+        workspace_path: str,
+        task: AgentTask,
+        instance: AgentInstance,
+    ) -> None:
+        if self._communication_gateway is None:
+            return
+        try:
+            self._communication_gateway.get_stream(stream_id)
+            return
+        except KeyError:
+            pass
+        try:
+            self._communication_gateway.create_stream(
+                CreateCommunicationStreamRequest(
+                    stream_id=stream_id,
+                    topic="agent.scene",
+                    owner_id=instance.agent_definition_id,
+                    metadata={
+                        "scene_id": scene_id,
+                        "workspace_path": workspace_path,
+                        "task_id": task.task_id,
+                        "thread_id": instance.thread_id,
+                        "agent_instance_id": instance.instance_id,
+                        "agent_definition_id": instance.agent_definition_id,
+                        "trace_id": instance.trace_id,
+                    },
+                ),
+            )
+        except ValueError:
+            return
 
     def detach_scene(
         self,

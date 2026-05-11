@@ -263,14 +263,17 @@ def serve(host: str | None, port: int | None) -> None:
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
+    communication_gateway = CommunicationFactory.create()
     # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
     # 以支持 attach_scene 编排（前端进入 scene 的统一入口）。
     scene_gateway = SceneFactory.create()
-    agent_runtime_gateway = AgentRuntimeFactory.create(scene_gateway=scene_gateway)
+    agent_runtime_gateway = AgentRuntimeFactory.create(
+        scene_gateway=scene_gateway,
+        communication_gateway=communication_gateway,
+    )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     agent_execution_engine = AgentExecutionFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
-    communication_gateway = CommunicationFactory.create()
 
     # Scene 会话注册表：追踪前端连接状态，过期时自动 detach scene。
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
