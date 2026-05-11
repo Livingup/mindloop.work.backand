@@ -88,7 +88,7 @@ prompt_template:
 
 skill_service:
   # Skill 仓库根目录。
-  skills_dir: "G:/skills"
+  skills_dir: "C:/skills"
 
 mcp_client:
   # MCP 服务配置 YAML 文件存放目录，每个 YAML 文件对应一个可连接的 MCP 服务。

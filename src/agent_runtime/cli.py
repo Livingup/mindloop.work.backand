@@ -34,7 +34,7 @@ def _load_initialized_runtime_config() -> None:
             f"运行配置文件不存在: {config_path}。请先执行 "
             "spread-ai config init --source <agent_runtime.yaml> 初始化服务配置。"
         )
-    ConfigRegistry.load(str(config_path))
+    ConfigRegistry.load(str(config_path), watch=True)
 
 
 def _echo_json(data: dict[str, object], *, err: bool = False) -> None:
