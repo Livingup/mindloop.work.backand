@@ -811,21 +811,18 @@ class AgentExecutionEngine:
             item.service_id: item
             for item in self._mcp_client_gateway.list_services()
         }
-        lines = [
-            "# Agent 可用的 MCP 服务",
-            "以下只列出当前 Agent 可用的 MCP 服务，不列出具体 MCP 工具权限。",
-        ]
-        for service_id in service_ids:
-            service = services.get(service_id)
-            if service is None:
-                lines.append(f"- `{service_id}`：未找到服务配置。")
-                continue
+        available_services = [services[sid] for sid in service_ids if sid in services]
+        if not available_services:
+            return ""
+        lines = ["# 可用的 MCP 服务列表"]
+        for service in available_services:
             description = service.description or ""
-            lines.append(
-                f"- `{service.service_id}`：name=`{service.name}`；description=`{description}`；"
-                f"enabled=`{service.enabled}`；connection_status=`{service.connection_status}`；"
-                f"group=`{service.group}`。"
-            )
+            lines.append(f"- `{service.service_id}`：`{description}`")
+        lines.append("## 使用方式")
+        lines.append(
+            "用 MCP 服务相关工具读取服务详情和 MCP tool 详情，了解 MCP 服务的功能和使用方式，"
+            "然后使用 MCP tool 调用工具调用对应 MCP tool 并获取执行结果。"
+        )
         return "\n".join(lines)
 
     def _build_skills_prompt(self, definition: AgentDefinition) -> str:
@@ -835,19 +832,23 @@ class AgentExecutionEngine:
             item.skill_id: item
             for item in self._skill_gateway.list_skills()
         }
-        lines = [
-            "# Agent 可用的 Skills",
-            "以下只列出 Skill 描述和目录路径；如需详细说明，Agent 应根据需要读取对应目录下的 SKILL.md 和相关资源。",
-        ]
-        for skill_id in definition.skill_ids:
-            skill = skills.get(skill_id)
-            if skill is None:
-                lines.append(f"- `{skill_id}`：未找到 Skill。")
-                continue
+        available_skills = [skills[sid] for sid in definition.skill_ids if sid in skills]
+        if not available_skills:
+            return ""
+        lines = ["# 你可用的 Skills"]
+        for skill in available_skills:
             lines.append(
-                f"- `{skill.skill_id}`：name=`{skill.name}`；description=`{skill.description}`；"
-                f"directory_path=`{skill.directory_path}`。"
+                f"- `{skill.skill_id}`：skill 触发场景=`{skill.description}`；"
+                f"该 skill 仓库目录=`{skill.directory_path}`"
             )
+        lines.append("## skill 使用技巧")
+        lines.append(
+            "Skill 是 Agent 的“某个领域专家经验”，对你处理该领域的问题有极大的帮助。"
+            "每个 skill 都有他们适用的场景/领域，根据你当前的和接下来的目标来决定是否要读取某个 skill 的详细内容。"
+            "skill 仓库都是标准规范的 skill 目录，当你需要某个 skill 时，"
+            "使用命令行或是目录结构读取工具获取该 skill 仓库目录结构，"
+            "然后首先读取他的 SKILL.md 文件，再决定是否读取其他资源文件。"
+        )
         return "\n".join(lines)
 
     def _build_lifecycle_tool_notice(self, definition: AgentDefinition) -> str:
