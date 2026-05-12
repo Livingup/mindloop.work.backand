@@ -58,6 +58,11 @@ class ToolWikiItemResponse(BaseModel):
 class ToolExecBody(BaseModel):
     """工具执行请求体。"""
     params: dict[str, Any] = {}
+    request_id: str | None = None
+    task_id: str | None = None
+    agent_instance_id: str | None = None
+    trace_id: str | None = None
+    communication_stream_id: str | None = None
 
 
 class ToolExecResponse(BaseModel):
@@ -162,7 +167,15 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
         """执行指定工具。"""
         try:
             exec_result = await gateway.execute_tool(
-                ToolExecuteRequest(tool_name=name, params=body.params),
+                ToolExecuteRequest(
+                    tool_name=name,
+                    params=body.params,
+                    request_id=body.request_id,
+                    task_id=body.task_id,
+                    agent_instance_id=body.agent_instance_id,
+                    trace_id=body.trace_id,
+                    communication_stream_id=body.communication_stream_id,
+                ),
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"本地工具不存在: {name}")

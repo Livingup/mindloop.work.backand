@@ -117,6 +117,9 @@ class TerminalRuntimeScopeResolver:
         elif task_id:
             owner_type = "task"
             owner_id = task_id
+        elif communication_stream_id:
+            owner_type = "communication_stream"
+            owner_id = communication_stream_id
         else:
             raise ValueError("终端工具需要可解析的 task_id、agent_instance_id 或 communication_stream_id。")
 

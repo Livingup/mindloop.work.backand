@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Literal
 
 from pydantic import Field
@@ -145,7 +146,7 @@ async def terminal_read_output(request: TerminalReadOutputToolRequest, ctx: Tool
             trace_id=ctx.trace_id,
         )
     )
-    return BaseToolResult(success=True, execution_status="success", output=result.__dict__)
+    return BaseToolResult(success=True, execution_status="success", output=asdict(result))
 
 
 @tool(
