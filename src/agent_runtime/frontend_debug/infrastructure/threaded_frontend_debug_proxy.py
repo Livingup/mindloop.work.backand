@@ -450,20 +450,19 @@ def _debug_script(session_id: str) -> str:
   const chooseButton = createButton("选择元素");
   const sendButton = createButton("发送");
   const statusText = document.createElement("span");
-  statusText.textContent = "未选择";
   statusText.style.maxWidth = "220px";
   statusText.style.overflow = "hidden";
   statusText.style.textOverflow = "ellipsis";
   statusText.style.whiteSpace = "nowrap";
-  sendButton.disabled = true;
   toolbar.append(chooseButton, sendButton, statusText);
   document.documentElement.appendChild(toolbar);
+  renderToolbarState("idle");
 
   chooseButton.addEventListener("click", (event) => {{
     event.preventDefault();
     event.stopPropagation();
-    if (selecting) {{
-      stopSelecting(true);
+    if (selecting || selectedElement) {{
+      cancelSelection();
     }} else {{
       startSelecting();
     }}
@@ -474,8 +473,7 @@ def _debug_script(session_id: str) -> str:
     event.stopPropagation();
     if (!selectedElement) return;
     const payload = serializeElement(selectedElement);
-    statusText.textContent = "发送中...";
-    sendButton.disabled = true;
+    renderToolbarState("sending", "正在发送到聊天框...");
     try {{
       const response = await fetch(ENDPOINT, {{
         method: "POST",
@@ -483,11 +481,10 @@ def _debug_script(session_id: str) -> str:
         body: JSON.stringify(payload),
       }});
       if (!response.ok) throw new Error(await response.text());
-      statusText.textContent = "已发送到聊天输入框";
+      resetSelection();
     }} catch (error) {{
       console.error("[frontend-debug] send selected element failed", error);
-      statusText.textContent = "发送失败，查看控制台";
-      sendButton.disabled = false;
+      renderToolbarState("selected", "发送失败，查看控制台");
     }}
   }});
 
@@ -510,27 +507,50 @@ def _debug_script(session_id: str) -> str:
     return button;
   }}
 
+  /**
+   * 根据元素选择业务状态统一渲染工具条。
+   * idle 初始态只保留“选择元素”入口；selecting 引导用户悬停并点击页面元素；
+   * selected 保留“取消选择”作为放弃当前元素的业务动作，并展示“发送”按钮；
+   * sending 禁用发送按钮，避免同一个元素在异步回填聊天框过程中被重复提交。
+   */
+  function renderToolbarState(state, message) {{
+    const hasMessage = Boolean(message);
+    chooseButton.textContent = state === "idle" ? "选择元素" : "取消选择";
+    sendButton.style.display = state === "selected" || state === "sending" ? "inline-flex" : "none";
+    sendButton.disabled = state !== "selected";
+    statusText.style.display = hasMessage ? "inline" : "none";
+    statusText.textContent = hasMessage ? message : "";
+  }}
+
+  /**
+   * 重置元素选择会话，清理监听、选中元素和高亮层，确保取消或发送成功后回到纯初始化状态。
+   */
+  function resetSelection() {{
+    selecting = false;
+    selectedElement = null;
+    document.removeEventListener("mousemove", handleMouseMove, true);
+    document.removeEventListener("click", handleElementClick, true);
+    hideOverlay();
+    renderToolbarState("idle");
+  }}
+
+  function cancelSelection() {{
+    resetSelection();
+  }}
+
   function startSelecting() {{
     selecting = true;
     selectedElement = null;
-    sendButton.disabled = true;
-    chooseButton.textContent = "取消选择";
-    statusText.textContent = "移动鼠标选择元素";
+    hideOverlay();
+    renderToolbarState("selecting", "移动鼠标选择元素");
     document.addEventListener("mousemove", handleMouseMove, true);
     document.addEventListener("click", handleElementClick, true);
   }}
 
-  function stopSelecting(clearSelection) {{
+  function stopSelecting() {{
     selecting = false;
-    chooseButton.textContent = "选择元素";
     document.removeEventListener("mousemove", handleMouseMove, true);
     document.removeEventListener("click", handleElementClick, true);
-    if (clearSelection) {{
-      selectedElement = null;
-      sendButton.disabled = true;
-      statusText.textContent = "已取消";
-      hideOverlay();
-    }}
   }}
 
   function handleMouseMove(event) {{
@@ -538,7 +558,7 @@ def _debug_script(session_id: str) -> str:
     const element = findSelectableElement(event.target);
     if (!element) return;
     showOverlay(element);
-    statusText.textContent = describeElement(element);
+    renderToolbarState("selecting", describeElement(element));
   }}
 
   function handleElementClick(event) {{
@@ -549,9 +569,8 @@ def _debug_script(session_id: str) -> str:
     event.stopPropagation();
     selectedElement = element;
     showOverlay(element);
-    stopSelecting(false);
-    statusText.textContent = `已选择 ${{describeElement(element)}}`;
-    sendButton.disabled = false;
+    stopSelecting();
+    renderToolbarState("selected", `已选择 ${{describeElement(element)}}，点击发送到聊天框`);
   }}
 
   function findSelectableElement(candidate) {{
