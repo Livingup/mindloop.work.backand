@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -123,6 +123,7 @@ class _FrontendDebugProxyServer:
         self.target_url = target_url
         self.target_parts = urlsplit(target_url)
         self.target_origin = urlunsplit((self.target_parts.scheme, self.target_parts.netloc, "", "", ""))
+        self.target_route = _target_route_from_parts(self.target_parts)
         self.on_element_selected = on_element_selected
         handler = _build_request_handler(self)
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -198,8 +199,31 @@ def _build_request_handler(proxy: _FrontendDebugProxyServer) -> type[BaseHTTPReq
 
         def _proxy_request(self, method: str) -> None:
             """转发浏览器请求到原始前端目标地址，并对 HTML 响应注入调试脚本。"""
+            upstream_url = ""
+            started_at = time.perf_counter()
             try:
+                if method in {"GET", "HEAD"} and _should_redirect_proxy_root(self.path, proxy.target_route):
+                    logger.info(
+                        "前端调试代理根路径跳转: session=%s, method=%s, path=%s, location=%s",
+                        proxy.session_id,
+                        method,
+                        self.path,
+                        proxy.target_route,
+                    )
+                    self.send_response(302)
+                    self.send_header("Location", proxy.target_route)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
                 upstream_url = proxy.target_origin + self.path
+                logger.info(
+                    "前端调试代理收到请求: session=%s, method=%s, path=%s, upstream=%s",
+                    proxy.session_id,
+                    method,
+                    self.path,
+                    upstream_url,
+                )
                 body = self._read_body_if_present(method)
                 headers = self._build_upstream_headers()
                 request = urllib.request.Request(
@@ -217,7 +241,16 @@ def _build_request_handler(proxy: _FrontendDebugProxyServer) -> type[BaseHTTPReq
                     status = http_error.code
                     response_headers = http_error.headers
                     response_body = http_error.read() if method != "HEAD" else b""
+                    logger.warning(
+                        "前端调试代理上游返回错误: session=%s, method=%s, upstream=%s, status=%s, bytes=%s",
+                        proxy.session_id,
+                        method,
+                        upstream_url,
+                        status,
+                        len(response_body),
+                    )
 
+                injected = False
                 content_type = response_headers.get("Content-Type", "")
                 if method == "GET" and _is_html_response(content_type):
                     response_body = _inject_debug_script(
@@ -226,14 +259,40 @@ def _build_request_handler(proxy: _FrontendDebugProxyServer) -> type[BaseHTTPReq
                         session_id=proxy.session_id,
                     )
                     content_type = _ensure_utf8_text_html(content_type)
+                    injected = True
+                    logger.info(
+                        "前端调试代理已注入调试脚本: session=%s, path=%s, upstream=%s",
+                        proxy.session_id,
+                        self.path,
+                        upstream_url,
+                    )
 
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                logger.info(
+                    "前端调试代理返回响应: session=%s, method=%s, path=%s, upstream=%s, status=%s, content_type=%s, bytes=%s, injected=%s, elapsed_ms=%s",
+                    proxy.session_id,
+                    method,
+                    self.path,
+                    upstream_url,
+                    status,
+                    content_type,
+                    len(response_body),
+                    injected,
+                    elapsed_ms,
+                )
                 self.send_response(status)
                 self._send_response_headers(response_headers, len(response_body), content_type)
                 self.end_headers()
                 if method != "HEAD":
                     self.wfile.write(response_body)
             except Exception as exc:  # pragma: no cover - 代理线程错误需要返回给浏览器
-                logger.exception("前端调试代理转发失败: session=%s, path=%s", proxy.session_id, self.path)
+                logger.exception(
+                    "前端调试代理转发失败: session=%s, method=%s, path=%s, upstream=%s",
+                    proxy.session_id,
+                    method,
+                    self.path,
+                    upstream_url or "<not-built>",
+                )
                 self._send_json(502, {"status": "error", "message": str(exc)})
 
         def _read_body_if_present(self, method: str) -> bytes | None:
@@ -292,6 +351,22 @@ def _build_request_handler(proxy: _FrontendDebugProxyServer) -> type[BaseHTTPReq
 
 def _is_html_response(content_type: str) -> bool:
     return "text/html" in content_type.lower()
+
+
+def _target_route_from_parts(parts: urllib.parse.SplitResult) -> str:
+    """提取 target_url 中需要保留在代理地址上的 path/query/fragment。"""
+    path = parts.path or "/"
+    query = f"?{parts.query}" if parts.query else ""
+    fragment = f"#{parts.fragment}" if parts.fragment else ""
+    return f"{path}{query}{fragment}"
+
+
+def _should_redirect_proxy_root(request_path: str, target_route: str) -> bool:
+    """判断浏览器是否误打开了代理根路径，若 target_route 非根路径则应跳转到完整调试路径。"""
+    parsed_request = urllib.parse.urlsplit(request_path)
+    request_is_root = parsed_request.path in {"", "/"} and not parsed_request.query
+    target_is_root = target_route in {"", "/"}
+    return request_is_root and not target_is_root
 
 
 def _ensure_utf8_text_html(content_type: str) -> str:
