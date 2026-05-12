@@ -257,6 +257,10 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.scene.scene_factory import SceneFactory
     from agent_runtime.scene.north_gateway.scene_rest_adapter import create_scene_router
     from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
+    from agent_runtime.terminal.terminal_factory import TerminalFactory
+    from agent_runtime.terminal.north_gateway.terminal_rest_adapter import (
+        create_terminal_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -273,6 +277,7 @@ def serve(host: str | None, port: int | None) -> None:
     )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     agent_execution_engine = AgentExecutionFactory.create()
+    terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
 
     # Scene 会话注册表：追踪前端连接状态，过期时自动 detach scene。
@@ -408,6 +413,11 @@ def serve(host: str | None, port: int | None) -> None:
     app.include_router(
         create_scene_router(scene_gateway),
         tags=["Scene 项目与场景"],
+    )
+    app.include_router(
+        create_terminal_router(terminal_gateway),
+        prefix="/api/scene",
+        tags=["Scene Terminal"],
     )
 
     # host / port 优先用 CLI 参数，否则从配置文件读取。

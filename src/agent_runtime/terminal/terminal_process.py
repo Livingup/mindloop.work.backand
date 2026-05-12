@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Protocol
+
+TerminalOutputHandler = Callable[[str, str], Awaitable[None]]
+TerminalExitHandler = Callable[[int | None, str | None], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalProcessStartRequest:
+    terminal_id: str
+    command_id: str
+    command_line: str
+    cwd: str
+    shell: str
+    timeout_ms: int | None = None
+
+
+class TerminalProcessManager(Protocol):
+    async def start_command(
+        self,
+        request: TerminalProcessStartRequest,
+        *,
+        on_output: TerminalOutputHandler,
+        on_exit: TerminalExitHandler,
+    ) -> None:
+        ...
+
+    async def write_input(self, terminal_id: str, text: str) -> int:
+        ...
+
+    async def terminate_terminal(self, terminal_id: str) -> None:
+        ...
+
+    async def shutdown(self) -> None:
+        ...

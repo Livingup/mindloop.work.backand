@@ -46,6 +46,7 @@ from agent_runtime.conversation_message.config import ConversationRepositoryConf
 from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
 from agent_runtime.communication.communication_config import CommunicationConfig
+from agent_runtime.terminal.terminal_config import TerminalConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -116,6 +117,10 @@ class AgentRuntimeConfig:
     # Scene 模块配置（项目与场景）。
     scene: SceneConfig = field(
         default_factory=SceneConfig,
+    )
+
+    terminal: TerminalConfig = field(
+        default_factory=TerminalConfig,
     )
 
     # LLM 服务商与模型注册模块配置。
@@ -364,6 +369,17 @@ class ConfigRegistry:
             "scene", _build_scene_config,
         )
 
+    @property
+    def terminal(self) -> TerminalConfig:
+        """实时读取 Terminal 模块配置（终端状态与输出数据目录等）。"""
+        if self._config is not None:
+            return self._config.terminal
+        if self._raw_config_data is not None and "terminal" not in self._raw_config_data:
+            return TerminalConfig()
+        return self._get_section_config(
+            "terminal", _build_terminal_config,
+        )
+
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
 
@@ -556,6 +572,18 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
     """从 YAML 字典构建通用通信模块配置。"""
     return CommunicationConfig(
         data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
+    )
+
+
+def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
+    return TerminalConfig(
+        data_dir=str(data.get("data_dir", "~/.spread-ai/terminal")),
+        default_shell=(
+            str(data["default_shell"])
+            if data.get("default_shell") is not None
+            else None
+        ),
+        max_output_chars_per_read=int(data.get("max_output_chars_per_read", 50000)),
     )
 
 

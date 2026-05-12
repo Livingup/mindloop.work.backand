@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+from threading import RLock
+
+from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
+from agent_runtime.communication.communication_factory import CommunicationFactory
+from agent_runtime.terminal.infrastructure.asyncio_subprocess_terminal_process import (
+    AsyncioSubprocessTerminalProcessManager,
+)
+from agent_runtime.terminal.infrastructure.sqlite_terminal_repository import SqliteTerminalRepository
+from agent_runtime.terminal.north_gateway.terminal_gateway_impl import TerminalGatewayImpl
+from agent_runtime.terminal.terminal_config import TerminalConfig
+from agent_runtime.terminal.terminal_service import TerminalRuntimeScopeResolver, TerminalService
+
+
+class TerminalFactory:
+    _lock = RLock()
+    _gateway: TerminalGatewayImpl | None = None
+    _config_signature: tuple[str, str | None, int] | None = None
+
+    @classmethod
+    def create(cls) -> TerminalGatewayImpl:
+        with cls._lock:
+            config = cls._read_config()
+            signature = (config.data_dir, config.default_shell, config.max_output_chars_per_read)
+            if cls._gateway is None or cls._config_signature != signature:
+                communication_gateway = CommunicationFactory.create()
+                agent_runtime_gateway = AgentRuntimeFactory.create(
+                    communication_gateway=communication_gateway,
+                )
+                repository = SqliteTerminalRepository(
+                    data_dir_accessor=cls._build_data_dir_accessor(config),
+                )
+                process_manager = AsyncioSubprocessTerminalProcessManager()
+                scope_resolver = TerminalRuntimeScopeResolver(
+                    agent_runtime_gateway=agent_runtime_gateway,
+                    communication_gateway=communication_gateway,
+                )
+                service = TerminalService(
+                    repository=repository,
+                    process_manager=process_manager,
+                    scope_resolver=scope_resolver,
+                    communication_gateway=communication_gateway,
+                    default_shell=config.default_shell,
+                    max_output_chars_per_read=config.max_output_chars_per_read,
+                )
+                cls._gateway = TerminalGatewayImpl(service)
+                cls._config_signature = signature
+            return cls._gateway
+
+    @staticmethod
+    def _read_config() -> TerminalConfig:
+        try:
+            from agent_runtime.config import ConfigRegistry
+
+            return ConfigRegistry.instance().terminal
+        except RuntimeError:
+            return TerminalConfig()
+
+    @staticmethod
+    def _build_data_dir_accessor(config: TerminalConfig):
+        try:
+            from agent_runtime.config import ConfigRegistry
+
+            ConfigRegistry.instance()
+        except RuntimeError:
+            return lambda: config.data_dir
+        return lambda: ConfigRegistry.instance().terminal.data_dir
