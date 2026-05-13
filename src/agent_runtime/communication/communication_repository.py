@@ -36,3 +36,12 @@ class CommunicationRepository(Protocol):
     ) -> list[CommunicationMessage]:
         """按通信流和 seq 增量读取消息。"""
         ...
+
+    def list_latest_messages(
+        self,
+        stream_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[CommunicationMessage]:
+        """读取通信流最新一段历史消息，并按 seq 升序返回以便调用方重放。"""
+        ...

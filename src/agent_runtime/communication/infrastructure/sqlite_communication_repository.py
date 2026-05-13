@@ -188,6 +188,32 @@ class SqliteCommunicationRepository:
             ).fetchall()
             return [_row_to_message(row) for row in rows]
 
+    def list_latest_messages(
+        self,
+        stream_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[CommunicationMessage]:
+        """读取通信流最新一段历史消息，并按 seq 升序返回。"""
+        with self._lock:
+            rows = self._connection().execute(
+                """
+                SELECT message_id, stream_id, seq, type, topic, source, actor_id,
+                       correlation_id, parent_message_id, payload, metadata, created_at, schema_version
+                FROM (
+                    SELECT message_id, stream_id, seq, type, topic, source, actor_id,
+                           correlation_id, parent_message_id, payload, metadata, created_at, schema_version
+                    FROM communication_messages
+                    WHERE stream_id = ?
+                    ORDER BY seq DESC
+                    LIMIT ?
+                ) AS latest_messages
+                ORDER BY seq ASC
+                """,
+                (stream_id, limit),
+            ).fetchall()
+            return [_row_to_message(row) for row in rows]
+
     def _connection(self) -> sqlite3.Connection:
         """获取当前配置目录对应的 SQLite 连接，配置路径变化时自动重建连接。"""
         data_dir = Path(self._data_dir_accessor()).expanduser()

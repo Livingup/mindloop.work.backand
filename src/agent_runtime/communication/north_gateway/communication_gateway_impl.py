@@ -70,6 +70,15 @@ class CommunicationGatewayImpl(CommunicationGateway):
         """读取某条通信流的历史消息。"""
         return self._service.list_messages(stream_id, after_seq=after_seq, limit=limit)
 
+    def list_latest_messages(
+        self,
+        stream_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[CommunicationMessage]:
+        """读取某条通信流最新一段历史消息，并按 seq 升序返回。"""
+        return self._service.list_latest_messages(stream_id, limit=limit)
+
     async def subscribe_messages(self, stream_id: str) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         async for message in self._service.subscribe_messages(stream_id):

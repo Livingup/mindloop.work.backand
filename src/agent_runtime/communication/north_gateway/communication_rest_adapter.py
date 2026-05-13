@@ -115,10 +115,16 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
         stream_id: str,
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=500, ge=1, le=5000),
+        latest: bool = Query(default=False),
     ) -> list[CommunicationMessageResponse]:
         """读取通信流历史消息。"""
         try:
-            messages = gateway.list_messages(stream_id, after_seq=after_seq, limit=limit)
+            # latest 用于聊天场景恢复：只取尾部消息窗口，但返回顺序仍保持 seq 升序，方便前端按事件顺序重放。
+            messages = (
+                gateway.list_latest_messages(stream_id, limit=limit)
+                if latest
+                else gateway.list_messages(stream_id, after_seq=after_seq, limit=limit)
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"通信流不存在: {stream_id}")
         return [_message_response(message) for message in messages]

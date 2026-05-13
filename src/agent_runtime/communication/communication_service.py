@@ -128,6 +128,24 @@ class CommunicationService:
             limit=max(min(limit, 5000), 1),
         )
 
+    def list_latest_messages(
+        self,
+        stream_id: str,
+        *,
+        limit: int = 500,
+    ) -> list[CommunicationMessage]:
+        """读取某条通信流最新一段历史消息。
+
+        最新窗口用于聊天场景恢复：只取尾部 N 条消息，但仍按 seq 升序返回，
+        让前端 hydrate/replay 时保持和实时事件一致的时间顺序。
+        """
+        _require_non_blank(stream_id, "stream_id")
+        self.get_stream(stream_id)
+        return self._repository.list_latest_messages(
+            stream_id,
+            limit=max(min(limit, 5000), 1),
+        )
+
     async def subscribe_messages(self, stream_id: str) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
