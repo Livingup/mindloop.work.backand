@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING, AgentInstance
-from agent_runtime.agent.agent_task import AGENT_TASK_STATUS_RUNNING, AgentTask
+from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
     CreateTaskWithRootAgentInstanceRequest,
 )
-from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
+from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher, ToolDispatchResult
 from agent_runtime.agent_definition.agent_definition import AgentDefinition
 from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import (
     AgentDefinitionNorthGateway,
@@ -37,6 +37,7 @@ from agent_runtime.conversation_message.message.models import (
     PartMeta,
     TextPart,
     TextPartMeta,
+    ToolResultPart,
     ToolUsePart,
     UniMessage,
     UniPart,
@@ -64,7 +65,7 @@ from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import
 )
 from agent_runtime.skill.north_gateway.skill_contracts import SkillGateway
 from agent_runtime.tool.north_gateway.local_tool_contracts import LocalToolGateway
-from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecision
+from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecision, build_tool_error_result
 
 
 _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD = 5
@@ -251,6 +252,12 @@ class AgentExecutionEngine:
                 conversation_id=request.conversation_id,
             )
         )
+        self._runtime_gateway.enqueue_agent_instance_user_message(
+            instance.instance_id,
+            user_text=_request_user_text(request),
+            client_message_id=request.client_message_id,
+        )
+        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
         return await self._run_agent_instance(task, instance, request)
 
     async def run_agent_instance_message(
@@ -270,8 +277,10 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
-        if instance.is_terminal:
-            raise ValueError(f"Agent 实例已结束，不能继续对话: {instance.instance_id}")
+        instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
+            instance.instance_id,
+            user_text=user_text,
+        )
         request = AgentExecutionRequest.from_text(
             thread_id=instance.thread_id,
             current_working_directory=instance.current_working_directory,
@@ -306,12 +315,11 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
-        if instance.is_terminal:
-            raise ValueError(f"Agent 实例已结束，不能继续对话: {instance.instance_id}")
-        if task.status == AGENT_TASK_STATUS_RUNNING or instance.status == AGENT_INSTANCE_STATUS_RUNNING:
-            raise ValueError("Agent 正在执行，不能同时提交新的用户消息。")
-        if instance.instance_id in self._active_instance_ids:
-            raise ValueError("Agent 正在执行，不能同时提交新的用户消息。")
+        instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
+            instance.instance_id,
+            user_text=user_text,
+            client_message_id=client_message_id,
+        )
         request = AgentExecutionRequest.from_text(
             thread_id=instance.thread_id,
             current_working_directory=instance.current_working_directory,
@@ -330,6 +338,19 @@ class AgentExecutionEngine:
         communication_context = self._build_communication_context(request, task, instance)
         if request.communication_stream_id != communication_context.stream_id:
             request = replace(request, communication_stream_id=communication_context.stream_id)
+        is_running = (
+            instance.status == AGENT_INSTANCE_STATUS_RUNNING
+            or instance.instance_id in self._active_instance_ids
+        )
+        if is_running:
+            return AgentMessageSubmissionResult(
+                status="queued",
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                conversation_id=instance.conversation_id,
+                communication_stream_id=communication_context.stream_id,
+                instance=instance,
+            )
         self._active_instance_ids.add(instance.instance_id)
         task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request))
         self._background_tasks.add(task_handle)
@@ -361,6 +382,7 @@ class AgentExecutionEngine:
     ) -> AgentExecutionResult:
         communication_context = self._build_communication_context(request, task, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
+        conversation: Any | None = None
         try:
             self._runtime_gateway.start_task(task.task_id)
             self._runtime_gateway.start_agent_instance(instance.instance_id)
@@ -373,24 +395,15 @@ class AgentExecutionEngine:
             conversation = await self._load_or_create_conversation(instance, request)
             communication_context = communication_context.with_metadata(conversation_id=conversation.id)
 
-            conversation.add_user_message(list(request.user_parts), list(request.user_parts_meta))
-            user_message = conversation.messages[-1]
-            await self._conversation_repository.save(conversation)
-            self._trace_recorder.record_user_message(trace_path, user_message)
-            await self._event_publisher.publish(
-                communication_context,
-                "user.message.accepted",
-                {
-                    "client_message_id": request.client_message_id,
-                    "user_message_id": f"{conversation.id}:message:{len(conversation.messages) - 1}",
-                    "text": _message_text(user_message),
-                    "part_count": len(user_message.content),
-                },
-                source="agent_execution_engine",
-            )
-
             plain_text_fallback_count = 0
             while True:
+                instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                await self._drain_pending_user_messages_to_conversation(
+                    instance_id=instance.instance_id,
+                    conversation=conversation,
+                    communication_context=communication_context,
+                    trace_path=trace_path,
+                )
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
@@ -446,7 +459,7 @@ class AgentExecutionEngine:
                             },
                             source="agent_execution_engine",
                         )
-                        return AgentExecutionResult(
+                        result = AgentExecutionResult(
                             task_id=task.task_id,
                             instance_id=instance.instance_id,
                             conversation_id=conversation.id,
@@ -454,6 +467,19 @@ class AgentExecutionEngine:
                             assistant_message=assistant_message,
                             communication_stream_id=communication_context.stream_id,
                         )
+                        next_execution = await self._resume_from_pending_user_messages(
+                            task=task,
+                            instance=instance,
+                            request=request,
+                            conversation=conversation,
+                            communication_context=communication_context,
+                            trace_path=trace_path,
+                        )
+                        if next_execution is None:
+                            return result
+                        task, instance, request, conversation, communication_context, trace_path = next_execution
+                        plain_text_fallback_count = 0
+                        continue
                     continue
                 plain_text_fallback_count = 0
 
@@ -475,7 +501,7 @@ class AgentExecutionEngine:
                         tool_results=tool_results,
                         communication_context=communication_context,
                     )
-                    return AgentExecutionResult(
+                    result = AgentExecutionResult(
                         task_id=task.task_id,
                         instance_id=instance.instance_id,
                         conversation_id=conversation.id,
@@ -483,25 +509,130 @@ class AgentExecutionEngine:
                         assistant_message=assistant_message,
                         communication_stream_id=communication_context.stream_id,
                     )
+                    next_execution = await self._resume_from_pending_user_messages(
+                        task=task,
+                        instance=instance,
+                        request=request,
+                        conversation=conversation,
+                        communication_context=communication_context,
+                        trace_path=trace_path,
+                    )
+                    if next_execution is None:
+                        return result
+                    task, instance, request, conversation, communication_context, trace_path = next_execution
+                    plain_text_fallback_count = 0
+                    continue
 
             raise RuntimeError("Agent 执行循环异常结束。")
         except Exception as exc:
             failure_message = str(exc)
-            self._runtime_gateway.fail_agent_instance(instance.instance_id, failure_message)
-            self._runtime_gateway.fail_task(task.task_id, failure_message)
+            self._runtime_gateway.interrupt_agent_instance(instance.instance_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)
             await self._event_publisher.publish(
                 communication_context,
-                "agent.task.failed",
+                "agent.execution.interrupted",
                 {
                     "task_id": task.task_id,
                     "agent_instance_id": instance.instance_id,
                     "error_type": exc.__class__.__name__,
                     "error_message": failure_message,
+                    "resumable": True,
+                    "retryable": True,
                 },
                 source="agent_execution_engine",
             )
-            raise
+            current_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+            if conversation is not None and current_instance.pending_user_messages:
+                current_task = self._runtime_gateway.get_task(current_instance.task_id)
+                next_request = replace(
+                    request,
+                    thread_id=current_instance.thread_id,
+                    current_working_directory=current_instance.current_working_directory,
+                    agent_definition_id=current_instance.agent_definition_id,
+                    llm_provider_id=current_instance.llm_provider_id,
+                    llm_model_binding_id=current_instance.llm_model_binding_id,
+                    task_id=current_task.task_id,
+                    root_instance_id=current_instance.instance_id,
+                    conversation_id=current_instance.conversation_id,
+                    communication_stream_id=communication_context.stream_id,
+                )
+                return await self._run_agent_instance(current_task, current_instance, next_request)
+            return AgentExecutionResult(
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                conversation_id=(
+                    conversation.id
+                    if conversation is not None
+                    else (request.conversation_id or instance.conversation_id or "")
+                ),
+                trace_file_path=str(trace_path),
+                assistant_message=None,
+                communication_stream_id=communication_context.stream_id,
+            )
+
+    async def _resume_from_pending_user_messages(
+        self,
+        *,
+        task: AgentTask,
+        instance: AgentInstance,
+        request: AgentExecutionRequest,
+        conversation: Any,
+        communication_context: RuntimeCommunicationContext,
+        trace_path: Any,
+    ) -> tuple[AgentTask, AgentInstance, AgentExecutionRequest, Any, RuntimeCommunicationContext, Any] | None:
+        """一次完整执行轮次结束后，检查待处理消息队列并按需触发后续对话。
+
+        当前轮次的 loop_decision 或 interruption 语义必须先完整落地；之后如果 AgentInstance
+        队列中还有用户消息，才根据当前 task 生命周期决定继续同 task，或 Scene root 创建新 task。
+        """
+        current_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+        if not current_instance.pending_user_messages:
+            return None
+        current_task = self._runtime_gateway.get_task(current_instance.task_id)
+        if current_task.is_terminal:
+            if current_task.scene_id is None:
+                await self._event_publisher.publish(
+                    communication_context,
+                    "agent.pending_user_messages.blocked",
+                    {
+                        "task_id": current_task.task_id,
+                        "agent_instance_id": current_instance.instance_id,
+                        "pending_message_count": len(current_instance.pending_user_messages),
+                        "reason": "non_scene_terminal_task",
+                    },
+                    source="agent_execution_engine",
+                )
+                return None
+            current_task, current_instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                current_instance.instance_id,
+            )
+        next_request = replace(
+            request,
+            thread_id=current_instance.thread_id,
+            current_working_directory=current_instance.current_working_directory,
+            agent_definition_id=current_instance.agent_definition_id,
+            llm_provider_id=current_instance.llm_provider_id,
+            llm_model_binding_id=current_instance.llm_model_binding_id,
+            task_id=current_task.task_id,
+            root_instance_id=current_instance.instance_id,
+            conversation_id=current_instance.conversation_id,
+            communication_stream_id=communication_context.stream_id,
+        )
+        next_context = self._build_communication_context(next_request, current_task, current_instance)
+        if next_request.communication_stream_id != next_context.stream_id:
+            next_request = replace(next_request, communication_stream_id=next_context.stream_id)
+        next_trace_path = self._trace_recorder.start_trace(_trace_identity(current_instance))
+        self._runtime_gateway.start_task(current_task.task_id)
+        self._runtime_gateway.start_agent_instance(current_instance.instance_id)
+        await self._publish_task_status(
+            next_context,
+            "agent.task.started",
+            task_id=current_task.task_id,
+            instance_id=current_instance.instance_id,
+        )
+        next_conversation = await self._load_or_create_conversation(current_instance, next_request)
+        next_context = next_context.with_metadata(conversation_id=next_conversation.id)
+        return current_task, current_instance, next_request, next_conversation, next_context, next_trace_path
 
     def _build_communication_context(
         self,
@@ -779,6 +910,47 @@ class AgentExecutionEngine:
         )
         return conversation
 
+    async def _drain_pending_user_messages_to_conversation(
+        self,
+        *,
+        instance_id: str,
+        conversation: Any,
+        communication_context: RuntimeCommunicationContext,
+        trace_path: Any,
+    ) -> int:
+        """在完整执行轮次边界消费 AgentInstance 待处理用户消息队列。
+
+        用户消息无论是在 ready 还是 running 时提交，都会先进入 AgentInstance 队列；
+        执行循环只在下一次 LLM 请求前按 FIFO 顺序追加到 conversation 末尾。
+        """
+        _updated_instance, pending_messages = self._runtime_gateway.drain_agent_instance_user_messages(
+            instance_id,
+        )
+        if not pending_messages:
+            return 0
+        for pending_message in pending_messages:
+            conversation.add_user_message(
+                [TextPart(text=pending_message.user_text)],
+                [TextPartMeta()],
+            )
+            user_message = conversation.messages[-1]
+            self._trace_recorder.record_user_message(trace_path, user_message)
+            await self._event_publisher.publish(
+                communication_context,
+                "user.message.accepted",
+                {
+                    "pending_message_id": pending_message.message_id,
+                    "client_message_id": pending_message.client_message_id,
+                    "user_message_id": f"{conversation.id}:message:{len(conversation.messages) - 1}",
+                    "text": _message_text(user_message),
+                    "part_count": len(user_message.content),
+                    "queued_received_at": pending_message.received_at.isoformat(),
+                },
+                source="agent_execution_engine",
+            )
+        await self._conversation_repository.save(conversation)
+        return len(pending_messages)
+
     def _render_system_prompt(
         self,
         definition: AgentDefinition,
@@ -879,6 +1051,39 @@ class AgentExecutionEngine:
             f"- 禁止并发调用“{names}”这些工具，这些工具只能单独调用！这些工具只能单独调用！这些工具只能单独调用！"
         )
 
+    async def _execute_single_tool_use(
+        self,
+        definition: AgentDefinition,
+        tool_use: ToolUsePart,
+        communication_context: RuntimeCommunicationContext,
+    ) -> ToolDispatchResult:
+        """执行单个工具调用，调度层异常也转换为 LLM 可见的工具错误结果。"""
+        try:
+            return await self._tool_dispatcher.dispatch_tool_call(
+                agent_definition=definition,
+                tool_use=tool_use,
+                communication_context=communication_context.with_actor(
+                    actor_type="tool_dispatcher",
+                    actor_id=tool_use.name,
+                ),
+            )
+        except Exception as exc:
+            tool_call_id = _tool_use_ref(tool_use)
+            tool_result = build_tool_error_result(
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+            )
+            return ToolDispatchResult(
+                tool_name=tool_use.name,
+                source="tool_dispatcher",
+                result_part=ToolResultPart(
+                    tool_use_ref=tool_call_id,
+                    is_error=True,
+                    output=tool_result.error_message or "Tool dispatch failed.",
+                ),
+                tool_result=tool_result,
+            )
+
     async def _execute_tool_uses(
         self,
         definition: AgentDefinition,
@@ -888,13 +1093,10 @@ class AgentExecutionEngine:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
         result_parts = []
         tasks = [
-            asyncio.create_task(self._tool_dispatcher.dispatch_tool_call(
-                agent_definition=definition,
-                tool_use=tool_use,
-                communication_context=communication_context.with_actor(
-                    actor_type="tool_dispatcher",
-                    actor_id=tool_use.name,
-                ),
+            asyncio.create_task(self._execute_single_tool_use(
+                definition,
+                tool_use,
+                communication_context,
             ))
             for tool_use in tool_uses
         ]
@@ -1042,9 +1244,28 @@ class AgentExecutionEngine:
         )
 
 
+def _request_user_text(request: AgentExecutionRequest) -> str:
+    """从执行请求中提取可入队的用户文本。
+
+    当前 Agent 实例待处理消息队列承载文本消息；REST 消息入口也是文本。
+    如果历史调用方构造了多段文本，则按原顺序用空行拼接，保持用户输入语义。
+    """
+    texts = [
+        part.text
+        for part in request.user_parts
+        if isinstance(part, TextPart) and part.text
+    ]
+    return "\n\n".join(texts) or "用户提交了非文本输入。"
+
+
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
     """从 assistant 消息中提取工具调用。"""
     return [part for part in message.content if isinstance(part, ToolUsePart)]
+
+
+def _tool_use_ref(tool_use: ToolUsePart) -> str:
+    """确定工具结果要关联的工具调用引用。"""
+    return tool_use.tool_use_id or tool_use.name
 
 
 def _unsupported_input_modality_strategy(instance: AgentInstance) -> str:

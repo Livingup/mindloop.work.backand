@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent_runtime.agent.agent_instance import AgentInstance
+from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
 
 
@@ -118,7 +118,7 @@ class DetachSceneRequest:
     """断开（detach）scene 的请求。
 
     由 SceneSessionRegistry 过期回调或前端显式关闭时触发。
-    detach 将 scene 下所有非终态 task 和 instance 置为 cancelled，释放运行态资源。
+    detach 将 scene 下所有非终态 task 标记为 failed 结束，并把相关 instance 恢复为 ready。
     """
 
     # 项目目录绝对路径。用于路由 SceneGateway。
@@ -129,10 +129,10 @@ class DetachSceneRequest:
 class DetachSceneResponse:
     """detach scene 的响应。"""
 
-    # 被取消的 task 数量。
+    # 被归入失败结束的 task 数量。
     cancelled_task_count: int
 
-    # 被取消的 agent instance 数量。
+    # 被恢复为 ready 的 agent instance 数量。
     cancelled_instance_count: int
 
 
@@ -226,10 +226,10 @@ class AgentRuntimeGateway(Protocol):
         """查询指定 Agent 实例的父实例；根实例返回 None。"""
 
     def start_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 running。"""
+        """确认任务仍处于未完成生命周期状态。"""
 
     def pause_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 paused。"""
+        """暂停不改变 Task 生命周期状态，仅保持未完成。"""
 
 
     def attach_scene(
@@ -257,17 +257,17 @@ class AgentRuntimeGateway(Protocol):
         scene_id: str,
         request: "DetachSceneRequest",
     ) -> "DetachSceneResponse":
-        """断开（detach）scene，取消其下所有非终态 task 和 instance。
+        """断开（detach）scene，将其下未结束 task 标记为失败结束并让 instance 回到 ready。
 
         条件：scene 下没有正在执行的 agent（由调用方保证或本方法兜底跳过 running instance）。
         典型触发时机：SceneSessionRegistry 过期回调、前端显式关闭。
 
-        本方法是幂等的：已处于终态的 task / instance 不受影响。
+        本方法是幂等的：已结束的 task 不受影响。
         """
         ...
 
     def resume_task(self, task_id: str) -> AgentTask:
-        """将任务状态从 paused 恢复为 running。"""
+        """恢复不改变 Task 生命周期状态，仅保持未完成。"""
 
     def complete_task(self, task_id: str) -> AgentTask:
         """显式标记任务完成。"""
@@ -299,23 +299,30 @@ class AgentRuntimeGateway(Protocol):
         """取消任务。"""
 
     def start_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 running。"""
+        """将 Agent 实例执行载体标记为 running。"""
 
     def pause_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 paused。"""
+        """将 Agent 实例执行载体恢复为 ready。"""
 
     def resume_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将暂停 Agent 实例恢复为 running。"""
+        """将 Agent 实例执行载体重新标记为 running。"""
 
     def complete_agent_instance(self, instance_id: str) -> AgentInstance:
-        """显式标记 Agent 实例完成。"""
+        """任务结束后将 Agent 实例执行载体恢复为 ready。"""
 
     def fail_agent_instance(
         self,
         instance_id: str,
         failure_message: str,
     ) -> AgentInstance:
-        """标记 Agent 实例失败。"""
+        """记录最近失败原因并将 Agent 实例执行载体恢复为 ready。"""
+
+    def interrupt_agent_instance(
+        self,
+        instance_id: str,
+        interruption_message: str,
+    ) -> AgentInstance:
+        """记录技术性执行中断并将 Agent 实例执行载体恢复为 ready，不改变 Task 生命周期。"""
 
     def cancel_agent_instance(self, instance_id: str) -> AgentInstance:
         """取消 Agent 实例。"""
@@ -327,6 +334,24 @@ class AgentRuntimeGateway(Protocol):
         conversation_id: str,
     ) -> AgentInstance:
         """为 Agent 实例绑定历史会话 ID。"""
+        ...
+
+    def enqueue_agent_instance_user_message(
+        self,
+        instance_id: str,
+        *,
+        user_text: str,
+        client_message_id: str | None = None,
+        message_id: str | None = None,
+    ) -> tuple[AgentInstance, PendingAgentUserMessage]:
+        """把用户消息追加到 Agent 实例待处理队列。"""
+        ...
+
+    def drain_agent_instance_user_messages(
+        self,
+        instance_id: str,
+    ) -> tuple[AgentInstance, tuple[PendingAgentUserMessage, ...]]:
+        """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
         ...
 
     def switch_agent_instance_llm_policy(

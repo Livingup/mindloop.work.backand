@@ -70,6 +70,7 @@ class AgentInstanceResponse(BaseModel):
     conversation_id: str | None
     trace_id: str
     status: str
+    pending_user_message_count: int = 0
     created_at: str
     updated_at: str
 
@@ -578,6 +579,7 @@ def _instance_response(instance: AgentInstance) -> AgentInstanceResponse:
         conversation_id=instance.conversation_id,
         trace_id=instance.trace_id,
         status=instance.status,
+        pending_user_message_count=len(instance.pending_user_messages),
         created_at=_datetime_text(instance.created_at),
         updated_at=_datetime_text(instance.updated_at),
     )

@@ -9,60 +9,47 @@ from typing import Final, TypeAlias
 
 AgentTaskStatus: TypeAlias = str
 
-# 任务已创建且已有根 Agent 实例，但尚未进入执行。
-AGENT_TASK_STATUS_CREATED: Final[str] = "created"
+# 任务未结束。Task 只表达用户任务生命周期，不表达执行循环是否正在运行或暂停。
+# created/running/paused 等历史执行态在读取时都会归一化为 unfinished。
+AGENT_TASK_STATUS_UNFINISHED: Final[str] = "unfinished"
 
-# 任务正在执行。任务内允许多个 Agent 实例并发 running。
-AGENT_TASK_STATUS_RUNNING: Final[str] = "running"
-
-# 任务整体暂停。任务内实例状态仍由执行编排层分别维护。
-AGENT_TASK_STATUS_PAUSED: Final[str] = "paused"
-
-# 任务正常完成。该状态必须由执行编排层显式标记。
+# 任务成功结束。该状态只能由 end_task 生命周期工具驱动的完成语义触发。
 AGENT_TASK_STATUS_COMPLETED: Final[str] = "completed"
 
-# 任务失败，failure_message 保存失败原因摘要。
+# 任务失败结束。该状态只能由 fail_task 或用户主动取消任务触发。
 AGENT_TASK_STATUS_FAILED: Final[str] = "failed"
 
-# 任务被取消。
-AGENT_TASK_STATUS_CANCELLED: Final[str] = "cancelled"
-
 AGENT_TASK_STATUSES: Final[frozenset[str]] = frozenset({
-    AGENT_TASK_STATUS_CREATED,
-    AGENT_TASK_STATUS_RUNNING,
-    AGENT_TASK_STATUS_PAUSED,
+    AGENT_TASK_STATUS_UNFINISHED,
     AGENT_TASK_STATUS_COMPLETED,
     AGENT_TASK_STATUS_FAILED,
-    AGENT_TASK_STATUS_CANCELLED,
 })
 
 _TERMINAL_AGENT_TASK_STATUSES: Final[frozenset[str]] = frozenset({
     AGENT_TASK_STATUS_COMPLETED,
     AGENT_TASK_STATUS_FAILED,
-    AGENT_TASK_STATUS_CANCELLED,
 })
 
-_AGENT_TASK_STATUS_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
-    AGENT_TASK_STATUS_CREATED: frozenset({
-        AGENT_TASK_STATUS_RUNNING,
-        AGENT_TASK_STATUS_FAILED,
-        AGENT_TASK_STATUS_CANCELLED,
-    }),
-    AGENT_TASK_STATUS_RUNNING: frozenset({
-        AGENT_TASK_STATUS_PAUSED,
-        AGENT_TASK_STATUS_COMPLETED,
-        AGENT_TASK_STATUS_FAILED,
-        AGENT_TASK_STATUS_CANCELLED,
-    }),
-    AGENT_TASK_STATUS_PAUSED: frozenset({
-        AGENT_TASK_STATUS_RUNNING,
-        AGENT_TASK_STATUS_FAILED,
-        AGENT_TASK_STATUS_CANCELLED,
-    }),
-    AGENT_TASK_STATUS_COMPLETED: frozenset(),
-    AGENT_TASK_STATUS_FAILED: frozenset(),
-    AGENT_TASK_STATUS_CANCELLED: frozenset(),
-}
+_LEGACY_UNFINISHED_TASK_STATUSES: Final[frozenset[str]] = frozenset({
+    "created",
+    "running",
+    "paused",
+})
+
+_LEGACY_FAILED_TASK_STATUSES: Final[frozenset[str]] = frozenset({
+    "cancelled",
+})
+
+
+def _normalize_task_status(status: str) -> str:
+    """把历史任务执行态归一化为当前任务生命周期三态。"""
+    if status in AGENT_TASK_STATUSES:
+        return status
+    if status in _LEGACY_UNFINISHED_TASK_STATUSES:
+        return AGENT_TASK_STATUS_UNFINISHED
+    if status in _LEGACY_FAILED_TASK_STATUSES:
+        return AGENT_TASK_STATUS_FAILED
+    raise ValueError(f"未知 Agent 任务状态: {status}")
 
 
 def _utc_now() -> datetime:
@@ -130,8 +117,8 @@ class AgentTask:
     # 当前任务中的 Agent 实例父子关系树边集合。根实例不会作为 child 出现。
     parent_child_relations: tuple[AgentParentChildRelation, ...] = ()
 
-    # 当前任务状态。任务状态与实例状态解耦，由执行编排层显式触发。
-    status: AgentTaskStatus = AGENT_TASK_STATUS_CREATED
+    # 当前任务生命周期状态。Task 只表达任务是否结束以及成功/失败结束方式。
+    status: AgentTaskStatus = AGENT_TASK_STATUS_UNFINISHED
 
     # 任务创建时间。
     created_at: datetime = None  # type: ignore[assignment]
@@ -139,19 +126,19 @@ class AgentTask:
     # 最近一次状态或结构更新时间。
     updated_at: datetime = None  # type: ignore[assignment]
 
-    # 首次进入 running 的时间。
+    # 任务首次进入执行循环的审计时间；Task 主状态不表达 running，仅保留历史字段。
     started_at: datetime | None = None
 
-    # 最近一次进入 paused 的时间。
+    # 任务最近一次由执行循环主动暂停的审计时间；Task 主状态仍保持 unfinished。
     paused_at: datetime | None = None
 
-    # 正常完成或取消的时间。
+    # 任务成功完成的时间。用户主动取消会归入 failed_at / failure_message。
     finished_at: datetime | None = None
 
-    # 进入 failed 的时间。
+    # 任务失败结束或用户主动取消的时间。
     failed_at: datetime | None = None
 
-    # 失败原因摘要。仅 failed 状态要求有值。
+    # 任务失败结束或用户主动取消的原因摘要。仅 failed 状态要求有值。
     failure_message: str | None = None
 
     # 任务所属场景 ID（scene 模块聚合根）。可选；为 None 表示该任务尚未挂到任何场景。
@@ -164,8 +151,11 @@ class AgentTask:
         """校验任务内部实例集合与父子关系树的一致性。"""
         _require_non_blank(self.task_id, "task_id")
         _require_non_blank(self.root_agent_instance_id, "root_agent_instance_id")
-        if self.status not in AGENT_TASK_STATUSES:
-            raise ValueError(f"未知 Agent 任务状态: {self.status}")
+        normalized_status = _normalize_task_status(self.status)
+        if normalized_status != self.status:
+            object.__setattr__(self, "status", normalized_status)
+        if normalized_status == AGENT_TASK_STATUS_FAILED and not self.failure_message:
+            object.__setattr__(self, "failure_message", "任务已失败或被取消。")
         if self.status == AGENT_TASK_STATUS_FAILED:
             _require_non_blank(self.failure_message or "", "failure_message")
         if self.failure_message is not None and not self.failure_message.strip():
@@ -229,32 +219,32 @@ class AgentTask:
         failure_message: str | None = None,
         at: datetime | None = None,
     ) -> AgentTask:
-        """按领域允许的任务状态机流转到目标状态。"""
-        if target_status not in AGENT_TASK_STATUSES:
-            raise ValueError(f"未知 Agent 任务状态: {target_status}")
+        """按任务生命周期三态流转。
+
+        Task 不再承载 running/paused 这类执行态；这些由 AgentInstance 与执行循环负责。
+        因此 start_task/pause_task/resume_task 对 Task 来说都是保持 unfinished 的幂等操作。
+        """
+        target_status = _normalize_task_status(target_status)
         if target_status == self.status:
             return self
-        allowed_targets = _AGENT_TASK_STATUS_TRANSITIONS[self.status]
-        if target_status not in allowed_targets:
+        if self.is_terminal:
+            raise ValueError(f"Agent 任务状态不能从 {self.status} 流转到 {target_status}。")
+        if self.status != AGENT_TASK_STATUS_UNFINISHED:
+            raise ValueError(f"未知 Agent 任务状态: {self.status}")
+        if target_status not in _TERMINAL_AGENT_TASK_STATUSES:
             raise ValueError(f"Agent 任务状态不能从 {self.status} 流转到 {target_status}。")
         now = at or _utc_now()
         values: dict[str, object] = {
             "status": target_status,
             "updated_at": now,
         }
-        if target_status == AGENT_TASK_STATUS_RUNNING:
-            values["started_at"] = self.started_at or now
-        elif target_status == AGENT_TASK_STATUS_PAUSED:
-            values["paused_at"] = now
-        elif target_status == AGENT_TASK_STATUS_COMPLETED:
+        if target_status == AGENT_TASK_STATUS_COMPLETED:
             values["finished_at"] = now
             values["failure_message"] = None
         elif target_status == AGENT_TASK_STATUS_FAILED:
             _require_non_blank(failure_message or "", "failure_message")
             values["failed_at"] = now
             values["failure_message"] = failure_message
-        elif target_status == AGENT_TASK_STATUS_CANCELLED:
-            values["finished_at"] = now
         return replace(self, **values)
 
     def parent_of(self, instance_id: str) -> str | None:

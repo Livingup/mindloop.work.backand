@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 
-from agent_runtime.agent.agent_instance import AgentInstance
+from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
 
 
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS agent_instances (
     conversation_id      TEXT,
     trace_id             TEXT NOT NULL,
     status               TEXT NOT NULL,
+    pending_user_messages_json TEXT NOT NULL DEFAULT '[]',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     started_at           TEXT,
@@ -199,9 +200,9 @@ class SqliteAgentRuntimeRepository:
                     instance_id, task_id, thread_id, current_working_directory, agent_definition_id,
                     llm_provider_id, llm_model_binding_id, llm_policy_group_id,
                     llm_policy_snapshot_json, conversation_id, trace_id,
-                    status, created_at, updated_at, started_at, paused_at,
+                    status, pending_user_messages_json, created_at, updated_at, started_at, paused_at,
                     finished_at, failed_at, failure_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     instance.instance_id,
@@ -216,6 +217,7 @@ class SqliteAgentRuntimeRepository:
                     instance.conversation_id,
                     instance.trace_id,
                     instance.status,
+                    _pending_user_messages_to_json(instance.pending_user_messages),
                     _datetime_to_text(instance.created_at),
                     _datetime_to_text(instance.updated_at),
                     _optional_datetime_to_text(instance.started_at),
@@ -320,6 +322,11 @@ class SqliteAgentRuntimeRepository:
                 "ALTER TABLE agent_instances "
                 "ADD COLUMN llm_policy_snapshot_json TEXT NOT NULL DEFAULT '{}'"
             )
+        if "pending_user_messages_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE agent_instances "
+                "ADD COLUMN pending_user_messages_json TEXT NOT NULL DEFAULT '[]'"
+            )
         # 读取 agent_tasks 表列集，补齐以往版本未包含的 scene_id 列（允许 NULL，表示旧任务未挂到场景）。
         task_columns = {
             row[1]
@@ -393,7 +400,7 @@ _INSTANCE_SELECT_SQL = """
 SELECT instance_id, task_id, thread_id, current_working_directory, agent_definition_id,
        llm_provider_id, llm_model_binding_id, llm_policy_group_id, llm_policy_snapshot_json,
        conversation_id, trace_id,
-       status, created_at, updated_at, started_at, paused_at,
+       status, pending_user_messages_json, created_at, updated_at, started_at, paused_at,
        finished_at, failed_at, failure_message
 FROM agent_instances
 """
@@ -445,14 +452,56 @@ def _row_to_instance(row: sqlite3.Row | tuple) -> AgentInstance:
         conversation_id=row[9],
         trace_id=row[10],
         status=row[11],
-        created_at=_text_to_datetime(row[12]),
-        updated_at=_text_to_datetime(row[13]),
-        started_at=_optional_text_to_datetime(row[14]),
-        paused_at=_optional_text_to_datetime(row[15]),
-        finished_at=_optional_text_to_datetime(row[16]),
-        failed_at=_optional_text_to_datetime(row[17]),
-        failure_message=row[18],
+        pending_user_messages=_pending_user_messages_from_json(row[12]),
+        created_at=_text_to_datetime(row[13]),
+        updated_at=_text_to_datetime(row[14]),
+        started_at=_optional_text_to_datetime(row[15]),
+        paused_at=_optional_text_to_datetime(row[16]),
+        finished_at=_optional_text_to_datetime(row[17]),
+        failed_at=_optional_text_to_datetime(row[18]),
+        failure_message=row[19],
     )
+
+
+def _pending_user_messages_to_json(messages: tuple[PendingAgentUserMessage, ...]) -> str:
+    """序列化 AgentInstance 待处理用户消息队列。"""
+    return json.dumps(
+        [
+            {
+                "message_id": message.message_id,
+                "user_text": message.user_text,
+                "client_message_id": message.client_message_id,
+                "received_at": _datetime_to_text(message.received_at),
+            }
+            for message in messages
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _pending_user_messages_from_json(value: str | None) -> tuple[PendingAgentUserMessage, ...]:
+    """反序列化 AgentInstance 待处理用户消息队列。"""
+    if not value:
+        return ()
+    raw_items = json.loads(value)
+    if not isinstance(raw_items, list):
+        return ()
+    messages: list[PendingAgentUserMessage] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        user_text = str(item.get("user_text") or "")
+        if not user_text.strip():
+            continue
+        messages.append(
+            PendingAgentUserMessage(
+                message_id=str(item.get("message_id") or "legacy-pending-user-message"),
+                user_text=user_text,
+                client_message_id=item.get("client_message_id"),
+                received_at=_text_to_datetime(item["received_at"]) if item.get("received_at") else None,
+            )
+        )
+    return tuple(messages)
 
 
 def _datetime_to_text(value: datetime) -> str:

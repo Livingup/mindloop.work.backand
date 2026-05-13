@@ -130,15 +130,15 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         return self._service.get_parent_agent_instance(child_instance_id)
 
     def start_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 running。"""
+        """确认任务仍处于未完成生命周期状态。"""
         return self._service.start_task(task_id)
 
     def pause_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 paused。"""
+        """暂停不改变 Task 生命周期状态，仅保持未完成。"""
         return self._service.pause_task(task_id)
 
     def resume_task(self, task_id: str) -> AgentTask:
-        """将任务状态从 paused 恢复为 running。"""
+        """恢复不改变 Task 生命周期状态，仅保持未完成。"""
         return self._service.resume_task(task_id)
 
     def complete_task(self, task_id: str) -> AgentTask:
@@ -183,19 +183,19 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         return self._service.cancel_task(task_id)
 
     def start_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 running。"""
+        """将 Agent 实例执行载体标记为 running。"""
         return self._service.start_agent_instance(instance_id)
 
     def pause_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 paused。"""
+        """将 Agent 实例执行载体恢复为 ready。"""
         return self._service.pause_agent_instance(instance_id)
 
     def resume_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将暂停 Agent 实例恢复为 running。"""
+        """将 Agent 实例执行载体重新标记为 running。"""
         return self._service.resume_agent_instance(instance_id)
 
     def complete_agent_instance(self, instance_id: str) -> AgentInstance:
-        """显式标记 Agent 实例完成。"""
+        """任务结束后将 Agent 实例执行载体恢复为 ready。"""
         return self._service.complete_agent_instance(instance_id)
 
     def fail_agent_instance(
@@ -203,11 +203,19 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         instance_id: str,
         failure_message: str,
     ) -> AgentInstance:
-        """标记 Agent 实例失败。"""
+        """记录最近失败原因并将 Agent 实例执行载体恢复为 ready。"""
         return self._service.fail_agent_instance(instance_id, failure_message)
 
+    def interrupt_agent_instance(
+        self,
+        instance_id: str,
+        interruption_message: str,
+    ) -> AgentInstance:
+        """记录技术性执行中断并将 Agent 实例执行载体恢复为 ready。"""
+        return self._service.interrupt_agent_instance(instance_id, interruption_message)
+
     def cancel_agent_instance(self, instance_id: str) -> AgentInstance:
-        """取消 Agent 实例。"""
+        """取消当前实例执行并恢复为 ready。"""
         return self._service.cancel_agent_instance(instance_id)
 
     def bind_agent_instance_conversation(
@@ -220,6 +228,29 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             instance_id,
             conversation_id,
         )
+
+    def enqueue_agent_instance_user_message(
+        self,
+        instance_id: str,
+        *,
+        user_text: str,
+        client_message_id: str | None = None,
+        message_id: str | None = None,
+    ):
+        """把用户消息追加到 Agent 实例待处理队列。"""
+        return self._service.enqueue_agent_instance_user_message(
+            instance_id,
+            user_text=user_text,
+            client_message_id=client_message_id,
+            message_id=message_id,
+        )
+
+    def drain_agent_instance_user_messages(
+        self,
+        instance_id: str,
+    ):
+        """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
+        return self._service.drain_agent_instance_user_messages(instance_id)
 
     def switch_agent_instance_llm_policy(
         self,
@@ -397,12 +428,12 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         scene_id: str,
         request: DetachSceneRequest,
     ) -> DetachSceneResponse:
-        """断开 scene，取消其下所有非终态 task 和 instance。
+        """断开 scene，将其下未结束 task 标记为失败结束，并让关联 instance 回到 ready。
 
-        遍历 scene 下全部 task（按 created_at DESC），对每个非终态 task：
-        - 取消该 task 下所有非终态 instance；
-        - 取消 task 本身。
-        已终态的 task/instance 不受影响（幂等）。
+        遍历 scene 下全部 task（按 created_at DESC），对每个未结束 task：
+        - 取消该 task 下全部 instance 的当前执行载体；
+        - 将 task 本身标记为失败结束。
+        已结束的 task 不受影响（幂等）。
         """
         tasks = self._service.list_tasks_by_scene_id(scene_id)
         cancelled_task_count = 0
@@ -411,16 +442,13 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         for task in tasks:
             if task.is_terminal:
                 continue
-            # 取消该 task 下所有非终态 instance
             for instance_id in task.agent_instance_ids:
                 try:
-                    instance = self._service.get_agent_instance(instance_id)
+                    self._service.get_agent_instance(instance_id)
                 except KeyError:
                     continue
-                if not instance.is_terminal:
-                    self._service.cancel_agent_instance(instance_id)
-                    cancelled_instance_count += 1
-            # 取消 task 本身
+                self._service.cancel_agent_instance(instance_id)
+                cancelled_instance_count += 1
             self._service.cancel_task(task.task_id)
             cancelled_task_count += 1
 

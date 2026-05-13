@@ -8,21 +8,17 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.agent.agent_instance import (
-    AGENT_INSTANCE_STATUS_CANCELLED,
-    AGENT_INSTANCE_STATUS_COMPLETED,
-    AGENT_INSTANCE_STATUS_FAILED,
-    AGENT_INSTANCE_STATUS_PAUSED,
+    AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
     AgentInstance,
     AgentInstanceStatus,
+    PendingAgentUserMessage,
 )
 from agent_runtime.agent.agent_runtime_repository import AgentRuntimeRepository
 from agent_runtime.agent.agent_task import (
-    AGENT_TASK_STATUS_CANCELLED,
     AGENT_TASK_STATUS_COMPLETED,
     AGENT_TASK_STATUS_FAILED,
-    AGENT_TASK_STATUS_PAUSED,
-    AGENT_TASK_STATUS_RUNNING,
+    AGENT_TASK_STATUS_UNFINISHED,
     AgentParentChildRelation,
     AgentTask,
     AgentTaskStatus,
@@ -222,8 +218,8 @@ class AgentRuntimeService:
 
         判定规则：
         - 取该 scene 下最近一条 task（created_at DESC），若 task 已终态则视为无活跃；
-        - 再取该 task 的 root_agent_instance_id 对应实例，若实例已终态则视为无活跃；
-        - 两者都非终态时返回 (task, instance)；否则返回 None。
+        - 再取该 task 的 root_agent_instance_id 对应实例；
+        - task 未终态且 root instance 存在时返回 (task, instance)。
 
         本方法不抛错，scene 不存在 / 无任务 / 已终态都返回 None。
         """
@@ -235,7 +231,7 @@ class AgentRuntimeService:
         if latest_task.is_terminal:
             return None
         instance = self._repository.get_agent_instance(latest_task.root_agent_instance_id)
-        if instance is None or instance.is_terminal:
+        if instance is None:
             return None
         return latest_task, instance
 
@@ -283,16 +279,22 @@ class AgentRuntimeService:
         return self._get_required_instance(parent_id)
 
     def start_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 running。"""
-        return self._transition_task(task_id, AGENT_TASK_STATUS_RUNNING)
+        """确认任务仍处于未完成生命周期状态。
+
+        Task 不再表达 running，执行循环是否正在运行由 AgentInstance.status 表达。
+        """
+        return self._transition_task(task_id, AGENT_TASK_STATUS_UNFINISHED)
 
     def pause_task(self, task_id: str) -> AgentTask:
-        """将任务状态流转为 paused。"""
-        return self._transition_task(task_id, AGENT_TASK_STATUS_PAUSED)
+        """确认任务仍处于未完成生命周期状态。
+
+        暂停是执行载体语义，不改变 Task 生命周期状态。
+        """
+        return self._transition_task(task_id, AGENT_TASK_STATUS_UNFINISHED)
 
     def resume_task(self, task_id: str) -> AgentTask:
-        """将暂停任务恢复为 running。"""
-        return self._transition_task(task_id, AGENT_TASK_STATUS_RUNNING)
+        """确认任务仍处于未完成生命周期状态。"""
+        return self._transition_task(task_id, AGENT_TASK_STATUS_UNFINISHED)
 
     def complete_task(self, task_id: str) -> AgentTask:
         """显式标记任务完成。任务完成不由单个实例完成自动推导。"""
@@ -309,7 +311,7 @@ class AgentRuntimeService:
         该方法在同一服务锁内完成 task 终态保存与 root instance 运行态清理：
         - task 进入 completed，保留历史审计记录；
         - root instance 保留 instance_id、Agent 定义、LLM 策略和工作目录；
-        - root instance 清空本轮 conversation_id，状态回到 created，等待下一条用户消息创建新 task。
+        - root instance 清空本轮 conversation_id，状态回到 ready，等待下一条用户消息创建新 task。
         """
         with self._lock:
             task = self._get_required_task(task_id)
@@ -392,40 +394,64 @@ class AgentRuntimeService:
         )
 
     def cancel_task(self, task_id: str) -> AgentTask:
-        """取消任务。"""
-        return self._transition_task(task_id, AGENT_TASK_STATUS_CANCELLED)
+        """取消任务。取消属于失败结束的一种业务原因。"""
+        return self._transition_task(
+            task_id,
+            AGENT_TASK_STATUS_FAILED,
+            failure_message="任务被用户或系统取消。",
+        )
 
     def start_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 running。"""
+        """将 Agent 实例执行载体标记为 running。"""
         return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_RUNNING)
 
     def pause_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将 Agent 实例状态流转为 paused。"""
-        return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_PAUSED)
+        """将 Agent 实例执行载体恢复为 ready。"""
+        return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_READY)
 
     def resume_agent_instance(self, instance_id: str) -> AgentInstance:
-        """将暂停 Agent 实例恢复为 running。"""
+        """将 Agent 实例执行载体重新标记为 running。"""
         return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_RUNNING)
 
     def complete_agent_instance(self, instance_id: str) -> AgentInstance:
-        """显式标记 Agent 实例完成。"""
-        return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_COMPLETED)
+        """任务完成后将 Agent 实例执行载体恢复为 ready。"""
+        return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_READY)
 
     def fail_agent_instance(
         self,
         instance_id: str,
         failure_message: str,
     ) -> AgentInstance:
-        """标记 Agent 实例失败。"""
+        """记录实例最近失败原因，并将执行载体恢复为 ready。"""
         return self._transition_instance(
             instance_id,
-            AGENT_INSTANCE_STATUS_FAILED,
+            AGENT_INSTANCE_STATUS_READY,
             failure_message=failure_message,
         )
 
+    def interrupt_agent_instance(
+        self,
+        instance_id: str,
+        interruption_message: str,
+    ) -> AgentInstance:
+        """记录技术性执行中断，并将执行载体恢复为 ready。
+
+        该方法用于 LLM 请求失败、网络异常、上下文超限等可恢复中断；它不会改变 Task
+        生命周期状态，用户后续发消息可继续同一个任务。
+        """
+        return self._transition_instance(
+            instance_id,
+            AGENT_INSTANCE_STATUS_READY,
+            failure_message=interruption_message,
+        )
+
     def cancel_agent_instance(self, instance_id: str) -> AgentInstance:
-        """取消 Agent 实例。"""
-        return self._transition_instance(instance_id, AGENT_INSTANCE_STATUS_CANCELLED)
+        """取消当前实例执行载体，把它恢复为 ready。"""
+        return self._transition_instance(
+            instance_id,
+            AGENT_INSTANCE_STATUS_READY,
+            failure_message="Agent 实例执行被取消。",
+        )
 
     def bind_agent_instance_conversation(
         self,
@@ -443,6 +469,44 @@ class AgentRuntimeService:
             self._repository.save_agent_instance(updated)
             return updated
 
+    def enqueue_agent_instance_user_message(
+        self,
+        instance_id: str,
+        *,
+        user_text: str,
+        client_message_id: str | None = None,
+        message_id: str | None = None,
+    ) -> tuple[AgentInstance, PendingAgentUserMessage]:
+        """把用户消息追加到 Agent 实例待处理队列。
+
+        所有用户发给 AgentInstance 的消息都先进入该 FIFO 队列；执行循环只在完整轮次边界
+        drain 队列并追加到 conversation，避免打断当前 LLM 请求或工具执行。
+        """
+        _require_non_blank(user_text, "user_text")
+        actual_message_id = message_id or _new_id("pending-user-message")
+        pending_message = PendingAgentUserMessage(
+            message_id=actual_message_id,
+            user_text=user_text,
+            client_message_id=client_message_id,
+        )
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            updated = instance.enqueue_user_message(pending_message)
+            self._repository.save_agent_instance(updated)
+            return updated, pending_message
+
+    def drain_agent_instance_user_messages(
+        self,
+        instance_id: str,
+    ) -> tuple[AgentInstance, tuple[PendingAgentUserMessage, ...]]:
+        """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            updated, drained_messages = instance.drain_pending_user_messages()
+            if drained_messages:
+                self._repository.save_agent_instance(updated)
+            return updated, drained_messages
+
     def switch_agent_instance_llm_policy(
         self,
         instance_id: str,
@@ -454,8 +518,6 @@ class AgentRuntimeService:
     ) -> AgentInstance:
         with self._lock:
             instance = self._get_required_instance(instance_id)
-            if instance.is_terminal:
-                raise ValueError(f"Agent 实例已结束，不能切换 LLM 执行策略组: {instance_id}")
             updated = instance.switch_llm_policy(
                 llm_policy_group_id=llm_policy_group_id,
                 llm_policy_snapshot_json=llm_policy_snapshot_json,

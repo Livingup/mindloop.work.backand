@@ -14,60 +14,33 @@ from typing import Any, Final, TypeAlias
 
 AgentInstanceStatus: TypeAlias = str
 
-# Agent 实例已创建但尚未进入执行循环。
-AGENT_INSTANCE_STATUS_CREATED: Final[str] = "created"
+# Agent 实例当前没有执行循环在跑，可以接收用户消息并按需启动执行。
+AGENT_INSTANCE_STATUS_READY: Final[str] = "ready"
 
-# Agent 实例正在执行。一个 task 内允许多个实例同时处于 running。
+# Agent 实例当前正在执行循环。此时仍接收用户消息，但只进入待处理消息队列。
 AGENT_INSTANCE_STATUS_RUNNING: Final[str] = "running"
 
-# Agent 实例被执行编排层暂停，后续可恢复到 running。
-AGENT_INSTANCE_STATUS_PAUSED: Final[str] = "paused"
-
-# Agent 实例正常完成。
-AGENT_INSTANCE_STATUS_COMPLETED: Final[str] = "completed"
-
-# Agent 实例执行失败，failure_message 保存失败原因摘要。
-AGENT_INSTANCE_STATUS_FAILED: Final[str] = "failed"
-
-# Agent 实例被取消，不再继续执行。
-AGENT_INSTANCE_STATUS_CANCELLED: Final[str] = "cancelled"
-
 AGENT_INSTANCE_STATUSES: Final[frozenset[str]] = frozenset({
-    AGENT_INSTANCE_STATUS_CREATED,
+    AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
-    AGENT_INSTANCE_STATUS_PAUSED,
-    AGENT_INSTANCE_STATUS_COMPLETED,
-    AGENT_INSTANCE_STATUS_FAILED,
-    AGENT_INSTANCE_STATUS_CANCELLED,
 })
 
-_TERMINAL_AGENT_INSTANCE_STATUSES: Final[frozenset[str]] = frozenset({
-    AGENT_INSTANCE_STATUS_COMPLETED,
-    AGENT_INSTANCE_STATUS_FAILED,
-    AGENT_INSTANCE_STATUS_CANCELLED,
+_LEGACY_READY_INSTANCE_STATUSES: Final[frozenset[str]] = frozenset({
+    "created",
+    "paused",
+    "completed",
+    "failed",
+    "cancelled",
 })
 
-_AGENT_INSTANCE_STATUS_TRANSITIONS: Final[dict[str, frozenset[str]]] = {
-    AGENT_INSTANCE_STATUS_CREATED: frozenset({
-        AGENT_INSTANCE_STATUS_RUNNING,
-        AGENT_INSTANCE_STATUS_FAILED,
-        AGENT_INSTANCE_STATUS_CANCELLED,
-    }),
-    AGENT_INSTANCE_STATUS_RUNNING: frozenset({
-        AGENT_INSTANCE_STATUS_PAUSED,
-        AGENT_INSTANCE_STATUS_COMPLETED,
-        AGENT_INSTANCE_STATUS_FAILED,
-        AGENT_INSTANCE_STATUS_CANCELLED,
-    }),
-    AGENT_INSTANCE_STATUS_PAUSED: frozenset({
-        AGENT_INSTANCE_STATUS_RUNNING,
-        AGENT_INSTANCE_STATUS_FAILED,
-        AGENT_INSTANCE_STATUS_CANCELLED,
-    }),
-    AGENT_INSTANCE_STATUS_COMPLETED: frozenset(),
-    AGENT_INSTANCE_STATUS_FAILED: frozenset(),
-    AGENT_INSTANCE_STATUS_CANCELLED: frozenset(),
-}
+
+def _normalize_instance_status(status: str) -> str:
+    """把历史实例生命周期态归一化为当前执行载体两态。"""
+    if status in AGENT_INSTANCE_STATUSES:
+        return status
+    if status in _LEGACY_READY_INSTANCE_STATUSES:
+        return AGENT_INSTANCE_STATUS_READY
+    raise ValueError(f"未知 Agent 实例状态: {status}")
 
 
 def _utc_now() -> datetime:
@@ -84,13 +57,43 @@ def _require_non_blank(value: str, field_name: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingAgentUserMessage:
+    """Agent 实例待处理用户消息。
+
+    用户发给 AgentInstance 的消息统一先进入该队列；执行循环只在完整轮次边界消费，
+    避免用户输入插入 LLM 请求或工具执行的中途。
+    """
+
+    # 队列消息唯一标识，用于前端提交幂等追踪与运行时事件关联。
+    message_id: str
+
+    # 用户输入文本。当前 REST 消息入口只支持文本输入。
+    user_text: str
+
+    # 前端可选消息 ID，便于 UI 对齐本地乐观消息与后端入队事实。
+    client_message_id: str | None = None
+
+    # 后端接收消息的时间，用于审计与 FIFO 排序辅助。
+    received_at: datetime = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        """校验待处理用户消息的业务字段。"""
+        _require_non_blank(self.message_id, "message_id")
+        _require_non_blank(self.user_text, "user_text")
+        if self.client_message_id is not None:
+            _require_non_blank(self.client_message_id, "client_message_id")
+        if self.received_at is None:
+            object.__setattr__(self, "received_at", _utc_now())
+
+
+@dataclass(frozen=True, slots=True)
 class AgentInstance:
     """Agent 运行时实例。
 
-    AgentInstance 表示可执行的 Agent 运行主体。普通子实例仍然隶属于单个 task；
-    Scene 绑定的 root agent instance 是长期复用的主 Agent 运行主体，可以在同一个 Scene
-    下依次承载多个 task。每次 task 结束后，root instance 会清空本轮 conversation_id
-    与运行时间戳，回到可接收下一轮 task 的待命状态。
+    AgentInstance 表示可执行的 Agent 运行主体。它的主状态只表达执行载体是否正在运行：
+    ready 表示当前可接收输入并可启动执行；running 表示执行循环正在进行。普通子实例仍然
+    隶属于单个 task；Scene 绑定的 root agent instance 是长期复用的主 Agent 运行主体，
+    可以在同一个 Scene 下依次承载多个 task。
     """
 
     # Agent 运行时实例唯一标识。每次创建实例都应生成新的 instance_id。
@@ -125,8 +128,12 @@ class AgentInstance:
 
     llm_policy_snapshot_json: dict[str, Any] = field(default_factory=dict)
 
-    # 当前实例状态。状态流转由领域服务显式触发。
-    status: AgentInstanceStatus = AGENT_INSTANCE_STATUS_CREATED
+    # 当前实例执行载体状态。ready 可接收输入，running 表示执行循环正在进行。
+    status: AgentInstanceStatus = AGENT_INSTANCE_STATUS_READY
+
+    # 用户发给当前 AgentInstance 但尚未被对话消费的消息队列。
+    # 队列只能由执行循环在完整轮次边界按 FIFO 顺序 drain 到 conversation。
+    pending_user_messages: tuple[PendingAgentUserMessage, ...] = ()
 
     # 实例创建时间。
     created_at: datetime = None  # type: ignore[assignment]
@@ -137,16 +144,16 @@ class AgentInstance:
     # 首次进入 running 的时间。
     started_at: datetime | None = None
 
-    # 最近一次进入 paused 的时间。
+    # 最近一次进入 ready 的时间。
     paused_at: datetime | None = None
 
-    # 正常完成或取消的时间。
+    # 保留字段：实例作为执行载体不再进入 completed/cancelled 主状态，历史数据和审计仍可读取该时间。
     finished_at: datetime | None = None
 
-    # 进入 failed 的时间。
+    # 最近一次执行失败或中断的时间，仅作审计快照，不代表实例进入 failed 主状态。
     failed_at: datetime | None = None
 
-    # 失败原因摘要。仅 failed 状态要求有值。
+    # 最近一次执行失败或中断原因摘要，仅作审计快照，不代表实例进入 failed 主状态。
     failure_message: str | None = None
 
     def __post_init__(self) -> None:
@@ -165,10 +172,12 @@ class AgentInstance:
         _require_non_blank(self.trace_id, "trace_id")
         if self.conversation_id is not None:
             _require_non_blank(self.conversation_id, "conversation_id")
-        if self.status not in AGENT_INSTANCE_STATUSES:
-            raise ValueError(f"未知 Agent 实例状态: {self.status}")
-        if self.status == AGENT_INSTANCE_STATUS_FAILED:
-            _require_non_blank(self.failure_message or "", "failure_message")
+        normalized_status = _normalize_instance_status(self.status)
+        if normalized_status != self.status:
+            object.__setattr__(self, "status", normalized_status)
+        for pending_message in self.pending_user_messages:
+            if not isinstance(pending_message, PendingAgentUserMessage):
+                raise ValueError("pending_user_messages 必须由 PendingAgentUserMessage 组成。")
         if self.failure_message is not None and not self.failure_message.strip():
             raise ValueError("failure_message 不能是空白字符串。")
         if self.created_at is None:
@@ -178,8 +187,8 @@ class AgentInstance:
 
     @property
     def is_terminal(self) -> bool:
-        """实例是否已经进入终态。"""
-        return self.status in _TERMINAL_AGENT_INSTANCE_STATUSES
+        """实例是否已经进入终态。当前 AgentInstance 两态模型下实例没有终态。"""
+        return False
 
     def bind_conversation(
         self,
@@ -215,10 +224,10 @@ class AgentInstance:
         return replace(
             self,
             conversation_id=None,
-            status=AGENT_INSTANCE_STATUS_CREATED,
+            status=AGENT_INSTANCE_STATUS_READY,
             updated_at=now,
             started_at=None,
-            paused_at=None,
+            paused_at=now,
             finished_at=None,
             failed_at=None,
             failure_message=None,
@@ -250,10 +259,10 @@ class AgentInstance:
             thread_id=thread_id,
             conversation_id=None,
             trace_id=trace_id,
-            status=AGENT_INSTANCE_STATUS_CREATED,
+            status=AGENT_INSTANCE_STATUS_READY,
             updated_at=now,
             started_at=None,
-            paused_at=None,
+            paused_at=now,
             finished_at=None,
             failed_at=None,
             failure_message=None,
@@ -282,23 +291,53 @@ class AgentInstance:
             updated_at=at or _utc_now(),
         )
 
+    def enqueue_user_message(
+        self,
+        pending_message: PendingAgentUserMessage,
+        *,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        """把用户发来的消息追加到待处理队列末尾。
+
+        所有用户消息统一先进入队列；running 时不打断当前执行循环，ready 时由执行引擎
+        启动执行后在循环边界消费。
+        """
+        if not isinstance(pending_message, PendingAgentUserMessage):
+            raise ValueError("pending_message 必须是 PendingAgentUserMessage。")
+        return replace(
+            self,
+            pending_user_messages=(*self.pending_user_messages, pending_message),
+            updated_at=at or _utc_now(),
+        )
+
+    def drain_pending_user_messages(
+        self,
+        *,
+        at: datetime | None = None,
+    ) -> tuple["AgentInstance", tuple[PendingAgentUserMessage, ...]]:
+        """按 FIFO 顺序取出并清空待处理用户消息队列。"""
+        if not self.pending_user_messages:
+            return self, ()
+        drained = self.pending_user_messages
+        return replace(
+            self,
+            pending_user_messages=(),
+            updated_at=at or _utc_now(),
+        ), drained
+
     def transition_to(
         self,
         target_status: AgentInstanceStatus,
         *,
         failure_message: str | None = None,
         at: datetime | None = None,
-    ) -> AgentInstance:
-        """按领域允许的状态机流转到目标状态。"""
-        if target_status not in AGENT_INSTANCE_STATUSES:
-            raise ValueError(f"未知 Agent 实例状态: {target_status}")
-        if target_status == self.status:
-            return self
-        allowed_targets = _AGENT_INSTANCE_STATUS_TRANSITIONS[self.status]
-        if target_status not in allowed_targets:
-            raise ValueError(
-                f"Agent 实例状态不能从 {self.status} 流转到 {target_status}。"
-            )
+    ) -> "AgentInstance":
+        """按 ready/running 两态切换执行载体状态。
+
+        AgentInstance 不再表达 completed/failed/cancelled 终态；任务是否结束由 AgentTask 表达。
+        执行异常或 fail_task 只会把实例恢复到 ready，并把 failure_message 作为最近错误审计。
+        """
+        target_status = _normalize_instance_status(target_status)
         now = at or _utc_now()
         values: dict[str, object] = {
             "status": target_status,
@@ -306,15 +345,12 @@ class AgentInstance:
         }
         if target_status == AGENT_INSTANCE_STATUS_RUNNING:
             values["started_at"] = self.started_at or now
-        elif target_status == AGENT_INSTANCE_STATUS_PAUSED:
+        else:
             values["paused_at"] = now
-        elif target_status == AGENT_INSTANCE_STATUS_COMPLETED:
-            values["finished_at"] = now
-            values["failure_message"] = None
-        elif target_status == AGENT_INSTANCE_STATUS_FAILED:
-            _require_non_blank(failure_message or "", "failure_message")
-            values["failed_at"] = now
-            values["failure_message"] = failure_message
-        elif target_status == AGENT_INSTANCE_STATUS_CANCELLED:
-            values["finished_at"] = now
+            if failure_message is not None:
+                _require_non_blank(failure_message, "failure_message")
+                values["failed_at"] = now
+                values["failure_message"] = failure_message
+        if target_status == self.status and failure_message is None:
+            return self
         return replace(self, **values)
