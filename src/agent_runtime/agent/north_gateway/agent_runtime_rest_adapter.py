@@ -108,6 +108,9 @@ class AgentMessageSubmissionResponse(BaseModel):
     conversation_id: str | None = None
     communication_stream_id: str
     event_stream_url: str
+    pending_message_id: str
+    client_message_id: str | None = None
+    queued_for_later: bool = False
     root_agent_instance: AgentInstanceResponse | None = None
 class AttachSceneBody(BaseModel):
     """attach scene 入参。
@@ -604,6 +607,9 @@ def _submission_response(result: AgentMessageSubmissionResult) -> AgentMessageSu
         conversation_id=result.conversation_id,
         communication_stream_id=result.communication_stream_id,
         event_stream_url=f"/api/communication/streams/{result.communication_stream_id}/events",
+        pending_message_id=result.pending_message_id,
+        client_message_id=result.client_message_id,
+        queued_for_later=result.queued_for_later,
         root_agent_instance=_instance_response(result.instance),
     )
 

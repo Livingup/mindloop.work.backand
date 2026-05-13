@@ -183,6 +183,12 @@ class AgentMessageSubmissionResult:
     instance_id: str
     conversation_id: str | None
     communication_stream_id: str
+    # 后端为本次用户输入生成的待处理消息 ID；SSE user.message.accepted 会携带同一 ID。
+    pending_message_id: str
+    # 前端提交的客户端消息 ID；用于前端在 HTTP 响应和 SSE 接收事件之间做 UI 对齐。
+    client_message_id: str | None
+    # True 表示消息仅进入等待队列，需在浮层展示；False 表示已启动执行循环，可按正常 chat 消息展示。
+    queued_for_later: bool
     # 当前 root agent instance 快照。Scene root instance 会跨 task 复用，
     # 当后端自动创建下一轮 task 时，前端需要用该快照同步 task_id/thread_id/trace_id。
     instance: AgentInstance
@@ -315,7 +321,7 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
-        instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
+        instance, pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
             client_message_id=client_message_id,
@@ -349,6 +355,9 @@ class AgentExecutionEngine:
                 instance_id=instance.instance_id,
                 conversation_id=instance.conversation_id,
                 communication_stream_id=communication_context.stream_id,
+                pending_message_id=pending_message.message_id,
+                client_message_id=pending_message.client_message_id,
+                queued_for_later=True,
                 instance=instance,
             )
         self._active_instance_ids.add(instance.instance_id)
@@ -363,6 +372,9 @@ class AgentExecutionEngine:
             instance_id=instance.instance_id,
             conversation_id=instance.conversation_id,
             communication_stream_id=communication_context.stream_id,
+            pending_message_id=pending_message.message_id,
+            client_message_id=pending_message.client_message_id,
+            queued_for_later=False,
             instance=instance,
         )
 
