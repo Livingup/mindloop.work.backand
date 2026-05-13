@@ -264,7 +264,7 @@ class SceneService:
         """更新场景的可变字段。
 
         ``bound_agent_definition_id`` 永久绑定不可变；如需更换 Agent 请新建 scene。
-        ``bound_root_conversation_id`` 通过 ``set_bound_root_conversation_id`` 回填，不在此处更新。
+        ``bound_root_conversation_id`` 是历史兼容字段，不在普通更新接口中修改。
         ``status`` 可传 ``'active' / 'archived'`` 触发激活/归档；其他字段为 None 表示不变。
         """
         scene = self.get_scene(workspace_path, scene_id)
@@ -286,10 +286,10 @@ class SceneService:
         scene_id: str,
         conversation_id: str,
     ) -> Scene:
-        """回填场景持有的 conversation_id。
+        """回填旧版 scene 级 conversation_id 兼容字段。
 
-        由 attach 编排层在 scene 下首次创建 root agent instance 后调用；同一 scene 不能重复
-        绑定到不同的 conversation_id（领域层会拒绝），保证"scene 与对话上下文一对一"。
+        当前业务要求每个 task 独立创建 conversation_id，并在 end_task 后从 root agent instance 清空。
+        该方法仅保留给历史数据或兼容流程使用；同一 scene 不能重复绑定到不同 conversation_id。
 
         Raises:
             KeyError: scene 不存在。

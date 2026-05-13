@@ -49,7 +49,9 @@ class AgentRuntimeService:
 
     该服务只负责程序内部动态运行态管理，不执行 LLM 请求循环。
     它保证一个任务只有一个根 Agent 实例入口，任务内部可以维护任意数量的
-    Agent 实例以及一棵父子关系树；多个任务、同一任务内多个实例均不设数量上限。
+    Agent 实例以及一棵父子关系树。Scene 绑定的 root agent instance 是长期复用的
+    主 Agent 运行主体：同一 Scene 下可以依次创建多个 task，并把同一个 root instance
+    切换到最新 task 上执行，从而隔离 task/conversation 数据但复用 Agent 身份与策略。
     """
 
     def __init__(self, repository: AgentRuntimeRepository) -> None:
@@ -296,6 +298,91 @@ class AgentRuntimeService:
         """显式标记任务完成。任务完成不由单个实例完成自动推导。"""
         return self._transition_task(task_id, AGENT_TASK_STATUS_COMPLETED)
 
+    def complete_scene_task_and_reset_root_agent_instance(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """完成 Scene 当前 task，并把长期复用的 root agent instance 恢复为待命状态。
+
+        end_task 在 Scene 语境下只表示“当前用户任务完成”，不能销毁 Scene 的主 Agent。
+        该方法在同一服务锁内完成 task 终态保存与 root instance 运行态清理：
+        - task 进入 completed，保留历史审计记录；
+        - root instance 保留 instance_id、Agent 定义、LLM 策略和工作目录；
+        - root instance 清空本轮 conversation_id，状态回到 created，等待下一条用户消息创建新 task。
+        """
+        with self._lock:
+            task = self._get_required_task(task_id)
+            instance = self._get_required_instance(root_instance_id)
+            self._ensure_scene_root_instance(task, instance)
+            updated_task = task.transition_to(AGENT_TASK_STATUS_COMPLETED)
+            updated_instance = instance.reset_for_next_scene_task()
+            self._repository.save_task(updated_task)
+            self._repository.save_agent_instance(updated_instance)
+            return updated_task, updated_instance
+
+    def reset_scene_root_agent_instance_for_next_task(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> AgentInstance:
+        """把已完成 task 上的 Scene root agent instance 重置为可接收新任务。
+
+        该方法用于兼容旧版本 end_task 曾把 root instance 置为 completed 的历史数据，
+        以及 attach 到已完成 task 时恢复 Scene 主 Agent 的待命态。它不会创建新 task。
+        """
+        with self._lock:
+            task = self._get_required_task(task_id)
+            instance = self._get_required_instance(root_instance_id)
+            self._ensure_scene_root_instance(task, instance)
+            if not task.is_terminal:
+                raise ValueError(f"Scene task 尚未结束，不能重置 root agent instance: {task_id}")
+            updated_instance = instance.reset_for_next_scene_task()
+            self._repository.save_agent_instance(updated_instance)
+            return updated_instance
+
+    def prepare_scene_root_agent_instance_for_new_task(
+        self,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """为同一 Scene 的下一条用户消息创建新 task，并复用既有 root agent instance。
+
+        当前 root instance 仍指向上一轮已终态 task。下一条用户消息到来时，
+        系统在这里创建新的 task_id/thread_id/trace_id，把同一个 root instance
+        切换到新 task，并保持 conversation_id 为空，确保新 task 会创建独立 conversation。
+        """
+        with self._lock:
+            instance = self._get_required_instance(root_instance_id)
+            previous_task = self._get_required_task(instance.task_id)
+            self._ensure_scene_root_instance(previous_task, instance)
+            if not previous_task.is_terminal:
+                return previous_task, instance
+            new_task_id = _new_id("task")
+            new_thread_id = _new_id("thread")
+            new_trace_id = _new_id("trace")
+            self._ensure_task_not_exists(new_task_id)
+            next_task = AgentTask(
+                task_id=new_task_id,
+                root_agent_instance_id=instance.instance_id,
+                agent_instance_ids=(instance.instance_id,),
+                scene_id=previous_task.scene_id,
+            )
+            updated_instance = instance.assign_to_new_scene_task(
+                task_id=new_task_id,
+                thread_id=new_thread_id,
+                trace_id=new_trace_id,
+            )
+            self._repository.save_task(next_task)
+            self._repository.save_agent_instance(updated_instance)
+            logger.info(
+                "Scene root Agent 实例复用并切换到新任务: scene_id=%s root_instance_id=%s previous_task_id=%s next_task_id=%s",
+                previous_task.scene_id,
+                root_instance_id,
+                previous_task.task_id,
+                new_task_id,
+            )
+            return next_task, updated_instance
+
     def fail_task(self, task_id: str, failure_message: str) -> AgentTask:
         """标记任务失败。"""
         return self._transition_task(
@@ -439,6 +526,16 @@ class AgentRuntimeService:
         _require_non_blank(instance_id, "instance_id")
         if self._repository.contains_agent_instance(instance_id):
             raise ValueError(f"Agent 实例已存在: {instance_id}")
+
+    def _ensure_scene_root_instance(self, task: AgentTask, instance: AgentInstance) -> None:
+        """校验实例是指定 Scene task 的 root agent instance。"""
+        if task.scene_id is None:
+            raise ValueError(f"任务未绑定 Scene，不能按 Scene root agent instance 复用: {task.task_id}")
+        if task.root_agent_instance_id != instance.instance_id:
+            raise ValueError(
+                f"Agent 实例不是 Scene task 的 root instance: "
+                f"task_id={task.task_id} root={task.root_agent_instance_id} instance={instance.instance_id}"
+            )
 
     def _build_relation_id(
         self,

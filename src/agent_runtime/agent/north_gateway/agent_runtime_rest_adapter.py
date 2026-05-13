@@ -107,6 +107,7 @@ class AgentMessageSubmissionResponse(BaseModel):
     conversation_id: str | None = None
     communication_stream_id: str
     event_stream_url: str
+    root_agent_instance: AgentInstanceResponse | None = None
 class AttachSceneBody(BaseModel):
     """attach scene 入参。
 
@@ -117,7 +118,8 @@ class AttachSceneBody(BaseModel):
     - 优先级 1：body 显式提供 llm_policy_group_id 或 llm_provider_id+llm_model_binding_id；
     - 优先级 2：未提供时回退到 agent_definition.default_llm_policy_group_id；
     - 都没有 → REST 层 400，前端应在 SceneCreator 时让用户选择策略组。
-    其余 attach 模式（resumed / recreated）忽略所有 LLM 字段。
+    其余 attach 模式会复用 Scene 已有 root agent instance 的 LLM 策略，忽略所有 LLM 字段。
+    每个新 task 都会在第一次用户消息时创建新的 conversation_id，不跨 task 复用旧会话。
     """
 
     workspace_path: str
@@ -129,7 +131,8 @@ class AttachSceneBody(BaseModel):
 class AttachSceneResponseModel(BaseModel):
     """attach scene 响应。
 
-    mode：resumed | recreated | created。
+    mode：resumed | created | recreated。resumed 表示复用 Scene 长期 root agent instance；
+    recreated 是旧设计兼容值，新设计默认不再因 task 完成而重建 root agent instance。
     """
 
     mode: str
@@ -290,9 +293,9 @@ def create_agent_runtime_router(
     ) -> AttachSceneResponseModel:
         """前端进入 scene 的统一入口。
 
-        - 返回 mode=resumed：scene 下当前已有活跃 root agent instance，直接复用；
-        - 返回 mode=recreated：旧 instance 已终态，按 scene 绑定 + 上一条 instance LLM 重建；
-        - 返回 mode=created：scene 下首次创建 root instance（需要 fallback LLM）。
+        - 返回 mode=resumed：scene 下已有长期 root agent instance，直接复用或恢复为待命态；
+        - 返回 mode=created：scene 下首次创建 root instance（需要 fallback LLM）；
+        - mode=recreated 仅为旧设计兼容值，新流程不再因 task 完成而重建 root instance。
 
         body 中的 LLM 字段仅在 mode=created 时实际生效。REST 层先解析 fallback LLM，
         然后由 gateway 决策真实 mode；其它路径的 fallback LLM 自动忽略。
@@ -317,7 +320,7 @@ def create_agent_runtime_router(
                 agent_definition_gateway=agent_definition_gateway,
             )
         except (KeyError, ValueError):
-            # fallback 解析失败不直接 fail：可能 scene 下已有 instance，attach 走 resumed/recreated 不需要 LLM。
+            # fallback 解析失败不直接 fail：可能 scene 下已有 instance，attach 走 resumed 不需要 LLM。
             # 把异常吞掉转为空 fallback；若 gateway 走 mode=created 路径会在 gateway 层抛 ValueError。
             fallback = None
 
@@ -599,6 +602,7 @@ def _submission_response(result: AgentMessageSubmissionResult) -> AgentMessageSu
         conversation_id=result.conversation_id,
         communication_stream_id=result.communication_stream_id,
         event_stream_url=f"/api/communication/streams/{result.communication_stream_id}/events",
+        root_agent_instance=_instance_response(result.instance),
     )
 
 

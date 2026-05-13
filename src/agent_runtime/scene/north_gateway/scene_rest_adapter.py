@@ -66,8 +66,8 @@ class SceneResponse(BaseModel):
     """场景响应模型。
 
     ``bound_agent_definition_id``：scene 创建时选定、永久绑定不可变的主 Agent 定义。
-    ``bound_root_conversation_id``：scene 首次创建 root instance 后由后端 attach 编排层回填，
-    跨 instance 重建复用以延续 LLM 历史。
+    ``bound_root_conversation_id``：旧版 scene 级 conversation 兼容字段；当前每个新 task
+    都创建独立 conversation_id，不再跨 task 复用该字段延续 LLM 历史。
     """
 
     model_config = ConfigDict(populate_by_name=True)
@@ -120,7 +120,8 @@ class CreateSceneBody(BaseModel):
 class UpdateSceneBody(BaseModel):
     """更新场景请求体。
 
-    ``bound_agent_definition_id / bound_root_conversation_id`` 不允许修改，本请求体不提供这些字段。
+    ``bound_agent_definition_id`` 不允许修改；``bound_root_conversation_id`` 是历史兼容字段，
+    也不允许通过普通场景更新接口修改。
     """
 
     workspace_path: str = Field(..., description="项目目录绝对路径，服务端读 manifest 验证场景归属。")

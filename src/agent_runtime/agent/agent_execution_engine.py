@@ -182,6 +182,9 @@ class AgentMessageSubmissionResult:
     instance_id: str
     conversation_id: str | None
     communication_stream_id: str
+    # 当前 root agent instance 快照。Scene root instance 会跨 task 复用，
+    # 当后端自动创建下一轮 task 时，前端需要用该快照同步 task_id/thread_id/trace_id。
+    instance: AgentInstance
 
 
 class AgentExecutionEngine:
@@ -262,7 +265,11 @@ class AgentExecutionEngine:
         instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
         task = self._runtime_gateway.get_task(instance.task_id)
         if task.is_terminal:
-            raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+            if task.scene_id is None:
+                raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+            task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                instance.instance_id,
+            )
         if instance.is_terminal:
             raise ValueError(f"Agent 实例已结束，不能继续对话: {instance.instance_id}")
         request = AgentExecutionRequest.from_text(
@@ -294,7 +301,11 @@ class AgentExecutionEngine:
         instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
         task = self._runtime_gateway.get_task(instance.task_id)
         if task.is_terminal:
-            raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+            if task.scene_id is None:
+                raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+            task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                instance.instance_id,
+            )
         if instance.is_terminal:
             raise ValueError(f"Agent 实例已结束，不能继续对话: {instance.instance_id}")
         if task.status == AGENT_TASK_STATUS_RUNNING or instance.status == AGENT_INSTANCE_STATUS_RUNNING:
@@ -331,6 +342,7 @@ class AgentExecutionEngine:
             instance_id=instance.instance_id,
             conversation_id=instance.conversation_id,
             communication_stream_id=communication_context.stream_id,
+            instance=instance,
         )
 
     def _on_background_task_done(self, task: asyncio.Task[AgentExecutionResult], instance_id: str) -> None:
@@ -962,8 +974,15 @@ class AgentExecutionEngine:
             )
             return
         if loop_decision == "complete":
-            self._runtime_gateway.complete_agent_instance(instance_id)
-            self._runtime_gateway.complete_task(task_id)
+            task = self._runtime_gateway.get_task(task_id)
+            if task.scene_id is not None:
+                self._runtime_gateway.complete_scene_task_and_reset_root_agent_instance(
+                    task_id,
+                    instance_id,
+                )
+            else:
+                self._runtime_gateway.complete_agent_instance(instance_id)
+                self._runtime_gateway.complete_task(task_id)
             self._trace_recorder.record_completed(trace_path)
             await self._publish_loop_decision_event(
                 communication_context,

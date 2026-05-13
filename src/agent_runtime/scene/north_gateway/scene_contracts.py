@@ -50,7 +50,8 @@ class SceneInfo:
     """场景信息 DTO。
 
     ``bound_agent_definition_id`` 是 scene 永久绑定的主 Agent 定义 ID，创建后不可变。
-    ``bound_root_conversation_id`` 是该 scene 持有的对话上下文，首次创建 root instance 后由编排层回填。
+    ``bound_root_conversation_id`` 是旧版 scene 级 conversation 兼容字段；当前新任务会
+    按 task 创建独立 conversation_id，不再通过 scene 跨 task 复用会话。
     LLM 策略不与 scene 绑定（属于 instance 维度）。
     """
 
@@ -116,7 +117,7 @@ class UpdateSceneRequest:
     """更新场景请求；任何字段为 None 表示不变。
 
     ``bound_agent_definition_id`` 不可变，本请求模型不提供该字段。
-    ``bound_root_conversation_id`` 也不能通过本请求修改，由 attach 编排层回填。
+    ``bound_root_conversation_id`` 是历史兼容字段，也不能通过本请求修改。
     """
 
     name: str | None = None
@@ -199,9 +200,10 @@ class SceneGateway(Protocol):
         scene_id: str,
         conversation_id: str,
     ) -> SceneInfo:
-        """在 scene 下首次创建 root agent instance 后回填 conversation_id。
+        """回填旧版 scene 级 conversation_id 兼容字段。
 
-        由 attach 编排层调用；同一 scene 不能重复绑定到不同 conversation_id。
+        当前新业务要求每个 task 独立创建 conversation_id；该方法仅保留给历史数据或
+        兼容流程使用。同一 scene 不能重复绑定到不同 conversation_id。
 
         Raises:
             KeyError: scene 不存在。

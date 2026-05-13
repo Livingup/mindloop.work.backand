@@ -61,8 +61,8 @@ class AttachSceneRequest:
     """连接（attach）到 scene 的请求。
 
     attach 是 scene 维度的统一入口：
-    - 若 scene 下当前有活跃 root agent instance → 返回 mode="resumed"，复用 instance；
-    - 否则若 scene 下有上一条 root agent instance → 继承其 LLM 策略与 conversation_id 重建，返回 mode="recreated"；
+    - 若 scene 下已有可复用 root agent instance → 返回 mode="resumed"，复用同一主 Agent；
+    - 若 scene 下只有旧版本终态 root instance → 重置为待命态后返回 mode="resumed"；
     - 否则首次创建 → 使用本请求中的 fallback LLM 信息创建首个 root instance，返回 mode="created"。
 
     Fallback LLM 字段仅在「mode=created」时实际生效；其余路径忽略本请求中的 LLM 字段，
@@ -92,9 +92,9 @@ class AttachSceneResponse:
     """attach scene 的响应。
 
     mode 取值：
-    - "resumed"：复用已有活跃 root instance，未创建新实例；
-    - "recreated"：旧实例已终态，按 scene 绑定 + 上一条 instance 的 LLM 重建新实例；
-    - "created"：scene 下首次创建 root instance。
+    - "resumed"：复用已有 Scene root agent instance，可能已从历史终态恢复为待命态；
+    - "created"：scene 下首次创建 root instance；
+    - "recreated"：历史兼容值，旧设计中表示终态后重建实例，新设计默认不再主动使用。
     """
 
     # attach 结果：resumed / recreated / created
@@ -237,12 +237,13 @@ class AgentRuntimeGateway(Protocol):
         scene_id: str,
         request: AttachSceneRequest,
     ) -> AttachSceneResponse:
-        """连接（attach）到 scene，自动恢复 / 重建 / 首次创建 root agent instance。
+        """连接（attach）到 scene，自动恢复或首次创建 root agent instance。
 
         本方法是前端进入 scene 后的唯一入口，编排了：
-        - SceneGateway：读取 bound_agent_definition_id、bound_root_conversation_id、project.workspace_path；
+        - SceneGateway：读取 bound_agent_definition_id 与 project.workspace_path；
         - AgentRuntimeRepository：按 scene 查活跃和最近 root instance；
-        - 必要时回写 scene.bound_root_conversation_id。
+        - 历史 root instance 存在时恢复同一个 instance 的待命态，不重建主 Agent；
+        - conversation_id 按 task 维度创建和清理，不再通过 scene 跨 task 复用。
 
         Raises:
             KeyError: scene 不存在。
@@ -270,6 +271,26 @@ class AgentRuntimeGateway(Protocol):
 
     def complete_task(self, task_id: str) -> AgentTask:
         """显式标记任务完成。"""
+
+    def complete_scene_task_and_reset_root_agent_instance(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """完成 Scene 当前 task，并把长期复用的 root agent instance 恢复为可接收新 task 的待命状态。"""
+
+    def reset_scene_root_agent_instance_for_next_task(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> AgentInstance:
+        """兼容恢复已终态 task 上的 Scene root agent instance，清空 conversation 并回到待命状态。"""
+
+    def prepare_scene_root_agent_instance_for_new_task(
+        self,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """当 Scene root agent instance 当前 task 已完成时，创建新 task 并复用同一个 root instance。"""
 
     def fail_task(self, task_id: str, failure_message: str) -> AgentTask:
         """标记任务失败。"""

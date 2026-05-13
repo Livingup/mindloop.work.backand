@@ -45,7 +45,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         # Agent 运行时领域服务。负责维护任务、实例状态和任务内父子关系树。
         self._service = service
         # Scene 北向网关。attach_scene 用其读取 bound_agent_definition_id /
-        # bound_root_conversation_id / project.workspace_path 以及回写 conversation 绑定。
+        # project.workspace_path，并校验 scene 与 workspace 归属；conversation_id 按 task 维度管理。
         self._scene_gateway = scene_gateway
         self._communication_gateway = communication_gateway
 
@@ -145,6 +145,35 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         """显式标记任务完成。"""
         return self._service.complete_task(task_id)
 
+    def complete_scene_task_and_reset_root_agent_instance(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """完成 Scene 当前 task，并把长期复用的 root agent instance 恢复为待命状态。"""
+        return self._service.complete_scene_task_and_reset_root_agent_instance(
+            task_id,
+            root_instance_id,
+        )
+
+    def reset_scene_root_agent_instance_for_next_task(
+        self,
+        task_id: str,
+        root_instance_id: str,
+    ) -> AgentInstance:
+        """兼容恢复已完成 task 上的 Scene root agent instance，使其可接收下一轮任务。"""
+        return self._service.reset_scene_root_agent_instance_for_next_task(
+            task_id,
+            root_instance_id,
+        )
+
+    def prepare_scene_root_agent_instance_for_new_task(
+        self,
+        root_instance_id: str,
+    ) -> tuple[AgentTask, AgentInstance]:
+        """为下一条用户消息创建新的 Scene task，并复用同一个 root agent instance。"""
+        return self._service.prepare_scene_root_agent_instance_for_new_task(root_instance_id)
+
     def fail_task(self, task_id: str, failure_message: str) -> AgentTask:
         """标记任务失败。"""
         return self._service.fail_task(task_id, failure_message)
@@ -214,18 +243,16 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         scene_id: str,
         request: AttachSceneRequest,
     ) -> AttachSceneResponse:
-        """连接 scene 并自动 resume / recreate / create root agent instance。
+        """连接 scene 并自动恢复或首次创建 root agent instance。
 
         调用顺序：
         1. 通过 SceneGateway（按 ``request.workspace_path`` 路由）读取 scene
-           ——拿 ``bound_agent_definition_id`` 与 ``bound_root_conversation_id``；
-           工作目录直接取 ``request.workspace_path``，不再单独读项目。
+           ——拿 ``bound_agent_definition_id`` 与工作目录，工作目录直接取 ``request.workspace_path``。
         2. 拒绝 archived scene。
         3. 查 scene 下「活跃 root instance」，存在即返回 mode=resumed。
-        4. 否则查 scene 下「最近 root instance」：
-           - 存在 → 继承其 LLM 与 conversation_id 重建（mode=recreated）；
-           - 不存在 → 用 request 中的 fallback LLM 首次创建（mode=created）。
-        5. 必要时回写 scene.bound_root_conversation_id 以保证 conversation 上下文跨 instance 重建可复用。
+        4. 否则查 scene 下「最近 root instance」：存在则恢复同一个 root instance 的待命态并返回 mode=resumed。
+        5. Scene 首次 attach 才使用 fallback LLM 创建首个 task + root instance。
+        6. conversation_id 按 task 维度创建和清理，不再通过 scene 做跨 task 复用。
         """
         if self._scene_gateway is None:
             raise RuntimeError(
@@ -240,7 +267,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         stream_id = f"stream-scene-{scene_id}"
         event_stream_url = f"/api/communication/streams/{stream_id}/events"
 
-        # 1. 活跃 root instance 直接复用
+        # 1. Scene 下存在非终态 task 时，直接复用当前 root instance。
         active = self._service.get_active_root_agent_instance_by_scene(scene_id)
         if active is not None:
             task, instance = active
@@ -259,34 +286,45 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
                 event_stream_url=event_stream_url,
             )
 
-        # 2. 决定 LLM 与 conversation_id 来源
+        # 2. 若 Scene 已有历史 root instance，则复用同一个 instance 身份。
+        #    旧版本 end_task 可能把 root instance 置为 completed；这里只做待命态恢复，
+        #    不创建新的 root agent instance。下一条用户消息到来时再创建新的 task/conversation。
         last = self._service.get_last_root_agent_instance_by_scene(scene_id)
         if last is not None:
-            _, last_instance = last
-            llm_provider_id = last_instance.llm_provider_id
-            llm_model_binding_id = last_instance.llm_model_binding_id
-            llm_policy_group_id = last_instance.llm_policy_group_id
-            llm_policy_snapshot_json = dict(last_instance.llm_policy_snapshot_json or {})
-            # conversation_id 优先用 scene 已绑定的；否则用上一条 instance 的（应当一致，
-            # 但 scene 字段允许在首次执行后异步回填，做一次兜底）。
-            conversation_id = (
-                scene.bound_root_conversation_id or last_instance.conversation_id
-            )
-            mode = "recreated"
-        else:
-            if not request.fallback_llm_provider_id or not request.fallback_llm_model_binding_id:
-                raise ValueError(
-                    f"Scene 下首次创建 root agent instance 必须提供 fallback LLM"
-                    f" provider 与 model binding: {scene_id}"
+            task, instance = last
+            if task.is_terminal:
+                instance = self._service.reset_scene_root_agent_instance_for_next_task(
+                    task.task_id,
+                    instance.instance_id,
                 )
-            llm_provider_id = request.fallback_llm_provider_id
-            llm_model_binding_id = request.fallback_llm_model_binding_id
-            llm_policy_group_id = request.fallback_llm_policy_group_id
-            llm_policy_snapshot_json = dict(request.fallback_llm_policy_snapshot_json or {})
-            conversation_id = scene.bound_root_conversation_id  # 一般为 None
-            mode = "created"
+            self._ensure_scene_communication_stream(
+                stream_id=stream_id,
+                scene_id=scene_id,
+                workspace_path=workspace_path,
+                task=task,
+                instance=instance,
+            )
+            return AttachSceneResponse(
+                mode="resumed",
+                task=task,
+                instance=instance,
+                communication_stream_id=stream_id,
+                event_stream_url=event_stream_url,
+            )
 
-        # 3. 创建新 task + root instance
+        # 3. Scene 首次 attach：创建第一条 task + root instance。
+        if not request.fallback_llm_provider_id or not request.fallback_llm_model_binding_id:
+            raise ValueError(
+                f"Scene 下首次创建 root agent instance 必须提供 fallback LLM"
+                f" provider 与 model binding: {scene_id}"
+            )
+        llm_provider_id = request.fallback_llm_provider_id
+        llm_model_binding_id = request.fallback_llm_model_binding_id
+        llm_policy_group_id = request.fallback_llm_policy_group_id
+        llm_policy_snapshot_json = dict(request.fallback_llm_policy_snapshot_json or {})
+        mode = "created"
+
+        # 4. 创建首个 task + root instance；conversation_id 留空，由第一次用户消息创建独立 conversation。
         new_thread_id = f"thread-{uuid4()}"
         task, instance = self._service.create_task_with_root_agent_instance(
             thread_id=new_thread_id,
@@ -296,18 +334,12 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             llm_model_binding_id=llm_model_binding_id,
             llm_policy_group_id=llm_policy_group_id,
             llm_policy_snapshot_json=llm_policy_snapshot_json,
-            conversation_id=conversation_id,
+            conversation_id=None,
             scene_id=scene_id,
         )
 
-        # 4. 必要时回写 scene.bound_root_conversation_id：
-        #    instance.conversation_id 在 mode=recreated 时已存在；在 mode=created 时通常为 None
-        #    （由执行引擎首次运行后 bind），所以仅当 instance 已绑定且 scene 未绑定时回写。
-        if instance.conversation_id and not scene.bound_root_conversation_id:
-            self._scene_gateway.set_bound_root_conversation_id(
-                workspace_path, scene_id, instance.conversation_id,
-            )
-
+        # 5. Scene 通信流按 scene 维度复用；conversation_id 按 task 维度由执行引擎创建，
+        #    不再回写到 scene 形成跨 task 的对话上下文复用。
         self._ensure_scene_communication_stream(
             stream_id=stream_id,
             scene_id=scene_id,

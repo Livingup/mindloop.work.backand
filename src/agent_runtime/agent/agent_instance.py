@@ -87,15 +87,17 @@ def _require_non_blank(value: str, field_name: str) -> None:
 class AgentInstance:
     """Agent 运行时实例。
 
-    一个 AgentInstance 表示某个 task 内一次真实创建出来的 Agent 执行单元。
-    它引用静态 Agent 定义、LLM 服务商模型接入项和历史会话对象，
-    并独立维护自身状态。一个 task 内可以有任意多个 AgentInstance 并发执行。
+    AgentInstance 表示可执行的 Agent 运行主体。普通子实例仍然隶属于单个 task；
+    Scene 绑定的 root agent instance 是长期复用的主 Agent 运行主体，可以在同一个 Scene
+    下依次承载多个 task。每次 task 结束后，root instance 会清空本轮 conversation_id
+    与运行时间戳，回到可接收下一轮 task 的待命状态。
     """
 
     # Agent 运行时实例唯一标识。每次创建实例都应生成新的 instance_id。
     instance_id: str
 
-    # 所属任务 ID。一个任务内可以同时存在多个 Agent 实例。
+    # 当前绑定的任务 ID。Scene root agent instance 会长期复用；它在同一时间只绑定一个当前 task，
+    # 当前 task 结束后可切换到下一轮新 task，历史 task 通过 root_agent_instance_id 保留审计关系。
     task_id: str
 
     # 所属线程 ID。线程用于区分同一任务内不同对话执行上下文。
@@ -112,7 +114,8 @@ class AgentInstance:
     # 本实例执行时选择的服务商模型接入项 ID。
     llm_model_binding_id: str
 
-    # 历史会话 ID。完整 Conversation 对象由 conversation_message 仓储维护，本实例只保存引用。
+    # 当前 task 的历史会话 ID。Scene root agent instance 在 end_task 后必须清空该字段，
+    # 下一轮新 task 会创建新的 conversation_id，避免不同用户任务的上下文互相污染。
     conversation_id: str | None
 
     # 执行日志 trace 标识。日志系统可用该字段把实例运行过程与日志链路关联起来。
@@ -196,6 +199,65 @@ class AgentInstance:
         if self.conversation_id is not None:
             raise ValueError("Agent 实例已经绑定其他 conversation_id，不能覆盖。")
         return replace(self, conversation_id=conversation_id, updated_at=at or _utc_now())
+
+    def reset_for_next_scene_task(
+        self,
+        *,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        """将 Scene root agent instance 恢复为等待下一轮 task 的待命状态。
+
+        end_task 的业务语义是完成当前 task，而不是销毁 Scene 的主 Agent。
+        因此 root instance 需要保留 instance_id、Agent 定义、LLM 策略和工作目录，
+        但必须清空本轮 task 的 conversation_id 与运行时间戳，避免下一轮任务复用旧会话上下文。
+        """
+        now = at or _utc_now()
+        return replace(
+            self,
+            conversation_id=None,
+            status=AGENT_INSTANCE_STATUS_CREATED,
+            updated_at=now,
+            started_at=None,
+            paused_at=None,
+            finished_at=None,
+            failed_at=None,
+            failure_message=None,
+        )
+
+    def assign_to_new_scene_task(
+        self,
+        *,
+        task_id: str,
+        thread_id: str,
+        trace_id: str,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        """把长期复用的 Scene root agent instance 切换到新的当前 task。
+
+        每个用户任务必须拥有独立 task_id、thread_id、trace_id 和 conversation_id；
+        该方法只复用 root instance 的稳定身份、Agent 定义、工作目录和 LLM 策略。
+        调用方应先创建以本 instance_id 为 root_agent_instance_id 的新 AgentTask。
+        """
+        _require_non_blank(task_id, "task_id")
+        _require_non_blank(thread_id, "thread_id")
+        _require_non_blank(trace_id, "trace_id")
+        if self.status == AGENT_INSTANCE_STATUS_RUNNING:
+            raise ValueError("Agent 实例正在执行，不能切换到新的 Scene task。")
+        now = at or _utc_now()
+        return replace(
+            self,
+            task_id=task_id,
+            thread_id=thread_id,
+            conversation_id=None,
+            trace_id=trace_id,
+            status=AGENT_INSTANCE_STATUS_CREATED,
+            updated_at=now,
+            started_at=None,
+            paused_at=None,
+            finished_at=None,
+            failed_at=None,
+            failure_message=None,
+        )
 
     def switch_llm_policy(
         self,

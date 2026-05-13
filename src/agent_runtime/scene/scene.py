@@ -45,11 +45,11 @@ class Scene:
     - project_id 必须存在；引用关系由领域服务层校验，仓储层不强制外键以便回填灵活。
     - status 仅限 'active' / 'archived'；archived 场景不允许创建新 task（领域服务拒绝）。
     - bound_agent_definition_id 永久绑定主 Agent 定义；scene 创建时必填且**不可修改**，
-      所有运行实例（含跨 instance 重建）都使用同一 agent 定义；变更 Agent 等价于新建 scene。
-    - bound_root_conversation_id 是 scene 持有的对话上下文，首次在该 scene 下创建 root instance 时
-      由编排层回填；后续 instance 重建时复用以延续 LLM 历史。
-    - LLM 策略不与 scene 绑定，只属于 agent 实例（见 AgentInstance.llm_*）。重建实例时 LLM 策略
-      由编排层从该 scene 下最近一条 instance 拷贝；scene 模型本身不存任何 LLM 字段。
+      Scene 的长期 root agent instance 始终使用同一 agent 定义；变更 Agent 等价于新建 scene。
+    - bound_root_conversation_id 是旧版本跨 root instance 重建时复用会话的兼容字段。
+      新业务规则下 conversation_id 按 task 创建和清理，不再作为 Scene 跨 task 上下文复用依据。
+    - LLM 策略不与 scene 绑定，只属于 agent 实例（见 AgentInstance.llm_*）。Scene 长期 root instance
+      会保留运行中切换后的 LLM 策略，后续 task 复用同一 root instance 时继续沿用该策略。
     - 状态流转：active <-> archived 可双向切换；不允许直接删除（删除是仓储级硬删除）。
     """
 
@@ -77,9 +77,9 @@ class Scene:
     # 最近一次活动时间（发送消息、收到事件、状态切换等都会更新）。前端按此倒序排列。
     last_active_at: datetime = None  # type: ignore[assignment]
 
-    # 该 scene 持有的对话上下文 ID。首次创建 root instance 时由编排层回填；
-    # 后续 instance 重建时把它作为 conversation_id 复用，确保 LLM 历史连续。
-    # None 表示该 scene 还未被任何 instance 绑定过对话上下文。
+    # 旧版本 scene 级对话上下文 ID。当前业务要求每个 task 创建独立 conversation_id，
+    # 因此该字段仅作为历史兼容数据保留，新 task 不再读取它作为会话复用依据。
+    # None 表示该 scene 从未写入过旧版 scene 级 conversation。
     bound_root_conversation_id: str | None = None
 
     # 预留扩展字段。
@@ -144,9 +144,8 @@ class Scene:
         """更新场景的可变元数据，返回新副本。
 
         bound_agent_definition_id 永久绑定不可修改；如需更换 Agent 请新建 scene。
-        bound_root_conversation_id 通过专用方法 ``with_bound_root_conversation_id`` 设置，
-        语义上由编排层在首次创建 root instance 时回填，不属于"用户可改的元数据"。
-        所有参数都是 None 表示不变。
+        bound_root_conversation_id 是历史兼容字段，不再作为新 task 的 conversation 复用依据，
+        也不属于用户可改的元数据。所有参数都是 None 表示不变。
         """
         values: dict[str, Any] = {}
         if name is not None:
@@ -161,11 +160,11 @@ class Scene:
         return replace(self, **values)
 
     def with_bound_root_conversation_id(self, conversation_id: str) -> "Scene":
-        """回填 bound_root_conversation_id，返回新副本。
+        """回填旧版 scene 级 bound_root_conversation_id，返回新副本。
 
-        由编排层在 scene 下首次创建 root agent instance 后调用，把新 instance 的
-        conversation_id 持久化到 scene；此后所有重建的 instance 都会复用这个 conversation_id
-        以保证 LLM 历史不丢失。
+        该字段保留给已写入 scene 级 conversation 的历史数据兼容。新业务规则要求
+        每个 task 独立创建 conversation_id，并在 end_task 后从 root agent instance 清空，
+        因此新编排流程不应再依赖该字段实现跨 task 会话复用。
 
         Raises:
             ValueError: conversation_id 为空或当前 scene 已绑定其它 conversation_id。
