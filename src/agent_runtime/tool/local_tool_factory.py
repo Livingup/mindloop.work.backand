@@ -49,6 +49,7 @@ class LocalToolFactory:
         """
         import agent_runtime.agent_lifecycle.agent_lifecycle_tool  # noqa: F401
         import agent_runtime.file_tools.file_tools  # noqa: F401
+        import agent_runtime.file_tools.file_edit_tools  # noqa: F401
         import agent_runtime.frontend_debug.frontend_debug_tool  # noqa: F401
         import agent_runtime.terminal.terminal_tool  # noqa: F401
 

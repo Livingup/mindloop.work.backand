@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import locale
 import re
@@ -83,6 +84,49 @@ def _is_binary_file(path: Path) -> bool:
     with path.open("rb") as file:
         sample = file.read(4096)
     return b"\0" in sample
+
+
+def _sha256_file(path: Path) -> str:
+    """计算文件内容 SHA256，供 Agent 修改文件前做并发版本校验。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _detect_text_newline_info(path: Path, encoding: str) -> dict[str, Any]:
+    """识别文本文件换行风格和结尾换行，用于辅助后续安全编辑。"""
+
+    newline_counts = {"CRLF": 0, "LF": 0, "CR": 0}
+    has_final_newline = False
+    with path.open("r", encoding=encoding, errors="strict", newline="") as file:
+        for raw_line in file:
+            if raw_line.endswith("\r\n"):
+                newline_counts["CRLF"] += 1
+                has_final_newline = True
+            elif raw_line.endswith("\n"):
+                newline_counts["LF"] += 1
+                has_final_newline = True
+            elif raw_line.endswith("\r"):
+                newline_counts["CR"] += 1
+                has_final_newline = True
+            else:
+                has_final_newline = False
+    used_styles = [name for name, count in newline_counts.items() if count > 0]
+    if not used_styles:
+        newline = "NONE"
+    elif len(used_styles) == 1:
+        newline = used_styles[0]
+    else:
+        newline = "MIXED"
+    return {
+        "content_sha256": _sha256_file(path),
+        "newline": newline,
+        "newline_counts": newline_counts,
+        "has_final_newline": has_final_newline,
+    }
 
 
 def _normalize_extensions(extensions: list[str]) -> set[str]:
@@ -579,6 +623,7 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
         )
 
     output["encoding"] = used_encoding
+    output.update(_detect_text_newline_info(path, used_encoding))
     return BaseToolResult(output=output)
 
 
