@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import typing
 from typing import Any
 
@@ -125,6 +126,7 @@ class LocalToolService:
             KeyError: 工具不存在。
         """
         tool_def = self._repo.get_by_name(tool_name)
+        started_at = time.perf_counter()
         logger.info("执行本地工具: %s, 参数: %s", tool_name, params)
         try:
             kwargs = _build_tool_call_kwargs(tool_def.fn, params, runtime_context)
@@ -132,13 +134,24 @@ class LocalToolService:
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            logger.exception("本地工具执行失败: %s", tool_name)
+            logger.exception(
+                "本地工具执行失败: %s, 耗时=%sms",
+                tool_name,
+                int((time.perf_counter() - started_at) * 1000),
+            )
             return build_tool_error_result(
                 error_code=exc.__class__.__name__,
                 error_message=str(exc),
             )
         unified_result = wrap_tool_output(result)
         if unified_result.loop_decision not in tool_def.allowed_loop_decisions:
+            logger.warning(
+                "本地工具返回不允许的循环决策: %s, loop_decision=%s, allowed=%s, 耗时=%sms",
+                tool_name,
+                unified_result.loop_decision,
+                tool_def.allowed_loop_decisions,
+                int((time.perf_counter() - started_at) * 1000),
+            )
             return build_tool_error_result(
                 error_code="LoopDecisionNotAllowed",
                 error_message=(
@@ -146,6 +159,14 @@ class LocalToolService:
                     f"{unified_result.loop_decision}"
                 ),
             )
+        logger.info(
+            "本地工具执行完成: %s, success=%s, execution_status=%s, loop_decision=%s, 耗时=%sms",
+            tool_name,
+            unified_result.success,
+            unified_result.execution_status,
+            unified_result.loop_decision,
+            int((time.perf_counter() - started_at) * 1000),
+        )
         return unified_result
 
     # ── 业务用例 4：获取工具 wiki 列表 ────────────────────────────────

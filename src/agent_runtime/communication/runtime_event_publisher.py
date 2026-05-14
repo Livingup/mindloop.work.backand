@@ -2,7 +2,9 @@
 """运行时通信上下文与事件发布器。"""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import uuid4
@@ -13,6 +15,8 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
 )
 
 logger = logging.getLogger(__name__)
+_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS = 5.0
+_RUNTIME_EVENT_PUBLISH_SLOW_LOG_SECONDS = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,18 +116,37 @@ class CommunicationRuntimeEventPublisher:
             merged_metadata["trace_id"] = context.trace_id
         if metadata:
             merged_metadata.update(metadata)
+        started_at = time.perf_counter()
         try:
-            await self._communication_gateway.publish_message(
-                PublishCommunicationMessageRequest(
-                    stream_id=context.stream_id,
-                    message_type=event_type,
-                    payload=dict(payload or {}),
-                    source=source or context.actor_type,
-                    actor_id=context.actor_id,
-                    correlation_id=correlation_id,
-                    parent_message_id=parent_message_id,
-                    metadata=merged_metadata,
+            await asyncio.wait_for(
+                self._communication_gateway.publish_message(
+                    PublishCommunicationMessageRequest(
+                        stream_id=context.stream_id,
+                        message_type=event_type,
+                        payload=dict(payload or {}),
+                        source=source or context.actor_type,
+                        actor_id=context.actor_id,
+                        correlation_id=correlation_id,
+                        parent_message_id=parent_message_id,
+                        metadata=merged_metadata,
+                    )
+                ),
+                timeout=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+            )
+            duration_seconds = time.perf_counter() - started_at
+            if duration_seconds >= _RUNTIME_EVENT_PUBLISH_SLOW_LOG_SECONDS:
+                logger.warning(
+                    "发布运行时通信事件较慢: stream_id=%s event_type=%s duration_ms=%s",
+                    context.stream_id,
+                    event_type,
+                    int(duration_seconds * 1000),
                 )
+        except asyncio.TimeoutError:
+            logger.error(
+                "发布运行时通信事件超时，已跳过以避免阻塞 Agent 主流程: stream_id=%s event_type=%s timeout_seconds=%s",
+                context.stream_id,
+                event_type,
+                _RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
             )
         except Exception:  # noqa: BLE001 - 实时通知失败不能反向拖垮 Agent 执行
             logger.exception("发布运行时通信事件失败: stream_id=%s event_type=%s", context.stream_id, event_type)

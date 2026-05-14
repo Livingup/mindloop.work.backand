@@ -2,6 +2,8 @@
 """通用通信领域服务。"""
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
@@ -9,6 +11,9 @@ from agent_runtime.communication.communication_message import CommunicationMessa
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
 from agent_runtime.communication.message_bus import InMemoryCommunicationMessageBus
+
+logger = logging.getLogger(__name__)
+_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS = 1.0
 
 
 def _new_id(prefix: str) -> str:
@@ -91,6 +96,14 @@ class CommunicationService:
         message_id: str | None = None,
     ) -> CommunicationMessage:
         """发布一条通信消息，并实时推送给当前进程内订阅者。"""
+        started_at = time.perf_counter()
+        logger.debug(
+            "通信消息发布开始: stream_id=%s, message_type=%s, source=%s, correlation_id=%s",
+            stream_id,
+            message_type,
+            source,
+            correlation_id,
+        )
         _require_non_blank(stream_id, "stream_id")
         _require_non_blank(message_type, "message_type")
         stream = self.get_stream(stream_id)
@@ -109,7 +122,26 @@ class CommunicationService:
             metadata=dict(metadata or {}),
         )
         saved = self._repository.append_message(message)
+        persisted_at = time.perf_counter()
+        persist_duration_seconds = persisted_at - started_at
+        if persist_duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
+            logger.warning(
+                "通信消息落库较慢: stream_id=%s, message_type=%s, seq=%s, duration_ms=%s",
+                stream_id,
+                message_type,
+                saved.seq,
+                int(persist_duration_seconds * 1000),
+            )
         await self._message_bus.publish(saved)
+        duration_seconds = time.perf_counter() - started_at
+        if duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
+            logger.warning(
+                "通信消息发布较慢: stream_id=%s, message_type=%s, seq=%s, duration_ms=%s",
+                stream_id,
+                message_type,
+                saved.seq,
+                int(duration_seconds * 1000),
+            )
         return saved
 
     def list_messages(

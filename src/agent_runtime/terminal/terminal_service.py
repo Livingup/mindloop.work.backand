@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,7 @@ from agent_runtime.terminal.terminal_process import TerminalProcessManager, Term
 from agent_runtime.terminal.terminal_repository import TerminalRepository
 
 ReadMode = Literal["tail", "page", "since", "search"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,10 +327,21 @@ class TerminalService:
         query: str | None = None,
         case_sensitive: bool = False,
     ) -> TerminalOutputReadResult:
+        started_at = time.perf_counter()
+        logger.info(
+            "读取终端输出开始: terminal_id=%s, command_id=%s, mode=%s, wait_timeout_ms=%s, limit_lines=%s, limit_chars=%s",
+            terminal_id,
+            command_id,
+            mode,
+            wait_timeout_ms,
+            limit_lines,
+            limit_chars,
+        )
         terminal = self._require_terminal(scope, terminal_id)
         effective_limit_chars = min(max(limit_chars, 1000), self._max_output_chars_per_read)
         if wait_timeout_ms > 0:
             await self._wait_for_output(terminal_id, command_id, after_chunk_index, wait_timeout_ms)
+        result: TerminalOutputReadResult
         if mode == "search":
             if not query:
                 raise ValueError("search 模式必须提供 query。")
@@ -357,7 +371,7 @@ class TerminalService:
             text = "".join(chunk.chunk for chunk in all_chunks)
             lines = text.splitlines(keepends=True)
             tail_text = "".join(lines[-max(1, tail_lines):])
-            return _build_read_result(
+            result = _build_read_result(
                 terminal_id=terminal_id,
                 command_id=command_id,
                 status=terminal.status,
@@ -366,8 +380,21 @@ class TerminalService:
                 limit_chars=effective_limit_chars,
                 has_more=len(lines) > tail_lines,
             )
+            logger.info(
+                "读取终端输出完成: terminal_id=%s, command_id=%s, mode=%s, chunks_returned=%s, text_chars=%s, truncated=%s, has_more=%s, status=%s, 耗时=%sms",
+                terminal_id,
+                command_id,
+                mode,
+                result.chunks_returned,
+                len(result.text),
+                result.truncated,
+                result.has_more,
+                result.status,
+                int((time.perf_counter() - started_at) * 1000),
+            )
+            return result
         text = "".join(chunk.chunk for chunk in chunks)
-        return _build_read_result(
+        result = _build_read_result(
             terminal_id=terminal_id,
             command_id=command_id,
             status=terminal.status,
@@ -376,6 +403,19 @@ class TerminalService:
             limit_chars=effective_limit_chars,
             has_more=len(chunks) >= limit_lines,
         )
+        logger.info(
+            "读取终端输出完成: terminal_id=%s, command_id=%s, mode=%s, chunks_returned=%s, text_chars=%s, truncated=%s, has_more=%s, status=%s, 耗时=%sms",
+            terminal_id,
+            command_id,
+            mode,
+            result.chunks_returned,
+            len(result.text),
+            result.truncated,
+            result.has_more,
+            result.status,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return result
 
     async def write_input(
         self,

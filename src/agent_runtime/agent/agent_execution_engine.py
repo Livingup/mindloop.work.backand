@@ -6,10 +6,11 @@ import asyncio
 import os
 import platform
 import logging
+import time
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, TypeVar
 
 from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING, AgentInstance
 from agent_runtime.agent.agent_task import AgentTask
@@ -69,7 +70,9 @@ from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecisio
 
 
 _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD = 5
+_AGENT_STAGE_PROGRESS_LOG_INTERVAL_SECONDS = 30.0
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +352,14 @@ class AgentExecutionEngine:
             or instance.instance_id in self._active_instance_ids
         )
         if is_running:
+            logger.info(
+                "Agent 实例正在运行，新用户消息进入等待队列: instance_id=%s, task_id=%s, pending_message_id=%s, status=%s, active_in_memory=%s",
+                instance.instance_id,
+                task.task_id,
+                pending_message.message_id,
+                instance.status,
+                instance.instance_id in self._active_instance_ids,
+            )
             return AgentMessageSubmissionResult(
                 status="queued",
                 task_id=task.task_id,
@@ -360,6 +371,12 @@ class AgentExecutionEngine:
                 queued_for_later=True,
                 instance=instance,
             )
+        logger.info(
+            "Agent 实例启动后台执行: instance_id=%s, task_id=%s, pending_message_id=%s",
+            instance.instance_id,
+            task.task_id,
+            pending_message.message_id,
+        )
         self._active_instance_ids.add(instance.instance_id)
         task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request))
         self._background_tasks.add(task_handle)
@@ -385,6 +402,8 @@ class AgentExecutionEngine:
             exc = task.exception()
             if exc is not None:
                 logger.error("Agent 后台执行失败。", exc_info=(type(exc), exc, exc.__traceback__))
+                return
+            logger.info("Agent 后台执行结束: instance_id=%s", instance_id)
 
     async def _run_agent_instance(
         self,
@@ -395,6 +414,14 @@ class AgentExecutionEngine:
         communication_context = self._build_communication_context(request, task, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         conversation: Any | None = None
+        loop_index = 0
+        logger.info(
+            "Agent 执行开始: task_id=%s, instance_id=%s, conversation_id=%s, stream_id=%s",
+            task.task_id,
+            instance.instance_id,
+            request.conversation_id or instance.conversation_id,
+            communication_context.stream_id,
+        )
         try:
             self._runtime_gateway.start_task(task.task_id)
             self._runtime_gateway.start_agent_instance(instance.instance_id)
@@ -409,7 +436,16 @@ class AgentExecutionEngine:
 
             plain_text_fallback_count = 0
             while True:
+                loop_index += 1
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                logger.info(
+                    "Agent 循环轮次开始: task_id=%s, instance_id=%s, loop_index=%s, status=%s, pending_user_messages=%s",
+                    task.task_id,
+                    instance.instance_id,
+                    loop_index,
+                    instance.status,
+                    len(instance.pending_user_messages),
+                )
                 await self._drain_pending_user_messages_to_conversation(
                     instance_id=instance.instance_id,
                     conversation=conversation,
@@ -419,14 +455,24 @@ class AgentExecutionEngine:
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
-                llm_response = await self._send_prompt_with_policy_failover(
-                    conversation=conversation,
-                    agent_definition=agent_definition,
-                    instance=instance,
-                    resolved_candidates=resolved_candidates,
-                    render_options=request.render_options,
-                    request_overrides=request.request_overrides,
-                    communication_context=communication_context,
+                llm_response = await _await_with_progress_logging(
+                    self._send_prompt_with_policy_failover(
+                        conversation=conversation,
+                        agent_definition=agent_definition,
+                        instance=instance,
+                        resolved_candidates=resolved_candidates,
+                        render_options=request.render_options,
+                        request_overrides=request.request_overrides,
+                        communication_context=communication_context,
+                    ),
+                    stage="llm_prompt",
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    metadata={
+                        "loop_index": loop_index,
+                        "conversation_id": conversation.id,
+                        "candidate_count": len(resolved_candidates),
+                    },
                 )
                 assistant_message = llm_response.assistant_message
                 await self._conversation_repository.save(conversation)
@@ -495,15 +541,33 @@ class AgentExecutionEngine:
                     continue
                 plain_text_fallback_count = 0
 
-                tool_result_message, tool_results = await self._execute_tool_uses(
-                    agent_definition,
-                    tool_uses,
-                    communication_context,
+                tool_result_message, tool_results = await _await_with_progress_logging(
+                    self._execute_tool_uses(
+                        agent_definition,
+                        tool_uses,
+                        communication_context,
+                    ),
+                    stage="tool_batch",
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    metadata={
+                        "loop_index": loop_index,
+                        "tool_count": len(tool_uses),
+                        "tool_names": [tool_use.name for tool_use in tool_uses],
+                    },
                 )
                 conversation.append_message(tool_result_message)
                 await self._conversation_repository.save(conversation)
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
+                logger.info(
+                    "Agent 循环工具结果已落库: task_id=%s, instance_id=%s, loop_index=%s, tool_count=%s, loop_decision=%s",
+                    task.task_id,
+                    instance.instance_id,
+                    loop_index,
+                    len(tool_results),
+                    loop_decision,
+                )
                 if loop_decision != "continue":
                     await self._apply_loop_decision(
                         loop_decision=loop_decision,
@@ -538,6 +602,13 @@ class AgentExecutionEngine:
             raise RuntimeError("Agent 执行循环异常结束。")
         except Exception as exc:
             failure_message = str(exc)
+            logger.exception(
+                "Agent 执行异常中断: task_id=%s, instance_id=%s, error_type=%s, error_message=%s",
+                task.task_id,
+                instance.instance_id,
+                exc.__class__.__name__,
+                failure_message,
+            )
             self._runtime_gateway.interrupt_agent_instance(instance.instance_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)
             await self._event_publisher.publish(
@@ -1103,6 +1174,12 @@ class AgentExecutionEngine:
         communication_context: RuntimeCommunicationContext,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
+        started_at = time.perf_counter()
+        logger.info(
+            "Agent 工具批执行开始: tool_count=%s, tool_names=%s",
+            len(tool_uses),
+            [tool_use.name for tool_use in tool_uses],
+        )
         result_parts = []
         tasks = [
             asyncio.create_task(self._execute_single_tool_use(
@@ -1118,6 +1195,12 @@ class AgentExecutionEngine:
             result_parts.append(result.result_part)
             tool_results.append(result.tool_result)
             await self._publish_tool_frontend_message(result.tool_result, result.result_part.tool_use_ref, communication_context)
+        logger.info(
+            "Agent 工具批执行完成: tool_count=%s, loop_decisions=%s, 耗时=%sms",
+            len(tool_results),
+            [result.loop_decision for result in tool_results],
+            int((time.perf_counter() - started_at) * 1000),
+        )
         return UniMessage(role=ROLE_TOOL, content=result_parts), tool_results
 
     async def _publish_tool_frontend_message(
@@ -1454,3 +1537,63 @@ def _failure_message_from_tool_results(tool_results: list[BaseToolResult]) -> st
         if result.loop_decision == "fail" and isinstance(result.output, str):
             return result.output
     return "工具返回 fail 循环决策。"
+
+
+async def _await_with_progress_logging(
+    awaitable: Awaitable[_T],
+    *,
+    stage: str,
+    task_id: str,
+    instance_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> _T:
+    started_at = time.perf_counter()
+    task = asyncio.ensure_future(awaitable)
+    metadata = dict(metadata or {})
+    logger.info(
+        "Agent 阶段开始: stage=%s, task_id=%s, instance_id=%s, metadata=%s",
+        stage,
+        task_id,
+        instance_id,
+        metadata,
+    )
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {task},
+                timeout=_AGENT_STAGE_PROGRESS_LOG_INTERVAL_SECONDS,
+            )
+            if done:
+                result = task.result()
+                logger.info(
+                    "Agent 阶段完成: stage=%s, task_id=%s, instance_id=%s, 耗时=%sms, metadata=%s",
+                    stage,
+                    task_id,
+                    instance_id,
+                    int((time.perf_counter() - started_at) * 1000),
+                    metadata,
+                )
+                return result
+            logger.warning(
+                "Agent 阶段仍在执行: stage=%s, task_id=%s, instance_id=%s, 已耗时=%sms, metadata=%s",
+                stage,
+                task_id,
+                instance_id,
+                int((time.perf_counter() - started_at) * 1000),
+                metadata,
+            )
+    except asyncio.CancelledError:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        raise
+    except Exception:
+        logger.exception(
+            "Agent 阶段失败: stage=%s, task_id=%s, instance_id=%s, 耗时=%sms, metadata=%s",
+            stage,
+            task_id,
+            instance_id,
+            int((time.perf_counter() - started_at) * 1000),
+            metadata,
+        )
+        raise

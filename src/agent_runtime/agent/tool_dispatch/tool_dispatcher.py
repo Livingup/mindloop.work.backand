@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +36,7 @@ from agent_runtime.tool.tool_execution_models import (
 
 
 AGENT_MCP_TOOL_NAME_PREFIX = "mcp__"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +137,12 @@ class AgentToolDispatcher:
         source = "mcp" if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX) else "local"
         tool_call_id = _tool_use_ref(tool_use)
         started_at = time.perf_counter()
+        logger.info(
+            "Agent 工具调用开始: tool=%s, source=%s, tool_call_id=%s",
+            tool_use.name,
+            source,
+            tool_call_id,
+        )
         await self._event_publisher.publish(
             communication_context,
             "tool.call.started",
@@ -151,11 +159,24 @@ class AgentToolDispatcher:
             correlation_id=tool_call_id,
         )
         try:
+            logger.info(
+                "Agent 工具调用进入执行: tool=%s, source=%s, tool_call_id=%s",
+                tool_use.name,
+                source,
+                tool_call_id,
+            )
             if source == "mcp":
                 result = await self._dispatch_mcp_tool(agent_definition, tool_use)
             else:
                 result = await self._dispatch_local_tool(agent_definition, tool_use, communication_context)
         except Exception as exc:
+            logger.exception(
+                "Agent 工具调用失败: tool=%s, source=%s, tool_call_id=%s, 耗时=%sms",
+                tool_use.name,
+                source,
+                tool_call_id,
+                int((time.perf_counter() - started_at) * 1000),
+            )
             await self._event_publisher.publish(
                 communication_context,
                 "tool.call.failed",
@@ -172,6 +193,16 @@ class AgentToolDispatcher:
                 correlation_id=tool_call_id,
             )
             raise
+        logger.info(
+            "Agent 工具调用完成: tool=%s, source=%s, tool_call_id=%s, success=%s, execution_status=%s, loop_decision=%s, 耗时=%sms",
+            result.tool_name,
+            result.source,
+            tool_call_id,
+            result.tool_result.success,
+            result.tool_result.execution_status,
+            result.tool_result.loop_decision,
+            int((time.perf_counter() - started_at) * 1000),
+        )
         await self._event_publisher.publish(
             communication_context,
             "tool.call.completed",
