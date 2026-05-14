@@ -102,6 +102,11 @@ class CommunicationGateway(Protocol):
         """读取某条通信流最新一段历史消息，并按 seq 升序返回。"""
         ...
 
-    async def subscribe_messages(self, stream_id: str) -> AsyncIterator[CommunicationMessage]:
+    async def subscribe_messages(
+        self,
+        stream_id: str,
+        *,
+        after_seq: int = 0,
+    ) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         ...

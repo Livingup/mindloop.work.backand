@@ -10,7 +10,7 @@ from uuid import uuid4
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
-from agent_runtime.communication.message_bus import InMemoryCommunicationMessageBus
+from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
 
 logger = logging.getLogger(__name__)
 _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS = 1.0
@@ -39,13 +39,15 @@ class CommunicationService:
     def __init__(
         self,
         repository: CommunicationRepository,
-        message_bus: InMemoryCommunicationMessageBus,
+        event_hub: InMemoryCommunicationEventHub,
     ) -> None:
-        # 通信流与消息日志仓储。负责权威历史存储和断线恢复。
+        # 通信流元数据仓储。runtime event 不再通过 SQLite 消息日志承载。
         self._repository = repository
 
-        # 进程内实时消息总线。负责把新消息推给当前进程中的在线订阅连接。
-        self._message_bus = message_bus
+        # 进程内短期事件流。负责 stream 内 seq、短时间断线续传和 SSE 订阅分发。
+        self._event_hub = event_hub
+
+        self._stream_cache: dict[str, CommunicationStream] = {}
 
     def create_stream(
         self,
@@ -65,21 +67,29 @@ class CommunicationService:
             owner_id=owner_id,
             metadata=dict(metadata or {}),
         )
-        return self._repository.create_stream(stream)
+        created = self._repository.create_stream(stream)
+        self._stream_cache[created.stream_id] = created
+        return created
 
     def get_stream(self, stream_id: str) -> CommunicationStream:
         """按 stream_id 获取通信流。"""
         _require_non_blank(stream_id, "stream_id")
+        cached = self._stream_cache.get(stream_id)
+        if cached is not None:
+            return cached
         stream = self._repository.get_stream(stream_id)
         if stream is None:
             raise KeyError(f"通信流不存在: {stream_id}")
+        self._stream_cache[stream_id] = stream
         return stream
 
     def close_stream(self, stream_id: str) -> CommunicationStream:
         """关闭通信流。"""
         stream = self.get_stream(stream_id)
         closed = stream.close()
-        return self._repository.save_stream(closed)
+        saved = self._repository.save_stream(closed)
+        self._stream_cache[saved.stream_id] = saved
+        return saved
 
     async def publish_message(
         self,
@@ -121,18 +131,7 @@ class CommunicationService:
             payload=dict(payload or {}),
             metadata=dict(metadata or {}),
         )
-        saved = self._repository.append_message(message)
-        persisted_at = time.perf_counter()
-        persist_duration_seconds = persisted_at - started_at
-        if persist_duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
-            logger.warning(
-                "通信消息落库较慢: stream_id=%s, message_type=%s, seq=%s, duration_ms=%s",
-                stream_id,
-                message_type,
-                saved.seq,
-                int(persist_duration_seconds * 1000),
-            )
-        await self._message_bus.publish(saved)
+        saved = await self._event_hub.publish(message)
         duration_seconds = time.perf_counter() - started_at
         if duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
             logger.warning(
@@ -154,7 +153,7 @@ class CommunicationService:
         """读取某条通信流中的历史消息。"""
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        return self._repository.list_messages(
+        return self._event_hub.list_messages(
             stream_id,
             after_seq=max(after_seq, 0),
             limit=max(min(limit, 5000), 1),
@@ -173,14 +172,19 @@ class CommunicationService:
         """
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        return self._repository.list_latest_messages(
+        return self._event_hub.list_latest_messages(
             stream_id,
             limit=max(min(limit, 5000), 1),
         )
 
-    async def subscribe_messages(self, stream_id: str) -> AsyncIterator[CommunicationMessage]:
+    async def subscribe_messages(
+        self,
+        stream_id: str,
+        *,
+        after_seq: int = 0,
+    ) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        async for message in self._message_bus.subscribe(stream_id):
+        async for message in self._event_hub.subscribe(stream_id, after_seq=max(after_seq, 0)):
             yield message

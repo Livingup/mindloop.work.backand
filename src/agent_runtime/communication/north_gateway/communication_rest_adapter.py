@@ -169,12 +169,7 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"通信流不存在: {stream_id}")
 
         async def event_generator() -> AsyncIterator[str]:
-            for message in gateway.list_messages(stream_id, after_seq=after_seq, limit=5000):
-                if await request.is_disconnected():
-                    return
-                yield _format_sse_message(message)
-
-            subscription = gateway.subscribe_messages(stream_id)
+            subscription = gateway.subscribe_messages(stream_id, after_seq=after_seq)
             next_message = asyncio.create_task(anext(subscription))
             try:
                 while True:

@@ -572,6 +572,8 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
     """从 YAML 字典构建通用通信模块配置。"""
     return CommunicationConfig(
         data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
+        replay_buffer_size=int(data.get("replay_buffer_size", 5000)),
+        subscriber_queue_size=int(data.get("subscriber_queue_size", 1000)),
     )
 
 

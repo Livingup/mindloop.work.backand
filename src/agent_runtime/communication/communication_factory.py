@@ -6,10 +6,10 @@ from threading import RLock
 
 from agent_runtime.communication.communication_config import CommunicationConfig
 from agent_runtime.communication.communication_service import CommunicationService
+from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
 from agent_runtime.communication.infrastructure.sqlite_communication_repository import (
     SqliteCommunicationRepository,
 )
-from agent_runtime.communication.message_bus import InMemoryCommunicationMessageBus
 from agent_runtime.communication.north_gateway.communication_gateway_impl import (
     CommunicationGatewayImpl,
 )
@@ -23,19 +23,22 @@ class CommunicationFactory:
 
     _lock = RLock()
     _gateway: CommunicationGatewayImpl | None = None
-    _config_signature: tuple[str] | None = None
+    _config_signature: tuple[str, int, int] | None = None
 
     @classmethod
     def create(cls) -> CommunicationGatewayImpl:
         """创建或返回进程内共享的通用通信北向网关。"""
         with cls._lock:
             config = cls._read_config()
-            signature = (config.data_dir,)
+            signature = (config.data_dir, config.replay_buffer_size, config.subscriber_queue_size)
             if cls._gateway is None or cls._config_signature != signature:
                 data_dir_accessor = cls._build_data_dir_accessor(config)
                 repository = SqliteCommunicationRepository(data_dir_accessor=data_dir_accessor)
-                message_bus = InMemoryCommunicationMessageBus()
-                service = CommunicationService(repository, message_bus)
+                event_hub = InMemoryCommunicationEventHub(
+                    replay_buffer_size=config.replay_buffer_size,
+                    subscriber_queue_size=config.subscriber_queue_size,
+                )
+                service = CommunicationService(repository, event_hub)
                 cls._gateway = CommunicationGatewayImpl(service)
                 cls._config_signature = signature
             return cls._gateway

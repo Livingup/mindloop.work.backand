@@ -16,7 +16,15 @@ class CommunicationConfig:
     # 通信流和消息日志 SQLite 数据目录。
     data_dir: str = "~/.spread-ai/communication"
 
+    replay_buffer_size: int = 5000
+
+    subscriber_queue_size: int = 1000
+
     def __post_init__(self) -> None:
         """校验通信模块配置合法性。"""
         if not isinstance(self.data_dir, str) or not self.data_dir.strip():
             raise ValueError("communication.data_dir 不能为空。")
+        if self.replay_buffer_size <= 0:
+            raise ValueError("communication.replay_buffer_size 必须大于 0。")
+        if self.subscriber_queue_size <= 0:
+            raise ValueError("communication.subscriber_queue_size 必须大于 0。")
