@@ -251,6 +251,7 @@ def serve(host: str | None, port: int | None) -> None:
     )
     from agent_runtime.file_tools.workspace_rest_adapter import create_workspace_router
     from agent_runtime.communication.communication_factory import CommunicationFactory
+    from agent_runtime.chat_bubble.chat_bubble_factory import ChatBubbleFactory
     from agent_runtime.communication.north_gateway.communication_rest_adapter import (
         create_communication_router,
     )
@@ -268,6 +269,7 @@ def serve(host: str | None, port: int | None) -> None:
     mcp_gateway = McpClientFactory.create()
     agent_definition_gateway = AgentDefinitionFactory.create()
     communication_gateway = CommunicationFactory.create()
+    chat_bubble_service = ChatBubbleFactory.create()
     # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
     # 以支持 attach_scene 编排（前端进入 scene 的统一入口）。
     scene_gateway = SceneFactory.create()
@@ -385,6 +387,7 @@ def serve(host: str | None, port: int | None) -> None:
             agent_definition_gateway,
             scene_gateway=scene_gateway,
             session_registry=scene_session_registry,
+            chat_bubble_service=chat_bubble_service,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],

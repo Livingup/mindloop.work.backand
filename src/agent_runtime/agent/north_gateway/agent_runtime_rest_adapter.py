@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agent_runtime.agent.agent_instance import AgentInstance
+from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
 from agent_runtime.agent.agent_execution_engine import (
     AgentExecutionEngine,
     AgentExecutionResult,
@@ -29,6 +29,15 @@ from agent_runtime.llm_model_registry.llm_model_registry_service import (
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelRegistryGateway,
 )
+from agent_runtime.chat_bubble.chat_bubble_message import (
+    CHAT_BUBBLE_STATUS_COMPLETED,
+    ChatBubbleInteractionOption,
+    ChatBubbleMessage,
+    ChatBubbleRole,
+    ChatBubbleStatus,
+    ChatBubbleTextFormat,
+)
+from agent_runtime.chat_bubble.chat_bubble_service import ChatBubbleService
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
 
@@ -57,6 +66,13 @@ class AgentRuntimeTaskResponse(BaseModel):
     scene_id: str | None = None
 
 
+class PendingUserMessageResponse(BaseModel):
+    message_id: str
+    user_text: str
+    client_message_id: str | None = None
+    received_at: str
+
+
 class AgentInstanceResponse(BaseModel):
     instance_id: str
     task_id: str
@@ -71,8 +87,74 @@ class AgentInstanceResponse(BaseModel):
     trace_id: str
     status: str
     pending_user_message_count: int = 0
+    pending_user_messages: list[PendingUserMessageResponse] = Field(default_factory=list)
     created_at: str
     updated_at: str
+
+
+class ChatBubbleInteractionOptionModel(BaseModel):
+    id: str
+    label: str
+    description: str | None = None
+
+
+class ChatBubbleMessageResponse(BaseModel):
+    bubble_id: str
+    scene_id: str
+    agent_instance_id: str | None = None
+    task_id: str | None = None
+    conversation_id: str | None = None
+    role: str
+    status: str
+    text: str
+    text_format: str
+    channel: str | None = None
+    client_message_id: str | None = None
+    backend_message_id: str | None = None
+    pending_message_id: str | None = None
+    interaction_options: list[ChatBubbleInteractionOptionModel] = Field(default_factory=list)
+    selected_option_id: str | None = None
+    sort_order: int
+    created_at: str
+    updated_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ListChatBubbleMessagesResponse(BaseModel):
+    messages: list[ChatBubbleMessageResponse]
+    limit: int
+    before_sort_order: int | None = None
+
+
+class CreateChatBubbleMessageBody(BaseModel):
+    bubble_id: str | None = None
+    agent_instance_id: str | None = None
+    task_id: str | None = None
+    conversation_id: str | None = None
+    role: ChatBubbleRole
+    status: ChatBubbleStatus = CHAT_BUBBLE_STATUS_COMPLETED
+    text: str
+    text_format: ChatBubbleTextFormat = "markdown"
+    channel: str | None = "web"
+    client_message_id: str | None = None
+    backend_message_id: str | None = None
+    pending_message_id: str | None = None
+    interaction_options: list[ChatBubbleInteractionOptionModel] = Field(default_factory=list)
+    selected_option_id: str | None = None
+    sort_order: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class PatchChatBubbleMessageBody(BaseModel):
+    status: ChatBubbleStatus | None = None
+    text: str | None = None
+    text_format: ChatBubbleTextFormat | None = None
+    channel: str | None = None
+    backend_message_id: str | None = None
+    pending_message_id: str | None = None
+    interaction_options: list[ChatBubbleInteractionOptionModel] | None = None
+    selected_option_id: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class CreateRootAgentInstanceResponse(BaseModel):
@@ -168,6 +250,7 @@ def create_agent_runtime_router(
     agent_definition_gateway: AgentDefinitionNorthGateway | None = None,
     scene_gateway: SceneGateway | None = None,
     session_registry: SceneSessionRegistry | None = None,
+    chat_bubble_service: ChatBubbleService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -393,6 +476,121 @@ def create_agent_runtime_router(
             cancelled_instance_count=response.cancelled_instance_count,
         )
 
+    @router.get("/scenes/{scene_id}/chat-bubbles", response_model=ListChatBubbleMessagesResponse)
+    def list_scene_chat_bubbles(
+        scene_id: str,
+        limit: int = Query(default=100, ge=1, le=500),
+        before_sort_order: int | None = Query(default=None, ge=0),
+        agent_instance_id: str | None = None,
+    ) -> ListChatBubbleMessagesResponse:
+        """读取 Scene 的前端历史消息气泡。
+
+        Chat Bubble 是前端 UI 展示状态，不从 communication event log 回放生成。前端打开 Scene
+        时应调用本接口恢复消息气泡列表；事件日志仍只用于 SSE、审计和调试。
+        """
+        if chat_bubble_service is None:
+            raise HTTPException(status_code=501, detail="Chat Bubble 服务未启用。")
+        try:
+            messages = chat_bubble_service.list_scene_messages(
+                scene_id,
+                limit=limit,
+                before_sort_order=before_sort_order,
+                agent_instance_id=agent_instance_id,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return ListChatBubbleMessagesResponse(
+            messages=[_chat_bubble_response(message) for message in messages],
+            limit=limit,
+            before_sort_order=before_sort_order,
+        )
+
+    @router.post(
+        "/scenes/{scene_id}/chat-bubbles",
+        response_model=ChatBubbleMessageResponse,
+        status_code=201,
+    )
+    def create_scene_chat_bubble(
+        scene_id: str,
+        body: CreateChatBubbleMessageBody,
+    ) -> ChatBubbleMessageResponse:
+        """创建一条前端消息气泡。
+
+        前端在用户消息真正进入 chat 列表、assistant 消息展示或交互问题展示时调用；
+        queued_for_later 的用户消息只展示在浮层，暂不写入 Chat Bubble 表。
+        """
+        if chat_bubble_service is None:
+            raise HTTPException(status_code=501, detail="Chat Bubble 服务未启用。")
+        try:
+            message = chat_bubble_service.create_message(
+                scene_id=scene_id,
+                bubble_id=body.bubble_id,
+                agent_instance_id=body.agent_instance_id,
+                task_id=body.task_id,
+                conversation_id=body.conversation_id,
+                role=body.role,
+                status=body.status,
+                text=body.text,
+                text_format=body.text_format,
+                channel=body.channel,
+                client_message_id=body.client_message_id,
+                backend_message_id=body.backend_message_id,
+                pending_message_id=body.pending_message_id,
+                interaction_options=_interaction_options_tuple(body.interaction_options),
+                selected_option_id=body.selected_option_id,
+                sort_order=body.sort_order,
+                metadata=body.metadata,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _chat_bubble_response(message)
+
+    @router.patch(
+        "/scenes/{scene_id}/chat-bubbles/{bubble_id}",
+        response_model=ChatBubbleMessageResponse,
+    )
+    def patch_scene_chat_bubble(
+        scene_id: str,
+        bubble_id: str,
+        body: PatchChatBubbleMessageBody,
+    ) -> ChatBubbleMessageResponse:
+        """更新一条前端消息气泡展示状态。"""
+        if chat_bubble_service is None:
+            raise HTTPException(status_code=501, detail="Chat Bubble 服务未启用。")
+        try:
+            message = chat_bubble_service.patch_message(
+                scene_id=scene_id,
+                bubble_id=bubble_id,
+                status=body.status,
+                text=body.text,
+                text_format=body.text_format,
+                channel=body.channel,
+                backend_message_id=body.backend_message_id,
+                pending_message_id=body.pending_message_id,
+                interaction_options=(
+                    _interaction_options_tuple(body.interaction_options)
+                    if body.interaction_options is not None
+                    else None
+                ),
+                selected_option_id=body.selected_option_id,
+                metadata=body.metadata,
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return _chat_bubble_response(message)
+
+    @router.delete("/scenes/{scene_id}/chat-bubbles/{bubble_id}", status_code=204)
+    def delete_scene_chat_bubble(scene_id: str, bubble_id: str) -> None:
+        """删除一条前端消息气泡。"""
+        if chat_bubble_service is None:
+            raise HTTPException(status_code=501, detail="Chat Bubble 服务未启用。")
+        try:
+            chat_bubble_service.delete_message(scene_id=scene_id, bubble_id=bubble_id)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     return router
 
 
@@ -583,8 +781,61 @@ def _instance_response(instance: AgentInstance) -> AgentInstanceResponse:
         trace_id=instance.trace_id,
         status=instance.status,
         pending_user_message_count=len(instance.pending_user_messages),
+        pending_user_messages=[
+            _pending_user_message_response(message)
+            for message in instance.pending_user_messages
+        ],
         created_at=_datetime_text(instance.created_at),
         updated_at=_datetime_text(instance.updated_at),
+    )
+
+
+def _pending_user_message_response(message: PendingAgentUserMessage) -> PendingUserMessageResponse:
+    return PendingUserMessageResponse(
+        message_id=message.message_id,
+        user_text=message.user_text,
+        client_message_id=message.client_message_id,
+        received_at=_datetime_text(message.received_at),
+    )
+
+
+def _interaction_options_tuple(
+    options: list[ChatBubbleInteractionOptionModel],
+) -> tuple[ChatBubbleInteractionOption, ...]:
+    return tuple(
+        ChatBubbleInteractionOption(
+            option_id=option.id,
+            label=option.label,
+            description=option.description,
+        )
+        for option in options
+    )
+
+
+def _chat_bubble_response(message: ChatBubbleMessage) -> ChatBubbleMessageResponse:
+    return ChatBubbleMessageResponse(
+        bubble_id=message.bubble_id,
+        scene_id=message.scene_id,
+        agent_instance_id=message.agent_instance_id,
+        task_id=message.task_id,
+        conversation_id=message.conversation_id,
+        role=message.role,
+        status=message.status,
+        text=message.text,
+        text_format=message.text_format,
+        channel=message.channel,
+        client_message_id=message.client_message_id,
+        backend_message_id=message.backend_message_id,
+        pending_message_id=message.pending_message_id,
+        interaction_options=[
+            ChatBubbleInteractionOptionModel(**option.to_json())
+            for option in message.interaction_options
+        ],
+        selected_option_id=message.selected_option_id,
+        sort_order=message.sort_order,
+        created_at=_datetime_text(message.created_at),
+        updated_at=_datetime_text(message.updated_at),
+        metadata=message.metadata,
     )
 
 
