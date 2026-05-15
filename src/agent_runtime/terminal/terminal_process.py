@@ -30,6 +30,9 @@ class TerminalProcessManager(Protocol):
     async def write_input(self, terminal_id: str, text: str) -> int:
         ...
 
+    async def interrupt_terminal(self, terminal_id: str) -> None:
+        ...
+
     async def terminate_terminal(self, terminal_id: str) -> None:
         ...
 

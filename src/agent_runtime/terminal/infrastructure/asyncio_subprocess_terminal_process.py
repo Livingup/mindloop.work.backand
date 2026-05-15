@@ -4,8 +4,11 @@ import asyncio
 import codecs
 import locale
 import os
+import signal
+import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from agent_runtime.terminal.terminal_process import (
     TerminalExitHandler,
@@ -52,24 +55,30 @@ class AsyncioSubprocessTerminalProcessManager(TerminalProcessManager):
         await running.process.stdin.drain()
         return len(data)
 
+    async def interrupt_terminal(self, terminal_id: str) -> None:
+        running = self._processes.get(terminal_id)
+        if running is None or running.process.returncode is not None:
+            raise KeyError(f"终端没有可中断的运行中进程: {terminal_id}")
+        try:
+            _send_interrupt(running.process)
+        except ProcessLookupError:
+            return
+        except Exception:
+            await _terminate_process(running.process, grace_seconds=1)
+            return
+        try:
+            await asyncio.wait_for(running.process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            await _force_kill_process(running.process)
+            await running.process.wait()
+
     async def terminate_terminal(self, terminal_id: str) -> None:
         running = self._processes.get(terminal_id)
         if running is None:
             return
         process = running.process
         if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(process.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                await process.wait()
+            await _terminate_process(process, grace_seconds=3)
         try:
             await asyncio.wait_for(running.task, timeout=3)
         except asyncio.TimeoutError:
@@ -105,10 +114,7 @@ class AsyncioSubprocessTerminalProcessManager(TerminalProcessManager):
                     await asyncio.wait_for(wait_task, timeout=request.timeout_ms / 1000)
                 except asyncio.TimeoutError:
                     error_message = f"命令执行超时: {request.timeout_ms}ms"
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
+                    await _force_kill_process(process)
                     await process.wait()
             else:
                 await wait_task
@@ -222,23 +228,84 @@ def _shell_argv(shell: str, command_line: str) -> list[str]:
 
 
 async def _create_subprocess(request: TerminalProcessStartRequest) -> asyncio.subprocess.Process:
+    process_kwargs = _process_kwargs(request)
     if _should_use_windows_cmd_shell(request.shell):
         return await asyncio.create_subprocess_shell(
             request.command_line,
-            cwd=request.cwd,
-            env=_process_env(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            **process_kwargs,
         )
     return await asyncio.create_subprocess_exec(
         *_shell_argv(request.shell, request.command_line),
-        cwd=request.cwd,
-        env=_process_env(),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        **process_kwargs,
     )
+
+
+def _process_kwargs(request: TerminalProcessStartRequest) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "cwd": request.cwd,
+        "env": _process_env(),
+        "stdin": asyncio.subprocess.PIPE,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+    }
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    return kwargs
+
+
+def _send_interrupt(process: asyncio.subprocess.Process) -> None:
+    if sys.platform.startswith("win"):
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+        return
+    os.killpg(process.pid, signal.SIGINT)
+
+
+async def _terminate_process(process: asyncio.subprocess.Process, *, grace_seconds: float) -> None:
+    if sys.platform.startswith("win"):
+        await _force_kill_process(process)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+        except asyncio.TimeoutError:
+            pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=grace_seconds)
+    except asyncio.TimeoutError:
+        await _force_kill_process(process)
+        await process.wait()
+
+
+async def _force_kill_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    if sys.platform.startswith("win"):
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            await killer.wait()
+            return
+        except Exception:
+            pass
+    try:
+        if sys.platform.startswith("win"):
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
 
 
 def _should_use_windows_cmd_shell(shell: str) -> bool:

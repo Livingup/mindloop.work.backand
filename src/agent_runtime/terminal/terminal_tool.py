@@ -48,7 +48,10 @@ class TerminalWriteInputToolRequest(BaseToolRequest):
     terminal_id: str = Field(description="要写入输入的终端 ID。")
     text: str | None = Field(default=None, description="要输入的文本。")
     append_newline: bool = Field(default=False, description="是否在文本末尾追加换行。")
-    control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(default=None, description="可选控制输入；设置后 text 可为空。")
+    control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(
+        default=None,
+        description="可选控制输入，仅支持 enter/ctrl_c/ctrl_d/escape；ctrl_c 会中断该终端正在运行的命令进程，设置后 text 可为空。",
+    )
 
 
 @tool(
@@ -84,7 +87,7 @@ async def terminal_create(request: TerminalCreateToolRequest, ctx: ToolRuntimeCo
 
 @tool(
     name="terminal_execute_command",
-    description="在当前任务/场景归属终端中启动命令。可指定 terminal_id/cwd/shell；不指定 terminal_id 时自动选择空闲终端或创建新终端。工具成功表示命令已开始异步执行，返回实际 cwd、terminal_id 和 command_id。",
+    description="在当前任务/场景归属终端中启动命令。一个 terminal_id 同时最多运行一个命令；长进程会占用该终端直到退出或被中断。可指定 terminal_id/cwd/shell；不指定 terminal_id 时自动选择空闲终端或创建新终端。工具成功表示命令已开始异步执行，返回实际 cwd、terminal_id 和 command_id。",
     group="terminal",
     category="business",
 )
@@ -151,7 +154,7 @@ async def terminal_read_output(request: TerminalReadOutputToolRequest, ctx: Tool
 
 @tool(
     name="terminal_write_input",
-    description="向当前任务/场景归属终端写入输入，用于交互式命令。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入。",
+    description="向当前任务/场景归属终端写入输入，用于交互式命令。仅支持正在运行或等待输入的终端。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 表示中断正在运行的命令进程。",
     group="terminal",
     category="business",
 )
