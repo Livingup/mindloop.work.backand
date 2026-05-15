@@ -8,16 +8,12 @@ TerminalStatus: TypeAlias = str
 
 TERMINAL_STATUS_IDLE: Final[str] = "idle"
 TERMINAL_STATUS_BUSY: Final[str] = "busy"
-TERMINAL_STATUS_WAITING_INPUT: Final[str] = "waiting_input"
-TERMINAL_STATUS_CLOSED: Final[str] = "closed"
 TERMINAL_STATUS_DELETED: Final[str] = "deleted"
 TERMINAL_STATUS_ERROR: Final[str] = "error"
 
 TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({
     TERMINAL_STATUS_IDLE,
     TERMINAL_STATUS_BUSY,
-    TERMINAL_STATUS_WAITING_INPUT,
-    TERMINAL_STATUS_CLOSED,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
 })
@@ -25,7 +21,6 @@ TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({
 _TERMINAL_ACTIVE_STATUSES: Final[frozenset[str]] = frozenset({
     TERMINAL_STATUS_IDLE,
     TERMINAL_STATUS_BUSY,
-    TERMINAL_STATUS_WAITING_INPUT,
 })
 
 
@@ -105,14 +100,6 @@ class TerminalInstance:
             updated_at=now,
             last_active_at=now,
         )
-
-    def mark_waiting_input(self, *, at: datetime | None = None) -> "TerminalInstance":
-        now = at or utc_now()
-        return replace(self, status=TERMINAL_STATUS_WAITING_INPUT, updated_at=now, last_active_at=now)
-
-    def close(self, *, at: datetime | None = None) -> "TerminalInstance":
-        now = at or utc_now()
-        return replace(self, status=TERMINAL_STATUS_CLOSED, current_command_id=None, updated_at=now, last_active_at=now)
 
     def delete(self, *, at: datetime | None = None) -> "TerminalInstance":
         now = at or utc_now()

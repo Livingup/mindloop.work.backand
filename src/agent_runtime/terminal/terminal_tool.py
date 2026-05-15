@@ -154,7 +154,7 @@ async def terminal_read_output(request: TerminalReadOutputToolRequest, ctx: Tool
 
 @tool(
     name="terminal_write_input",
-    description="向当前任务/场景归属终端写入输入，用于交互式命令。仅支持正在运行或等待输入的终端。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 会作为真实终端按键写入 PTY/ConPTY，由终端驱动/控制台中断前台进程。",
+    description="向当前任务/场景归属终端的正在运行前台命令写入输入，用于交互式命令。Agent 应通过读取输出判断是否需要输入；后端不承诺可靠识别 waiting_input。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 会作为真实终端按键写入 PTY/ConPTY，由终端驱动/控制台中断前台进程。",
     group="terminal",
     category="business",
 )

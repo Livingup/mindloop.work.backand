@@ -10,11 +10,9 @@ from typing import Any, Callable
 
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_BUSY,
-    TERMINAL_STATUS_CLOSED,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
     TERMINAL_STATUS_IDLE,
-    TERMINAL_STATUS_WAITING_INPUT,
     TerminalInstance,
     utc_now,
 )
@@ -29,6 +27,8 @@ from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 _TERMINAL_OUTPUT_LINE_RETENTION_LIMIT = 30000
 _SQLITE_DELETE_BATCH_SIZE = 500
 _LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n")
+_LEGACY_TERMINAL_STATUS_CLOSED = "closed"
+_LEGACY_TERMINAL_STATUS_WAITING_INPUT = "waiting_input"
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS terminals (
@@ -116,9 +116,9 @@ class SqliteTerminalRepository:
                     TERMINAL_STATUS_IDLE,
                     now,
                     TERMINAL_STATUS_BUSY,
-                    TERMINAL_STATUS_WAITING_INPUT,
+                    _LEGACY_TERMINAL_STATUS_WAITING_INPUT,
                     TERMINAL_STATUS_ERROR,
-                    TERMINAL_STATUS_CLOSED,
+                    _LEGACY_TERMINAL_STATUS_CLOSED,
                     TERMINAL_STATUS_IDLE,
                 ),
             )
@@ -417,14 +417,19 @@ def _terminal_to_row(terminal: TerminalInstance) -> tuple[Any, ...]:
 
 
 def _row_to_terminal(row: tuple[Any, ...]) -> TerminalInstance:
+    status = row[5]
+    current_command_id = row[6]
+    if status in {_LEGACY_TERMINAL_STATUS_CLOSED, _LEGACY_TERMINAL_STATUS_WAITING_INPUT}:
+        status = TERMINAL_STATUS_IDLE
+        current_command_id = None
     return TerminalInstance(
         terminal_id=row[0],
         owner_type=row[1],
         owner_id=row[2],
         cwd=row[3],
         shell=row[4],
-        status=row[5],
-        current_command_id=row[6],
+        status=status,
+        current_command_id=current_command_id,
         created_at=_text_to_datetime(row[7]),
         updated_at=_text_to_datetime(row[8]),
         last_active_at=_text_to_datetime(row[9]),

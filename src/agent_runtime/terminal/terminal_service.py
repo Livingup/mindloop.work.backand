@@ -17,11 +17,9 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
 )
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_BUSY,
-    TERMINAL_STATUS_CLOSED,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
     TERMINAL_STATUS_IDLE,
-    TERMINAL_STATUS_WAITING_INPUT,
     TerminalInstance,
 )
 from agent_runtime.terminal.terminal_command import TerminalCommand
@@ -438,9 +436,9 @@ class TerminalService:
         control: str | None = None,
     ) -> int:
         terminal = self._require_usable_terminal(scope, terminal_id)
-        if terminal.status not in {TERMINAL_STATUS_BUSY, TERMINAL_STATUS_WAITING_INPUT}:
+        if terminal.status != TERMINAL_STATUS_BUSY:
             raise ValueError(
-                f"终端当前没有正在执行或等待输入的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
+                f"终端当前没有正在执行的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
             )
         try:
             if control == "ctrl_c":
@@ -471,18 +469,18 @@ class TerminalService:
         terminal = self._require_usable_terminal(scope, terminal_id)
         self._runtime_tokens.pop(terminal_id, None)
         await self._process_manager.terminate_terminal(terminal_id)
-        closed = terminal.close()
-        self._repo.save_terminal(closed)
+        detached = terminal.mark_idle()
+        self._repo.save_terminal(detached)
         await self._publish(
             scope,
-            "terminal.closed",
+            "terminal.runtime.detached",
             {
                 "terminal_id": terminal_id,
-                "status": closed.status,
+                "status": detached.status,
             },
             correlation_id=scope.tool_call_id,
         )
-        return closed
+        return detached
 
     async def delete_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
         terminal = self._require_terminal(scope, terminal_id)
@@ -528,7 +526,7 @@ class TerminalService:
         requested_cwd = self._resolve_cwd(cwd, scope.default_cwd) if cwd is not None else None
         requested_shell = self._resolve_shell(shell) if shell is not None else None
         for terminal in self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id):
-            if terminal.status not in {TERMINAL_STATUS_IDLE, TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_ERROR}:
+            if terminal.status not in {TERMINAL_STATUS_IDLE, TERMINAL_STATUS_ERROR}:
                 continue
             if requested_cwd is not None and self._resolve_cwd(terminal.cwd, scope.default_cwd) != requested_cwd:
                 continue
@@ -550,7 +548,7 @@ class TerminalService:
         return terminal
 
     def _recover_terminal_slot_if_needed(self, terminal: TerminalInstance) -> TerminalInstance:
-        if terminal.status not in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_ERROR}:
+        if terminal.status != TERMINAL_STATUS_ERROR:
             return terminal
         recovered = terminal.mark_idle()
         self._repo.save_terminal(recovered)
@@ -653,7 +651,7 @@ class TerminalService:
                 stderr_bytes=stderr_bytes,
             )
         self._repo.save_command(completed)
-        if terminal.current_command_id == command_id and terminal.status not in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_DELETED}:
+        if terminal.current_command_id == command_id and terminal.status != TERMINAL_STATUS_DELETED:
             try:
                 self._repo.save_terminal(terminal.mark_idle())
             except ValueError:
@@ -685,7 +683,7 @@ class TerminalService:
         error_message: str | None,
     ) -> None:
         terminal = self._repo.get_terminal(terminal_id)
-        if terminal is None or terminal.status in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_DELETED}:
+        if terminal is None or terminal.status == TERMINAL_STATUS_DELETED:
             return
         if runtime_token is not None and self._runtime_tokens.get(terminal_id) != runtime_token:
             return
@@ -694,7 +692,7 @@ class TerminalService:
         self._repo.save_terminal(updated)
         await self._publish(
             scope,
-            "terminal.closed",
+            "terminal.runtime.detached",
             {
                 "terminal_id": terminal_id,
                 "status": updated.status,
