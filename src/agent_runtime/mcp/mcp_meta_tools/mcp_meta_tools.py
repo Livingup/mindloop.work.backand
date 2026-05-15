@@ -12,6 +12,9 @@ import asyncio
 import json
 from typing import Any
 
+from pydantic import Field
+
+from agent_runtime.tool.tool_execution_models import BaseToolRequest
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
     McpClientGateway,
@@ -46,6 +49,30 @@ def _tool_error(message: str) -> str:
     return json.dumps({"is_error": True, "content": message}, ensure_ascii=False)
 
 
+class McpGetServiceDetailRequest(BaseToolRequest):
+    service_id: str = Field(description="MCP 服务唯一标识；必须与已配置或已注册的 MCP 服务 service_id 完全一致。")
+
+
+class McpListResourcesRequest(BaseToolRequest):
+    service_id: str = Field(description="MCP 服务唯一标识；必须与已配置或已注册的 MCP 服务 service_id 完全一致。")
+
+
+class McpReadResourceRequest(BaseToolRequest):
+    service_id: str = Field(description="MCP 服务唯一标识；必须与已配置或已注册的 MCP 服务 service_id 完全一致。")
+    uri: str = Field(description="要读取的资源 URI；必须使用 mcp_list_resources 返回的资源 uri。")
+
+
+class McpGetToolDetailRequest(BaseToolRequest):
+    service_id: str = Field(description="MCP 服务唯一标识；必须与已配置或已注册的 MCP 服务 service_id 完全一致。")
+    tool_names: str = Field(description="要查询详情的 MCP 工具名列表；多个工具名用英文逗号分隔，例如 create_task,list_tasks。")
+
+
+class McpCallToolRequest(BaseToolRequest):
+    service_id: str = Field(description="MCP 服务唯一标识；必须与已配置或已注册的 MCP 服务 service_id 完全一致。")
+    tool_name: str = Field(description="要执行的 MCP 工具名称；必须是 mcp_get_tool_detail 返回过的工具名。")
+    arguments: str = Field(description="MCP 工具参数，必须是合法 JSON 对象字符串；字段结构必须符合 mcp_get_tool_detail 返回的 input_schema。")
+
+
 # ══════════════════════════════════════════
 # 5 个 MCP 元工具
 # ══════════════════════════════════════════
@@ -58,7 +85,7 @@ def _tool_error(message: str) -> str:
     wiki="查询指定 MCP 服务的 capabilities（是否支持 tools/resources）和 instructions（使用指南）。"
     "在调用 MCP 工具前建议先用此工具了解服务的使用策略。",
 )
-async def mcp_get_service_detail(service_id: str) -> str:
+async def mcp_get_service_detail(request: McpGetServiceDetailRequest) -> str:
     """获取 MCP 服务的能力信息和使用指南。
 
     Args:
@@ -69,7 +96,7 @@ async def mcp_get_service_detail(service_id: str) -> str:
     """
     try:
         gw = _get_gateway()
-        detail = await gw.get_service_detail(service_id)
+        detail = await gw.get_service_detail(request.service_id)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 服务详情获取失败: {e}")
     return json.dumps(
@@ -91,7 +118,7 @@ async def mcp_get_service_detail(service_id: str) -> str:
     wiki="列出指定 MCP 服务暴露的所有资源。"
     "返回资源列表，每个资源包含 uri、name、description、mime_type。",
 )
-async def mcp_list_resources(service_id: str) -> str:
+async def mcp_list_resources(request: McpListResourcesRequest) -> str:
     """列出 MCP 服务的可用资源。
 
     Args:
@@ -102,7 +129,7 @@ async def mcp_list_resources(service_id: str) -> str:
     """
     try:
         gw = _get_gateway()
-        resources = await gw.list_resources(service_id)
+        resources = await gw.list_resources(request.service_id)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 资源列表获取失败: {e}")
     return json.dumps(
@@ -126,7 +153,7 @@ async def mcp_list_resources(service_id: str) -> str:
     wiki="读取指定 MCP 服务上某个资源的具体内容。"
     "需要提供 service_id 和资源的 URI（从 mcp_list_resources 获取）。",
 )
-async def mcp_read_resource(service_id: str, uri: str) -> str:
+async def mcp_read_resource(request: McpReadResourceRequest) -> str:
     """读取 MCP 服务的指定资源内容。
 
     Args:
@@ -138,7 +165,7 @@ async def mcp_read_resource(service_id: str, uri: str) -> str:
     """
     try:
         gw = _get_gateway()
-        content = await gw.read_resource(service_id, uri)
+        content = await gw.read_resource(request.service_id, request.uri)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 资源读取失败: {e}")
     result: dict[str, Any] = {
@@ -160,7 +187,7 @@ async def mcp_read_resource(service_id: str, uri: str) -> str:
     "tool_names 是逗号分隔的工具名列表。"
     "在调用 mcp_call_tool 前务必先查看工具参数定义。",
 )
-async def mcp_get_tool_detail(service_id: str, tool_names: str) -> str:
+async def mcp_get_tool_detail(request: McpGetToolDetailRequest) -> str:
     """获取 MCP 工具的参数定义。
 
     Args:
@@ -170,10 +197,10 @@ async def mcp_get_tool_detail(service_id: str, tool_names: str) -> str:
     Returns:
         JSON 格式的工具参数定义列表。
     """
-    names = [n.strip() for n in tool_names.split(",") if n.strip()]
+    names = [n.strip() for n in request.tool_names.split(",") if n.strip()]
     try:
         gw = _get_gateway()
-        tools = await gw.get_tool_detail(service_id, names)
+        tools = await gw.get_tool_detail(request.service_id, names)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 工具详情获取失败: {e}")
     return json.dumps(
@@ -197,7 +224,7 @@ async def mcp_get_tool_detail(service_id: str, tool_names: str) -> str:
     "arguments 为 JSON 格式的工具参数。"
     "调用前必须先用 mcp_get_tool_detail 查看参数定义。",
 )
-async def mcp_call_tool(service_id: str, tool_name: str, arguments: str) -> str:
+async def mcp_call_tool(request: McpCallToolRequest) -> str:
     """执行 MCP 工具。
 
     Args:
@@ -209,13 +236,13 @@ async def mcp_call_tool(service_id: str, tool_name: str, arguments: str) -> str:
         JSON 格式的执行结果。
     """
     try:
-        args_dict = json.loads(arguments)
+        args_dict = json.loads(request.arguments)
     except json.JSONDecodeError as e:
         return _tool_error(f"参数 JSON 解析失败: {e}")
 
     try:
         gw = _get_gateway()
-        result = await gw.call_tool(service_id, tool_name, args_dict)
+        result = await gw.call_tool(request.service_id, request.tool_name, args_dict)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 工具执行失败: {e}")
     data: dict[str, Any] = {

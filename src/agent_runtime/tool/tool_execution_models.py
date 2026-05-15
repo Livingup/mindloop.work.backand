@@ -18,7 +18,7 @@ class FrontendMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(description="需要展示给用户的文本内容。")
-    text_format: TextFormat = Field(default="markdown", description="文本内容的格式声明。")
+    text_format: TextFormat = Field(default="markdown", description="文本内容的格式声明；可选值仅限 plain_text、markdown、json。")
     channel: str | None = Field(default=None, description="目标前端通道，例如 web、cli。")
     metadata: dict[str, Any] = Field(default_factory=dict, description="前端渲染或业务追踪所需的附加元数据。")
 
@@ -28,7 +28,7 @@ class LoopControl(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    decision: LoopDecision = Field(default="continue", description="Runtime 应采用的下一步循环控制决策。")
+    decision: LoopDecision = Field(default="continue", description="Runtime 应采用的下一步循环控制决策；可选值仅限 continue、pause、complete、fail。")
     reason: str | None = Field(default=None, description="产生该循环决策的业务原因。")
 
 
@@ -78,7 +78,7 @@ class BaseToolResult(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     success: bool = Field(default=True, description="工具是否执行成功。")
-    execution_status: ToolExecutionStatus = Field(default="success", description="工具执行状态。")
+    execution_status: ToolExecutionStatus = Field(default="success", description="工具执行状态；可选值仅限 success、failed、skipped。")
     error_code: str | None = Field(default=None, description="工具执行失败时的机器可读错误码。")
     error_message: str | None = Field(default=None, description="工具执行失败时的人类可读错误信息。")
     output: Any = Field(default=None, description="工具业务输出。")

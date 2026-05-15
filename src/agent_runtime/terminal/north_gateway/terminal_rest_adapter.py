@@ -65,7 +65,7 @@ class ExecuteTerminalCommandBody(BaseModel):
     command_line: str = Field(description="要执行的命令行。")
     cwd: str | None = Field(default=None, description="可选初始工作目录；仅在自动创建新终端时生效，不能改变已有终端 cwd。")
     shell: str | None = Field(default=None, description="可选初始 shell；仅在自动创建新终端时生效，不能改变已有终端 shell。")
-    timeout_ms: int | None = Field(default=None, ge=1, description="可选命令超时时间。")
+    timeout_ms: int | None = Field(default=None, ge=1, description="可选命令超时时间，单位毫秒；如提供则取值必须大于等于 1。")
 
 
 class ExecuteTerminalCommandResponse(BaseModel):
@@ -92,9 +92,9 @@ class ReadTerminalOutputResponse(BaseModel):
 
 class WriteTerminalInputBody(BaseModel):
     workspace_path: str = Field(description="当前 scene 所属 workspace 绝对路径。")
-    text: str | None = None
-    append_newline: bool = False
-    control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = None
+    text: str | None = Field(default=None, description="要输入的文本。")
+    append_newline: bool = Field(default=False, description="是否在文本末尾追加换行。")
+    control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(default=None, description="可选控制输入；可选值仅限 enter、ctrl_c、ctrl_d、escape。")
 
 
 class WriteTerminalInputResponse(BaseModel):

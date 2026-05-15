@@ -31,8 +31,8 @@ class FileModifyEdit(BaseModel):
     时执行替换，避免模糊修改或误改多个相似代码片段。
     """
 
-    feature_desc: str = Field(min_length=1, description="本次编辑服务的业务需求或修改目的。")
-    search_lines: list[str] = Field(min_length=1, description="要精确匹配的原始连续文本行；每个元素代表一行且不包含换行符。")
+    feature_desc: str = Field(min_length=1, description="本次编辑服务的业务需求或修改目的；长度必须至少 1 个字符。")
+    search_lines: list[str] = Field(min_length=1, description="要精确匹配的原始连续文本行；列表长度必须至少 1 行，每个元素代表一行且不包含换行符。")
     replace_lines: list[str] = Field(default_factory=list, description="替换后的完整文本行；每个元素代表一行且不包含换行符。")
 
 
@@ -45,7 +45,7 @@ class FileModifyRequest(BaseToolRequest):
 
     project_root: str = Field(description="项目工作区根目录，所有写入目标必须位于该目录内。")
     file_path: str = Field(description="要修改的文本文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
-    edits: list[FileModifyEdit] = Field(min_length=1, description="按顺序应用的连续行替换编辑列表。")
+    edits: list[FileModifyEdit] = Field(min_length=1, description="按顺序应用的连续行替换编辑列表；列表长度必须至少 1 个编辑块。")
     expected_content_sha256: str | None = Field(default=None, description="可选的修改前文件内容 SHA256，用于防止覆盖并行修改。")
     encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
     dry_run: bool = Field(default=False, description="为 true 时只校验并计算是否可修改，不实际写入文件。")
@@ -58,7 +58,7 @@ class FileCreateRequest(BaseToolRequest):
     file_path: str = Field(description="要创建的文本文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     content_lines: list[str] = Field(default_factory=list, description="新文件内容行；每个元素代表一行且不包含换行符。")
     encoding: str = Field(default="utf-8", description="写入文件时使用的文本编码。")
-    line_ending: LineEndingName = Field(default="LF", description="写入文件时使用的换行风格。")
+    line_ending: LineEndingName = Field(default="LF", description="写入文件时使用的换行风格；可选值仅限 LF、CRLF、CR。")
     final_newline: bool = Field(default=True, description="是否在非空内容末尾追加结尾换行。")
     overwrite: bool = Field(default=False, description="是否允许覆盖已有文件；默认禁止。覆盖时必须提供 expected_content_sha256。")
     expected_content_sha256: str | None = Field(default=None, description="覆盖已有文件时必须提供的旧文件内容 SHA256。")
@@ -71,7 +71,7 @@ class FileDeleteRequest(BaseToolRequest):
 
     project_root: str = Field(description="项目工作区根目录，删除目标必须位于该目录内。")
     file_path: str = Field(description="要删除的文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
-    reason: str = Field(min_length=1, description="删除文件的业务原因，用于审计和防止误删。")
+    reason: str = Field(min_length=1, description="删除文件的业务原因，用于审计和防止误删；长度必须至少 1 个字符。")
     expected_content_sha256: str | None = Field(default=None, description="可选的删除前文件内容 SHA256，用于防止删除并行修改后的文件。")
     dry_run: bool = Field(default=False, description="为 true 时只返回将要删除的文件信息，不实际删除。")
 
@@ -86,7 +86,7 @@ class FileMoveRequest(BaseToolRequest):
     project_root: str = Field(description="项目工作区根目录，源路径和目标路径都必须位于该目录内。")
     source_path: str = Field(description="要移动或重命名的源文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     target_path: str = Field(description="移动或重命名后的目标文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
-    reason: str = Field(min_length=1, description="移动或重命名文件的业务原因，用于审计和防止误操作。")
+    reason: str = Field(min_length=1, description="移动或重命名文件的业务原因，用于审计和防止误操作；长度必须至少 1 个字符。")
     expected_source_sha256: str | None = Field(default=None, description="可选的源文件内容 SHA256，用于防止移动并行修改后的文件。")
     overwrite: bool = Field(default=False, description="是否允许覆盖目标文件；默认禁止。覆盖时必须提供 expected_target_sha256。")
     expected_target_sha256: str | None = Field(default=None, description="覆盖目标文件时必须提供的目标文件旧内容 SHA256。")

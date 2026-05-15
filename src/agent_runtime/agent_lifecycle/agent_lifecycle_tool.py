@@ -44,7 +44,7 @@ class MessageUserRequest(BaseToolRequest):
 
     action: MessageAction = Field(
         description=(
-            "选择消息发送模式（决定是否阻塞 Agent 循环）。\n"
+            "选择消息发送模式（决定是否阻塞 Agent 循环）；可选值仅限 notify、request_response。\n"
             "\n"
             "• notify：单向同步消息，发完后不阻塞，Agent 继续推进任务。"
             "适用：阶段性进度报告、即将执行耗时操作的预告、发现重要事实但不需用户决策、关键状态广播。"
@@ -65,7 +65,7 @@ class MessageUserRequest(BaseToolRequest):
     )
     text_format: TextFormat = Field(
         default="markdown",
-        description="message 的文本格式：plain_text（纯文本）、markdown（带标题/列表/代码块的推荐默认值）、json（结构化 JSON，需要前端渲染为表格/卡片时使用）。",
+        description="message 的文本格式；可选值仅限 plain_text、markdown、json。plain_text 表示纯文本，markdown 表示带标题/列表/代码块的推荐默认值，json 表示结构化 JSON 且需要前端渲染为表格/卡片时使用。",
     )
     options: list[MessageOption] = Field(
         default_factory=list,

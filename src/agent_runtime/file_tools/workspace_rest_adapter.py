@@ -8,15 +8,15 @@ from pydantic import BaseModel, Field
 
 
 class WorkspaceTreeRequest(BaseModel):
-    directory_path: str
-    max_depth: int = Field(default=2, ge=0, le=4)
-    max_entries_per_directory: int = Field(default=80, ge=1, le=300)
+    directory_path: str = Field(description="要读取工作区目录树的目录路径。")
+    max_depth: int = Field(default=2, ge=0, le=4, description="目录树最大递归深度；取值范围为 0 到 4。")
+    max_entries_per_directory: int = Field(default=80, ge=1, le=300, description="每个目录最多返回的子项数量；取值范围为 1 到 300。")
 
 
 class WorkspaceTreeNodeResponse(BaseModel):
     name: str
     path: str
-    type: Literal["folder", "file"]
+    type: Literal["folder", "file"] = Field(description="节点类型；可选值仅限 folder、file。")
     children: list["WorkspaceTreeNodeResponse"] = Field(default_factory=list)
 
 
