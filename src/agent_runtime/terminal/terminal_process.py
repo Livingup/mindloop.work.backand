@@ -17,7 +17,24 @@ class TerminalProcessStartRequest:
     timeout_ms: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TerminalSessionStartRequest:
+    terminal_id: str
+    cwd: str
+    shell: str
+    cols: int = 120
+    rows: int = 30
+
+
 class TerminalProcessManager(Protocol):
+    async def start_terminal(
+        self,
+        request: TerminalSessionStartRequest,
+        *,
+        on_exit: TerminalExitHandler,
+    ) -> None:
+        ...
+
     async def start_command(
         self,
         request: TerminalProcessStartRequest,

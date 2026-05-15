@@ -63,8 +63,8 @@ class CreateTerminalBody(BaseModel):
 class ExecuteTerminalCommandBody(BaseModel):
     workspace_path: str = Field(description="当前 scene 所属 workspace 绝对路径。")
     command_line: str = Field(description="要执行的命令行。")
-    cwd: str | None = Field(default=None, description="可选本次命令工作目录。")
-    shell: str | None = Field(default=None, description="可选本次命令 shell。")
+    cwd: str | None = Field(default=None, description="可选初始工作目录；仅在自动创建新 PTY/ConPTY 终端实例时生效。")
+    shell: str | None = Field(default=None, description="可选初始 shell；仅在自动创建新 PTY/ConPTY 终端实例时生效。")
     timeout_ms: int | None = Field(default=None, ge=1, description="可选命令超时时间。")
 
 

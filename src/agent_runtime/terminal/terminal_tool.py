@@ -24,9 +24,9 @@ class TerminalCreateToolRequest(BaseToolRequest):
 
 class TerminalExecuteCommandToolRequest(BaseToolRequest):
     command_line: str = Field(description="要执行的命令行。")
-    terminal_id: str | None = Field(default=None, description="可选终端 ID；不传时自动选择空闲终端，没有则创建新终端。")
-    cwd: str | None = Field(default=None, description="可选本次命令工作目录；不传时使用终端 cwd 或默认工作目录。")
-    shell: str | None = Field(default=None, description="可选本次命令 shell；不传时使用终端 shell 或服务默认 shell。")
+    terminal_id: str | None = Field(default=None, description="可选 PTY/ConPTY 终端实例 ID；不传时自动选择匹配的空闲终端实例，没有则创建新实例。")
+    cwd: str | None = Field(default=None, description="可选初始工作目录；仅在自动创建新 PTY/ConPTY 终端实例时生效，不能改变已有终端实例 cwd。")
+    shell: str | None = Field(default=None, description="可选初始 shell；仅在自动创建新 PTY/ConPTY 终端实例时生效，不能改变已有终端实例 shell。")
     timeout_ms: int | None = Field(default=None, ge=1, description="可选命令超时时间，单位毫秒。")
 
 
@@ -50,13 +50,13 @@ class TerminalWriteInputToolRequest(BaseToolRequest):
     append_newline: bool = Field(default=False, description="是否在文本末尾追加换行。")
     control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(
         default=None,
-        description="可选控制输入，仅支持 enter/ctrl_c/ctrl_d/escape；ctrl_c 会中断该终端正在运行的命令进程，设置后 text 可为空。",
+        description="可选控制输入，仅支持 enter/ctrl_c/ctrl_d/escape；ctrl_c 会作为真实按键写入 PTY/ConPTY 并中断前台命令，设置后 text 可为空。",
     )
 
 
 @tool(
     name="terminal_create",
-    description="创建一个当前任务/场景归属的终端。可以指定 cwd 和 shell；不指定 cwd 时使用默认工作目录。",
+    description="创建一个当前任务/场景归属的真实 PTY/ConPTY 终端实例。terminal_id 对应该后端长期存活的终端 shell 实例；可以指定初始 cwd 和 shell，不指定 cwd 时使用默认工作目录。",
     group="terminal",
     category="business",
 )
@@ -87,7 +87,7 @@ async def terminal_create(request: TerminalCreateToolRequest, ctx: ToolRuntimeCo
 
 @tool(
     name="terminal_execute_command",
-    description="在当前任务/场景归属终端中启动命令。一个 terminal_id 同时最多运行一个命令；长进程会占用该终端直到退出或被中断。可指定 terminal_id/cwd/shell；不指定 terminal_id 时自动选择空闲终端或创建新终端。工具成功表示命令已开始异步执行，返回实际 cwd、terminal_id 和 command_id。",
+    description="在当前任务/场景归属 PTY/ConPTY 终端实例中输入并执行一条命令。terminal_id 对应长期存活的后端终端 shell 实例，一个 terminal_id 同时最多跟踪一个前台命令；长进程会占用该终端直到退出或被中断。cwd/shell 只在自动创建新终端时作为初始值，不能改变已有 PTY 实例。工具成功表示命令已写入终端并开始异步执行，返回实际 cwd、terminal_id 和 command_id。",
     group="terminal",
     category="business",
 )
@@ -154,7 +154,7 @@ async def terminal_read_output(request: TerminalReadOutputToolRequest, ctx: Tool
 
 @tool(
     name="terminal_write_input",
-    description="向当前任务/场景归属终端写入输入，用于交互式命令。仅支持正在运行或等待输入的终端。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 表示中断正在运行的命令进程。",
+    description="向当前任务/场景归属 PTY/ConPTY 终端实例写入输入，用于交互式命令。仅支持正在运行或等待输入的终端。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 会作为真实终端按键写入 PTY/ConPTY，由终端驱动/控制台中断前台进程。",
     group="terminal",
     category="business",
 )

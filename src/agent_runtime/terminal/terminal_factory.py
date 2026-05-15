@@ -4,9 +4,7 @@ from threading import RLock
 
 from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
 from agent_runtime.communication.communication_factory import CommunicationFactory
-from agent_runtime.terminal.infrastructure.asyncio_subprocess_terminal_process import (
-    AsyncioSubprocessTerminalProcessManager,
-)
+from agent_runtime.terminal.infrastructure.pty_terminal_process import PtyTerminalProcessManager
 from agent_runtime.terminal.infrastructure.sqlite_terminal_repository import SqliteTerminalRepository
 from agent_runtime.terminal.north_gateway.terminal_gateway_impl import TerminalGatewayImpl
 from agent_runtime.terminal.terminal_config import TerminalConfig
@@ -32,7 +30,7 @@ class TerminalFactory:
                     data_dir_accessor=cls._build_data_dir_accessor(config),
                 )
                 repository.reset_runtime_state()
-                process_manager = AsyncioSubprocessTerminalProcessManager()
+                process_manager = PtyTerminalProcessManager()
                 scope_resolver = TerminalRuntimeScopeResolver(
                     agent_runtime_gateway=agent_runtime_gateway,
                     communication_gateway=communication_gateway,

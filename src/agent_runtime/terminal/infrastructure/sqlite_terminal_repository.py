@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_BUSY,
+    TERMINAL_STATUS_CLOSED,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
     TERMINAL_STATUS_IDLE,
@@ -109,15 +110,15 @@ class SqliteTerminalRepository:
                 """
                 UPDATE terminals
                 SET status = ?, current_command_id = NULL, updated_at = ?
-                WHERE status IN (?, ?, ?) OR (status = ? AND current_command_id IS NOT NULL)
+                WHERE status IN (?, ?, ?, ?)
                 """,
                 (
-                    TERMINAL_STATUS_IDLE,
+                    TERMINAL_STATUS_CLOSED,
                     now,
+                    TERMINAL_STATUS_IDLE,
                     TERMINAL_STATUS_BUSY,
                     TERMINAL_STATUS_WAITING_INPUT,
                     TERMINAL_STATUS_ERROR,
-                    TERMINAL_STATUS_IDLE,
                 ),
             )
             command_result = conn.execute(
@@ -130,7 +131,7 @@ class SqliteTerminalRepository:
                     TERMINAL_COMMAND_STATUS_FAILED,
                     now,
                     now,
-                    "AgentRuntime restarted; terminal process state was reset.",
+                    "AgentRuntime restarted; PTY terminal instance was closed.",
                     TERMINAL_COMMAND_STATUS_ACCEPTED,
                     TERMINAL_COMMAND_STATUS_RUNNING,
                 ),
