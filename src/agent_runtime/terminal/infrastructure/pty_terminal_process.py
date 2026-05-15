@@ -39,6 +39,7 @@ class _TerminalSession:
     terminal_id: str
     shell: str
     on_exit: TerminalExitHandler
+    runtime_token: str | None = None
     process: asyncio.subprocess.Process | None = None
     master_fd: int | None = None
     winpty: Any | None = None
@@ -58,11 +59,13 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         request: TerminalSessionStartRequest,
         *,
         on_exit: TerminalExitHandler,
-    ) -> None:
+    ) -> bool:
         async with self._lock:
             existing = self._sessions.get(request.terminal_id)
             if existing is not None and _session_alive(existing):
-                raise ValueError(f"终端 PTY 实例已存在: {request.terminal_id}")
+                return False
+            if existing is not None:
+                self._sessions.pop(request.terminal_id, None)
             if sys.platform.startswith("win"):
                 session = await _start_windows_terminal(request, on_exit=on_exit)
                 session.task = asyncio.create_task(self._watch_windows_terminal(session))
@@ -70,6 +73,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 session = await _start_unix_terminal(request, on_exit=on_exit)
                 session.task = asyncio.create_task(self._watch_unix_terminal(session))
             self._sessions[request.terminal_id] = session
+            return True
 
     async def start_command(
         self,
@@ -128,7 +132,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     await session.task
                 except asyncio.CancelledError:
                     pass
-        self._sessions.pop(terminal_id, None)
+        self._discard_session_if_current(session)
 
     async def shutdown(self) -> None:
         for terminal_id in list(self._sessions.keys()):
@@ -137,8 +141,12 @@ class PtyTerminalProcessManager(TerminalProcessManager):
     def _require_session(self, terminal_id: str) -> _TerminalSession:
         session = self._sessions.get(terminal_id)
         if session is None or not _session_alive(session):
-            raise KeyError(f"终端 PTY 实例不存在或已退出: {terminal_id}")
+            raise KeyError(f"终端运行时未挂载或已退出: {terminal_id}")
         return session
+
+    def _discard_session_if_current(self, session: _TerminalSession) -> None:
+        if self._sessions.get(session.terminal_id) is session:
+            self._sessions.pop(session.terminal_id, None)
 
     async def _watch_unix_terminal(self, session: _TerminalSession) -> None:
         decoder = _StreamTextDecoder()
@@ -163,8 +171,8 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         except Exception as exc:
             error_message = None if session.closing else str(exc)
         finally:
-            self._sessions.pop(session.terminal_id, None)
-            await self._fail_active_command(session, error_message or "终端 PTY 实例已退出。")
+            self._discard_session_if_current(session)
+            await self._fail_active_command(session, error_message or "终端运行时已退出。")
             await session.on_exit(exit_code, error_message)
             if session.master_fd is not None:
                 try:
@@ -190,8 +198,8 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         except Exception as exc:
             error_message = None if session.closing else str(exc)
         finally:
-            self._sessions.pop(session.terminal_id, None)
-            await self._fail_active_command(session, error_message or "终端 ConPTY 实例已退出。")
+            self._discard_session_if_current(session)
+            await self._fail_active_command(session, error_message or "终端运行时已退出。")
             await session.on_exit(exit_code, error_message)
 
     async def _handle_terminal_output(self, session: _TerminalSession, text: str) -> None:
@@ -282,7 +290,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             session,
             command_id,
             exit_code=None,
-            error_message="命令被 Ctrl+C 中断后未返回终端提示，PTY 实例已关闭。",
+            error_message="命令被 Ctrl+C 中断后未返回终端提示，终端运行时已关闭。",
         )
         await _close_terminal_session(session)
 
@@ -324,6 +332,7 @@ async def _start_unix_terminal(request: TerminalSessionStartRequest, *, on_exit:
         terminal_id=request.terminal_id,
         shell=request.shell,
         on_exit=on_exit,
+        runtime_token=request.runtime_token,
         process=process,
         master_fd=master_fd,
     )
@@ -348,6 +357,7 @@ async def _start_windows_terminal(request: TerminalSessionStartRequest, *, on_ex
         terminal_id=request.terminal_id,
         shell=request.shell,
         on_exit=on_exit,
+        runtime_token=request.runtime_token,
         winpty=winpty,
     )
 
@@ -387,7 +397,7 @@ async def _write_terminal(session: _TerminalSession, text: str) -> None:
     if session.winpty is not None:
         await asyncio.to_thread(session.winpty.write, text)
         return
-    raise KeyError(f"终端 PTY 实例不可写: {session.terminal_id}")
+    raise KeyError(f"终端运行时不可写: {session.terminal_id}")
 
 
 async def _close_terminal_session(session: _TerminalSession) -> None:

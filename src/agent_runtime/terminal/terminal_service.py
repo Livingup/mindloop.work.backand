@@ -164,6 +164,7 @@ class TerminalService:
         self._locks: dict[str, asyncio.Lock] = {}
         self._byte_offsets: dict[tuple[str, str], int] = {}
         self._stream_bytes: dict[tuple[str, str, str], int] = {}
+        self._runtime_tokens: dict[str, str] = {}
 
     def resolve_scope(
         self,
@@ -207,15 +208,8 @@ class TerminalService:
                 "trace_id": scope.trace_id,
             },
         )
-        await self._process_manager.start_terminal(
-            TerminalSessionStartRequest(
-                terminal_id=terminal.terminal_id,
-                cwd=terminal.cwd or actual_cwd,
-                shell=terminal.shell,
-            ),
-            on_exit=lambda exit_code, error_message: self._handle_terminal_exit(scope, terminal.terminal_id, exit_code, error_message),
-        )
-        self._repo.save_terminal(terminal)
+        await self._ensure_terminal_runtime(scope, terminal, cwd=terminal.cwd or actual_cwd, shell=terminal.shell)
+        terminal = self._repo.get_terminal(terminal.terminal_id) or self._repo.save_terminal(terminal)
         await self._publish(
             scope,
             "terminal.created",
@@ -254,6 +248,8 @@ class TerminalService:
                 raise ValueError(f"终端正在执行命令: {terminal.terminal_id}")
             actual_cwd = self._resolve_cwd(terminal.cwd, scope.default_cwd)
             actual_shell = self._resolve_shell(terminal.shell)
+            await self._ensure_terminal_runtime(scope, terminal, cwd=actual_cwd, shell=actual_shell)
+            terminal = self._repo.get_terminal(terminal.terminal_id) or terminal
             command = TerminalCommand(
                 command_id=_new_id("cmd"),
                 terminal_id=terminal.terminal_id,
@@ -473,6 +469,7 @@ class TerminalService:
 
     async def close_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
         terminal = self._require_usable_terminal(scope, terminal_id)
+        self._runtime_tokens.pop(terminal_id, None)
         await self._process_manager.terminate_terminal(terminal_id)
         closed = terminal.close()
         self._repo.save_terminal(closed)
@@ -516,27 +513,28 @@ class TerminalService:
     ) -> TerminalInstance:
         if terminal_id:
             terminal = self._require_usable_terminal(scope, terminal_id)
+            terminal = self._recover_terminal_slot_if_needed(terminal)
             if cwd is not None:
                 requested_cwd = self._resolve_cwd(cwd, scope.default_cwd)
                 current_cwd = self._resolve_cwd(terminal.cwd, scope.default_cwd)
                 if requested_cwd != current_cwd:
-                    raise ValueError(f"PTY 终端实例的 cwd 固定为 {current_cwd}，不能在执行命令时改为 {requested_cwd}。")
+                    raise ValueError(f"终端 {terminal.terminal_id} 的 cwd 固定为 {current_cwd}，不能在执行命令时改为 {requested_cwd}。")
             if shell is not None:
                 requested_shell = self._resolve_shell(shell)
                 current_shell = self._resolve_shell(terminal.shell)
                 if requested_shell != current_shell:
-                    raise ValueError(f"PTY 终端实例的 shell 固定为 {current_shell}，不能在执行命令时改为 {requested_shell}。")
+                    raise ValueError(f"终端 {terminal.terminal_id} 的 shell 固定为 {current_shell}，不能在执行命令时改为 {requested_shell}。")
             return terminal
         requested_cwd = self._resolve_cwd(cwd, scope.default_cwd) if cwd is not None else None
         requested_shell = self._resolve_shell(shell) if shell is not None else None
         for terminal in self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id):
-            if terminal.status != TERMINAL_STATUS_IDLE:
+            if terminal.status not in {TERMINAL_STATUS_IDLE, TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_ERROR}:
                 continue
             if requested_cwd is not None and self._resolve_cwd(terminal.cwd, scope.default_cwd) != requested_cwd:
                 continue
             if requested_shell is not None and self._resolve_shell(terminal.shell) != requested_shell:
                 continue
-            return terminal
+            return self._recover_terminal_slot_if_needed(terminal)
         return await self.create_terminal(scope, cwd=cwd, shell=shell)
 
     def _require_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
@@ -549,9 +547,41 @@ class TerminalService:
         terminal = self._require_terminal(scope, terminal_id)
         if terminal.status == TERMINAL_STATUS_DELETED:
             raise KeyError(f"终端已删除: {terminal_id}")
-        if terminal.status in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_ERROR}:
-            raise KeyError(f"终端 PTY 实例不可用: terminal_id={terminal_id} status={terminal.status}")
         return terminal
+
+    def _recover_terminal_slot_if_needed(self, terminal: TerminalInstance) -> TerminalInstance:
+        if terminal.status not in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_ERROR}:
+            return terminal
+        recovered = terminal.mark_idle()
+        self._repo.save_terminal(recovered)
+        return recovered
+
+    async def _ensure_terminal_runtime(
+        self,
+        scope: TerminalRuntimeScope,
+        terminal: TerminalInstance,
+        *,
+        cwd: str,
+        shell: str,
+    ) -> None:
+        runtime_token = _new_id("runtime")
+        started = await self._process_manager.start_terminal(
+            TerminalSessionStartRequest(
+                terminal_id=terminal.terminal_id,
+                cwd=cwd,
+                shell=shell,
+                runtime_token=runtime_token,
+            ),
+            on_exit=lambda exit_code, error_message: self._handle_terminal_exit(
+                scope,
+                terminal.terminal_id,
+                runtime_token,
+                exit_code,
+                error_message,
+            ),
+        )
+        if started:
+            self._runtime_tokens[terminal.terminal_id] = runtime_token
 
     async def _handle_output(
         self,
@@ -650,13 +680,17 @@ class TerminalService:
         self,
         scope: TerminalRuntimeScope,
         terminal_id: str,
+        runtime_token: str | None,
         exit_code: int | None,
         error_message: str | None,
     ) -> None:
         terminal = self._repo.get_terminal(terminal_id)
         if terminal is None or terminal.status in {TERMINAL_STATUS_CLOSED, TERMINAL_STATUS_DELETED}:
             return
-        updated = terminal.mark_error() if error_message else terminal.close()
+        if runtime_token is not None and self._runtime_tokens.get(terminal_id) != runtime_token:
+            return
+        updated = terminal.mark_error() if error_message else terminal.mark_idle()
+        self._runtime_tokens.pop(terminal_id, None)
         self._repo.save_terminal(updated)
         await self._publish(
             scope,

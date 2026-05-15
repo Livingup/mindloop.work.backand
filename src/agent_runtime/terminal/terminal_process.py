@@ -22,6 +22,7 @@ class TerminalSessionStartRequest:
     terminal_id: str
     cwd: str
     shell: str
+    runtime_token: str | None = None
     cols: int = 120
     rows: int = 30
 
@@ -32,7 +33,7 @@ class TerminalProcessManager(Protocol):
         request: TerminalSessionStartRequest,
         *,
         on_exit: TerminalExitHandler,
-    ) -> None:
+    ) -> bool:
         ...
 
     async def start_command(

@@ -110,15 +110,16 @@ class SqliteTerminalRepository:
                 """
                 UPDATE terminals
                 SET status = ?, current_command_id = NULL, updated_at = ?
-                WHERE status IN (?, ?, ?, ?)
+                WHERE status IN (?, ?, ?, ?) OR (status = ? AND current_command_id IS NOT NULL)
                 """,
                 (
-                    TERMINAL_STATUS_CLOSED,
-                    now,
                     TERMINAL_STATUS_IDLE,
+                    now,
                     TERMINAL_STATUS_BUSY,
                     TERMINAL_STATUS_WAITING_INPUT,
                     TERMINAL_STATUS_ERROR,
+                    TERMINAL_STATUS_CLOSED,
+                    TERMINAL_STATUS_IDLE,
                 ),
             )
             command_result = conn.execute(
@@ -131,7 +132,7 @@ class SqliteTerminalRepository:
                     TERMINAL_COMMAND_STATUS_FAILED,
                     now,
                     now,
-                    "AgentRuntime restarted; PTY terminal instance was closed.",
+                    "AgentRuntime restarted; terminal runtime state was reset.",
                     TERMINAL_COMMAND_STATUS_ACCEPTED,
                     TERMINAL_COMMAND_STATUS_RUNNING,
                 ),
