@@ -4,6 +4,27 @@
 
 ---
 
+## 开发环境安装与拉取代码后的依赖刷新
+
+`spread-ai` 命令由 `AgentRuntime/pyproject.toml` 的 `[project.scripts]` 声明生成，Windows 下通常表现为 Python 环境 `Scripts` 目录中的 `spread-ai.exe`。它只是 CLI 启动器，负责调用 `agent_runtime.cli:main`，业务代码仍从当前安装的 `agent-runtime` 包中导入。
+
+本项目开发态建议在 `AgentRuntime` 目录执行 editable 安装：
+
+```powershell
+python -m pip install -e .
+```
+
+普通 `.py` 源码变更不需要重新安装；editable 安装会让 `spread-ai.exe` 继续导入工作区中的最新源码。但拉取代码、切换分支或合并代码后，如果出现以下变化，需要重新执行 `python -m pip install -e .` 刷新安装元数据和依赖：
+
+- `pyproject.toml` 中新增、删除或修改了 `dependencies` / `optional-dependencies`。
+- `pyproject.toml` 中新增、删除或修改了 `[project.scripts]` 命令入口，例如 `spread-ai = "agent_runtime.cli:main"`。
+- 包结构、构建配置、包名、入口模块路径发生变化。
+- 当前 Python 环境发生变化，例如从全局 Python 切换到虚拟环境，或更换了解释器。
+
+如果只拉取到普通业务源码变更，且 `pyproject.toml` 未变化，通常无需重新生成 `spread-ai.exe`。如果运行时出现 `ModuleNotFoundError`，优先检查当前 `spread-ai` 所在 Python 环境是否已重新安装依赖。
+
+---
+
 ## 已完成模块
 
 ### 统一文件资源服务（file_resource）
