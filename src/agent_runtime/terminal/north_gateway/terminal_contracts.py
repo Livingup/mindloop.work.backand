@@ -8,19 +8,6 @@ ReadMode = Literal["tail", "page", "since", "search"]
 
 
 @dataclass(frozen=True, slots=True)
-class TerminalInfo:
-    terminal_id: str
-    cwd: str | None
-    shell: str
-    status: str
-    current_command_id: str | None
-    created_at: datetime
-    updated_at: datetime
-    last_active_at: datetime
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
 class TerminalCommandInfo:
     command_id: str
     terminal_id: str
@@ -37,6 +24,20 @@ class TerminalCommandInfo:
     stdout_bytes: int = 0
     stderr_bytes: int = 0
     error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalInfo:
+    terminal_id: str
+    cwd: str | None
+    shell: str
+    status: str
+    current_command_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    last_active_at: datetime
+    metadata: dict[str, Any] = field(default_factory=dict)
+    latest_command: TerminalCommandInfo | None = None
 
 
 @dataclass(frozen=True, slots=True)

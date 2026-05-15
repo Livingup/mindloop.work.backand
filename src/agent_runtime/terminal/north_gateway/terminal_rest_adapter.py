@@ -23,6 +23,24 @@ from agent_runtime.terminal.north_gateway.terminal_contracts import (
 ReadMode = Literal["tail", "page", "since", "search"]
 
 
+class TerminalCommandResponse(BaseModel):
+    command_id: str
+    terminal_id: str
+    command_line: str
+    actual_cwd: str
+    shell: str
+    status: str
+    requested_cwd: str | None = None
+    tool_call_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    error_message: str | None = None
+
+
 class TerminalResponse(BaseModel):
     terminal_id: str
     cwd: str | None = None
@@ -33,6 +51,7 @@ class TerminalResponse(BaseModel):
     updated_at: datetime
     last_active_at: datetime
     metadata: dict[str, object] = {}
+    latest_command: TerminalCommandResponse | None = None
 
 
 class CreateTerminalBody(BaseModel):
@@ -257,6 +276,27 @@ def _terminal_to_response(info: TerminalInfo) -> TerminalResponse:
         updated_at=info.updated_at,
         last_active_at=info.last_active_at,
         metadata=dict(info.metadata),
+        latest_command=_command_to_response(info.latest_command) if info.latest_command is not None else None,
+    )
+
+
+def _command_to_response(info) -> TerminalCommandResponse:
+    return TerminalCommandResponse(
+        command_id=info.command_id,
+        terminal_id=info.terminal_id,
+        command_line=info.command_line,
+        actual_cwd=info.actual_cwd,
+        shell=info.shell,
+        status=info.status,
+        requested_cwd=info.requested_cwd,
+        tool_call_id=info.tool_call_id,
+        started_at=info.started_at,
+        completed_at=info.completed_at,
+        exit_code=info.exit_code,
+        duration_ms=info.duration_ms,
+        stdout_bytes=info.stdout_bytes,
+        stderr_bytes=info.stderr_bytes,
+        error_message=info.error_message,
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agent_runtime.terminal.terminal import TerminalInstance
+from agent_runtime.terminal.terminal_command import TerminalCommand
 from agent_runtime.terminal.terminal_service import TerminalOutputReadResult, TerminalRuntimeScope, TerminalService
 from agent_runtime.terminal.north_gateway.terminal_contracts import (
     CloseTerminalRequest,
@@ -12,6 +13,7 @@ from agent_runtime.terminal.north_gateway.terminal_contracts import (
     ListTerminalsRequest,
     ReadTerminalOutputRequest,
     ReadTerminalOutputResult,
+    TerminalCommandInfo,
     TerminalInfo,
     WriteTerminalInputRequest,
     WriteTerminalInputResult,
@@ -77,7 +79,13 @@ class TerminalGatewayImpl:
 
     def list_terminals(self, request: ListTerminalsRequest) -> list[TerminalInfo]:
         scope = self._scope_from_request(request)
-        return [_terminal_to_info(terminal) for terminal in self._service.list_terminals(scope)]
+        return [
+            _terminal_to_info(
+                terminal,
+                latest_command=self._service.get_latest_command(terminal.terminal_id),
+            )
+            for terminal in self._service.list_terminals(scope)
+        ]
 
     async def close_terminal(self, request: CloseTerminalRequest) -> TerminalInfo:
         scope = self._scope_from_request(request)
@@ -104,7 +112,7 @@ class TerminalGatewayImpl:
         )
 
 
-def _terminal_to_info(terminal: TerminalInstance) -> TerminalInfo:
+def _terminal_to_info(terminal: TerminalInstance, *, latest_command: TerminalCommand | None = None) -> TerminalInfo:
     return TerminalInfo(
         terminal_id=terminal.terminal_id,
         cwd=terminal.cwd,
@@ -115,6 +123,27 @@ def _terminal_to_info(terminal: TerminalInstance) -> TerminalInfo:
         updated_at=terminal.updated_at,
         last_active_at=terminal.last_active_at,
         metadata=dict(terminal.metadata or {}),
+        latest_command=_command_to_info(latest_command) if latest_command is not None else None,
+    )
+
+
+def _command_to_info(command: TerminalCommand) -> TerminalCommandInfo:
+    return TerminalCommandInfo(
+        command_id=command.command_id,
+        terminal_id=command.terminal_id,
+        command_line=command.command_line,
+        actual_cwd=command.actual_cwd,
+        shell=command.shell,
+        status=command.status,
+        requested_cwd=command.requested_cwd,
+        tool_call_id=command.tool_call_id,
+        started_at=command.started_at,
+        completed_at=command.completed_at,
+        exit_code=command.exit_code,
+        duration_ms=command.duration_ms,
+        stdout_bytes=command.stdout_bytes,
+        stderr_bytes=command.stderr_bytes,
+        error_message=command.error_message,
     )
 
 

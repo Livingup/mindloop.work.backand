@@ -16,9 +16,11 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     PublishCommunicationMessageRequest,
 )
 from agent_runtime.terminal.terminal import (
+    TERMINAL_STATUS_BUSY,
     TERMINAL_STATUS_CLOSED,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_IDLE,
+    TERMINAL_STATUS_WAITING_INPUT,
     TerminalInstance,
 )
 from agent_runtime.terminal.terminal_command import TerminalCommand
@@ -221,6 +223,10 @@ class TerminalService:
 
     def list_terminals(self, scope: TerminalRuntimeScope) -> list[TerminalInstance]:
         return self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id)
+
+    def get_latest_command(self, terminal_id: str) -> TerminalCommand | None:
+        commands = self._repo.list_commands_by_terminal(terminal_id, limit=1)
+        return commands[0] if commands else None
 
     async def execute_command(
         self,
@@ -426,13 +432,20 @@ class TerminalService:
         append_newline: bool = False,
         control: str | None = None,
     ) -> int:
-        self._require_usable_terminal(scope, terminal_id)
+        terminal = self._require_usable_terminal(scope, terminal_id)
+        if terminal.status not in {TERMINAL_STATUS_BUSY, TERMINAL_STATUS_WAITING_INPUT}:
+            raise ValueError(
+                f"终端当前没有正在执行或等待输入的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
+            )
         payload = _control_text(control) if control else (text or "")
         if append_newline:
             payload += "\n"
         if not payload:
             raise ValueError("写入终端的输入不能为空。")
-        bytes_written = await self._process_manager.write_input(terminal_id, payload)
+        try:
+            bytes_written = await self._process_manager.write_input(terminal_id, payload)
+        except KeyError as exc:
+            raise ValueError(f"终端运行进程不可写，可能命令已结束或运行时已重启: {terminal_id}") from exc
         await self._publish(
             scope,
             "terminal.input.sent",
