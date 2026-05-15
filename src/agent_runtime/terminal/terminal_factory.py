@@ -31,6 +31,7 @@ class TerminalFactory:
                 repository = SqliteTerminalRepository(
                     data_dir_accessor=cls._build_data_dir_accessor(config),
                 )
+                repository.reset_runtime_state()
                 process_manager = AsyncioSubprocessTerminalProcessManager()
                 scope_resolver = TerminalRuntimeScopeResolver(
                     agent_runtime_gateway=agent_runtime_gateway,

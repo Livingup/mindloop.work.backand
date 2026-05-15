@@ -426,7 +426,7 @@ class TerminalService:
         append_newline: bool = False,
         control: str | None = None,
     ) -> int:
-        self._require_terminal(scope, terminal_id)
+        self._require_usable_terminal(scope, terminal_id)
         payload = _control_text(control) if control else (text or "")
         if append_newline:
             payload += "\n"
@@ -446,7 +446,7 @@ class TerminalService:
         return bytes_written
 
     async def close_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
-        terminal = self._require_terminal(scope, terminal_id)
+        terminal = self._require_usable_terminal(scope, terminal_id)
         await self._process_manager.terminate_terminal(terminal_id)
         closed = terminal.close()
         self._repo.save_terminal(closed)
@@ -489,7 +489,7 @@ class TerminalService:
         shell: str | None,
     ) -> TerminalInstance:
         if terminal_id:
-            return self._require_terminal(scope, terminal_id)
+            return self._require_usable_terminal(scope, terminal_id)
         terminal = self._repo.find_idle_terminal(scope.owner_type, scope.owner_id)
         if terminal is not None:
             return terminal
@@ -499,6 +499,12 @@ class TerminalService:
         terminal = self._repo.get_terminal(terminal_id)
         if terminal is None or terminal.owner_type != scope.owner_type or terminal.owner_id != scope.owner_id:
             raise KeyError(f"终端不存在: {terminal_id}")
+        return terminal
+
+    def _require_usable_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
+        terminal = self._require_terminal(scope, terminal_id)
+        if terminal.status == TERMINAL_STATUS_DELETED:
+            raise KeyError(f"终端已删除: {terminal_id}")
         return terminal
 
     async def _handle_output(

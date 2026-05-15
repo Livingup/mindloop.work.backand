@@ -8,6 +8,9 @@ from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 
 
 class TerminalRepository(Protocol):
+    def reset_runtime_state(self) -> int:
+        ...
+
     def save_terminal(self, terminal: TerminalInstance) -> TerminalInstance:
         ...
 

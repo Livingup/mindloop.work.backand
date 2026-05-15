@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
-from agent_runtime.terminal.terminal import TERMINAL_STATUS_DELETED, TerminalInstance
-from agent_runtime.terminal.terminal_command import TerminalCommand
+from agent_runtime.terminal.terminal import (
+    TERMINAL_STATUS_BUSY,
+    TERMINAL_STATUS_DELETED,
+    TERMINAL_STATUS_ERROR,
+    TERMINAL_STATUS_IDLE,
+    TERMINAL_STATUS_WAITING_INPUT,
+    TerminalInstance,
+    utc_now,
+)
+from agent_runtime.terminal.terminal_command import (
+    TERMINAL_COMMAND_STATUS_ACCEPTED,
+    TERMINAL_COMMAND_STATUS_FAILED,
+    TERMINAL_COMMAND_STATUS_RUNNING,
+    TerminalCommand,
+)
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
+
+_TERMINAL_OUTPUT_LINE_RETENTION_LIMIT = 30000
+_SQLITE_DELETE_BATCH_SIZE = 500
+_LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n")
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS terminals (
@@ -82,6 +100,43 @@ class SqliteTerminalRepository:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+
+    def reset_runtime_state(self) -> int:
+        with self._lock:
+            now = _datetime_to_text(utc_now())
+            conn = self._connection()
+            terminal_result = conn.execute(
+                """
+                UPDATE terminals
+                SET status = ?, current_command_id = NULL, updated_at = ?
+                WHERE status IN (?, ?, ?) OR (status = ? AND current_command_id IS NOT NULL)
+                """,
+                (
+                    TERMINAL_STATUS_IDLE,
+                    now,
+                    TERMINAL_STATUS_BUSY,
+                    TERMINAL_STATUS_WAITING_INPUT,
+                    TERMINAL_STATUS_ERROR,
+                    TERMINAL_STATUS_IDLE,
+                ),
+            )
+            command_result = conn.execute(
+                """
+                UPDATE terminal_commands
+                SET status = ?, completed_at = COALESCE(completed_at, ?), updated_at = ?, error_message = COALESCE(error_message, ?)
+                WHERE status IN (?, ?)
+                """,
+                (
+                    TERMINAL_COMMAND_STATUS_FAILED,
+                    now,
+                    now,
+                    "AgentRuntime restarted; terminal process state was reset.",
+                    TERMINAL_COMMAND_STATUS_ACCEPTED,
+                    TERMINAL_COMMAND_STATUS_RUNNING,
+                ),
+            )
+            conn.commit()
+            return int(terminal_result.rowcount or 0) + int(command_result.rowcount or 0)
 
     def save_terminal(self, terminal: TerminalInstance) -> TerminalInstance:
         with self._lock:
@@ -243,6 +298,7 @@ class SqliteTerminalRepository:
                 """,
                 _chunk_to_row(chunk),
             )
+            _prune_terminal_output_lines(conn, chunk.terminal_id, _TERMINAL_OUTPUT_LINE_RETENTION_LIMIT)
             conn.commit()
             return chunk
 
@@ -277,12 +333,13 @@ class SqliteTerminalRepository:
                 clauses.append("chunk_index > ?")
                 params.append(after_chunk_index)
             params.extend([max(1, min(limit, 5000)), max(offset, 0)])
+            order_by = "chunk_index ASC" if command_id is not None else "created_at ASC, rowid ASC"
             rows = self._connection().execute(
                 f"""
                 SELECT terminal_id, command_id, chunk_index, byte_offset, stream, chunk, encoding, created_at
                 FROM terminal_output_chunks
                 WHERE {' AND '.join(clauses)}
-                ORDER BY chunk_index ASC
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
                 """,
                 tuple(params),
@@ -311,12 +368,13 @@ class SqliteTerminalRepository:
                 clauses.append("lower(chunk) LIKE ?")
                 params.append(f"%{query.lower()}%")
             params.append(max(1, min(limit, 1000)))
+            order_by = "chunk_index ASC" if command_id is not None else "created_at ASC, rowid ASC"
             rows = self._connection().execute(
                 f"""
                 SELECT terminal_id, command_id, chunk_index, byte_offset, stream, chunk, encoding, created_at
                 FROM terminal_output_chunks
                 WHERE {' AND '.join(clauses)}
-                ORDER BY chunk_index ASC
+                ORDER BY {order_by}
                 LIMIT ?
                 """,
                 tuple(params),
@@ -444,6 +502,77 @@ def _row_to_chunk(row: tuple[Any, ...]) -> TerminalOutputChunk:
         encoding=row[6],
         created_at=_text_to_datetime(row[7]),
     )
+
+
+def _prune_terminal_output_lines(conn: sqlite3.Connection, terminal_id: str, max_lines: int) -> None:
+    rows = conn.execute(
+        """
+        SELECT rowid, chunk
+        FROM terminal_output_chunks
+        WHERE terminal_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        """,
+        (terminal_id,),
+    ).fetchall()
+    remaining_lines = max_lines
+    rowids_to_delete: list[int] = []
+    replacement_rowid: int | None = None
+    replacement_chunk: str | None = None
+
+    for rowid, chunk in rows:
+        actual_rowid = int(rowid)
+        line_count = _count_output_lines(chunk)
+        if remaining_lines <= 0:
+            rowids_to_delete.append(actual_rowid)
+            continue
+        if line_count <= remaining_lines:
+            remaining_lines -= line_count
+            continue
+        replacement_rowid = actual_rowid
+        replacement_chunk = _trim_text_to_latest_lines(chunk, remaining_lines)
+        remaining_lines = 0
+
+    if rowids_to_delete:
+        for rowid_batch in _batched(rowids_to_delete, _SQLITE_DELETE_BATCH_SIZE):
+            conn.execute(
+                f"DELETE FROM terminal_output_chunks WHERE rowid IN ({','.join('?' for _ in rowid_batch)})",
+                tuple(rowid_batch),
+            )
+    if replacement_rowid is not None and replacement_chunk is not None:
+        if replacement_chunk:
+            conn.execute(
+                "UPDATE terminal_output_chunks SET chunk = ? WHERE rowid = ?",
+                (replacement_chunk, replacement_rowid),
+            )
+        else:
+            conn.execute("DELETE FROM terminal_output_chunks WHERE rowid = ?", (replacement_rowid,))
+
+
+def _count_output_lines(text: str) -> int:
+    if text == "":
+        return 0
+    lines = len(_LINE_BREAK_PATTERN.findall(text))
+    if not _LINE_BREAK_PATTERN.search(text[-1]):
+        lines += 1
+    return lines
+
+
+def _trim_text_to_latest_lines(text: str, max_lines: int) -> str:
+    if max_lines <= 0:
+        return ""
+    line_count = _count_output_lines(text)
+    if line_count <= max_lines:
+        return text
+    lines_to_drop = line_count - max_lines
+    for match in _LINE_BREAK_PATTERN.finditer(text):
+        lines_to_drop -= 1
+        if lines_to_drop <= 0:
+            return text[match.end():]
+    return ""
+
+
+def _batched(values: list[int], batch_size: int) -> list[list[int]]:
+    return [values[index:index + batch_size] for index in range(0, len(values), batch_size)]
 
 
 def _datetime_to_text(value: datetime | None) -> str | None:
