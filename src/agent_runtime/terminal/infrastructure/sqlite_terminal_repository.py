@@ -24,7 +24,7 @@ from agent_runtime.terminal.terminal_command import (
 )
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 
-_TERMINAL_OUTPUT_LINE_RETENTION_LIMIT = 30000
+_TERMINAL_OUTPUT_LINE_RETENTION_LIMIT = 5000
 _SQLITE_DELETE_BATCH_SIZE = 500
 _LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n")
 _LEGACY_TERMINAL_STATUS_CLOSED = "closed"

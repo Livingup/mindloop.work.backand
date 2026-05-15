@@ -20,6 +20,8 @@ from agent_runtime.terminal.terminal_process import (
 )
 
 _SENTINEL_PREFIX = "__AGENT_RUNTIME_COMMAND_DONE__"
+_PTY_READ_CHUNK_SIZE = 4096
+_PTY_PENDING_TEXT_MAX_CHARS = 8192
 
 
 @dataclass(slots=True)
@@ -210,7 +212,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         _strip_command_echo(active)
         match = active.sentinel_pattern.search(active.pending_text)
         if match is None:
-            keep_tail = len(_SENTINEL_PREFIX) + len(active.command_id) + 32
+            keep_tail = min(_PTY_PENDING_TEXT_MAX_CHARS, len(_SENTINEL_PREFIX) + len(active.command_id) + 32)
             if len(active.pending_text) <= keep_tail:
                 return
             emit_text = active.pending_text[:-keep_tail]
@@ -376,7 +378,7 @@ async def _read_unix_pty(master_fd: int) -> bytes:
     finally:
         loop.remove_reader(master_fd)
     try:
-        return os.read(master_fd, 4096)
+        return os.read(master_fd, _PTY_READ_CHUNK_SIZE)
     except BlockingIOError:
         return b""
     except OSError:
@@ -385,7 +387,7 @@ async def _read_unix_pty(master_fd: int) -> bytes:
 
 def _read_windows_pty(winpty: Any) -> str:
     try:
-        return winpty.read(4096)
+        return winpty.read(_PTY_READ_CHUNK_SIZE)
     except EOFError:
         return ""
 
