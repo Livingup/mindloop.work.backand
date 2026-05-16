@@ -445,7 +445,7 @@ def create_agent_runtime_router(
     def scene_heartbeat(scene_id: str) -> None:
         """前端定期发送的 scene 心跳，用于维持 session 活跃状态。
 
-        前端应以 stale_timeout / 3 的间隔（默认约 10s）调用本接口。
+        前端应以 stale_timeout / 3 的间隔（默认约 40s）调用本接口。
         返回 204 表示心跳成功；404 表示 session 不存在，前端应重新 attach。
         """
         if session_registry is None:

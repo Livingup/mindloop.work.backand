@@ -21,8 +21,8 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 # 默认心跳过期超时（秒）。前端应以 STALE_TIMEOUT / 3 的间隔发送心跳。
-# 设为 90s 以容忍浏览器对后台 Tab 的 setInterval 节流（通常降至 ~1 次/分钟）。
-DEFAULT_STALE_TIMEOUT_SECONDS: float = 90.0
+# 设为 120s 以容忍浏览器对后台 Tab 的 setInterval 节流（通常降至 ~1 次/分钟）。
+DEFAULT_STALE_TIMEOUT_SECONDS: float = 120.0
 
 # 后台扫描间隔（秒）。
 DEFAULT_SWEEP_INTERVAL_SECONDS: float = 5.0
