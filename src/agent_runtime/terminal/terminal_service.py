@@ -191,11 +191,12 @@ class TerminalService:
         *,
         cwd: str | None = None,
         shell: str | None = None,
+        terminal_id: str | None = None,
     ) -> TerminalInstance:
         actual_cwd = self._resolve_cwd(cwd, scope.default_cwd)
         actual_shell = self._resolve_shell(shell)
         terminal = TerminalInstance(
-            terminal_id=_new_id("term"),
+            terminal_id=terminal_id or _new_id("term"),
             owner_type=scope.owner_type,
             owner_id=scope.owner_id,
             cwd=actual_cwd,
@@ -510,7 +511,10 @@ class TerminalService:
         shell: str | None,
     ) -> TerminalInstance:
         if terminal_id:
-            terminal = self._require_usable_terminal(scope, terminal_id)
+            try:
+                terminal = self._require_usable_terminal(scope, terminal_id)
+            except KeyError:
+                return await self.create_terminal(scope, cwd=cwd, shell=shell, terminal_id=terminal_id)
             terminal = self._recover_terminal_slot_if_needed(terminal)
             if cwd is not None:
                 requested_cwd = self._resolve_cwd(cwd, scope.default_cwd)
