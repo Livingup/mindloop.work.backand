@@ -172,7 +172,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
         limit_lines: int = Query(default=200, ge=1, le=2000),
         limit_chars: int = Query(default=12000, ge=1000, le=50000),
         after_chunk_index: int | None = Query(default=None, ge=0),
-        wait_timeout_ms: int = Query(default=0, ge=0, le=60000),
+        wait_timeout_ms: int = Query(default=0, ge=0, le=3600000),
         query: str | None = None,
         case_sensitive: bool = False,
     ) -> ReadTerminalOutputResponse:

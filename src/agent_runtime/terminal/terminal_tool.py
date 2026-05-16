@@ -39,7 +39,7 @@ class TerminalReadOutputToolRequest(BaseToolRequest):
     limit_lines: int = Field(default=200, ge=1, le=2000, description="最多读取的输出 chunk 数；取值范围为 1 到 2000。")
     limit_chars: int = Field(default=12000, ge=1000, le=50000, description="最多返回字符数，避免撑爆上下文；取值范围为 1000 到 50000。")
     after_chunk_index: int | None = Field(default=None, ge=0, description="since 模式读取该 chunk_index 之后的输出；如提供则取值必须大于等于 0。")
-    wait_timeout_ms: int = Field(default=0, ge=0, le=60000, description="没有新输出时最多等待多久，单位毫秒；取值范围为 0 到 60000，0 表示不等待。")
+    wait_timeout_ms: int = Field(default=0, ge=0, le=3600000, description="没有新输出时最多等待多久，单位毫秒；取值范围为 0 到 3600000（即最多 1 小时），0 表示不等待。")
     query: str | None = Field(default=None, description="search 模式搜索关键词。")
     case_sensitive: bool = Field(default=False, description="search 模式是否大小写敏感。")
 
