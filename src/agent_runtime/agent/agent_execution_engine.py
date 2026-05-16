@@ -475,6 +475,7 @@ class AgentExecutionEngine:
                     },
                 )
                 assistant_message = llm_response.assistant_message
+                _record_last_context_usage(conversation, llm_response)
                 await self._conversation_repository.save(conversation)
                 self._trace_recorder.record_llm_response(trace_path, assistant_message)
                 await self._event_publisher.publish(
@@ -1351,6 +1352,19 @@ def _request_user_text(request: AgentExecutionRequest) -> str:
         if isinstance(part, TextPart) and part.text
     ]
     return "\n\n".join(texts) or "用户提交了非文本输入。"
+
+
+def _record_last_context_usage(conversation: Any, llm_response: LlmPromptResponse) -> None:
+    token_usage = dict(llm_response.token_usage or {})
+    conversation.state.last_context_usage = {
+        "token_usage": token_usage,
+        "context_window_used_tokens": int(token_usage.get("total_tokens") or 0),
+        "context_window_max": llm_response.context_window_max,
+        "provider_id": llm_response.provider_id,
+        "binding_id": llm_response.binding_id,
+        "model_id": llm_response.model_id,
+        "model_alias": llm_response.model_alias,
+    }
 
 
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:

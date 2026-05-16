@@ -81,3 +81,15 @@ class LlmPromptResponse:
 
     # 本次请求尝试次数。
     attempt_count: int = 1
+
+    token_usage: dict[str, int] = field(default_factory=dict)
+
+    context_window_max: int | None = None
+
+    provider_id: str | None = None
+
+    binding_id: str | None = None
+
+    model_id: str | None = None
+
+    model_alias: str | None = None

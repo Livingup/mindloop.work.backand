@@ -262,6 +262,7 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.terminal.north_gateway.terminal_rest_adapter import (
         create_terminal_router,
     )
+    from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -270,6 +271,9 @@ def serve(host: str | None, port: int | None) -> None:
     agent_definition_gateway = AgentDefinitionFactory.create()
     communication_gateway = CommunicationFactory.create()
     chat_bubble_service = ChatBubbleFactory.create()
+    conversation_repository = SqliteConversationRepository(
+        ConfigRegistry.instance().conversation_repository.data_dir,
+    )
     # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
     # 以支持 attach_scene 编排（前端进入 scene 的统一入口）。
     scene_gateway = SceneFactory.create()
@@ -388,6 +392,7 @@ def serve(host: str | None, port: int | None) -> None:
             scene_gateway=scene_gateway,
             session_registry=scene_session_registry,
             chat_bubble_service=chat_bubble_service,
+            conversation_repository=conversation_repository,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],

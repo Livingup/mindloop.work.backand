@@ -23,6 +23,7 @@ from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
 from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import (
     AgentDefinitionNorthGateway,
 )
+from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmExecutionPolicy,
 )
@@ -88,6 +89,7 @@ class AgentInstanceResponse(BaseModel):
     status: str
     pending_user_message_count: int = 0
     pending_user_messages: list[PendingUserMessageResponse] = Field(default_factory=list)
+    context_usage: dict[str, Any] | None = None
     created_at: str
     updated_at: str
 
@@ -251,6 +253,7 @@ def create_agent_runtime_router(
     scene_gateway: SceneGateway | None = None,
     session_registry: SceneSessionRegistry | None = None,
     chat_bubble_service: ChatBubbleService | None = None,
+    conversation_repository: ConversationRepository | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -259,7 +262,7 @@ def create_agent_runtime_router(
         response_model=CreateRootAgentInstanceResponse,
         status_code=201,
     )
-    def create_root_agent_instance(
+    async def create_root_agent_instance(
         body: CreateRootAgentInstanceBody,
     ) -> CreateRootAgentInstanceResponse:
         try:
@@ -291,7 +294,7 @@ def create_agent_runtime_router(
             raise HTTPException(status_code=409, detail=str(e))
         return CreateRootAgentInstanceResponse(
             task=_task_response(task),
-            root_agent_instance=_instance_response(instance),
+            root_agent_instance=await _instance_response(instance, conversation_repository, llm_registry_gateway),
         )
 
     @router.get("/tasks/{task_id}", response_model=AgentRuntimeTaskResponse)
@@ -303,15 +306,15 @@ def create_agent_runtime_router(
         return _task_response(task)
 
     @router.get("/instances/{instance_id}", response_model=AgentInstanceResponse)
-    def get_agent_instance(instance_id: str) -> AgentInstanceResponse:
+    async def get_agent_instance(instance_id: str) -> AgentInstanceResponse:
         try:
             instance = gateway.get_agent_instance(instance_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
-        return _instance_response(instance)
+        return await _instance_response(instance, conversation_repository, llm_registry_gateway)
 
     @router.patch("/instances/{instance_id}/llm-policy", response_model=AgentInstanceResponse)
-    def switch_agent_instance_llm_policy(
+    async def switch_agent_instance_llm_policy(
         instance_id: str,
         body: SwitchAgentInstanceLlmPolicyBody,
     ) -> AgentInstanceResponse:
@@ -339,7 +342,7 @@ def create_agent_runtime_router(
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return _instance_response(updated)
+        return await _instance_response(updated, conversation_repository, llm_registry_gateway)
 
     @router.post(
         "/instances/{instance_id}/messages",
@@ -367,14 +370,14 @@ def create_agent_runtime_router(
             raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
-        return _submission_response(result)
+        return await _submission_response(result, conversation_repository, llm_registry_gateway)
 
     @router.post(
         "/scenes/{scene_id}/attach",
         response_model=AttachSceneResponseModel,
         status_code=200,
     )
-    def attach_scene(
+    async def attach_scene(
         scene_id: str,
         body: AttachSceneBody,
     ) -> AttachSceneResponseModel:
@@ -436,7 +439,11 @@ def create_agent_runtime_router(
         return AttachSceneResponseModel(
             mode=response.mode,
             task=_task_response(response.task),
-            root_agent_instance=_instance_response(response.instance),
+            root_agent_instance=await _instance_response(
+                response.instance,
+                conversation_repository,
+                llm_registry_gateway,
+            ),
             communication_stream_id=response.communication_stream_id,
             event_stream_url=response.event_stream_url,
         )
@@ -748,6 +755,7 @@ def _policy_snapshot_without_secrets(
                 "model_alias": candidate.resolved_model.model_alias,
                 "api_format": candidate.resolved_model.api_format,
                 "sdk_platform": candidate.resolved_model.sdk_platform,
+                "context_window": candidate.resolved_model.context_window,
             }
             for candidate in resolved.candidates
         ],
@@ -766,7 +774,11 @@ def _task_response(task: AgentTask) -> AgentRuntimeTaskResponse:
     )
 
 
-def _instance_response(instance: AgentInstance) -> AgentInstanceResponse:
+async def _instance_response(
+    instance: AgentInstance,
+    conversation_repository: ConversationRepository | None = None,
+    llm_registry_gateway: LlmModelRegistryGateway | None = None,
+) -> AgentInstanceResponse:
     return AgentInstanceResponse(
         instance_id=instance.instance_id,
         task_id=instance.task_id,
@@ -785,9 +797,177 @@ def _instance_response(instance: AgentInstance) -> AgentInstanceResponse:
             _pending_user_message_response(message)
             for message in instance.pending_user_messages
         ],
+        context_usage=await _instance_context_usage(
+            instance,
+            conversation_repository,
+            llm_registry_gateway,
+        ),
         created_at=_datetime_text(instance.created_at),
         updated_at=_datetime_text(instance.updated_at),
     )
+
+
+async def _instance_context_usage(
+    instance: AgentInstance,
+    conversation_repository: ConversationRepository | None,
+    llm_registry_gateway: LlmModelRegistryGateway | None,
+) -> dict[str, Any] | None:
+    fallback = _fallback_context_usage(instance, llm_registry_gateway)
+    usage = None
+    if conversation_repository is not None and instance.conversation_id:
+        try:
+            conversation = await conversation_repository.get(instance.conversation_id)
+            usage = _normalize_context_usage(conversation.state.last_context_usage)
+        except Exception:
+            usage = None
+    if usage is None:
+        return fallback
+    if usage.get("context_window_max") is None and fallback is not None:
+        usage = {**fallback, **usage, "context_window_max": fallback.get("context_window_max")}
+    return usage
+
+
+def _normalize_context_usage(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    token_usage = _normalize_token_usage(value.get("token_usage"))
+    used_tokens = _int_or_none(value.get("context_window_used_tokens"))
+    if used_tokens is None:
+        used_tokens = int(token_usage.get("total_tokens") or 0) if token_usage else 0
+    result = {
+        "token_usage": token_usage,
+        "context_window_used_tokens": used_tokens,
+        "context_window_max": _int_or_none(value.get("context_window_max")),
+        "provider_id": _optional_text(value.get("provider_id")),
+        "binding_id": _optional_text(value.get("binding_id")),
+        "model_id": _optional_text(value.get("model_id")),
+        "model_alias": _optional_text(value.get("model_alias")),
+    }
+    if result["context_window_max"] is None and token_usage is None:
+        return None
+    return result
+
+
+def _normalize_token_usage(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "input_tokens": _non_negative_int(value.get("input_tokens")),
+        "output_tokens": _non_negative_int(value.get("output_tokens")),
+        "total_tokens": _non_negative_int(value.get("total_tokens")),
+        "cached_tokens": _non_negative_int(value.get("cached_tokens")),
+        **(
+            {"reasoning_tokens": _non_negative_int(value.get("reasoning_tokens"))}
+            if value.get("reasoning_tokens") is not None
+            else {}
+        ),
+        **(
+            {"cache_creation_tokens": _non_negative_int(value.get("cache_creation_tokens"))}
+            if value.get("cache_creation_tokens") is not None
+            else {}
+        ),
+    }
+
+
+def _fallback_context_usage(
+    instance: AgentInstance,
+    llm_registry_gateway: LlmModelRegistryGateway | None,
+) -> dict[str, Any] | None:
+    candidate = _first_policy_candidate(instance)
+    if llm_registry_gateway is not None and candidate is not None:
+        provider_id = candidate.get("provider_id")
+        model_binding_id = candidate.get("model_binding_id")
+        if provider_id and model_binding_id:
+            try:
+                resolved = llm_registry_gateway.resolve_provider_model(
+                    str(provider_id),
+                    str(model_binding_id),
+                )
+                return _context_usage_from_model(
+                    provider_id=resolved.provider_id,
+                    binding_id=resolved.binding_id,
+                    model_id=resolved.model_id,
+                    model_alias=resolved.model_alias,
+                    context_window_max=resolved.context_window,
+                )
+            except (KeyError, ValueError):
+                pass
+    if candidate is not None:
+        context_window = _int_or_none(candidate.get("context_window"))
+        if context_window is not None:
+            return _context_usage_from_model(
+                provider_id=_optional_text(candidate.get("provider_id")),
+                binding_id=_optional_text(candidate.get("model_binding_id")),
+                model_id=_optional_text(candidate.get("model_id")),
+                model_alias=_optional_text(candidate.get("model_alias")),
+                context_window_max=context_window,
+            )
+    if llm_registry_gateway is not None:
+        try:
+            resolved = llm_registry_gateway.resolve_provider_model(
+                instance.llm_provider_id,
+                instance.llm_model_binding_id,
+            )
+            return _context_usage_from_model(
+                provider_id=resolved.provider_id,
+                binding_id=resolved.binding_id,
+                model_id=resolved.model_id,
+                model_alias=resolved.model_alias,
+                context_window_max=resolved.context_window,
+            )
+        except (KeyError, ValueError):
+            return None
+    return None
+
+
+def _first_policy_candidate(instance: AgentInstance) -> dict[str, Any] | None:
+    candidates = instance.llm_policy_snapshot_json.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return None
+    first = candidates[0]
+    return first if isinstance(first, dict) else None
+
+
+def _context_usage_from_model(
+    *,
+    provider_id: str | None,
+    binding_id: str | None,
+    model_id: str | None,
+    model_alias: str | None,
+    context_window_max: int,
+) -> dict[str, Any]:
+    return {
+        "token_usage": None,
+        "context_window_used_tokens": 0,
+        "context_window_max": context_window_max,
+        "provider_id": provider_id,
+        "binding_id": binding_id,
+        "model_id": model_id,
+        "model_alias": model_alias,
+    }
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _pending_user_message_response(message: PendingAgentUserMessage) -> PendingUserMessageResponse:
@@ -850,7 +1030,11 @@ def _execution_response(result: AgentExecutionResult) -> AgentExecutionResponse:
     )
 
 
-def _submission_response(result: AgentMessageSubmissionResult) -> AgentMessageSubmissionResponse:
+async def _submission_response(
+    result: AgentMessageSubmissionResult,
+    conversation_repository: ConversationRepository | None = None,
+    llm_registry_gateway: LlmModelRegistryGateway | None = None,
+) -> AgentMessageSubmissionResponse:
     return AgentMessageSubmissionResponse(
         status=result.status,
         task_id=result.task_id,
@@ -861,7 +1045,11 @@ def _submission_response(result: AgentMessageSubmissionResult) -> AgentMessageSu
         pending_message_id=result.pending_message_id,
         client_message_id=result.client_message_id,
         queued_for_later=result.queued_for_later,
-        root_agent_instance=_instance_response(result.instance),
+        root_agent_instance=await _instance_response(
+            result.instance,
+            conversation_repository,
+            llm_registry_gateway,
+        ),
     )
 
 

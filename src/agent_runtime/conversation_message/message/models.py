@@ -304,6 +304,8 @@ class ConversationState:
     # 累计 PDF 页数。
     pdf_page_count: int = 0
 
+    last_context_usage: dict[str, Any] | None = None
+
 
 @dataclass(slots=True)
 class Conversation:

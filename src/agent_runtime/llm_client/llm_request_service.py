@@ -281,6 +281,12 @@ class LlmRequestService:
                         assistant_message=assistant_message,
                         api_key_index=key_index,
                         attempt_count=attempt_count,
+                        token_usage=token_usage,
+                        context_window_max=resolved.context_window,
+                        provider_id=resolved.provider_id,
+                        binding_id=resolved.binding_id,
+                        model_id=resolved.model_id,
+                        model_alias=resolved.model_alias,
                     )
         if last_error is not None:
             await self._event_publisher.publish(

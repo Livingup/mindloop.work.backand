@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     vendors         TEXT    NOT NULL DEFAULT '[]',
     modalities      TEXT    NOT NULL DEFAULT '[]',
     image_count     INTEGER NOT NULL DEFAULT 0,
-    pdf_page_count  INTEGER NOT NULL DEFAULT 0
+    pdf_page_count  INTEGER NOT NULL DEFAULT 0,
+    last_context_usage TEXT
 );
 
 CREATE TABLE IF NOT EXISTS provider_state (
@@ -171,6 +172,7 @@ class SqliteConversationRepository:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
 
     def close(self) -> None:
@@ -216,7 +218,7 @@ class SqliteConversationRepository:
 
         # 从 SQLite 读取会话派生状态。
         sr = c.execute(
-            "SELECT providers, vendors, modalities, image_count, pdf_page_count "
+            "SELECT providers, vendors, modalities, image_count, pdf_page_count, last_context_usage "
             "FROM conversation_state WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
@@ -226,6 +228,7 @@ class SqliteConversationRepository:
             modalities=json.loads(sr[2]),
             image_count=sr[3],
             pdf_page_count=sr[4],
+            last_context_usage=json.loads(sr[5]) if sr[5] else None,
         ) if sr else ConversationState()
 
         # 从 SQLite 读取各 LLM 供应商的会话状态。
@@ -362,8 +365,8 @@ class SqliteConversationRepository:
     def _upsert_state(self, cid: str, state: ConversationState) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO conversation_state "
-            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count, last_context_usage) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 cid,
                 json.dumps(state.providers, ensure_ascii=False),
@@ -371,5 +374,16 @@ class SqliteConversationRepository:
                 json.dumps(state.modalities, ensure_ascii=False),
                 state.image_count,
                 state.pdf_page_count,
+                json.dumps(state.last_context_usage, ensure_ascii=False)
+                if state.last_context_usage is not None
+                else None,
             ),
         )
+
+    def _migrate_schema(self) -> None:
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(conversation_state)").fetchall()
+        }
+        if "last_context_usage" not in columns:
+            self._conn.execute("ALTER TABLE conversation_state ADD COLUMN last_context_usage TEXT")
