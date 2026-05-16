@@ -24,7 +24,7 @@ class TerminalCreateToolRequest(BaseToolRequest):
 
 class TerminalExecuteCommandToolRequest(BaseToolRequest):
     command_line: str = Field(description="要执行的命令行。")
-    terminal_id: str | None = Field(default=None, description="可选稳定终端 ID；不传时自动选择匹配的空闲终端，没有则创建新终端。")
+    terminal_id: str | None = Field(default=None, description="要复用的终端 ID，由后端在首次执行时返回。首次执行命令时不要传此字段，让后端自动创建并返回 terminal_id；后续要在同一终端中执行命令时，传入上次返回的 terminal_id 即可。不要自己编造 terminal_id。")
     cwd: str | None = Field(default=None, description="可选初始工作目录；仅在自动创建新终端时生效，不能改变已有终端 cwd。")
     shell: str | None = Field(default=None, description="可选初始 shell；仅在自动创建新终端时生效，不能改变已有终端 shell。")
     timeout_ms: int | None = Field(default=None, ge=1, description="可选命令超时时间，单位毫秒；如提供则取值必须大于等于 1。")
@@ -87,7 +87,7 @@ async def terminal_create(request: TerminalCreateToolRequest, ctx: ToolRuntimeCo
 
 @tool(
     name="terminal_execute_command",
-    description="在当前任务/场景归属终端中输入并执行一条命令。terminal_id 是稳定业务终端 ID，后端会为它按需挂载或重建 PTY/ConPTY shell；一个 terminal_id 同时最多跟踪一个前台命令。长进程会占用该终端直到退出或被中断。cwd/shell 只在自动创建新终端时作为初始值，不能改变已有终端。工具成功表示命令已写入终端并开始异步执行，返回实际 cwd、terminal_id 和 command_id。",
+    description="在当前任务/场景归属终端中输入并执行一条命令。首次执行时不要传 terminal_id，后端会自动创建终端并返回 terminal_id；后续要在同一终端中执行命令时，传入上次返回的 terminal_id 即可实现连贯操作。terminal_id 是后端分配的稳定业务标识，不要自己编造。一个 terminal_id 同时最多跟踪一个前台命令，长进程会占用该终端直到退出或被中断。cwd/shell 只在自动创建新终端时作为初始值，不能改变已有终端。工具成功表示命令已写入终端并开始异步执行，返回 actual_cwd、terminal_id 和 command_id。",
     group="terminal",
     category="business",
 )
