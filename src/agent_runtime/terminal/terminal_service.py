@@ -193,6 +193,10 @@ class TerminalService:
         shell: str | None = None,
         terminal_id: str | None = None,
     ) -> TerminalInstance:
+        if terminal_id:
+            existing = self._repo.get_terminal(terminal_id)
+            if existing is not None and existing.status == TERMINAL_STATUS_DELETED:
+                raise KeyError(f"终端已删除，不能复用: {terminal_id}")
         actual_cwd = self._resolve_cwd(cwd, scope.default_cwd)
         actual_shell = self._resolve_shell(shell)
         terminal = TerminalInstance(
@@ -486,6 +490,7 @@ class TerminalService:
     async def delete_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
         terminal = self._require_terminal(scope, terminal_id)
         await self._process_manager.terminate_terminal(terminal_id)
+        self._runtime_tokens.pop(terminal_id, None)
         deleted = terminal.delete()
         self._repo.save_terminal(deleted)
         await self._publish(
@@ -511,10 +516,11 @@ class TerminalService:
         shell: str | None,
     ) -> TerminalInstance:
         if terminal_id:
-            try:
-                terminal = self._require_usable_terminal(scope, terminal_id)
-            except KeyError:
+            terminal = self._repo.get_terminal(terminal_id)
+            if terminal is None or terminal.owner_type != scope.owner_type or terminal.owner_id != scope.owner_id:
                 return await self.create_terminal(scope, cwd=cwd, shell=shell, terminal_id=terminal_id)
+            if terminal.status == TERMINAL_STATUS_DELETED:
+                raise KeyError(f"终端已删除，不能复用: {terminal_id}")
             terminal = self._recover_terminal_slot_if_needed(terminal)
             if cwd is not None:
                 requested_cwd = self._resolve_cwd(cwd, scope.default_cwd)
