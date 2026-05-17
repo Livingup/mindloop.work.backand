@@ -166,6 +166,20 @@ class SqliteTerminalRepository:
             conn.commit()
             return terminal
 
+    def delete_terminal_data(self, terminal_id: str) -> int:
+        with self._lock:
+            conn = self._connection()
+            chunk_result = conn.execute(
+                "DELETE FROM terminal_output_chunks WHERE terminal_id = ?",
+                (terminal_id,),
+            )
+            command_result = conn.execute(
+                "DELETE FROM terminal_commands WHERE terminal_id = ?",
+                (terminal_id,),
+            )
+            conn.commit()
+            return int(chunk_result.rowcount or 0) + int(command_result.rowcount or 0)
+
     def get_terminal(self, terminal_id: str) -> TerminalInstance | None:
         with self._lock:
             row = self._connection().execute(

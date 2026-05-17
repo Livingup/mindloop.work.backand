@@ -491,8 +491,10 @@ class TerminalService:
         terminal = self._require_terminal(scope, terminal_id)
         await self._process_manager.terminate_terminal(terminal_id)
         self._runtime_tokens.pop(terminal_id, None)
+        self._discard_terminal_runtime_state(terminal_id)
         deleted = terminal.delete()
         self._repo.save_terminal(deleted)
+        self._repo.delete_terminal_data(terminal_id)
         await self._publish(
             scope,
             "terminal.deleted",
@@ -768,6 +770,15 @@ class TerminalService:
             lock = asyncio.Lock()
             self._locks[key] = lock
         return lock
+
+    def _discard_terminal_runtime_state(self, terminal_id: str) -> None:
+        for key in [key for key in self._byte_offsets if key[0] == terminal_id]:
+            self._byte_offsets.pop(key, None)
+        for key in [key for key in self._stream_bytes if key[0] == terminal_id]:
+            self._stream_bytes.pop(key, None)
+        lock_prefix = f"output:{terminal_id}:"
+        for key in [key for key in self._locks if key.startswith(lock_prefix)]:
+            self._locks.pop(key, None)
 
     def _resolve_shell(self, shell: str | None) -> str:
         actual = shell or self._default_shell

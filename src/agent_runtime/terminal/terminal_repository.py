@@ -14,6 +14,9 @@ class TerminalRepository(Protocol):
     def save_terminal(self, terminal: TerminalInstance) -> TerminalInstance:
         ...
 
+    def delete_terminal_data(self, terminal_id: str) -> int:
+        ...
+
     def get_terminal(self, terminal_id: str) -> TerminalInstance | None:
         ...
 
