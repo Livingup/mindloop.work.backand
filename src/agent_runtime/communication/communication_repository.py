@@ -27,6 +27,9 @@ class CommunicationRepository(Protocol):
         """追加通信消息，并分配流内递增 seq。"""
         ...
 
+    def advance_stream_cursor(self, stream_id: str, *, seq: int) -> None:
+        ...
+
     def list_messages(
         self,
         stream_id: str,

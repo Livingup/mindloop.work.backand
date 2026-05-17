@@ -2,8 +2,10 @@
 """通用通信领域服务。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from contextlib import suppress
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
@@ -41,10 +43,10 @@ class CommunicationService:
         repository: CommunicationRepository,
         event_hub: InMemoryCommunicationEventHub,
     ) -> None:
-        # 通信流元数据仓储。runtime event 不再通过 SQLite 消息日志承载。
+        # 通信流与消息日志仓储。SQLite 消息日志是跨重启断线恢复的权威来源。
         self._repository = repository
 
-        # 进程内短期事件流。负责 stream 内 seq、短时间断线续传和 SSE 订阅分发。
+        # 进程内短期事件流。负责在线订阅分发和同进程短期缓冲。
         self._event_hub = event_hub
 
         self._stream_cache: dict[str, CommunicationStream] = {}
@@ -131,7 +133,8 @@ class CommunicationService:
             payload=dict(payload or {}),
             metadata=dict(metadata or {}),
         )
-        saved = await self._event_hub.publish(message)
+        saved = self._repository.append_message(message)
+        await self._event_hub.publish(saved)
         duration_seconds = time.perf_counter() - started_at
         if duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
             logger.warning(
@@ -153,7 +156,7 @@ class CommunicationService:
         """读取某条通信流中的历史消息。"""
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        return self._event_hub.list_messages(
+        return self._repository.list_messages(
             stream_id,
             after_seq=max(after_seq, 0),
             limit=max(min(limit, 5000), 1),
@@ -172,7 +175,7 @@ class CommunicationService:
         """
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        return self._event_hub.list_latest_messages(
+        return self._repository.list_latest_messages(
             stream_id,
             limit=max(min(limit, 5000), 1),
         )
@@ -186,5 +189,50 @@ class CommunicationService:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
-        async for message in self._event_hub.subscribe(stream_id, after_seq=max(after_seq, 0)):
-            yield message
+        cursor = max(after_seq, 0)
+        subscription = self._event_hub.subscribe(stream_id, after_seq=cursor)
+        next_live_message = asyncio.create_task(anext(subscription))
+        await asyncio.sleep(0)
+        try:
+            while True:
+                replay_messages = self._repository.list_messages(
+                    stream_id,
+                    after_seq=cursor,
+                    limit=5000,
+                )
+                if not replay_messages:
+                    break
+                for message in replay_messages:
+                    if message.seq <= cursor:
+                        continue
+                    cursor = message.seq
+                    yield message
+                if len(replay_messages) < 5000:
+                    break
+            while True:
+                message = await next_live_message
+                next_live_message = asyncio.create_task(anext(subscription))
+                if message.seq <= cursor:
+                    continue
+                if message.seq > cursor + 1:
+                    gap_messages = self._repository.list_messages(
+                        stream_id,
+                        after_seq=cursor,
+                        limit=5000,
+                    )
+                    for gap_message in gap_messages:
+                        if gap_message.seq <= cursor:
+                            continue
+                        cursor = gap_message.seq
+                        yield gap_message
+                        if cursor >= message.seq:
+                            break
+                    if message.seq <= cursor:
+                        continue
+                cursor = message.seq
+                yield message
+        finally:
+            next_live_message.cancel()
+            with suppress(asyncio.CancelledError):
+                await next_live_message
+            await subscription.aclose()

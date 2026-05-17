@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS communication_streams (
     owner_id   TEXT,
     status     TEXT NOT NULL,
     metadata   TEXT NOT NULL,
+    last_seq   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -132,10 +133,28 @@ class SqliteCommunicationRepository:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM communication_messages WHERE stream_id = ?",
-                    (message.stream_id,),
+                    """
+                    SELECT MAX(
+                        COALESCE(
+                            (SELECT last_seq FROM communication_streams WHERE stream_id = ?),
+                            0
+                        ),
+                        COALESCE(MAX(seq), 0)
+                    ) + 1
+                    FROM communication_messages
+                    WHERE stream_id = ?
+                    """,
+                    (message.stream_id, message.stream_id),
                 ).fetchone()
                 next_seq = int(row[0])
+                conn.execute(
+                    """
+                    UPDATE communication_streams
+                    SET last_seq = CASE WHEN last_seq < ? THEN ? ELSE last_seq END
+                    WHERE stream_id = ?
+                    """,
+                    (next_seq, next_seq, message.stream_id),
+                )
                 saved = CommunicationMessage(
                     message_id=message.message_id,
                     stream_id=message.stream_id,
@@ -166,6 +185,24 @@ class SqliteCommunicationRepository:
                 conn.rollback()
                 raise
 
+    def advance_stream_cursor(self, stream_id: str, *, seq: int) -> None:
+        if seq <= 0:
+            return
+        with self._lock:
+            conn = self._connection()
+            self._advance_stream_cursor(conn, stream_id, seq)
+            conn.commit()
+
+    def _advance_stream_cursor(self, conn: sqlite3.Connection, stream_id: str, seq: int) -> None:
+        conn.execute(
+            """
+            UPDATE communication_streams
+            SET last_seq = CASE WHEN last_seq < ? THEN ? ELSE last_seq END
+            WHERE stream_id = ?
+            """,
+            (seq, seq, stream_id),
+        )
+
     def list_messages(
         self,
         stream_id: str,
@@ -175,7 +212,10 @@ class SqliteCommunicationRepository:
     ) -> list[CommunicationMessage]:
         """按通信流和 seq 增量读取消息。"""
         with self._lock:
-            rows = self._connection().execute(
+            conn = self._connection()
+            self._advance_stream_cursor(conn, stream_id, after_seq)
+            conn.commit()
+            rows = conn.execute(
                 """
                 SELECT message_id, stream_id, seq, type, topic, source, actor_id,
                        correlation_id, parent_message_id, payload, metadata, created_at, schema_version
@@ -227,9 +267,31 @@ class SqliteCommunicationRepository:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
         self._db_path = db_path
         return self._conn
+
+    def _migrate_schema(self) -> None:
+        columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(communication_streams)").fetchall()
+        }
+        if "last_seq" not in columns:
+            self._conn.execute(
+                "ALTER TABLE communication_streams ADD COLUMN last_seq INTEGER NOT NULL DEFAULT 0"
+            )
+        self._conn.execute(
+            """
+            UPDATE communication_streams
+            SET last_seq = COALESCE((
+                SELECT MAX(seq)
+                FROM communication_messages
+                WHERE communication_messages.stream_id = communication_streams.stream_id
+            ), 0)
+            WHERE last_seq = 0
+            """
+        )
 
 
 def _stream_to_row(stream: CommunicationStream) -> tuple[Any, ...]:

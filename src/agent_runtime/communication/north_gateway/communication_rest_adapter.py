@@ -167,9 +167,10 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
             gateway.get_stream(stream_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"通信流不存在: {stream_id}")
+        effective_after_seq = max(after_seq, _last_event_id_to_seq(request.headers.get("last-event-id")))
 
         async def event_generator() -> AsyncIterator[str]:
-            subscription = gateway.subscribe_messages(stream_id, after_seq=after_seq)
+            subscription = gateway.subscribe_messages(stream_id, after_seq=effective_after_seq)
             next_message = asyncio.create_task(anext(subscription))
             try:
                 while True:
@@ -227,3 +228,12 @@ def _format_sse_message(message: CommunicationMessage) -> str:
     """把通信消息格式化为 SSE 帧。"""
     payload = json.dumps(message.to_dict(), ensure_ascii=False, separators=(",", ":"))
     return f"id: {message.seq}\nevent: {message.type}\ndata: {payload}\n\n"
+
+
+def _last_event_id_to_seq(value: str | None) -> int:
+    if value is None:
+        return 0
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return 0

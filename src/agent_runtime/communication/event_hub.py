@@ -42,8 +42,9 @@ class InMemoryCommunicationEventHub:
         state = self._state_for(message.stream_id)
         overflow_queues: list[asyncio.Queue[CommunicationMessage | None]] = []
         with state.lock:
-            saved = _message_with_seq(message, state.next_seq)
-            state.next_seq += 1
+            seq = message.seq if message.seq > 0 else state.next_seq
+            saved = _message_with_seq(message, seq)
+            state.next_seq = max(state.next_seq, seq + 1)
             state.buffer.append(saved)
             while len(state.buffer) > self._replay_buffer_size:
                 state.buffer.popleft()

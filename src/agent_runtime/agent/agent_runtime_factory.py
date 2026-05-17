@@ -2,6 +2,7 @@
 """Agent 运行时任务与实例管理模块工厂。"""
 from __future__ import annotations
 
+import logging
 from threading import RLock
 
 from agent_runtime.agent.agent_runtime_config import (
@@ -24,6 +25,8 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
 )
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntimeFactory:
@@ -57,6 +60,9 @@ class AgentRuntimeFactory:
             signature = (config.repository_type, config.data_dir)
             if cls._gateway is None or cls._repository_signature != signature:
                 repository = cls._create_repository(config)
+                reset_count = repository.reset_runtime_state()
+                if reset_count:
+                    logger.warning("Agent 运行态启动恢复已重置过期执行状态: reset_count=%s", reset_count)
                 service = AgentRuntimeService(repository)
                 cls._gateway = AgentRuntimeGatewayImpl(
                     service,

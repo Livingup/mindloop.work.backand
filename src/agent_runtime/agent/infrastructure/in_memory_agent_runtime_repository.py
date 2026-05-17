@@ -95,6 +95,9 @@ class InMemoryAgentRuntimeRepository(AgentRuntimeRepository):
             tasks = [task for task in self._tasks.values() if task.scene_id == scene_id]
             return sorted(tasks, key=lambda item: item.created_at, reverse=True)
 
+    def reset_runtime_state(self) -> int:
+        return 0
+
     def contains_task(self, task_id: str) -> bool:
         """判断任务是否存在。"""
         with self._lock:

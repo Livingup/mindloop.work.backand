@@ -44,6 +44,9 @@ class AgentRuntimeRepository(Protocol):
         没有任何任务时返回空列表，不抛错。
         """
 
+    def reset_runtime_state(self) -> int:
+        ...
+
     def contains_task(self, task_id: str) -> bool:
         """判断任务是否存在。"""
 

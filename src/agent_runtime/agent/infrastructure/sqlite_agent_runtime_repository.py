@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
-from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
+from agent_runtime.agent.agent_instance import (
+    AGENT_INSTANCE_STATUS_READY,
+    AGENT_INSTANCE_STATUS_RUNNING,
+    AgentInstance,
+    PendingAgentUserMessage,
+)
+from agent_runtime.agent.agent_task import (
+    AGENT_TASK_STATUS_FAILED,
+    AGENT_TASK_STATUS_UNFINISHED,
+    AgentParentChildRelation,
+    AgentTask,
+)
 
 
 _SCHEMA = """\
@@ -99,6 +109,60 @@ class SqliteAgentRuntimeRepository:
         """关闭底层 SQLite 连接。"""
         with self._lock:
             self._conn.close()
+
+    def reset_runtime_state(self) -> int:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT task_id FROM agent_instances WHERE status = ?",
+                (AGENT_INSTANCE_STATUS_RUNNING,),
+            ).fetchall()
+            affected_task_ids = [str(row[0]) for row in rows]
+            if not affected_task_ids:
+                return 0
+            now = _datetime_to_text(datetime.now(timezone.utc))
+            placeholders = ",".join("?" for _ in affected_task_ids)
+            instance_message = "AgentRuntime restarted; running instance state was reset."
+            task_message = "AgentRuntime restarted; unfinished task state was failed."
+            instance_result = self._conn.execute(
+                f"""
+                UPDATE agent_instances
+                SET status = ?,
+                    pending_user_messages_json = '[]',
+                    updated_at = ?,
+                    paused_at = ?,
+                    failed_at = ?,
+                    failure_message = ?
+                WHERE task_id IN ({placeholders})
+                """,
+                (
+                    AGENT_INSTANCE_STATUS_READY,
+                    now,
+                    now,
+                    now,
+                    instance_message,
+                    *affected_task_ids,
+                ),
+            )
+            task_result = self._conn.execute(
+                f"""
+                UPDATE agent_tasks
+                SET status = ?,
+                    updated_at = ?,
+                    failed_at = ?,
+                    failure_message = ?
+                WHERE status = ? AND task_id IN ({placeholders})
+                """,
+                (
+                    AGENT_TASK_STATUS_FAILED,
+                    now,
+                    now,
+                    task_message,
+                    AGENT_TASK_STATUS_UNFINISHED,
+                    *affected_task_ids,
+                ),
+            )
+            self._conn.commit()
+            return int(instance_result.rowcount or 0) + int(task_result.rowcount or 0)
 
     def save_task(self, task: AgentTask) -> None:
         """保存或覆盖任务运行态，并同步该任务的父子关系树。"""
