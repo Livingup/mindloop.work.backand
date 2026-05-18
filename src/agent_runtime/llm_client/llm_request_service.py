@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import replace
 from typing import Any, Callable
 
@@ -37,6 +38,11 @@ from agent_runtime.llm_client.llm_request_models import (
 from agent_runtime.llm_client.llm_stream_events import LlmSemanticStreamParser
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
+_SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
+    "llm.response.completed",
+    "llm.response.failed",
+    "llm.tool_call.arguments.completed",
+}
 
 
 class LlmRequestService:
@@ -91,43 +97,65 @@ class LlmRequestService:
         if not api_keys:
             api_keys = [None]
 
-        request_started_at = time.perf_counter()
-        await self._event_publisher.publish(
-            request.communication_context,
-            "llm.request.started",
-            {
-                "provider_id": resolved.provider_id,
-                "binding_id": resolved.binding_id,
-                "model_id": resolved.model_id,
-                "model_alias": resolved.model_alias,
-                "api_format": resolved.api_format,
-                "tool_count": len(tool_schemas),
-                "api_key_count": len(api_keys),
-            },
-            source="llm_client",
-            metadata={"conversation_id": request.conversation.id},
-        )
-
+        llm_call_id = request.llm_call_id or f"llm-call-{uuid.uuid4().hex}"
+        call_started_at = time.perf_counter()
         attempt_count = 0
         last_error: Exception | None = None
         last_service_call_error: Exception | None = None
         for key_index, raw_api_key in enumerate(api_keys):
+            request_attempt_started_at = time.perf_counter()
+            attempt_count += 1
+            retry_index = 0
+            llm_request_id = _build_llm_request_id(
+                llm_call_id=llm_call_id,
+                candidate_index=request.candidate_index,
+                api_key_index=key_index,
+                retry_index=retry_index,
+            )
+            request_payload = _build_request_attempt_payload(
+                llm_call_id=llm_call_id,
+                llm_request_id=llm_request_id,
+                resolved=resolved,
+                candidate_index=request.candidate_index,
+                api_key_index=key_index,
+                retry_index=retry_index,
+                attempt_count=attempt_count,
+                tool_count=len(tool_schemas),
+                api_key_count=len(api_keys),
+            )
+            await self._event_publisher.publish(
+                request.communication_context,
+                "llm.request.started",
+                request_payload,
+                source="llm_client",
+                metadata={"conversation_id": request.conversation.id},
+            )
             try:
                 api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
             except Exception as exc:
                 last_error = exc
+                retry_target = _build_retry_target_payload(
+                    resolved=resolved,
+                    candidate_index=request.candidate_index,
+                    api_key_index=key_index,
+                    retry_index=retry_index,
+                    max_retries=0,
+                    api_key_count=len(api_keys),
+                    next_resolved_model=request.next_resolved_model,
+                    retryable=False,
+                )
                 await self._event_publisher.publish(
                     request.communication_context,
-                    "llm.request.api_key.failed",
+                    "llm.request.failed",
                     {
-                        "provider_id": resolved.provider_id,
-                        "binding_id": resolved.binding_id,
-                        "model_alias": resolved.model_alias,
-                        "api_key_index": key_index,
+                        **request_payload,
                         "attempt_count": attempt_count,
                         "error_type": exc.__class__.__name__,
                         "error_message": str(exc),
-                        "will_try_next_key": key_index < len(api_keys) - 1,
+                        "failed_stage": "api_key_resolution",
+                        "partial_response": False,
+                        "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                        **retry_target,
                     },
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
@@ -135,35 +163,52 @@ class LlmRequestService:
                 continue
             max_retries = resolved.retry.max_retries_per_key
             for retry_index in range(max_retries + 1):
-                attempt_count += 1
-                try:
+                if retry_index > 0:
+                    request_attempt_started_at = time.perf_counter()
+                    attempt_count += 1
+                    llm_request_id = _build_llm_request_id(
+                        llm_call_id=llm_call_id,
+                        candidate_index=request.candidate_index,
+                        api_key_index=key_index,
+                        retry_index=retry_index,
+                    )
+                    request_payload = _build_request_attempt_payload(
+                        llm_call_id=llm_call_id,
+                        llm_request_id=llm_request_id,
+                        resolved=resolved,
+                        candidate_index=request.candidate_index,
+                        api_key_index=key_index,
+                        retry_index=retry_index,
+                        attempt_count=attempt_count,
+                        tool_count=len(tool_schemas),
+                        api_key_count=len(api_keys),
+                    )
                     await self._event_publisher.publish(
                         request.communication_context,
-                        "llm.request.attempt.started",
-                        {
-                            "provider_id": resolved.provider_id,
-                            "binding_id": resolved.binding_id,
-                            "model_alias": resolved.model_alias,
-                            "api_key_index": key_index,
-                            "retry_index": retry_index,
-                            "attempt_count": attempt_count,
-                        },
+                        "llm.request.started",
+                        request_payload,
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                stream_state: dict[str, bool] = {"response_started": False, "response_failed": False}
+                try:
                     stream_event_handler = _build_stream_event_handler(
                         publisher=self._event_publisher,
                         context=request.communication_context,
                         event_loop=asyncio.get_running_loop(),
                         conversation_id=request.conversation.id,
+                        llm_call_id=llm_call_id,
+                        llm_request_id=llm_request_id,
                         provider_id=resolved.provider_id,
                         binding_id=resolved.binding_id,
                         model_id=resolved.model_id,
                         model_alias=resolved.model_alias,
                         api_format=resolved.api_format,
+                        candidate_index=request.candidate_index,
                         api_key_index=key_index,
                         retry_index=retry_index,
                         attempt_count=attempt_count,
+                        stream_state=stream_state,
                     )
                     raw_response = await client.request(
                         resolved_model=resolved,
@@ -179,60 +224,46 @@ class LlmRequestService:
                         raise
                     last_error = exc
                     last_service_call_error = exc
+                    retry_target = _build_retry_target_payload(
+                        resolved=resolved,
+                        candidate_index=request.candidate_index,
+                        api_key_index=key_index,
+                        retry_index=retry_index,
+                        max_retries=max_retries,
+                        api_key_count=len(api_keys),
+                        next_resolved_model=request.next_resolved_model,
+                        retryable=_should_retry(exc, resolved.retry.retryable_status_codes),
+                    )
                     await self._event_publisher.publish(
                         request.communication_context,
-                        "llm.request.attempt.failed",
+                        "llm.request.failed",
                         {
-                            "provider_id": resolved.provider_id,
-                            "binding_id": resolved.binding_id,
-                            "model_alias": resolved.model_alias,
-                            "api_key_index": key_index,
-                            "retry_index": retry_index,
+                            **request_payload,
                             "attempt_count": attempt_count,
                             "error_type": exc.__class__.__name__,
                             "error_message": str(exc),
+                            "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                            "partial_response": stream_state.get("response_started") is True,
+                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                            **retry_target,
                         },
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
                     if not _should_retry(exc, resolved.retry.retryable_status_codes):
-                        await self._event_publisher.publish(
-                            request.communication_context,
-                            "llm.request.api_key.failed",
-                            {
-                                "provider_id": resolved.provider_id,
-                                "binding_id": resolved.binding_id,
-                                "model_alias": resolved.model_alias,
-                                "api_key_index": key_index,
-                                "attempt_count": attempt_count,
-                                "error_type": exc.__class__.__name__,
-                                "error_message": str(exc),
-                                "will_try_next_key": key_index < len(api_keys) - 1,
-                            },
-                            source="llm_client",
-                            metadata={"conversation_id": request.conversation.id},
-                        )
                         break
                     if retry_index >= max_retries:
-                        await self._event_publisher.publish(
-                            request.communication_context,
-                            "llm.request.api_key.failed",
-                            {
-                                "provider_id": resolved.provider_id,
-                                "binding_id": resolved.binding_id,
-                                "model_alias": resolved.model_alias,
-                                "api_key_index": key_index,
-                                "attempt_count": attempt_count,
-                                "error_type": exc.__class__.__name__,
-                                "error_message": str(exc),
-                                "will_try_next_key": key_index < len(api_keys) - 1,
-                            },
-                            source="llm_client",
-                            metadata={"conversation_id": request.conversation.id},
-                        )
                         break
                     await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
                 else:
+                    if not stream_state.get("response_started"):
+                        await self._event_publisher.publish(
+                            request.communication_context,
+                            "llm.response.started",
+                            {**request_payload, "content_type": None},
+                            source="llm_client",
+                            metadata={"conversation_id": request.conversation.id},
+                        )
                     _apply_render_side_effects(
                         request.conversation,
                         resolved.api_format,
@@ -244,33 +275,17 @@ class LlmRequestService:
                         raw_response,
                         {**render_options, "vendor": resolved.provider_id},
                     )
-                    if _count_parts(assistant_message.content, ThinkingPart) > 0:
-                        await self._event_publisher.publish(
-                            request.communication_context,
-                            "llm.thinking.received",
-                            {
-                                "provider_id": resolved.provider_id,
-                                "binding_id": resolved.binding_id,
-                                "model_alias": resolved.model_alias,
-                                "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
-                            },
-                            source="llm_client",
-                            metadata={"conversation_id": request.conversation.id},
-                        )
                     token_usage = _extract_token_usage(resolved.api_format, raw_response)
                     await self._event_publisher.publish(
                         request.communication_context,
-                        "llm.request.completed",
+                        "llm.response.completed",
                         {
-                            "provider_id": resolved.provider_id,
-                            "binding_id": resolved.binding_id,
-                            "model_alias": resolved.model_alias,
-                            "api_key_index": key_index,
-                            "attempt_count": attempt_count,
+                            **request_payload,
                             "assistant_part_count": len(assistant_message.content),
                             "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
                             "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
-                            "duration_ms": int((time.perf_counter() - request_started_at) * 1000),
+                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                            "call_duration_ms": int((time.perf_counter() - call_started_at) * 1000),
                             "token_usage": token_usage,
                             "context_window_max": resolved.context_window,
                         },
@@ -290,27 +305,29 @@ class LlmRequestService:
                         model_alias=resolved.model_alias,
                     )
         if last_error is not None:
-            await self._event_publisher.publish(
-                request.communication_context,
-                "llm.request.failed",
-                {
-                    "provider_id": resolved.provider_id,
-                    "binding_id": resolved.binding_id,
-                    "model_alias": resolved.model_alias,
-                    "attempt_count": attempt_count,
-                    "error_type": last_error.__class__.__name__,
-                    "error_message": str(last_error),
-                },
-                source="llm_client",
-                metadata={"conversation_id": request.conversation.id},
-            )
-            if last_service_call_error is not None:
+            if request.next_resolved_model is None:
+                await self._event_publisher.publish(
+                    request.communication_context,
+                    "llm.call.failed",
+                    {
+                        "llm_call_id": llm_call_id,
+                        "candidate_index": request.candidate_index,
+                        "attempt_count": attempt_count,
+                        "error_type": last_error.__class__.__name__,
+                        "error_message": str(last_error),
+                        "duration_ms": int((time.perf_counter() - call_started_at) * 1000),
+                    },
+                    source="llm_client",
+                    metadata={"conversation_id": request.conversation.id},
+                )
+            if last_service_call_error is not None or request.next_resolved_model is not None:
+                cause = last_service_call_error or last_error
                 raise LlmProviderModelServiceUnavailable(
                     provider_id=resolved.provider_id,
                     binding_id=resolved.binding_id,
                     attempt_count=attempt_count,
-                    cause=last_service_call_error,
-                ) from last_service_call_error
+                    cause=cause,
+                ) from cause
             raise last_error
         raise RuntimeError("LLM 请求未执行。")
 
@@ -346,6 +363,100 @@ def _with_default_relay_session_header(request: LlmPromptRequest):
     return replace(request.resolved_model, custom_headers=headers)
 
 
+def _build_llm_request_id(
+    *,
+    llm_call_id: str,
+    candidate_index: int,
+    api_key_index: int,
+    retry_index: int,
+) -> str:
+    return f"{llm_call_id}:candidate-{candidate_index}:key-{api_key_index}:retry-{retry_index}"
+
+
+def _build_request_attempt_payload(
+    *,
+    llm_call_id: str,
+    llm_request_id: str,
+    resolved: Any,
+    candidate_index: int,
+    api_key_index: int,
+    retry_index: int,
+    attempt_count: int,
+    tool_count: int,
+    api_key_count: int,
+) -> dict[str, Any]:
+    return {
+        "llm_call_id": llm_call_id,
+        "llm_request_id": llm_request_id,
+        "candidate_index": candidate_index,
+        "provider_id": resolved.provider_id,
+        "binding_id": resolved.binding_id,
+        "model_id": resolved.model_id,
+        "model_alias": resolved.model_alias,
+        "api_format": resolved.api_format,
+        "api_key_index": api_key_index,
+        "retry_index": retry_index,
+        "attempt_count": attempt_count,
+        "tool_count": tool_count,
+        "api_key_count": api_key_count,
+    }
+
+
+def _build_retry_target_payload(
+    *,
+    resolved: Any,
+    candidate_index: int,
+    api_key_index: int,
+    retry_index: int,
+    max_retries: int,
+    api_key_count: int,
+    next_resolved_model: Any | None,
+    retryable: bool,
+) -> dict[str, Any]:
+    retry_same_key = retryable and retry_index < max_retries
+    retry_next_key = not retry_same_key and api_key_index < api_key_count - 1
+    retry_next_candidate = not retry_same_key and not retry_next_key and next_resolved_model is not None
+    payload: dict[str, Any] = {
+        "retryable": retryable,
+        "will_retry": retry_same_key or retry_next_key or retry_next_candidate,
+    }
+    payload["final"] = not payload["will_retry"]
+    if retry_same_key:
+        payload.update({
+            "next_candidate_index": candidate_index,
+            "next_provider_id": resolved.provider_id,
+            "next_binding_id": resolved.binding_id,
+            "next_model_id": resolved.model_id,
+            "next_model_alias": resolved.model_alias,
+            "next_api_format": resolved.api_format,
+            "next_api_key_index": api_key_index,
+            "next_retry_index": retry_index + 1,
+        })
+    elif retry_next_key:
+        payload.update({
+            "next_candidate_index": candidate_index,
+            "next_provider_id": resolved.provider_id,
+            "next_binding_id": resolved.binding_id,
+            "next_model_id": resolved.model_id,
+            "next_model_alias": resolved.model_alias,
+            "next_api_format": resolved.api_format,
+            "next_api_key_index": api_key_index + 1,
+            "next_retry_index": 0,
+        })
+    elif retry_next_candidate:
+        payload.update({
+            "next_candidate_index": candidate_index + 1,
+            "next_provider_id": next_resolved_model.provider_id,
+            "next_binding_id": next_resolved_model.binding_id,
+            "next_model_id": next_resolved_model.model_id,
+            "next_model_alias": next_resolved_model.model_alias,
+            "next_api_format": next_resolved_model.api_format,
+            "next_api_key_index": 0,
+            "next_retry_index": 0,
+        })
+    return payload
+
+
 def _merge_json_field(target: dict[str, Any], json_text: str | None, fallback_key: str) -> None:
     """把用户自定义 JSON 字符串合并到请求参数。"""
     if json_text is None:
@@ -363,14 +474,18 @@ def _build_stream_event_handler(
     context: Any,
     event_loop: asyncio.AbstractEventLoop,
     conversation_id: str,
+    llm_call_id: str,
+    llm_request_id: str,
     provider_id: str,
     binding_id: str,
     model_id: str,
     model_alias: str,
     api_format: str,
+    candidate_index: int,
     api_key_index: int,
     retry_index: int,
     attempt_count: int,
+    stream_state: dict[str, bool],
 ) -> Callable[[dict[str, Any]], None]:
     semantic_parser = LlmSemanticStreamParser(api_format)
 
@@ -378,6 +493,9 @@ def _build_stream_event_handler(
         event_type = str(event.get("event_type") or "llm.response.stream.event")
         event_payload = dict(event.get("payload") or {})
         base_payload = {
+            "llm_call_id": llm_call_id,
+            "llm_request_id": llm_request_id,
+            "candidate_index": candidate_index,
             "provider_id": provider_id,
             "binding_id": binding_id,
             "model_id": model_id,
@@ -387,11 +505,12 @@ def _build_stream_event_handler(
             "retry_index": retry_index,
             "attempt_count": attempt_count,
         }
-        raw_event_payload = dict(event_payload)
-        raw_event_payload.pop("data", None)
-        payload = {**base_payload, **raw_event_payload}
-        events_to_publish: list[tuple[str, dict[str, Any]]] = [(event_type, payload)]
-        if event_type == "llm.response.stream.event":
+        events_to_publish: list[tuple[str, dict[str, Any]]] = []
+        if event_type == "llm.response.stream.started":
+            if not stream_state.get("response_started"):
+                stream_state["response_started"] = True
+                events_to_publish.append(("llm.response.started", {**base_payload, "content_type": event_payload.get("content_type")}))
+        elif event_type == "llm.response.stream.event":
             semantic_events = semantic_parser.parse_provider_event(
                 event_name=str(event_payload.get("event") or "message"),
                 data=event_payload.get("data") if isinstance(event_payload.get("data"), dict) else None,
@@ -400,7 +519,10 @@ def _build_stream_event_handler(
             events_to_publish.extend(
                 (semantic.event_type, {**base_payload, **semantic.payload})
                 for semantic in semantic_events
+                if semantic.event_type not in _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS
             )
+        elif event_type == "llm.response.stream.failed":
+            stream_state["response_failed"] = True
         elif event_type == "llm.response.stream.completed":
             semantic_events = semantic_parser.parse_provider_event(
                 event_name="stream.completed",
@@ -410,6 +532,7 @@ def _build_stream_event_handler(
             events_to_publish.extend(
                 (semantic.event_type, {**base_payload, **semantic.payload})
                 for semantic in semantic_events
+                if semantic.event_type not in _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS
             )
         for publish_event_type, publish_payload in events_to_publish:
             future = asyncio.run_coroutine_threadsafe(

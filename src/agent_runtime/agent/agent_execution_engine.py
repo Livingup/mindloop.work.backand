@@ -7,6 +7,7 @@ import os
 import platform
 import logging
 import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -881,6 +882,7 @@ class AgentExecutionEngine:
         last_error: Exception | None = None
         skipped_for_modalities = False
         unsupported_modality_strategy = _unsupported_input_modality_strategy(instance)
+        llm_call_id = f"llm-call-{uuid.uuid4().hex}"
         for candidate_index, resolved_model in enumerate(resolved_candidates):
             missing_modalities = _missing_input_modalities(conversation, resolved_model)
             if (
@@ -927,6 +929,11 @@ class AgentExecutionEngine:
                             actor_type="llm_client",
                             actor_id=instance.instance_id,
                         ),
+                        llm_call_id=llm_call_id,
+                        candidate_index=candidate_index,
+                        next_resolved_model=resolved_candidates[candidate_index + 1]
+                        if candidate_index < len(resolved_candidates) - 1
+                        else None,
                     )
                 )
             except Exception as exc:

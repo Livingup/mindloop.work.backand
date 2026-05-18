@@ -65,6 +65,12 @@ class LlmPromptRequest:
     # 可选运行时通信上下文。LLM 请求服务在关键节点通过该上下文发布实时事件。
     communication_context: RuntimeCommunicationContext | None = None
 
+    llm_call_id: str | None = None
+
+    candidate_index: int = 0
+
+    next_resolved_model: ResolvedLlmProviderModel | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class LlmPromptResponse:
