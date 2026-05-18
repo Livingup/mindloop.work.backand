@@ -93,7 +93,8 @@ class LlmRequestService:
             render_options,
         )
         tool_schemas = tuple(tool.schema for tool in request.tools)
-        api_keys: list[str | None] = [item.key for item in resolved.api_keys]
+        api_key_items = list(resolved.api_keys)
+        api_keys: list[str | None] = [item.key for item in api_key_items]
         if not api_keys:
             api_keys = [None]
 
@@ -103,6 +104,7 @@ class LlmRequestService:
         last_error: Exception | None = None
         last_service_call_error: Exception | None = None
         for key_index, raw_api_key in enumerate(api_keys):
+            api_key_name = api_key_items[key_index].name if key_index < len(api_key_items) else None
             request_attempt_started_at = time.perf_counter()
             attempt_count += 1
             retry_index = 0
@@ -112,28 +114,31 @@ class LlmRequestService:
                 api_key_index=key_index,
                 retry_index=retry_index,
             )
-            request_payload = _build_request_attempt_payload(
-                llm_call_id=llm_call_id,
-                llm_request_id=llm_request_id,
-                resolved=resolved,
-                candidate_index=request.candidate_index,
-                api_key_index=key_index,
-                retry_index=retry_index,
-                attempt_count=attempt_count,
-                tool_count=len(tool_schemas),
-                api_key_count=len(api_keys),
-            )
-            await self._event_publisher.publish(
-                request.communication_context,
-                "llm.request.started",
-                request_payload,
-                source="llm_client",
-                metadata={"conversation_id": request.conversation.id},
-            )
+            api_key_label = _api_key_label(raw_api_key, api_key_name)
             try:
                 api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
+                api_key_label = _api_key_label(api_key, api_key_name)
             except Exception as exc:
                 last_error = exc
+                request_payload = _build_request_attempt_payload(
+                    llm_call_id=llm_call_id,
+                    llm_request_id=llm_request_id,
+                    resolved=resolved,
+                    candidate_index=request.candidate_index,
+                    api_key_index=key_index,
+                    api_key_label=api_key_label,
+                    retry_index=retry_index,
+                    attempt_count=attempt_count,
+                    tool_count=len(tool_schemas),
+                    api_key_count=len(api_keys),
+                )
+                await self._event_publisher.publish(
+                    request.communication_context,
+                    "llm.request.started",
+                    request_payload,
+                    source="llm_client",
+                    metadata={"conversation_id": request.conversation.id},
+                )
                 retry_target = _build_retry_target_payload(
                     resolved=resolved,
                     candidate_index=request.candidate_index,
@@ -161,6 +166,25 @@ class LlmRequestService:
                     metadata={"conversation_id": request.conversation.id},
                 )
                 continue
+            request_payload = _build_request_attempt_payload(
+                llm_call_id=llm_call_id,
+                llm_request_id=llm_request_id,
+                resolved=resolved,
+                candidate_index=request.candidate_index,
+                api_key_index=key_index,
+                api_key_label=api_key_label,
+                retry_index=retry_index,
+                attempt_count=attempt_count,
+                tool_count=len(tool_schemas),
+                api_key_count=len(api_keys),
+            )
+            await self._event_publisher.publish(
+                request.communication_context,
+                "llm.request.started",
+                request_payload,
+                source="llm_client",
+                metadata={"conversation_id": request.conversation.id},
+            )
             max_retries = resolved.retry.max_retries_per_key
             for retry_index in range(max_retries + 1):
                 if retry_index > 0:
@@ -178,6 +202,7 @@ class LlmRequestService:
                         resolved=resolved,
                         candidate_index=request.candidate_index,
                         api_key_index=key_index,
+                        api_key_label=api_key_label,
                         retry_index=retry_index,
                         attempt_count=attempt_count,
                         tool_count=len(tool_schemas),
@@ -206,6 +231,7 @@ class LlmRequestService:
                         api_format=resolved.api_format,
                         candidate_index=request.candidate_index,
                         api_key_index=key_index,
+                        api_key_label=api_key_label,
                         retry_index=retry_index,
                         attempt_count=attempt_count,
                         stream_state=stream_state,
@@ -380,6 +406,7 @@ def _build_request_attempt_payload(
     resolved: Any,
     candidate_index: int,
     api_key_index: int,
+    api_key_label: str | None,
     retry_index: int,
     attempt_count: int,
     tool_count: int,
@@ -395,6 +422,7 @@ def _build_request_attempt_payload(
         "model_alias": resolved.model_alias,
         "api_format": resolved.api_format,
         "api_key_index": api_key_index,
+        "api_key_label": api_key_label,
         "retry_index": retry_index,
         "attempt_count": attempt_count,
         "tool_count": tool_count,
@@ -483,6 +511,7 @@ def _build_stream_event_handler(
     api_format: str,
     candidate_index: int,
     api_key_index: int,
+    api_key_label: str | None,
     retry_index: int,
     attempt_count: int,
     stream_state: dict[str, bool],
@@ -502,6 +531,7 @@ def _build_stream_event_handler(
             "model_alias": model_alias,
             "api_format": api_format,
             "api_key_index": api_key_index,
+            "api_key_label": api_key_label,
             "retry_index": retry_index,
             "attempt_count": attempt_count,
         }
@@ -605,6 +635,21 @@ def _resolve_api_key(key: str) -> str:
     if default is not None:
         return default
     raise ValueError(f"LLM API Key 环境变量未设置: {env_key}")
+
+
+def _api_key_label(key: str | None, name: str | None = None) -> str | None:
+    if name is not None and name.strip():
+        return name.strip()
+    if key is None:
+        return None
+    normalized = key.strip()
+    if not normalized:
+        return None
+    if _ENV_VAR_PATTERN.match(normalized):
+        return normalized
+    if len(normalized) <= 8:
+        return f"{normalized[:2]}****{normalized[-1:]}"
+    return f"{normalized[:3]}****{normalized[-4:]}"
 
 
 def _count_parts(parts: Any, part_type: type) -> int:
