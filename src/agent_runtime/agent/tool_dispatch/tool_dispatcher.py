@@ -37,6 +37,10 @@ from agent_runtime.tool.tool_execution_models import (
 
 AGENT_MCP_TOOL_NAME_PREFIX = "mcp__"
 logger = logging.getLogger(__name__)
+TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH = 4000
+TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS = 20
+TOOL_RESULT_PREVIEW_MAX_DICT_ITEMS = 40
+TOOL_RESULT_PREVIEW_MAX_DEPTH = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +192,12 @@ class AgentToolDispatcher:
                     "error_type": exc.__class__.__name__,
                     "error_message": str(exc),
                     "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                    "result_preview": {
+                        "success": False,
+                        "execution_status": "failed",
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                    },
                 },
                 source="tool_dispatcher",
                 correlation_id=tool_call_id,
@@ -217,6 +227,7 @@ class AgentToolDispatcher:
                 "error_code": result.tool_result.error_code,
                 "error_message": result.tool_result.error_message,
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                "result_preview": _preview_tool_result(result.tool_result),
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -417,6 +428,53 @@ def _extract_llm_visible_output(result: BaseToolResult) -> Any:
     if isinstance(result.output, str):
         return f"{error_text}\n\nPartial output: {result.output}"
     return {"error_message": error_text, "partial_output": result.output}
+
+
+def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
+    preview: dict[str, Any] = {
+        "success": result.success,
+        "execution_status": result.execution_status,
+        "loop_decision": result.loop_decision,
+        "output": _preview_value(result.output),
+    }
+    if result.error_code:
+        preview["error_code"] = result.error_code
+    if result.error_message:
+        preview["error_message"] = result.error_message
+    return preview
+
+
+def _preview_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= TOOL_RESULT_PREVIEW_MAX_DEPTH:
+        return "<truncated: max depth reached>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) <= TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH:
+            return value
+        return f"{value[:TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH]}...<truncated {len(value) - TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH} chars>"
+    if isinstance(value, dict):
+        items = list(value.items())
+        preview = {
+            str(key): _preview_value(item_value, depth=depth + 1)
+            for key, item_value in items[:TOOL_RESULT_PREVIEW_MAX_DICT_ITEMS]
+        }
+        if len(items) > TOOL_RESULT_PREVIEW_MAX_DICT_ITEMS:
+            preview["<truncated>"] = f"{len(items) - TOOL_RESULT_PREVIEW_MAX_DICT_ITEMS} more keys"
+        return preview
+    if isinstance(value, (list, tuple)):
+        preview_items = [_preview_value(item, depth=depth + 1) for item in value[:TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS]]
+        if len(value) > TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS:
+            preview_items.append(f"<truncated {len(value) - TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS} more items>")
+        return preview_items
+    if isinstance(value, BaseToolResult):
+        return _preview_value(value.to_serializable_dict(), depth=depth + 1)
+    if hasattr(value, "model_dump"):
+        try:
+            return _preview_value(value.model_dump(mode="json"), depth=depth + 1)
+        except Exception:
+            return str(value)
+    return str(value)
 
 
 def _preview_arguments(value: Any) -> dict[str, Any]:
