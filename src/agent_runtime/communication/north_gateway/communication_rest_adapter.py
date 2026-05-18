@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from contextlib import suppress
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,9 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CreateCommunicationStreamRequest,
     PublishCommunicationMessageRequest,
 )
+
+
+COMMUNICATION_SSE_EVENT_TYPE = "communication.message"
 
 
 class CommunicationStreamCreateBody(BaseModel):
@@ -227,7 +231,7 @@ def _message_response(message: CommunicationMessage) -> CommunicationMessageResp
 def _format_sse_message(message: CommunicationMessage) -> str:
     """把通信消息格式化为 SSE 帧。"""
     payload = json.dumps(message.to_dict(), ensure_ascii=False, separators=(",", ":"))
-    return f"id: {message.seq}\nevent: {message.type}\ndata: {payload}\n\n"
+    return f"id: {message.seq}\nevent: {COMMUNICATION_SSE_EVENT_TYPE}\ndata: {payload}\n\n"
 
 
 def _last_event_id_to_seq(value: str | None) -> int:
