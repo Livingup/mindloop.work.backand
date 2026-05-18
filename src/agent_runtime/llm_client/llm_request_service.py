@@ -34,6 +34,7 @@ from agent_runtime.llm_client.llm_request_models import (
     LlmPromptRequest,
     LlmPromptResponse,
 )
+from agent_runtime.llm_client.llm_stream_events import LlmSemanticStreamParser
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
 
@@ -371,9 +372,12 @@ def _build_stream_event_handler(
     retry_index: int,
     attempt_count: int,
 ) -> Callable[[dict[str, Any]], None]:
+    semantic_parser = LlmSemanticStreamParser(api_format)
+
     def handle(event: dict[str, Any]) -> None:
         event_type = str(event.get("event_type") or "llm.response.stream.event")
-        payload = {
+        event_payload = dict(event.get("payload") or {})
+        base_payload = {
             "provider_id": provider_id,
             "binding_id": binding_id,
             "model_id": model_id,
@@ -382,22 +386,46 @@ def _build_stream_event_handler(
             "api_key_index": api_key_index,
             "retry_index": retry_index,
             "attempt_count": attempt_count,
-            **dict(event.get("payload") or {}),
         }
-        future = asyncio.run_coroutine_threadsafe(
-            publisher.publish(
-                context,
-                event_type,
-                payload,
-                source="llm_client",
-                metadata={"conversation_id": conversation_id},
-            ),
-            event_loop,
-        )
-        try:
-            future.result()
-        except Exception:
-            pass
+        raw_event_payload = dict(event_payload)
+        raw_event_payload.pop("data", None)
+        payload = {**base_payload, **raw_event_payload}
+        events_to_publish: list[tuple[str, dict[str, Any]]] = [(event_type, payload)]
+        if event_type == "llm.response.stream.event":
+            semantic_events = semantic_parser.parse_provider_event(
+                event_name=str(event_payload.get("event") or "message"),
+                data=event_payload.get("data") if isinstance(event_payload.get("data"), dict) else None,
+                done=event_payload.get("done") is True,
+            )
+            events_to_publish.extend(
+                (semantic.event_type, {**base_payload, **semantic.payload})
+                for semantic in semantic_events
+            )
+        elif event_type == "llm.response.stream.completed":
+            semantic_events = semantic_parser.parse_provider_event(
+                event_name="stream.completed",
+                data=None,
+                done=True,
+            )
+            events_to_publish.extend(
+                (semantic.event_type, {**base_payload, **semantic.payload})
+                for semantic in semantic_events
+            )
+        for publish_event_type, publish_payload in events_to_publish:
+            future = asyncio.run_coroutine_threadsafe(
+                publisher.publish(
+                    context,
+                    publish_event_type,
+                    publish_payload,
+                    source="llm_client",
+                    metadata={"conversation_id": conversation_id},
+                ),
+                event_loop,
+            )
+            try:
+                future.result()
+            except Exception:
+                pass
 
     return handle
 

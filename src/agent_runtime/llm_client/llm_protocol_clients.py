@@ -479,13 +479,16 @@ def _emit_sse_block_event(handler: StreamEventHandler | None, event_lines: list[
             "event": event_name,
             "data_preview": data_text[:500],
         }
-        if data_text != "[DONE]":
+        if data_text == "[DONE]":
+            payload["done"] = True
+        else:
             try:
                 data = json.loads(data_text)
             except json.JSONDecodeError:
                 data = None
             if isinstance(data, dict):
                 payload["data_type"] = data.get("type")
+                payload["data"] = data
         _emit_stream_event(handler, "llm.response.stream.event", payload)
         emitted += 1
     return emitted
