@@ -26,6 +26,7 @@ from agent_runtime.terminal.terminal_command import TerminalCommand
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 from agent_runtime.terminal.terminal_process import TerminalProcessManager, TerminalProcessStartRequest, TerminalSessionStartRequest
 from agent_runtime.terminal.terminal_repository import TerminalRepository
+from agent_runtime.terminal.terminal_text_projection import render_terminal_text
 
 ReadMode = Literal["tail", "page", "since", "search"]
 logger = logging.getLogger(__name__)
@@ -382,7 +383,7 @@ class TerminalService:
             )
         else:
             all_chunks = self._repo.list_output_chunks(terminal_id, command_id=command_id, limit=5000)
-            text = "".join(chunk.chunk for chunk in all_chunks)
+            text = render_terminal_text("".join(chunk.chunk for chunk in all_chunks))
             lines = text.splitlines(keepends=True)
             tail_text = "".join(lines[-max(1, tail_lines):])
             result = _build_read_result(
@@ -407,7 +408,7 @@ class TerminalService:
                 int((time.perf_counter() - started_at) * 1000),
             )
             return result
-        text = "".join(chunk.chunk for chunk in chunks)
+        text = render_terminal_text("".join(chunk.chunk for chunk in chunks))
         result = _build_read_result(
             terminal_id=terminal_id,
             command_id=command_id,
