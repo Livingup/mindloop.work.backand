@@ -30,6 +30,7 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 
 StreamEventHandler = Callable[[dict[str, Any]], None]
+_DEFAULT_USER_AGENT = "spread-ai-agent-runtime/0.1.0"
 
 
 class LlmProtocolClient(Protocol):
@@ -375,8 +376,14 @@ def _build_claude_cached_tools(tools: tuple[dict[str, Any], ...]) -> list[dict[s
 def _json_headers(custom_headers: dict[str, str]) -> dict[str, str]:
     """构建 JSON 请求头，保留用户自定义 header。"""
     headers = dict(custom_headers)
-    headers.setdefault("Content-Type", "application/json")
+    _setdefault_header(headers, "Content-Type", "application/json")
+    _setdefault_header(headers, "User-Agent", _DEFAULT_USER_AGENT)
     return headers
+
+
+def _setdefault_header(headers: dict[str, str], name: str, value: str) -> None:
+    if not any(key.lower() == name.lower() for key in headers):
+        headers[name] = value
 
 
 def _join_url(base_url: str, path: str) -> str:
