@@ -4,12 +4,11 @@ import asyncio
 import codecs
 import locale
 import os
-import re
 import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Pattern
+from typing import Any
 
 from agent_runtime.terminal.terminal_process import (
     TerminalExitHandler,
@@ -19,9 +18,7 @@ from agent_runtime.terminal.terminal_process import (
     TerminalSessionStartRequest,
 )
 
-_SENTINEL_PREFIX = "__AGENT_RUNTIME_COMMAND_DONE__"
 _PTY_READ_CHUNK_SIZE = 4096
-_PTY_PENDING_TEXT_MAX_CHARS = 8192
 
 
 @dataclass(slots=True)
@@ -29,11 +26,7 @@ class _ActiveCommand:
     command_id: str
     on_output: TerminalOutputHandler
     on_exit: TerminalExitHandler
-    sentinel_pattern: Pattern[str]
-    command_echo: str
     timeout_task: asyncio.Task[None] | None = None
-    pending_text: str = ""
-    echo_stripped: bool = False
 
 
 @dataclass(slots=True)
@@ -87,20 +80,19 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         session = self._require_session(request.terminal_id)
         async with session.lock:
             if session.active_command is not None:
-                raise ValueError(f"终端已有命令在执行: {request.terminal_id}")
-            command_text = _wrap_command(session.shell, request.command_id, request.command_line)
+                previous = session.active_command
+                if previous.timeout_task is not None:
+                    previous.timeout_task.cancel()
             active = _ActiveCommand(
                 command_id=request.command_id,
                 on_output=on_output,
                 on_exit=on_exit,
-                sentinel_pattern=_sentinel_pattern(request.command_id),
-                command_echo=command_text,
             )
             session.active_command = active
             if request.timeout_ms is not None and request.timeout_ms > 0:
                 active.timeout_task = asyncio.create_task(self._enforce_timeout(session, request.command_id, request.timeout_ms))
             try:
-                await _write_terminal(session, command_text + "\r")
+                await _write_terminal(session, _command_input_text(request.command_line))
             except Exception:
                 session.active_command = None
                 if active.timeout_task is not None:
@@ -116,9 +108,6 @@ class PtyTerminalProcessManager(TerminalProcessManager):
     async def interrupt_terminal(self, terminal_id: str) -> None:
         session = self._require_session(terminal_id)
         await _write_terminal(session, "\x03")
-        active = session.active_command
-        if active is not None:
-            asyncio.create_task(self._finalize_interrupted_command(session, active.command_id))
 
     async def terminate_terminal(self, terminal_id: str) -> None:
         session = self._sessions.get(terminal_id)
@@ -208,25 +197,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         active = session.active_command
         if active is None:
             return
-        active.pending_text += text
-        _strip_command_echo(active)
-        match = active.sentinel_pattern.search(active.pending_text)
-        if match is None:
-            keep_tail = min(_PTY_PENDING_TEXT_MAX_CHARS, len(_SENTINEL_PREFIX) + len(active.command_id) + 32)
-            if len(active.pending_text) <= keep_tail:
-                return
-            emit_text = active.pending_text[:-keep_tail]
-            emit_text = _remove_internal_command_echo(emit_text)
-            active.pending_text = active.pending_text[-keep_tail:]
-            if emit_text:
-                await active.on_output("pty", emit_text)
-            return
-        before = active.pending_text[: match.start()]
-        before = _remove_internal_command_echo(before)
-        if before:
-            await active.on_output("pty", before)
-        exit_code = int(match.group(1))
-        await self._complete_active_command(session, active.command_id, exit_code=exit_code, error_message=None)
+        await active.on_output("pty", text)
 
     async def _complete_active_command(
         self,
@@ -251,8 +222,6 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         session.active_command = None
         if active.timeout_task is not None:
             active.timeout_task.cancel()
-        if active.pending_text:
-            await active.on_output("pty", active.pending_text)
         await active.on_exit(None, error_message)
 
     async def _enforce_timeout(self, session: _TerminalSession, command_id: str, timeout_ms: int) -> None:
@@ -274,28 +243,6 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 await _close_terminal_session(session)
         except asyncio.CancelledError:
             raise
-
-    async def _finalize_interrupted_command(self, session: _TerminalSession, command_id: str) -> None:
-        await asyncio.sleep(0.5)
-        active = session.active_command
-        if active is None or active.command_id != command_id:
-            return
-        try:
-            await _write_terminal(session, _interrupt_completion_command(session.shell, command_id) + "\r")
-        except Exception:
-            return
-        await asyncio.sleep(5)
-        active = session.active_command
-        if active is None or active.command_id != command_id:
-            return
-        await self._complete_active_command(
-            session,
-            command_id,
-            exit_code=None,
-            error_message="命令被 Ctrl+C 中断后未返回终端提示，终端运行时已关闭。",
-        )
-        await _close_terminal_session(session)
-
 
 async def _start_unix_terminal(request: TerminalSessionStartRequest, *, on_exit: TerminalExitHandler) -> _TerminalSession:
     import fcntl
@@ -455,70 +402,9 @@ def _normalize_terminal_input(text: str) -> str:
     return text.replace("\r\n", "\r").replace("\n", "\r")
 
 
-def _sentinel_pattern(command_id: str) -> Pattern[str]:
-    return re.compile(re.escape(f"{_SENTINEL_PREFIX}{command_id}__") + r"(-?\d+)")
-
-
-def _wrap_command(shell: str, command_id: str, command_line: str) -> str:
-    sentinel = f"{_SENTINEL_PREFIX}{command_id}__"
-    normalized = shell.strip().lower()
-    if normalized in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
-        escaped = sentinel.replace('"', '`"')
-        completion = (
-            "$agentRuntimeExitCode = if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } elseif ($?) { 0 } else { 1 }; "
-            f"Write-Output \"{escaped}$agentRuntimeExitCode\""
-        )
-        return f"{command_line}\r{completion}"
-    if normalized in {"cmd", "cmd.exe"}:
-        return f"{command_line}\recho {sentinel}!ERRORLEVEL!"
-    return f"{command_line}\r__agent_runtime_exit_code=$?; printf '\\n{sentinel}%s\\n' \"$__agent_runtime_exit_code\""
-
-
-def _interrupt_completion_command(shell: str, command_id: str) -> str:
-    sentinel = f"{_SENTINEL_PREFIX}{command_id}__130"
-    normalized = shell.strip().lower()
-    if normalized in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
-        escaped = sentinel.replace('"', '`"')
-        return f"Write-Output \"{escaped}\""
-    if normalized in {"cmd", "cmd.exe"}:
-        return f"echo {sentinel}"
-    return f"printf '\\n{sentinel}\\n'"
-
-
-def _strip_command_echo(active: _ActiveCommand) -> None:
-    if active.echo_stripped:
-        return
-    index = active.pending_text.find(active.command_echo)
-    if index < 0:
-        if len(active.pending_text) > len(active.command_echo) + 16:
-            active.echo_stripped = True
-        return
-    end = index + len(active.command_echo)
-    while end < len(active.pending_text) and active.pending_text[end] in "\r\n":
-        end += 1
-    active.pending_text = active.pending_text[:index] + active.pending_text[end:]
-    active.echo_stripped = True
-
-
-def _remove_internal_command_echo(text: str) -> str:
-    if not text:
-        return text
-    cleaned_parts: list[str] = []
-    for line in re.split("(\r\n|\r|\n)", text):
-        normalized = _strip_ansi(line)
-        if (
-            "__AGENT_RUNTIME" in normalized
-            or "_COMMAND_DONE__" in normalized
-            or "agentRuntimeExitCode" in normalized
-            or "__agent_runtime_exit_code" in normalized
-        ):
-            continue
-        cleaned_parts.append(line)
-    return "".join(cleaned_parts)
-
-
-def _strip_ansi(text: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+def _command_input_text(command_line: str) -> str:
+    command_text = _normalize_terminal_input(command_line)
+    return command_text if command_text.endswith("\r") else command_text + "\r"
 
 
 class _StreamTextDecoder:

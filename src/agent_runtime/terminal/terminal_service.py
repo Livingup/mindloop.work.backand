@@ -16,7 +16,6 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     PublishCommunicationMessageRequest,
 )
 from agent_runtime.terminal.terminal import (
-    TERMINAL_STATUS_BUSY,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
     TERMINAL_STATUS_IDLE,
@@ -249,8 +248,6 @@ class TerminalService:
         lock_key = f"{scope.owner_type}:{scope.owner_id}"
         async with self._lock_for(lock_key):
             terminal = await self._select_terminal(scope, terminal_id=terminal_id, cwd=cwd, shell=shell)
-            if terminal.status != TERMINAL_STATUS_IDLE:
-                raise ValueError(f"终端正在执行命令: {terminal.terminal_id}")
             actual_cwd = self._resolve_cwd(terminal.cwd, scope.default_cwd)
             actual_shell = self._resolve_shell(terminal.shell)
             await self._ensure_terminal_runtime(scope, terminal, cwd=actual_cwd, shell=actual_shell)
@@ -303,6 +300,8 @@ class TerminalService:
                 on_output=lambda stream, text: self._handle_output(scope, terminal.terminal_id, command.command_id, stream, text),
                 on_exit=lambda exit_code, error_message: self._handle_exit(scope, terminal.terminal_id, command.command_id, exit_code, error_message),
             )
+            terminal = terminal.mark_idle()
+            self._repo.save_terminal(terminal)
         except Exception as exc:
             failed = command.fail(str(exc))
             self._repo.save_command(failed)
@@ -443,26 +442,19 @@ class TerminalService:
         control: str | None = None,
     ) -> int:
         terminal = self._require_usable_terminal(scope, terminal_id)
-        if control == "ctrl_c" and terminal.status != TERMINAL_STATUS_BUSY:
-            bytes_written = 0
-        else:
-            if terminal.status != TERMINAL_STATUS_BUSY:
-                raise ValueError(
-                    f"终端当前没有正在执行的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
-                )
-            try:
-                if control == "ctrl_c":
-                    await self._process_manager.interrupt_terminal(terminal_id)
-                    bytes_written = 0
-                else:
-                    payload = _control_text(control) if control else (text or "")
-                    if append_newline:
-                        payload += "\n"
-                    if not payload:
-                        raise ValueError("写入终端的输入不能为空。")
-                    bytes_written = await self._process_manager.write_input(terminal_id, payload)
-            except KeyError as exc:
-                raise ValueError(f"终端运行进程不可写，可能命令已结束或运行时已重启: {terminal_id}") from exc
+        try:
+            if control == "ctrl_c":
+                await self._process_manager.interrupt_terminal(terminal_id)
+                bytes_written = 0
+            else:
+                payload = _control_text(control) if control else (text or "")
+                if append_newline:
+                    payload += "\n"
+                if not payload:
+                    raise ValueError("写入终端的输入不能为空。")
+                bytes_written = await self._process_manager.write_input(terminal_id, payload)
+        except KeyError as exc:
+            raise ValueError(f"终端运行进程不可写，可能命令已结束或运行时已重启: {terminal_id}") from exc
         await self._publish(
             scope,
             "terminal.input.sent",
