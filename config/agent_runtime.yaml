@@ -102,3 +102,8 @@ llm_model_registry:
   # LLM 模型元数据与服务商定义 YAML 文件存放根目录。
   # 具体数据按 models/{model_id}.yaml 和 providers/{provider_id}.yaml 分目录存储。
   registry_dir: "~/.spread-ai/llm-model-registry"
+
+llm_http_trace:
+  enabled: true
+  data_dir: "~/.spread-ai/llm-http-traces"
+  max_body_bytes: 20971520

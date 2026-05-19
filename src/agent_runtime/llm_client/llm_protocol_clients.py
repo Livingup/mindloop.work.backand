@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import copy
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +25,8 @@ from agent_runtime.llm_api_protocol import (
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
 )
+from agent_runtime.llm_http_trace.models import LlmHttpTraceContext
+from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 
 StreamEventHandler = Callable[[dict[str, Any]], None]
@@ -47,6 +50,8 @@ class LlmProtocolClient(Protocol):
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         """发送一次 LLM 请求并返回 JSON 响应。"""
         ...
@@ -69,6 +74,8 @@ class OpenAIResponsesProtocolClient:
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, OpenAIRenderResult):
             raise TypeError("openai_responses 渲染结果类型不正确。")
@@ -100,6 +107,8 @@ class OpenAIResponsesProtocolClient:
             body,
             sse_aggregator=_aggregate_openai_responses_sse,
             stream_event_handler=stream_event_handler,
+            http_trace_service=http_trace_service,
+            http_trace_context=http_trace_context,
         )
 
 
@@ -120,6 +129,8 @@ class OpenAIChatCompletionsProtocolClient:
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, OpenAIChatRenderResult):
             raise TypeError("openai_chat_completions 渲染结果类型不正确。")
@@ -146,6 +157,8 @@ class OpenAIChatCompletionsProtocolClient:
             body,
             sse_aggregator=_aggregate_chat_completions_sse,
             stream_event_handler=stream_event_handler,
+            http_trace_service=http_trace_service,
+            http_trace_context=http_trace_context,
         )
 
 
@@ -166,6 +179,8 @@ class AnthropicMessagesProtocolClient:
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, ClaudeRenderResult):
             raise TypeError("anthropic_messages 渲染结果类型不正确。")
@@ -192,6 +207,8 @@ class AnthropicMessagesProtocolClient:
             body,
             sse_aggregator=_aggregate_anthropic_messages_sse,
             stream_event_handler=stream_event_handler,
+            http_trace_service=http_trace_service,
+            http_trace_context=http_trace_context,
         )
 
 
@@ -212,6 +229,8 @@ class GeminiGenerateContentProtocolClient:
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, GeminiRenderResult):
             raise TypeError("gemini_generate_content 渲染结果类型不正确。")
@@ -249,6 +268,8 @@ class GeminiGenerateContentProtocolClient:
             sse_aggregator=_aggregate_gemini_generate_content_sse,
             stream_event_handler=stream_event_handler,
             expect_stream=stream_requested,
+            http_trace_service=http_trace_service,
+            http_trace_context=http_trace_context,
         )
 
 
@@ -269,6 +290,8 @@ class ZhipuChatCompletionsProtocolClient:
         request_params: dict[str, Any],
         api_key: str | None,
         stream_event_handler: StreamEventHandler | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
+        http_trace_context: LlmHttpTraceContext | None = None,
     ) -> Any:
         from agent_runtime.conversation_message.message.zhipu_protocol import (
             ZhipuChatRenderResult,
@@ -301,6 +324,8 @@ class ZhipuChatCompletionsProtocolClient:
             body,
             sse_aggregator=_aggregate_chat_completions_sse,
             stream_event_handler=stream_event_handler,
+            http_trace_service=http_trace_service,
+            http_trace_context=http_trace_context,
         )
 
 
@@ -367,6 +392,8 @@ async def _post_json(
     sse_aggregator: Callable[[str], Any] | None = None,
     stream_event_handler: StreamEventHandler | None = None,
     expect_stream: bool = False,
+    http_trace_service: LlmHttpTraceService | None = None,
+    http_trace_context: LlmHttpTraceContext | None = None,
 ) -> Any:
     """?????????? JSON POST??????? HTTP ??????"""
     import asyncio
@@ -379,6 +406,8 @@ async def _post_json(
         sse_aggregator,
         stream_event_handler,
         expect_stream,
+        http_trace_service,
+        http_trace_context,
     )
 
 
@@ -389,6 +418,8 @@ def _post_json_sync(
     sse_aggregator: Callable[[str], Any] | None = None,
     stream_event_handler: StreamEventHandler | None = None,
     expect_stream: bool = False,
+    http_trace_service: LlmHttpTraceService | None = None,
+    http_trace_context: LlmHttpTraceContext | None = None,
 ) -> Any:
     """?? JSON POST??? HTTP ?????? status_code ????"""
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -396,19 +427,79 @@ def _post_json_sync(
     if body.get("stream") is True or expect_stream:
         request_headers.setdefault("Accept", "text/event-stream")
     request = urllib.request.Request(url=url, data=payload, headers=request_headers, method="POST")
+    trace_started_at = time.perf_counter()
+    trace_record = None
+    trace_enabled = http_trace_service is not None and http_trace_context is not None
+    if trace_enabled:
+        trace_record = http_trace_service.record_started(
+            context=http_trace_context,
+            method="POST",
+            url=url,
+            request_headers=request_headers,
+            request_body_bytes=payload,
+            is_stream=(body.get("stream") is True or expect_stream),
+        )
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
+            status_code = int(getattr(response, "status", response.getcode()))
+            response_headers = dict(response.headers.items())
             content_type = response.headers.get("Content-Type", "")
             if "text/event-stream" in content_type or expect_stream:
                 if sse_aggregator is None:
                     raise RuntimeError("??????????? text/event-stream ?????")
                 text = _read_sse_response_text(response, content_type, stream_event_handler)
+                response_bytes = text.encode("utf-8")
+                if trace_enabled:
+                    http_trace_service.record_completed(
+                        started_record=trace_record,
+                        context=http_trace_context,
+                        status_code=status_code,
+                        response_headers=response_headers,
+                        response_body_bytes=response_bytes,
+                        response_content_type=content_type,
+                        duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+                        sse_event_count=_count_sse_events(text),
+                    )
                 return sse_aggregator(text)
-            text = response.read().decode("utf-8")
+            response_bytes = response.read()
+            if trace_enabled:
+                http_trace_service.record_completed(
+                    started_record=trace_record,
+                    context=http_trace_context,
+                    status_code=status_code,
+                    response_headers=response_headers,
+                    response_body_bytes=response_bytes,
+                    response_content_type=content_type,
+                    duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+                )
+            text = response_bytes.decode("utf-8")
             return json.loads(text) if text else {}
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
+        error_bytes = exc.read()
+        if trace_enabled:
+            http_trace_service.record_failed(
+                started_record=trace_record,
+                context=http_trace_context,
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
+                duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+                status_code=exc.code,
+                response_headers=dict(exc.headers.items()) if exc.headers is not None else {},
+                response_body_bytes=error_bytes,
+                response_content_type=exc.headers.get("Content-Type") if exc.headers is not None else None,
+            )
+        error_text = error_bytes.decode("utf-8", errors="replace")
         raise LlmHttpRequestError(exc.code, error_text) from exc
+    except Exception as exc:
+        if trace_enabled:
+            http_trace_service.record_failed(
+                started_record=trace_record,
+                context=http_trace_context,
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
+                duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+            )
+        raise
 
 
 def _aggregate_openai_responses_sse(text: str) -> dict[str, Any]:
@@ -501,6 +592,10 @@ def _emit_stream_event(
 ) -> None:
     if handler is not None:
         handler({"event_type": event_type, "payload": payload})
+
+
+def _count_sse_events(text: str) -> int:
+    return sum(1 for _event_type, _data_text in _iter_sse_events(text))
 
 
 def _aggregate_chat_completions_sse(text: str) -> dict[str, Any]:

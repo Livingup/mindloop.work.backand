@@ -44,6 +44,7 @@ from agent_runtime.skill.skill_config import SkillConfig
 from agent_runtime.scene.scene_config import SceneConfig
 from agent_runtime.conversation_message.config import ConversationRepositoryConfig
 from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelRegistryConfig
+from agent_runtime.llm_http_trace.config import LlmHttpTraceConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
 from agent_runtime.communication.communication_config import CommunicationConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
@@ -128,6 +129,10 @@ class AgentRuntimeConfig:
         default_factory=lambda: LlmModelRegistryConfig(
             registry_dir="~/.spread-ai/llm-model-registry",
         ),
+    )
+
+    llm_http_trace: LlmHttpTraceConfig = field(
+        default_factory=LlmHttpTraceConfig,
     )
 
 
@@ -348,6 +353,16 @@ class ConfigRegistry:
         )
 
     @property
+    def llm_http_trace(self) -> LlmHttpTraceConfig:
+        if self._config is not None:
+            return self._config.llm_http_trace
+        if self._raw_config_data is not None and "llm_http_trace" not in self._raw_config_data:
+            return LlmHttpTraceConfig()
+        return self._get_section_config(
+            "llm_http_trace", _build_llm_http_trace_config,
+        )
+
+    @property
     def communication(self) -> CommunicationConfig:
         """实时读取通用通信模块配置（通信流与消息日志数据目录等）。"""
         if self._config is not None:
@@ -565,6 +580,14 @@ def _build_llm_model_registry_config(data: dict[str, Any]) -> LlmModelRegistryCo
     """从 YAML 字典构建 LLM 服务商与模型注册模块配置。"""
     return LlmModelRegistryConfig(
         registry_dir=str(data["registry_dir"]),
+    )
+
+
+def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
+    return LlmHttpTraceConfig(
+        enabled=bool(data.get("enabled", True)),
+        data_dir=str(data.get("data_dir", "~/.spread-ai/llm-http-traces")),
+        max_body_bytes=int(data.get("max_body_bytes", 20 * 1024 * 1024)),
     )
 
 

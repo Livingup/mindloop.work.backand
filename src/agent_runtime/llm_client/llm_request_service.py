@@ -36,6 +36,8 @@ from agent_runtime.llm_client.llm_request_models import (
     LlmPromptResponse,
 )
 from agent_runtime.llm_client.llm_stream_events import LlmSemanticStreamParser
+from agent_runtime.llm_http_trace.models import LlmHttpTraceContext
+from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
 _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
@@ -61,6 +63,7 @@ class LlmRequestService:
         protocol_clients: tuple[LlmProtocolClient, ...],
         resource_resolver: Any,
         event_publisher: RuntimeEventPublisher | None = None,
+        http_trace_service: LlmHttpTraceService | None = None,
     ) -> None:
         # 具体 API 协议客户端表。key 是 api_format，如 openai_responses。
         self._protocol_clients = {client.api_format: client for client in protocol_clients}
@@ -70,6 +73,8 @@ class LlmRequestService:
 
         # 运行时事件发布器。用于把 LLM 请求关键节点推送到通用通信流。
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
+
+        self._http_trace_service = http_trace_service
 
     async def send_prompt(self, request: LlmPromptRequest) -> LlmPromptResponse:
         """发送一次 LLM 请求，并把 assistant 响应追加到 Conversation。"""
@@ -244,6 +249,16 @@ class LlmRequestService:
                         request_params=request_params,
                         api_key=api_key,
                         stream_event_handler=stream_event_handler,
+                        http_trace_service=self._http_trace_service,
+                        http_trace_context=_build_http_trace_context(
+                            request=request,
+                            resolved=resolved,
+                            llm_call_id=llm_call_id,
+                            llm_request_id=llm_request_id,
+                            api_key_index=key_index,
+                            retry_index=retry_index,
+                            attempt_count=attempt_count,
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
                     if not _is_llm_service_call_failure(exc):
@@ -483,6 +498,43 @@ def _build_retry_target_payload(
             "next_retry_index": 0,
         })
     return payload
+
+
+def _build_http_trace_context(
+    *,
+    request: LlmPromptRequest,
+    resolved: Any,
+    llm_call_id: str,
+    llm_request_id: str,
+    api_key_index: int,
+    retry_index: int,
+    attempt_count: int,
+) -> LlmHttpTraceContext:
+    communication_context = request.communication_context
+    metadata = communication_context.metadata if communication_context is not None else {}
+    return LlmHttpTraceContext(
+        llm_request_id=llm_request_id,
+        llm_call_id=llm_call_id,
+        conversation_id=request.conversation.id,
+        task_id=_text_or_none(metadata.get("task_id")),
+        instance_id=_text_or_none(metadata.get("agent_instance_id")),
+        trace_id=communication_context.trace_id if communication_context is not None else None,
+        provider_id=resolved.provider_id,
+        binding_id=resolved.binding_id,
+        model_id=resolved.model_id,
+        model_alias=resolved.model_alias,
+        api_format=resolved.api_format,
+        candidate_index=request.candidate_index,
+        api_key_index=api_key_index,
+        retry_index=retry_index,
+        attempt_count=attempt_count,
+    )
+
+
+def _text_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def _merge_json_field(target: dict[str, Any], json_text: str | None, fallback_key: str) -> None:

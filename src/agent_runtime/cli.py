@@ -243,6 +243,12 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_rest_adapter import (
         create_llm_model_registry_router,
     )
+    from agent_runtime.llm_http_trace.llm_http_trace_factory import (
+        LlmHttpTraceFactory,
+    )
+    from agent_runtime.llm_http_trace.north_gateway.llm_http_trace_rest_adapter import (
+        create_llm_http_trace_router,
+    )
     from agent_runtime.system_settings.system_settings_factory import (
         SystemSettingsFactory,
     )
@@ -285,6 +291,7 @@ def serve(host: str | None, port: int | None) -> None:
         communication_gateway=communication_gateway,
     )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
+    llm_http_trace_service = LlmHttpTraceFactory.create()
     agent_execution_engine = AgentExecutionFactory.create()
     terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
@@ -404,6 +411,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
+    )
+    app.include_router(
+        create_llm_http_trace_router(llm_http_trace_service),
+        prefix="/api/llm-http-traces",
+        tags=["LLM HTTP 请求日志"],
     )
     app.include_router(
         create_system_settings_router(system_settings_gateway),

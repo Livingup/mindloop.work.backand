@@ -17,6 +17,7 @@ from agent_runtime.llm_client.llm_protocol_clients import (
     ZhipuChatCompletionsProtocolClient,
 )
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
+from agent_runtime.llm_http_trace.llm_http_trace_factory import LlmHttpTraceFactory
 
 
 class _TextOnlyResourceResolver:
@@ -63,4 +64,5 @@ class LlmClientFactory:
             ),
             resource_resolver=resolver,
             event_publisher=event_publisher,
+            http_trace_service=LlmHttpTraceFactory.create(),
         )
