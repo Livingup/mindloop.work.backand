@@ -442,23 +442,26 @@ class TerminalService:
         control: str | None = None,
     ) -> int:
         terminal = self._require_usable_terminal(scope, terminal_id)
-        if terminal.status != TERMINAL_STATUS_BUSY:
-            raise ValueError(
-                f"终端当前没有正在执行的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
-            )
-        try:
-            if control == "ctrl_c":
-                await self._process_manager.interrupt_terminal(terminal_id)
-                bytes_written = 0
-            else:
-                payload = _control_text(control) if control else (text or "")
-                if append_newline:
-                    payload += "\n"
-                if not payload:
-                    raise ValueError("写入终端的输入不能为空。")
-                bytes_written = await self._process_manager.write_input(terminal_id, payload)
-        except KeyError as exc:
-            raise ValueError(f"终端运行进程不可写，可能命令已结束或运行时已重启: {terminal_id}") from exc
+        if control == "ctrl_c" and terminal.status != TERMINAL_STATUS_BUSY:
+            bytes_written = 0
+        else:
+            if terminal.status != TERMINAL_STATUS_BUSY:
+                raise ValueError(
+                    f"终端当前没有正在执行的命令，不能写入输入: terminal_id={terminal_id} status={terminal.status}"
+                )
+            try:
+                if control == "ctrl_c":
+                    await self._process_manager.interrupt_terminal(terminal_id)
+                    bytes_written = 0
+                else:
+                    payload = _control_text(control) if control else (text or "")
+                    if append_newline:
+                        payload += "\n"
+                    if not payload:
+                        raise ValueError("写入终端的输入不能为空。")
+                    bytes_written = await self._process_manager.write_input(terminal_id, payload)
+            except KeyError as exc:
+                raise ValueError(f"终端运行进程不可写，可能命令已结束或运行时已重启: {terminal_id}") from exc
         await self._publish(
             scope,
             "terminal.input.sent",

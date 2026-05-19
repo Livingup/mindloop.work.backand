@@ -50,7 +50,7 @@ class TerminalWriteInputToolRequest(BaseToolRequest):
     append_newline: bool = Field(default=False, description="是否在文本末尾追加换行。")
     control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(
         default=None,
-        description="可选控制输入；可选值仅限 enter、ctrl_c、ctrl_d、escape；ctrl_c 会作为真实按键写入 PTY/ConPTY 并中断前台命令，设置后 text 可为空。",
+        description="可选控制输入；可选值仅限 enter、ctrl_c、ctrl_d、escape；ctrl_c 会作为真实按键写入 PTY/ConPTY 并中断前台命令，设置后 text 可为空；当终端没有正在执行的命令时，ctrl_c 会作为安全空操作成功返回。",
     )
 
 
@@ -154,7 +154,7 @@ async def terminal_read_output(request: TerminalReadOutputToolRequest, ctx: Tool
 
 @tool(
     name="terminal_write_input",
-    description="向当前任务/场景归属终端的正在运行前台命令写入输入，用于交互式命令。Agent 应通过读取输出判断是否需要输入；后端不承诺可靠识别 waiting_input。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；ctrl_c 会作为真实终端按键写入 PTY/ConPTY，由终端驱动/控制台中断前台进程。",
+    description="向当前任务/场景归属终端的正在运行前台命令写入输入，用于交互式命令。Agent 应通过读取输出判断是否需要输入；后端不承诺可靠识别 waiting_input。可写文本、追加换行，或发送 enter/ctrl_c/ctrl_d/escape 控制输入；普通文本、enter、ctrl_d、escape 仅允许在终端有前台命令时写入；ctrl_c 会作为真实终端按键写入 PTY/ConPTY，由终端驱动/控制台中断前台进程，若终端当前空闲则作为安全空操作成功返回。",
     group="terminal",
     category="business",
 )
