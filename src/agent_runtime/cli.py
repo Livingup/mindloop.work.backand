@@ -263,6 +263,9 @@ def serve(host: str | None, port: int | None) -> None:
         create_terminal_router,
     )
     from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
+    from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import (
+        create_file_resource_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -416,6 +419,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_communication_router(communication_gateway),
         prefix="/api/communication",
         tags=["通用通信"],
+    )
+    app.include_router(
+        create_file_resource_router(),
+        prefix="/api/file-resources",
+        tags=["统一文件资源"],
     )
     # Scene REST router 本身已声明 prefix=/api/scene，这里只补充 OpenAPI tag。
     app.include_router(

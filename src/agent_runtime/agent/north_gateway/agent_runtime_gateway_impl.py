@@ -234,6 +234,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         instance_id: str,
         *,
         user_text: str,
+        attachments=(),
         client_message_id: str | None = None,
         message_id: str | None = None,
     ):
@@ -241,6 +242,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         return self._service.enqueue_agent_instance_user_message(
             instance_id,
             user_text=user_text,
+            attachments=attachments,
             client_message_id=client_message_id,
             message_id=message_id,
         )

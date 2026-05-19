@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Final, TypeAlias
 
+from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 
 AgentInstanceStatus: TypeAlias = str
 
@@ -57,6 +58,31 @@ def _require_non_blank(value: str, field_name: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingUserMessageAttachment:
+    kind: str
+    resource_id: str
+    name: str | None = None
+    mime_type: str | None = None
+    size_in_bytes: int | None = None
+    width: int | None = None
+    height: int | None = None
+    page_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF}:
+            raise ValueError("attachment.kind 必须是 image 或 pdf。")
+        _require_non_blank(self.resource_id, "attachment.resource_id")
+        if self.name is not None and not self.name.strip():
+            raise ValueError("attachment.name 不能是空白字符串。")
+        if self.mime_type is not None and not self.mime_type.strip():
+            raise ValueError("attachment.mime_type 不能是空白字符串。")
+        for field_name in ("size_in_bytes", "width", "height", "page_count"):
+            value = getattr(self, field_name)
+            if value is not None and value < 0:
+                raise ValueError(f"attachment.{field_name} 不能小于 0。")
+
+
+@dataclass(frozen=True, slots=True)
 class PendingAgentUserMessage:
     """Agent 实例待处理用户消息。
 
@@ -73,15 +99,26 @@ class PendingAgentUserMessage:
     # 前端可选消息 ID，便于 UI 对齐本地乐观消息与后端入队事实。
     client_message_id: str | None = None
 
+    attachments: tuple[PendingUserMessageAttachment, ...] = ()
+
     # 后端接收消息的时间，用于审计与 FIFO 排序辅助。
     received_at: datetime = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         """校验待处理用户消息的业务字段。"""
         _require_non_blank(self.message_id, "message_id")
-        _require_non_blank(self.user_text, "user_text")
+        if not isinstance(self.user_text, str):
+            raise ValueError("user_text 必须是字符串。")
+        if self.user_text and self.user_text != self.user_text.strip():
+            raise ValueError("user_text 不能包含首尾空白字符。")
+        if not self.user_text.strip() and not self.attachments:
+            raise ValueError("user_text 和 attachments 必须至少提供一个。")
         if self.client_message_id is not None:
             _require_non_blank(self.client_message_id, "client_message_id")
+        for attachment in self.attachments:
+            if not isinstance(attachment, PendingUserMessageAttachment):
+                raise ValueError("attachments 必须由 PendingUserMessageAttachment 组成。")
+        object.__setattr__(self, "attachments", tuple(self.attachments))
         if self.received_at is None:
             object.__setattr__(self, "received_at", _utc_now())
 

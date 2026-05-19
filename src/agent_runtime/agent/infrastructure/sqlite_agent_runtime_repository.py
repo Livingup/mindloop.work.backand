@@ -13,6 +13,7 @@ from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_RUNNING,
     AgentInstance,
     PendingAgentUserMessage,
+    PendingUserMessageAttachment,
 )
 from agent_runtime.agent.agent_task import (
     AGENT_TASK_STATUS_FAILED,
@@ -535,6 +536,10 @@ def _pending_user_messages_to_json(messages: tuple[PendingAgentUserMessage, ...]
                 "message_id": message.message_id,
                 "user_text": message.user_text,
                 "client_message_id": message.client_message_id,
+                "attachments": [
+                    _pending_user_message_attachment_to_dict(attachment)
+                    for attachment in message.attachments
+                ],
                 "received_at": _datetime_to_text(message.received_at),
             }
             for message in messages
@@ -555,17 +560,77 @@ def _pending_user_messages_from_json(value: str | None) -> tuple[PendingAgentUse
         if not isinstance(item, dict):
             continue
         user_text = str(item.get("user_text") or "")
-        if not user_text.strip():
+        attachments = _pending_user_message_attachments_from_json(item.get("attachments"))
+        if not user_text.strip() and not attachments:
             continue
         messages.append(
             PendingAgentUserMessage(
                 message_id=str(item.get("message_id") or "legacy-pending-user-message"),
                 user_text=user_text,
+                attachments=attachments,
                 client_message_id=item.get("client_message_id"),
                 received_at=_text_to_datetime(item["received_at"]) if item.get("received_at") else None,
             )
         )
     return tuple(messages)
+
+
+def _pending_user_message_attachment_to_dict(
+    attachment: PendingUserMessageAttachment,
+) -> dict[str, object | None]:
+    return {
+        "kind": attachment.kind,
+        "resource_id": attachment.resource_id,
+        "name": attachment.name,
+        "mime_type": attachment.mime_type,
+        "size_in_bytes": attachment.size_in_bytes,
+        "width": attachment.width,
+        "height": attachment.height,
+        "page_count": attachment.page_count,
+    }
+
+
+def _pending_user_message_attachments_from_json(
+    value: object,
+) -> tuple[PendingUserMessageAttachment, ...]:
+    if not isinstance(value, list):
+        return ()
+    attachments: list[PendingUserMessageAttachment] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        try:
+            attachments.append(
+                PendingUserMessageAttachment(
+                    kind=str(item.get("kind") or ""),
+                    resource_id=str(item.get("resource_id") or ""),
+                    name=_optional_str(item.get("name")),
+                    mime_type=_optional_str(item.get("mime_type")),
+                    size_in_bytes=_optional_int(item.get("size_in_bytes")),
+                    width=_optional_int(item.get("width")),
+                    height=_optional_int(item.get("height")),
+                    page_count=_optional_int(item.get("page_count")),
+                )
+            )
+        except ValueError:
+            continue
+    return tuple(attachments)
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _datetime_to_text(value: datetime) -> str:

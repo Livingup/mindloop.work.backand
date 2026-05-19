@@ -9,7 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
+from agent_runtime.agent.agent_instance import (
+    AgentInstance,
+    PendingAgentUserMessage,
+    PendingUserMessageAttachment,
+)
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
 
 
@@ -341,6 +345,7 @@ class AgentRuntimeGateway(Protocol):
         instance_id: str,
         *,
         user_text: str,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
         client_message_id: str | None = None,
         message_id: str | None = None,
     ) -> tuple[AgentInstance, PendingAgentUserMessage]:

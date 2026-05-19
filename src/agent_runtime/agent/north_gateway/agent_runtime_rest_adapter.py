@@ -7,7 +7,11 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from agent_runtime.agent.agent_instance import AgentInstance, PendingAgentUserMessage
+from agent_runtime.agent.agent_instance import (
+    AgentInstance,
+    PendingAgentUserMessage,
+    PendingUserMessageAttachment,
+)
 from agent_runtime.agent.agent_execution_engine import (
     AgentExecutionEngine,
     AgentExecutionResult,
@@ -67,10 +71,22 @@ class AgentRuntimeTaskResponse(BaseModel):
     scene_id: str | None = None
 
 
+class UserMessageAttachmentModel(BaseModel):
+    kind: str
+    resource_id: str
+    name: str | None = None
+    mime_type: str | None = None
+    size_in_bytes: int | None = None
+    width: int | None = None
+    height: int | None = None
+    page_count: int | None = None
+
+
 class PendingUserMessageResponse(BaseModel):
     message_id: str
     user_text: str
     client_message_id: str | None = None
+    attachments: list[UserMessageAttachmentModel] = Field(default_factory=list)
     received_at: str
 
 
@@ -166,6 +182,7 @@ class CreateRootAgentInstanceResponse(BaseModel):
 
 class SendAgentInstanceMessageBody(BaseModel):
     user_message: str
+    attachments: list[UserMessageAttachmentModel] = Field(default_factory=list)
     client_message_id: str | None = None
     render_options: dict[str, Any] = Field(default_factory=dict)
     request_overrides: dict[str, Any] = Field(default_factory=dict)
@@ -355,12 +372,13 @@ def create_agent_runtime_router(
     ) -> AgentMessageSubmissionResponse:
         if execution_engine is None:
             raise HTTPException(status_code=501, detail="Agent 执行引擎未启用。")
-        if not body.user_message.strip():
-            raise HTTPException(status_code=400, detail="user_message 不能为空。")
+        if not body.user_message.strip() and not body.attachments:
+            raise HTTPException(status_code=400, detail="user_message 和 attachments 必须至少提供一个。")
         try:
             result = await execution_engine.submit_agent_instance_message(
                 agent_instance_id=instance_id,
-                user_text=body.user_message,
+                user_text=body.user_message.strip(),
+                attachments=tuple(_pending_attachment_from_model(item) for item in body.attachments),
                 render_options=body.render_options,
                 request_overrides=body.request_overrides,
                 communication_stream_id=body.communication_stream_id,
@@ -975,7 +993,34 @@ def _pending_user_message_response(message: PendingAgentUserMessage) -> PendingU
         message_id=message.message_id,
         user_text=message.user_text,
         client_message_id=message.client_message_id,
+        attachments=[_attachment_model(attachment) for attachment in message.attachments],
         received_at=_datetime_text(message.received_at),
+    )
+
+
+def _pending_attachment_from_model(model: UserMessageAttachmentModel) -> PendingUserMessageAttachment:
+    return PendingUserMessageAttachment(
+        kind=model.kind,
+        resource_id=model.resource_id,
+        name=model.name,
+        mime_type=model.mime_type,
+        size_in_bytes=model.size_in_bytes,
+        width=model.width,
+        height=model.height,
+        page_count=model.page_count,
+    )
+
+
+def _attachment_model(attachment: PendingUserMessageAttachment) -> UserMessageAttachmentModel:
+    return UserMessageAttachmentModel(
+        kind=attachment.kind,
+        resource_id=attachment.resource_id,
+        name=attachment.name,
+        mime_type=attachment.mime_type,
+        size_in_bytes=attachment.size_in_bytes,
+        width=attachment.width,
+        height=attachment.height,
+        page_count=attachment.page_count,
     )
 
 

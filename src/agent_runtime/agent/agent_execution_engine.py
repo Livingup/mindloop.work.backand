@@ -13,7 +13,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, TypeVar
 
-from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING, AgentInstance
+from agent_runtime.agent.agent_instance import (
+    AGENT_INSTANCE_STATUS_RUNNING,
+    AgentInstance,
+    PendingAgentUserMessage,
+    PendingUserMessageAttachment,
+)
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
@@ -37,6 +42,10 @@ from agent_runtime.communication.runtime_event_publisher import (
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import (
     PartMeta,
+    ImagePart,
+    ImagePartMeta,
+    PdfPart,
+    PdfPartMeta,
     TextPart,
     TextPartMeta,
     ToolResultPart,
@@ -46,6 +55,7 @@ from agent_runtime.conversation_message.message.models import (
     ROLE_TOOL,
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
 from agent_runtime.llm_client.llm_request_service import (
     LlmProviderModelServiceUnavailable,
@@ -265,6 +275,7 @@ class AgentExecutionEngine:
         self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=_request_user_text(request),
+            attachments=_request_user_attachments(request),
             client_message_id=request.client_message_id,
         )
         instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
@@ -275,6 +286,7 @@ class AgentExecutionEngine:
         *,
         agent_instance_id: str,
         user_text: str,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
         render_options: dict[str, Any] | None = None,
         request_overrides: dict[str, Any] | None = None,
         communication_stream_id: str | None = None,
@@ -290,6 +302,7 @@ class AgentExecutionEngine:
         instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
+            attachments=attachments,
         )
         request = AgentExecutionRequest.from_text(
             thread_id=instance.thread_id,
@@ -316,6 +329,7 @@ class AgentExecutionEngine:
         request_overrides: dict[str, Any] | None = None,
         communication_stream_id: str | None = None,
         client_message_id: str | None = None,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
     ) -> AgentMessageSubmissionResult:
         instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
         task = self._runtime_gateway.get_task(instance.task_id)
@@ -328,6 +342,7 @@ class AgentExecutionEngine:
         instance, pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
+            attachments=attachments,
             client_message_id=client_message_id,
         )
         request = AgentExecutionRequest.from_text(
@@ -1020,9 +1035,10 @@ class AgentExecutionEngine:
         if not pending_messages:
             return 0
         for pending_message in pending_messages:
+            parts, parts_meta = _pending_user_message_parts(pending_message)
             conversation.add_user_message(
-                [TextPart(text=pending_message.user_text)],
-                [TextPartMeta()],
+                parts,
+                parts_meta,
             )
             user_message = conversation.messages[-1]
             self._trace_recorder.record_user_message(trace_path, user_message)
@@ -1034,6 +1050,7 @@ class AgentExecutionEngine:
                     "client_message_id": pending_message.client_message_id,
                     "user_message_id": f"{conversation.id}:message:{len(conversation.messages) - 1}",
                     "text": _message_text(user_message),
+                    "attachments": _pending_user_message_attachments_payload(pending_message),
                     "part_count": len(user_message.content),
                     "queued_received_at": pending_message.received_at.isoformat(),
                 },
@@ -1358,7 +1375,67 @@ def _request_user_text(request: AgentExecutionRequest) -> str:
         for part in request.user_parts
         if isinstance(part, TextPart) and part.text
     ]
-    return "\n\n".join(texts) or "用户提交了非文本输入。"
+    return "\n\n".join(texts)
+
+
+def _request_user_attachments(
+    request: AgentExecutionRequest,
+) -> tuple[PendingUserMessageAttachment, ...]:
+    attachments: list[PendingUserMessageAttachment] = []
+    for index, part in enumerate(request.user_parts):
+        part_meta = request.user_parts_meta[index] if index < len(request.user_parts_meta) else None
+        if isinstance(part, ImagePart):
+            attachments.append(
+                PendingUserMessageAttachment(
+                    kind=INPUT_MODALITY_IMAGE,
+                    resource_id=part.resource_id,
+                )
+            )
+        elif isinstance(part, PdfPart):
+            attachments.append(
+                PendingUserMessageAttachment(
+                    kind=INPUT_MODALITY_PDF,
+                    resource_id=part.resource_id,
+                    page_count=part_meta.page_count if isinstance(part_meta, PdfPartMeta) else None,
+                )
+            )
+    return tuple(attachments)
+
+
+def _pending_user_message_parts(
+    pending_message: PendingAgentUserMessage,
+) -> tuple[list[UniPart], list[PartMeta]]:
+    parts: list[UniPart] = []
+    parts_meta: list[PartMeta] = []
+    if pending_message.user_text.strip():
+        parts.append(TextPart(text=pending_message.user_text))
+        parts_meta.append(TextPartMeta())
+    for attachment in pending_message.attachments:
+        if attachment.kind == INPUT_MODALITY_IMAGE:
+            parts.append(ImagePart(resource_id=attachment.resource_id))
+            parts_meta.append(ImagePartMeta())
+        elif attachment.kind == INPUT_MODALITY_PDF:
+            parts.append(PdfPart(resource_id=attachment.resource_id))
+            parts_meta.append(PdfPartMeta(page_count=attachment.page_count or 0))
+    return parts, parts_meta
+
+
+def _pending_user_message_attachments_payload(
+    pending_message: PendingAgentUserMessage,
+) -> list[dict[str, object | None]]:
+    return [
+        {
+            "kind": attachment.kind,
+            "resource_id": attachment.resource_id,
+            "name": attachment.name,
+            "mime_type": attachment.mime_type,
+            "size_in_bytes": attachment.size_in_bytes,
+            "width": attachment.width,
+            "height": attachment.height,
+            "page_count": attachment.page_count,
+        }
+        for attachment in pending_message.attachments
+    ]
 
 
 def _record_last_context_usage(conversation: Any, llm_response: LlmPromptResponse) -> None:

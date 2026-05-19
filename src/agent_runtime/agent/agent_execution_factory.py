@@ -14,7 +14,7 @@ from agent_runtime.conversation_message.south_gateway.resource_resolver.contract
     ResolvedResource,
     ResourceMeta,
 )
-from agent_runtime.file_resource import FileResourceServiceFactory
+from agent_runtime.file_resource.shared_service import get_file_resource_service
 from agent_runtime.llm_client import LlmClientFactory
 from agent_runtime.llm_model_registry.llm_model_registry_factory import (
     LlmModelRegistryFactory,
@@ -34,7 +34,7 @@ class _LazyFileResourceResolver:
     """
 
     def __init__(self) -> None:
-        self._file_resource_service = None
+        pass
 
     async def get_base64(self, resource_id: str) -> str:
         """按资源标识获取 Base64 编码内容。"""
@@ -75,13 +75,7 @@ class _LazyFileResourceResolver:
 
     def _service(self):
         """懒创建统一文件资源服务。"""
-        if self._file_resource_service is None:
-            from agent_runtime.config import ConfigRegistry
-
-            self._file_resource_service = FileResourceServiceFactory.create_from_config(
-                ConfigRegistry.instance().file_resource_service,
-            )
-        return self._file_resource_service
+        return get_file_resource_service()
 
 
 class AgentExecutionFactory:

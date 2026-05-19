@@ -13,6 +13,7 @@ from agent_runtime.agent.agent_instance import (
     AgentInstance,
     AgentInstanceStatus,
     PendingAgentUserMessage,
+    PendingUserMessageAttachment,
 )
 from agent_runtime.agent.agent_runtime_repository import AgentRuntimeRepository
 from agent_runtime.agent.agent_task import (
@@ -474,6 +475,7 @@ class AgentRuntimeService:
         instance_id: str,
         *,
         user_text: str,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
         client_message_id: str | None = None,
         message_id: str | None = None,
     ) -> tuple[AgentInstance, PendingAgentUserMessage]:
@@ -482,13 +484,18 @@ class AgentRuntimeService:
         所有用户发给 AgentInstance 的消息都先进入该 FIFO 队列；执行循环只在完整轮次边界
         drain 队列并追加到 conversation，避免打断当前 LLM 请求或工具执行。
         """
-        _require_non_blank(user_text, "user_text")
+        if not isinstance(user_text, str):
+            raise ValueError("user_text 必须是字符串。")
+        if not user_text.strip() and not attachments:
+            raise ValueError("user_text 和 attachments 必须至少提供一个。")
         actual_message_id = message_id or _new_id("pending-user-message")
         pending_message = PendingAgentUserMessage(
             message_id=actual_message_id,
             user_text=user_text,
+            attachments=attachments,
             client_message_id=client_message_id,
         )
+
         with self._lock:
             instance = self._get_required_instance(instance_id)
             updated = instance.enqueue_user_message(pending_message)
