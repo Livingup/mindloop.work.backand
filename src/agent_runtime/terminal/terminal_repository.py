@@ -29,6 +29,14 @@ class TerminalRepository(Protocol):
     ) -> list[TerminalInstance]:
         ...
 
+    def list_terminals_by_task_id(
+        self,
+        task_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> list[TerminalInstance]:
+        ...
+
     def find_idle_terminal(self, owner_type: str, owner_id: str) -> TerminalInstance | None:
         ...
 

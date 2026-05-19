@@ -97,6 +97,10 @@ class TerminalGatewayImpl:
         terminal = await self._service.delete_terminal(scope, request.terminal_id)
         return _terminal_to_info(terminal)
 
+    async def delete_task_terminals(self, task_id: str) -> list[TerminalInfo]:
+        terminals = await self._service.delete_task_terminals(task_id)
+        return [_terminal_to_info(terminal) for terminal in terminals]
+
     async def shutdown(self) -> None:
         await self._service.shutdown()
 

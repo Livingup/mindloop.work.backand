@@ -1297,6 +1297,7 @@ class AgentExecutionEngine:
             return
         if loop_decision == "complete":
             task = self._runtime_gateway.get_task(task_id)
+            await self._delete_task_terminals(task_id)
             if task.scene_id is not None:
                 self._runtime_gateway.complete_scene_task_and_reset_root_agent_instance(
                     task_id,
@@ -1317,6 +1318,7 @@ class AgentExecutionEngine:
             return
         if loop_decision == "fail":
             failure_message = _failure_message_from_tool_results(tool_results)
+            await self._delete_task_terminals(task_id)
             self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
             self._runtime_gateway.fail_task(task_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)
@@ -1331,6 +1333,16 @@ class AgentExecutionEngine:
             )
             return
         raise ValueError(f"未知循环决策: {loop_decision}")
+
+    async def _delete_task_terminals(self, task_id: str) -> None:
+        try:
+            from agent_runtime.terminal.terminal_factory import TerminalFactory
+
+            deleted = await TerminalFactory.create().delete_task_terminals(task_id)
+            if deleted:
+                logger.info("Agent 任务终态清理终端完成: task_id=%s terminal_count=%s", task_id, len(deleted))
+        except Exception:
+            logger.exception("Agent 任务终态清理终端失败: task_id=%s", task_id)
 
     async def _publish_loop_decision_event(
         self,

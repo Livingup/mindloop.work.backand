@@ -2,6 +2,7 @@
 """Agent 运行时任务与实例管理北向网关实现。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from uuid import uuid4
 
@@ -451,6 +452,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
                     continue
                 self._service.cancel_agent_instance(instance_id)
                 cancelled_instance_count += 1
+            _delete_task_terminals(task.task_id)
             self._service.cancel_task(task.task_id)
             cancelled_task_count += 1
 
@@ -466,3 +468,22 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             cancelled_task_count=cancelled_task_count,
             cancelled_instance_count=cancelled_instance_count,
         )
+
+
+def _delete_task_terminals(task_id: str) -> None:
+    async def delete() -> None:
+        try:
+            from agent_runtime.terminal.terminal_factory import TerminalFactory
+
+            deleted = await TerminalFactory.create().delete_task_terminals(task_id)
+            if deleted:
+                logger.info("Scene detach 清理任务终端完成: task_id=%s terminal_count=%s", task_id, len(deleted))
+        except Exception:
+            logger.exception("Scene detach 清理任务终端失败: task_id=%s", task_id)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(delete())
+    else:
+        loop.create_task(delete())

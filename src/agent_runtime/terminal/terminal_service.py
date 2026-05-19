@@ -209,6 +209,7 @@ class TerminalService:
             metadata={
                 "task_id": scope.task_id,
                 "agent_instance_id": scope.agent_instance_id,
+                "communication_stream_id": scope.communication_stream_id,
                 "trace_id": scope.trace_id,
             },
         )
@@ -510,6 +511,32 @@ class TerminalService:
         )
         return deleted
 
+    async def delete_task_terminals(self, task_id: str) -> list[TerminalInstance]:
+        terminals = self._repo.list_terminals_by_task_id(task_id)
+        deleted_terminals: list[TerminalInstance] = []
+        for terminal in terminals:
+            try:
+                await self._process_manager.terminate_terminal(terminal.terminal_id)
+            except Exception:
+                logger.exception("关闭任务终端运行时失败: task_id=%s terminal_id=%s", task_id, terminal.terminal_id)
+            self._runtime_tokens.pop(terminal.terminal_id, None)
+            self._discard_terminal_runtime_state(terminal.terminal_id)
+            deleted = terminal.delete()
+            self._repo.save_terminal(deleted)
+            self._repo.delete_terminal_data(terminal.terminal_id)
+            deleted_terminals.append(deleted)
+            scope = self._scope_for_existing_terminal(deleted)
+            await self._publish(
+                scope,
+                "terminal.deleted",
+                {
+                    "terminal_id": deleted.terminal_id,
+                    "status": deleted.status,
+                },
+                correlation_id=scope.tool_call_id,
+            )
+        return deleted_terminals
+
     async def shutdown(self) -> None:
         await self._process_manager.shutdown()
 
@@ -562,6 +589,18 @@ class TerminalService:
         if terminal.status == TERMINAL_STATUS_DELETED:
             raise KeyError(f"终端已删除: {terminal_id}")
         return terminal
+
+    def _scope_for_existing_terminal(self, terminal: TerminalInstance) -> TerminalRuntimeScope:
+        metadata = terminal.metadata or {}
+        return TerminalRuntimeScope(
+            owner_type=terminal.owner_type,
+            owner_id=terminal.owner_id,
+            default_cwd=terminal.cwd or os.getcwd(),
+            communication_stream_id=_string_or_none(metadata.get("communication_stream_id")),
+            task_id=_string_or_none(metadata.get("task_id")),
+            agent_instance_id=_string_or_none(metadata.get("agent_instance_id")),
+            trace_id=_string_or_none(metadata.get("trace_id")),
+        )
 
     def _recover_terminal_slot_if_needed(self, terminal: TerminalInstance) -> TerminalInstance:
         if terminal.status != TERMINAL_STATUS_ERROR:

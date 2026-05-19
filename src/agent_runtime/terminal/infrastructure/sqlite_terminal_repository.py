@@ -224,6 +224,37 @@ class SqliteTerminalRepository:
                 ).fetchall()
             return [_row_to_terminal(row) for row in rows]
 
+    def list_terminals_by_task_id(
+        self,
+        task_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> list[TerminalInstance]:
+        with self._lock:
+            if include_deleted:
+                rows = self._connection().execute(
+                    """
+                    SELECT terminal_id, owner_type, owner_id, cwd, shell, status,
+                           current_command_id, created_at, updated_at, last_active_at, metadata_json
+                    FROM terminals
+                    WHERE json_extract(metadata_json, '$.task_id') = ?
+                    ORDER BY last_active_at DESC
+                    """,
+                    (task_id,),
+                ).fetchall()
+            else:
+                rows = self._connection().execute(
+                    """
+                    SELECT terminal_id, owner_type, owner_id, cwd, shell, status,
+                           current_command_id, created_at, updated_at, last_active_at, metadata_json
+                    FROM terminals
+                    WHERE json_extract(metadata_json, '$.task_id') = ? AND status != ?
+                    ORDER BY last_active_at DESC
+                    """,
+                    (task_id, TERMINAL_STATUS_DELETED),
+                ).fetchall()
+            return [_row_to_terminal(row) for row in rows]
+
     def find_idle_terminal(self, owner_type: str, owner_id: str) -> TerminalInstance | None:
         with self._lock:
             row = self._connection().execute(
