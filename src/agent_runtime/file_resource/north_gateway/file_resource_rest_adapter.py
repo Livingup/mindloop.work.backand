@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Response
@@ -9,6 +10,8 @@ from pydantic import BaseModel, Field
 from agent_runtime.file_resource.models import ImageResourceMetadata, PdfResourceMetadata
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
+
+logger = logging.getLogger(__name__)
 
 
 class CreateFileResourceItem(BaseModel):
@@ -55,7 +58,21 @@ def create_file_resource_router() -> APIRouter:
             ])
             resolved = service.get_resources([item.resource_id for item in created])
         except ValueError as exc:
+            logger.warning(
+                "创建统一文件资源失败: count=%s mime_types=%s reason=%s",
+                len(body.resources),
+                [item.mime_type for item in body.resources],
+                str(exc),
+                exc_info=True,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            logger.exception(
+                "创建统一文件资源运行时失败: count=%s mime_types=%s",
+                len(body.resources),
+                [item.mime_type for item in body.resources],
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         responses: list[FileResourceResponse] = []
         for index, resource in enumerate(resolved):
             if resource is None:
