@@ -30,7 +30,7 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 
 StreamEventHandler = Callable[[dict[str, Any]], None]
-_DEFAULT_USER_AGENT = "spread-ai-agent-runtime/0.1.0"
+_DEFAULT_USER_AGENT = "mindloop.ai"
 
 
 class LlmProtocolClient(Protocol):
