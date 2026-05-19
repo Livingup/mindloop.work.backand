@@ -12,6 +12,7 @@ from agent_runtime.file_resource.config import (
     FileResourceServiceConfig,
     ObjectStorageGatewayConfig,
 )
+from agent_runtime.file_resource.infrastructure import SqliteFileResourceArchiveRepository
 from agent_runtime.file_resource.local_storage import LocalResourceStorage
 from agent_runtime.file_resource.metadata_parser import FileResourceMetadataParser
 from agent_runtime.file_resource.models import InMemoryFileResourceArchiveRepository
@@ -87,7 +88,9 @@ class FileResourceServiceFactory:
     ) -> FileResourceService:
         """从结构化配置创建统一文件资源服务实例。"""
         return FileResourceService(
-            archive_repository=InMemoryFileResourceArchiveRepository(),
+            archive_repository=FileResourceServiceFactory._create_archive_repository(
+                svc_config,
+            ),
             local_storage=FileResourceServiceFactory._create_local_storage(svc_config),
             object_storage_gateway=FileResourceServiceFactory._create_oss_gateway(
                 provider=svc_config.object_storage_gateway_provider,
@@ -96,6 +99,16 @@ class FileResourceServiceFactory:
             metadata_parser=FileResourceMetadataParser(),
             batch_limit=svc_config.file_resource_batch_limit,
         )
+
+    @staticmethod
+    def _create_archive_repository(
+        svc_config: FileResourceServiceConfig,
+    ) -> SqliteFileResourceArchiveRepository:
+        archive_data_dir = (
+            Path(svc_config.local_resource_storage_root_path)
+            / "archive"
+        )
+        return SqliteFileResourceArchiveRepository(archive_data_dir)
 
     @staticmethod
     def _create_local_storage(
