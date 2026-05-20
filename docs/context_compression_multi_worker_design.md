@@ -54,6 +54,8 @@ Runtime 应将待压缩历史转换为结构化 snapshot，再交给各 Worker�
 
 输入不是原始对话历史角色流，而是被标记为“待分析数据”的结构化内容。
 
+Snapshot 应坚持内容优先原则：Message Record 只保留压缩 Worker 理解消息内容所必需的信息。除消息序号、角色、正文、工具调用/工具结果语义、附件/资源引用、必要行号或页码外，不应加入与原始消息内容无关的运行时噪音字段，例如事件 ID、stream ID、provider raw、provider_state、缓存状态、非必要时间戳、内部 actor metadata 等。
+
 示例：
 
 ```markdown
@@ -70,23 +72,34 @@ Runtime 应将待压缩历史转换为结构化 snapshot，再交给各 Worker�
 
 ### Message 0
 - role: user
-- source: original_conversation
 - content:
-  ...
+  用户原始文本内容。
+- resource_references:
+  - kind: attachment
+    resource_id: ...
+    label: ...
 
 ### Message 1
 - role: assistant
-- source: original_conversation
-- semantic_parts:
-  - text: ...
-  - tool_use: ...
+- content:
+  - text: assistant 可见回复内容。
+  - tool_use:
+      name: ...
+      input: ...
+      tool_use_id: ...
 
 ### Message 2
 - role: tool
-- source: original_conversation
-- tool_result_for: ...
-- output_excerpt:
-  ...
+- content:
+  - tool_result:
+      tool_use_ref: ...
+      is_error: false
+      output_excerpt: 工具结果中与任务有关的关键内容。
+- resource_references:
+  - kind: file
+    absolute_path: ...
+    repo_relative_path: ...
+    line_ranges: ...
 ```
 
 对所有 Worker 的共同约束：
