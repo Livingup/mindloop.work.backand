@@ -177,7 +177,7 @@ final user:
 - Worker 可见 prompt 不应暴露模式编号、`input_mode` 或程序端分支判断。
 - 只能提取、压缩、归纳，不得创造新事实。
 - 对历史消息中出现过的可持久化资源，必须保留可再读取的引用形式，不能只保留资源名称或模糊说明。
-- 如果内容太多，必须分多次调用 append 工具写入，不要试图一次性输出完整章节。
+- 如果内容太多，必须分多次调用 append 工具写入，而不是一次性输出完整章节。
 - 如果无法判断，应写入风险、未知或冲突，而不是猜测。
 
 ## 4. 压缩 append 工具语义
@@ -772,7 +772,428 @@ Verifier 可以使用 `context_summary.report_section_issue` 报告：
 - 最近 raw tail 中的信息优先于压缩摘要。
 - 压缩摘要必须保留可再读取的资源引用，确保后续 Agent 能重新打开历史中用过的文件、URL、URI、附件或代码符号。
 
-## 15. 失败处理
+## 15. 当前系统接入设计
+
+本节描述上下文压缩如何接入当前 `agentruntime` 代码结构，目标是让后续实现可以直接按模块落地。
+
+### 15.1 当前代码中的权威接入点
+
+当前 Agent 主循环位于：
+
+```text
+src/agent_runtime/agent/agent_execution_engine.py
+```
+
+关键入口：
+
+- `_run_agent_instance`
+  - 每轮循环先调用 `_drain_pending_user_messages_to_conversation`，把待处理用户消息追加到 `Conversation.messages`。
+  - 随后调用 `_resolve_instance_llm_candidates` 获取当前 Agent 实例的 LLM 候选模型。
+  - 再调用 `_send_prompt_with_policy_failover` 发送主 Agent LLM 请求。
+  - LLM 响应后调用 `_record_last_context_usage` 把本次请求 token usage 写入 `conversation.state.last_context_usage`。
+- `_send_prompt_with_policy_failover`
+  - 遍历候选模型。
+  - 渲染 Agent system prompt。
+  - 构建业务工具 schema。
+  - 调用 `LlmRequestService.send_prompt`。
+- `Conversation`
+  - `messages` 是 LLM 历史真相源。
+  - `provider_state` 保存 provider cache / thinking / prompt cache 等协议状态。
+  - `state.last_context_usage` 保存最新 LLM 请求 token usage 快照。
+- `SqliteConversationRepository.save`
+  - 可全量覆写 JSONL 消息文件、派生状态和 provider_state，适合作为压缩完成后的原子持久化入口。
+
+因此，上下文压缩闸门应插入 `_run_agent_instance` 中每轮主 Agent LLM 请求之前：
+
+```text
+while True:
+  drain pending user messages into conversation
+  resolve LLM candidates
+  load agent definition
+  maybe run context compression and rewrite conversation
+  send main Agent LLM prompt
+  record last_context_usage
+  execute tools if any
+```
+
+压缩不能插入 LLM 流式响应中，也不能插入 assistant tool_use 与 tool_result 之间。
+
+### 15.2 新增运行时模块
+
+建议新增包：
+
+```text
+src/agent_runtime/context_compression/
+  __init__.py
+  config.py
+  models.py
+  gate.py
+  range_planner.py
+  input_planner.py
+  transcript_snapshot.py
+  prompt_loader.py
+  job_store.py
+  summary_tools.py
+  worker_runner.py
+  final_assembler.py
+  conversation_rewriter.py
+  compression_service.py
+```
+
+模块职责：
+
+- `config.py`
+  - 定义 `ContextCompressionConfig`。
+  - 包含 enabled、默认阈值比例、最小可压缩消息数、raw tail 保留策略、Worker 模型选择策略、是否启用 verifier、失败策略等。
+- `models.py`
+  - 定义 `CompressionJob`、`CompressionDecision`、`CompressionRange`、`CompressionInputPlan`、`SectionItem`、`FinalSummary`、`CompressionResult`。
+- `gate.py`
+  - 根据当前 Conversation、候选模型和 token usage 决定是否触发压缩。
+- `range_planner.py`
+  - 选择待压缩消息区间和 retained raw tail。
+  - 保证不拆分 tool_use/tool_result 协议配对。
+- `input_planner.py`
+  - 为每个 Worker 选择历史会话输入或文本快照输入。
+  - Worker 不感知选择过程。
+- `transcript_snapshot.py`
+  - 生成 Conversation Transcript Snapshot。
+  - 将图片/PDF/附件资源转换为 Agent 可再读取 locator。
+- `prompt_loader.py`
+  - 加载两套完整 Worker prompt 文档。
+- `job_store.py`
+  - 保存压缩 job 的中间 Section 条目、最终 Markdown、校验问题和运行状态。
+  - 第一阶段可使用内存实现；后续可增加 SQLite/JSON 持久化。
+- `summary_tools.py`
+  - 提供 `context_summary.append_section_items`、`mark_section_complete`、`append_final_markdown_section`、`mark_final_complete`、`report_section_issue` 等受限工具。
+  - 这些工具只写入压缩 job store，不操作业务文件、终端、MCP 或原 Conversation。
+- `worker_runner.py`
+  - 使用 `LlmRequestService` 驱动单个 Worker 的受限 LLM/tool 循环。
+  - 只暴露 context_summary 工具，不暴露 Agent 业务工具。
+- `final_assembler.py`
+  - 调用 FinalAssemblerWorker 和可选 FinalVerifierWorker。
+- `conversation_rewriter.py`
+  - 将最终压缩 Markdown 写成 synthetic user message，并与 retained raw tail 组成新的 `conversation.messages`。
+  - 清空 `conversation.provider_state`。
+  - 重建 `conversation.state`。
+- `compression_service.py`
+  - 对外提供 `compress_if_needed(...)`。
+  - 由 `AgentExecutionEngine` 在主 Agent LLM 请求前调用。
+
+### 15.3 执行引擎接入方式
+
+`AgentExecutionEngine.__init__` 增加可选依赖：
+
+```text
+context_compression_service: ContextCompressionService | None = None
+```
+
+`AgentExecutionFactory.create` 负责装配：
+
+```text
+resource_resolver = _LazyFileResourceResolver()
+llm_request_service = LlmClientFactory.create(resource_resolver, event_publisher=event_publisher)
+context_compression_service = ContextCompressionService(
+  llm_request_service=llm_request_service,
+  llm_registry_gateway=LlmModelRegistryFactory.create(),
+  resource_resolver=resource_resolver,
+  event_publisher=event_publisher,
+  config_accessor=lambda: ConfigRegistry.instance().context_compression,
+)
+```
+
+注意：
+
+- `resource_resolver` 应与主 LLM 请求共用同一个懒加载解析器，避免纯文本场景提前初始化 OSS 或文件资源服务。
+- `ContextCompressionService` 不应依赖业务工具调度器。
+- Worker LLM 请求使用独立临时 Conversation，不复用或污染主 Agent Conversation。
+- Worker LLM 请求的 tool schema 只包含 context_summary 受限工具。
+
+主循环接入位置：
+
+```text
+await drain_pending_user_messages_to_conversation(...)
+resolved_candidates = resolve_instance_llm_candidates(instance)
+agent_definition = load_agent_definition(instance.agent_definition_id)
+
+if context_compression_service is not None:
+  compression_result = await context_compression_service.compress_if_needed(
+    task=task,
+    instance=instance,
+    conversation=conversation,
+    resolved_candidates=resolved_candidates,
+    communication_context=communication_context,
+    interrupt_checker=lambda: interrupt_state.requested,
+  )
+  if compression_result.replaced:
+    await conversation_repository.save(conversation)
+    trace_recorder.record_event(...)
+
+llm_response = await send_prompt_with_policy_failover(...)
+```
+
+### 15.4 触发策略
+
+触发依据优先使用模型元数据中的 `compression_threshold`：
+
+```text
+effective_threshold =
+  resolved_model.compression_threshold
+  or floor(resolved_model.context_window * config.default_threshold_ratio)
+```
+
+当存在多个 failover candidates 时，闸门应使用当前可用候选中的最小 effective threshold，避免主候选失败后降级到更小上下文模型时才发现历史过长。
+
+第一阶段触发条件：
+
+- `conversation.state.last_context_usage` 存在。
+- `last_context_usage.context_window_used_tokens >= min_effective_threshold`。
+- Conversation 中存在足够长、可安全压缩的历史区间。
+- 当前没有用户中断请求。
+
+后续阶段可增强：
+
+- 在主 LLM 请求前增加轻量级 token 估算。
+- 捕获 provider 返回的 context window exceeded 错误后立即压缩并重试一次。
+- 按模型、模态和资源预算分别计算压缩触发阈值。
+
+闸门必须具备幂等性：
+
+- 如果上一轮已经压缩到只剩 synthetic summary + raw tail，且没有新的可压缩历史，必须跳过。
+- 不得因为旧的 `last_context_usage` 数值仍然较高而反复压缩同一段消息。
+- 判断是否可压缩应以 `CompressionRangePlanner` 返回的有效区间为准。
+
+### 15.5 压缩区间规划
+
+`CompressionRangePlanner` 输入：
+
+- `conversation.messages`
+- 最新 raw tail 保留策略
+- 当前消息模态和工具协议结构
+- 是否已经存在 synthetic compressed summary
+
+输出：
+
+```json
+{
+  "compressed_start_index": 0,
+  "compressed_end_index": 42,
+  "retained_tail_start_index": 43,
+  "retained_tail_end_index": 58,
+  "reason": "context_usage_exceeded_threshold"
+}
+```
+
+规则：
+
+- 默认从消息 0 开始压缩较早历史。
+- 如果消息 0 已经是旧的 Runtime Compressed Task Context，也应纳入新的压缩输入，由新 summary 替代旧 summary，避免多层嵌套摘要。
+- retained raw tail 至少保留最近用户消息。
+- 如果最近一轮是 assistant tool_use + tool_result，raw tail 必须同时保留 assistant tool_use 消息和对应 tool_result 消息。
+- 不允许 compressed range 与 raw tail 拆开同一组 tool_use/tool_result 配对。
+- 如果发现已有历史存在未配对 tool_use/tool_result，优先降级为 transcript snapshot；仍无法安全处理时暂停主 Agent 并报告 `context_compression_unsafe_tool_protocol`。
+- 如果可压缩区间消息数低于配置阈值，应跳过压缩。
+
+### 15.6 Worker LLM 执行方式
+
+每个 Section Worker 使用独立临时 Conversation：
+
+- 历史会话输入版：
+  - 临时 Conversation 包含待压缩区间的原始历史消息拷贝。
+  - 末尾追加当前压缩强指令 user message。
+  - system prompt 来自 `context_compression_worker_prompts_historical_conversation.md` 中对应 Worker 的完整 prompt。
+- 文本快照输入版：
+  - 临时 Conversation 只包含一条 user message，内容为 Conversation Transcript Snapshot。
+  - system prompt 来自 `context_compression_worker_prompts_transcript_snapshot.md` 中对应 Worker 的完整 prompt。
+
+WorkerRunner 执行循环：
+
+```text
+while not section_complete and round_count < max_rounds:
+  call LlmRequestService.send_prompt(temp_conversation, worker_system_prompt, context_summary_tools)
+  extract tool_use parts from assistant message
+  execute only context_summary tool calls against CompressionJobStore
+  append tool result message to temp_conversation
+```
+
+约束：
+
+- Worker 不使用主 Agent 的业务工具 schema。
+- Worker 不写主 Conversation。
+- Worker 不消费 AgentInstance.pending_user_messages。
+- Worker 中间 assistant/tool 消息不持久化到主 Conversation。
+- Worker 被用户中断时，应取消当前 Worker LLM 请求，不替换主 Conversation，并让主 Agent 暂停在安全边界。
+
+### 15.7 Section 并发与汇编
+
+第一批并发 Worker：
+
+```text
+RequirementConstraintWorker
+ProgressPlanWorker
+CodeArchitectureWorker
+ObservationEvidenceWorker
+DecisionRationaleWorker
+TodoRiskWorker
+```
+
+并发完成后：
+
+1. Runtime 将所有 SectionItem 按 section、priority、status 汇总。
+2. FinalAssemblerWorker 基于 SectionItem 和 provenance metadata 生成最终 Markdown。
+3. 如果启用 FinalVerifierWorker，则校验最终 Markdown。
+4. Verifier 发现 P0 缺失或无来源事实时，Runtime 可重跑相关 Section Worker 或 FinalAssembler。
+5. 多次失败后不替换 Conversation，并暂停主 Agent。
+
+### 15.8 Conversation 替换与状态更新
+
+压缩成功后，`conversation_rewriter` 构造：
+
+```text
+conversation.messages = [
+  synthetic user message: "# Runtime Compressed Task Context\n...",
+  ...retained raw tail messages
+]
+```
+
+synthetic user message 的 Markdown 必须包含 Usage Contract，并明确：
+
+- 这是 Runtime 自动生成的历史上下文压缩摘要。
+- 它不是新用户任务。
+- 如果它与后续 retained raw tail 冲突，以 raw tail 为准。
+
+替换后必须：
+
+- 保持 `conversation.id` 不变。
+- 保持 task / thread / agent / agent_instance 绑定不变。
+- 清空 `conversation.provider_state`，因为 provider cache、thinking 续接、message index 和 cache breakpoint 都已失效。
+- 重建 `conversation.state`。
+- 保留或重写 `conversation.state.last_context_usage` 时必须避免触发重复压缩；第一阶段建议由 gate 的区间幂等判断解决重复触发问题，不把旧 usage 当作唯一触发依据。
+- 调用 `ConversationRepository.save(conversation)` 全量覆写 JSONL 消息文件、派生状态和 provider_state。
+
+如果实现 `ContextCompressionArchiveRepository`，应在替换前额外保存：
+
+- job_id
+- conversation_id
+- compressed message index range
+- retained tail range
+- final summary markdown
+- verifier result
+- 压缩前消息快照或其持久化位置
+
+Archive 只用于 Runtime 内部审计和可能的恢复，不作为后续 Agent 的主上下文来源。
+
+### 15.9 事件、Trace 与用户中断
+
+Runtime 应发布独立事件，不伪装成普通 Agent assistant message：
+
+```text
+context_compression.started
+context_compression.section.started
+context_compression.section.completed
+context_compression.assembly.started
+context_compression.verification.completed
+context_compression.completed
+context_compression.failed
+context_compression.skipped
+```
+
+事件 payload 应包含：
+
+- task_id
+- agent_instance_id
+- conversation_id
+- job_id
+- compressed_range
+- retained_tail_range
+- reason
+- status
+
+不应在事件中暴露 API key、provider raw、完整压缩输入或大段中间摘要。
+
+用户中断语义：
+
+- 如果中断发生在 Worker LLM 请求中，取消 Worker 请求，不保存部分 Worker assistant。
+- 如果中断发生在 Section 已写入 job store 但 Conversation 尚未替换前，丢弃本次未完成 job，主 Conversation 保持原样。
+- 如果中断发生在替换已完成后，Conversation 已处于新的完整状态，主 Agent 在下一安全点暂停。
+- 不允许留下 assistant tool_use 没有 tool_result 的主 Conversation。
+
+### 15.10 配置设计
+
+建议在 `AgentRuntimeConfig` 增加：
+
+```yaml
+context_compression:
+  enabled: true
+  default_threshold_ratio: 0.75
+  min_compressible_messages: 12
+  retained_tail_min_messages: 8
+  retained_tail_max_estimated_tokens: 12000
+  section_worker_max_rounds: 8
+  assembler_max_rounds: 8
+  verifier_enabled: true
+  max_retries_per_section: 1
+  failure_policy: pause_agent
+  worker_model_policy: reuse_agent_policy
+```
+
+第一阶段建议：
+
+- `worker_model_policy = reuse_agent_policy`
+- 复用当前 Agent 实例的 LLM candidates。
+- 对每个 Worker 选择支持所需输入模态和工具调用的第一个 candidate。
+- 如果没有 candidate 支持图片/PDF 原生输入，则使用文本快照输入。
+
+后续可支持：
+
+- 独立的 compression worker provider/model binding。
+- 独立的低成本文本 Worker 模型和多模态 Worker 模型。
+- 不同 Section Worker 使用不同模型。
+
+### 15.11 实现阶段拆分
+
+#### Phase 1：最小可用上下文压缩闭环
+
+目标：在主 Agent LLM 请求前，当 `last_context_usage` 超过阈值时，完成一次可用压缩并替换 Conversation。
+
+实现内容：
+
+1. 新增 `context_compression` 包和内存 job store。
+2. 新增 ContextCompressionConfig，并接入 ConfigRegistry。
+3. 新增 Gate、RangePlanner、ConversationRewriter。
+4. 实现 transcript snapshot 输入路径。
+5. 实现 Section WorkerRunner 和 context_summary 受限工具。
+6. 实现 FinalAssemblerWorker。
+7. 接入 AgentExecutionEngine 主循环。
+8. 添加单元测试覆盖触发、区间、替换、provider_state 清空。
+
+Phase 1 可以先不启用原生多模态历史输入，只实现 transcript snapshot；但 prompt 文档和接口必须保留两种输入能力，避免后续接口重构。
+
+#### Phase 2：原生多模态历史输入
+
+目标：Worker 模型支持图片/PDF 时，优先使用原 Conversation 历史消息作为输入。
+
+实现内容：
+
+1. NativeMultimodalHistoryBuilder。
+2. Worker 模型模态能力选择。
+3. 资源 URL/base64/PDF 输入渲染验证。
+4. 工具协议安全渲染检测。
+5. 原生输入失败时自动降级 transcript snapshot。
+
+#### Phase 3：质量、恢复与可观测性增强
+
+目标：提升压缩稳定性和可排障能力。
+
+实现内容：
+
+1. FinalVerifierWorker。
+2. ContextCompressionArchiveRepository。
+3. context window exceeded 失败后的压缩重试。
+4. 更准确的 token 估算。
+5. 压缩 job REST 查询接口。
+6. 前端展示压缩进度事件。
+
+## 16. 失败处理
 
 如果 Section Worker 失败：
 
@@ -792,7 +1213,7 @@ Verifier 可以使用 `context_summary.report_section_issue` 报告：
 - 可要求 FinalAssembler 重新汇编。
 - 多次失败后暂停 Agent。
 
-## 16. 设计原则总结
+## 17. 设计原则总结
 
 - 压缩 Worker 不是普通业务 Agent。
 - 原历史是待分析数据，不是当前指令。
