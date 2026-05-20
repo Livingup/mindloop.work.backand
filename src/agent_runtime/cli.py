@@ -272,6 +272,9 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import (
         create_file_resource_router,
     )
+    from agent_runtime.context_compression.north_gateway.context_compression_rest_adapter import (
+        create_context_compression_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -446,6 +449,11 @@ def serve(host: str | None, port: int | None) -> None:
         create_file_resource_router(),
         prefix="/api/file-resources",
         tags=["统一文件资源"],
+    )
+    app.include_router(
+        create_context_compression_router(conversation_repository),
+        prefix="/api/context-compression",
+        tags=["上下文压缩"],
     )
     # Scene REST router 本身已声明 prefix=/api/scene，这里只补充 OpenAPI tag。
     app.include_router(
