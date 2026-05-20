@@ -30,7 +30,7 @@
 
 你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=requirements_constraints。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=requirements_constraints。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## ProgressPlanWorker
@@ -60,7 +60,7 @@
 
 你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=progress_plan。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=progress_plan。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## CodeArchitectureWorker
@@ -93,7 +93,7 @@
 
 你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=code_architecture。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=code_architecture。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## ObservationEvidenceWorker
@@ -128,7 +128,7 @@
 
 如果一个工具输出很长，只保留命令/工具名、执行位置、成功失败、关键输出、根因和结论。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=observations_evidence。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=observations_evidence。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## DecisionRationaleWorker
@@ -157,7 +157,7 @@
 
 你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=decisions_rationale。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=decisions_rationale。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## TodoRiskWorker
@@ -187,7 +187,7 @@
 
 你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
 
-你的输出必须通过 context_summary.append_section_items 写入 section=todos_risks。不要试图一次性输出完整章节。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
+你的输出必须通过 context_summary.append_section_items 写入 section=todos_risks。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 context_summary.mark_section_complete。
 ```
 
 ## FinalAssemblerWorker
