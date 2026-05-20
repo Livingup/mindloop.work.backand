@@ -74,6 +74,33 @@ GPT-5.5 的工具调用是多个独立 `function_call` output item，因此可�
 
 DeepSeek v4 的工具调用增量都挂在 `message[choices[0].delta.tool_calls]` 下。协议没有 GPT-5.5 那种 `function_call_arguments.done` / `output_item.done[item.type=function_call]`，所以“一个工具生成结束”只能由后端状态机在整体 `finish_reason=tool_calls` 到达时补齐，不能从 provider 原始事件中逐个精确读取。
 
+## GLM 5.1 官方判定规则
+
+请求条件：
+
+```text
+model=glm-5.1
+stream=true
+thinking={"type":"enabled","clear_thinking":false}
+tool_stream=true               # 使用工具流式输出时需要
+```
+
+`clear_thinking=false` 是 Preserved Thinking，用于保留历史 turns 的 `reasoning_content`；它不改变当前 turn 是否产生 thinking。GLM 5.1 当前 turn 在实测中会流式返回 `delta.reasoning_content`。
+
+| 前端语义节点 | 原始事件判定条件 | 说明 |
+| --- | --- | --- |
+| `llm.response.started` | 收到 SSE stream started / HTTP stream headers | LLM 开始有流式响应，不等第一个 token |
+| `llm.thinking.started` | 首个 `message[choices[0].delta.reasoning_content]` | thinking 开始 |
+| `llm.thinking.completed` | 已 thinking 后首次出现 `delta.content` / `delta.tool_calls` / `finish_reason` | GLM 5.1 Chat Completions 没有单独 thinking done 事件，只能根据阶段切换判断 |
+| `llm.content.started` | 首个 `message[choices[0].delta.content]` | 普通文本开始流式输出 |
+| `llm.content.delta` | 每个 `message[choices[0].delta.content]` | 前端实时追加普通文本 |
+| `llm.content.completed` | 已 content 后首次出现 `delta.tool_calls` / `finish_reason` | 没有单独 content done 事件，只能根据阶段切换判断 |
+| `llm.tool_call.started` | 某个 `tool_calls[].index` 首次出现 | 每个 index 对应一个工具调用；首个 chunk 通常携带 `id`、`type`、`function.name` 和参数片段 |
+| `llm.tool_call.completed` | `finish_reason=tool_calls` 时，对已出现的所有 `tool_calls[].index` 逐个补完成 | GLM 5.1 工具流式没有单个 tool_call done 事件，只能在工具调用流整体结束时按 index 完成 |
+| `llm.response.completed` | provider `finish_reason` 非空后，runtime 完成 assistant message ingest；usage 在同一个 finish chunk 上 | assistant response 完成 |
+
+GLM 5.1 官方实测流式顺序是 `reasoning_content -> content -> tool_calls[index=0] -> tool_calls[index=1] -> finish_reason=tool_calls + usage -> [DONE]`。`choices[0].delta.role` 可能在多数字段 chunk 中重复出现，不能作为阶段边界。
+
 ---
 
 # GPT-5.5
@@ -188,3 +215,61 @@ message[choices[0].finish_reason=tool_calls]   # 所有 tool_call 增量结束
 message[usage]                                  # token usage 统计
 [DONE]                                          # SSE 传输结束标记
 ```
+
+---
+
+# GLM 5.1 官方
+
+协议：OpenAI Chat Completions 兼容流式协议
+
+Endpoint：`https://open.bigmodel.cn/api/paas/v4/chat/completions`
+
+## 真实流式顺序
+
+实测请求参数：
+
+```text
+model=glm-5.1
+stream=true
+thinking={"type":"enabled","clear_thinking":false}
+tool_stream=true
+tool_choice=auto
+parallel_tool_calls=true
+```
+
+GLM 5.1 的 SSE 事件名是 `message`，节点语义由 `choices[0].delta` 与 `choices[0].finish_reason` 判断。
+
+```text
+message[choices[0].delta.role][choices[0].delta.reasoning_content]  # thinking 增量，可重复；role 可能重复出现
+message[choices[0].delta.role][choices[0].delta.content]            # 普通 content 增量，可重复；role 可能重复出现
+message[choices[0].delta.tool_calls[index=0]]                       # 第 1 个 tool_call 增量，可重复
+message[choices[0].delta.tool_calls[index=1]]                       # 第 2 个 tool_call 增量，可重复
+message[choices[0].delta.role][choices[0].finish_reason=tool_calls][usage]  # assistant response 完成；携带 token usage
+[DONE]                                                              # SSE 传输结束标记
+```
+
+## 节点含义
+
+| 事件名称 | 判别字段 | 节点含义 |
+| --- | --- | --- |
+| `message` | `choices[0].delta.reasoning_content` | thinking 增量，可重复 |
+| `message` | `choices[0].delta.content` | 普通 content 增量，可重复 |
+| `message` | `choices[0].delta.tool_calls[].index` | tool call 增量，可重复；通过 `index` 区分多个工具调用 |
+| `message` | `choices[0].finish_reason=tool_calls` | 工具调用流整体结束，下一步需要执行工具 |
+| `message` | `usage` | token usage 统计；实测随 `finish_reason` chunk 返回 |
+| `[DONE]` | - | SSE 传输结束标记；不是 Chat Completions choice |
+
+## 多工具调用结构
+
+GLM 5.1 官方工具流式输出需要 `tool_stream=true`。多个工具调用通过 `tool_calls[].index` 聚合：
+
+```text
+message[choices[0].delta.tool_calls[index=0]]  # 第 1 个 tool_call 开始/增量，首个 chunk 通常带 id/name
+message[choices[0].delta.tool_calls[index=0]]  # 第 1 个 tool_call 参数增量，可重复
+message[choices[0].delta.tool_calls[index=1]]  # 第 2 个 tool_call 开始/增量，首个 chunk 通常带 id/name
+message[choices[0].delta.tool_calls[index=1]]  # 第 2 个 tool_call 参数增量，可重复
+message[choices[0].finish_reason=tool_calls][usage]  # 所有 tool_call 增量结束；携带 token usage
+[DONE]                                          # SSE 传输结束标记
+```
+
+GLM 5.1 官方协议没有单个 tool_call done 事件；后端只能在 `finish_reason=tool_calls` 时对已见 `tool_calls[].index` 批量补 `llm.tool_call.completed`。

@@ -315,6 +315,7 @@ class ZhipuChatCompletionsProtocolClient:
             # 智谱 GLM 兼容 OpenAI Chat Completions 字段，应用层默认启用并发工具调用；
             # provider 通过 request_params.parallel_tool_calls=False 可显式关闭。
             body.setdefault("parallel_tool_calls", True)
+            body.setdefault("tool_stream", True)
         url = _join_url(resolved_model.api_base_url, "chat/completions")
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
