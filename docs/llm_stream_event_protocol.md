@@ -218,7 +218,7 @@ message[usage]                                  # token usage 统计
 
 ---
 
-# GLM 5.1 官方
+# GLM 5.1 官方 / zhipu_chat_completions
 
 协议：OpenAI Chat Completions 兼容流式协议
 
