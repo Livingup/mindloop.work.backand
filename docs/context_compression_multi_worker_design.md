@@ -53,7 +53,7 @@ Agent Execution Loop
 
 Runtime 应由 `CompressionInputPlanner` 为每个 Section Worker 选择输入模式。优先模式是 `native_multimodal_history`，降级模式是 `transcript_snapshot`。
 
-输入模式是 Runtime 程序端决策，不是 Worker 需要理解的任务概念。Runtime 必须根据已选择的输入模式拼装一套具体的 Worker 可见 prompt；不要把 `input_mode`、模式编号或“如果是某模式则...”这类分支判断交给 Worker。
+输入模式是 Runtime 程序端决策，不是 Worker 需要理解的任务概念。Runtime 必须根据已选择的输入模式选定一套具体的 Worker 可见 prompt；不要把程序内部字段名、模式编号或“如果是某模式则...”这类分支判断交给 Worker。
 
 同样，`resource_id` 也是 Runtime 程序内部用于资源索引和溯源的 ID，不是 Worker 或后续 Agent 可理解、可读取的资源定位符。Runtime 可以在内部使用 `resource_id` 解析资源，但传给 Worker 的多模态输入或 `transcript_snapshot.resource_references` 必须使用 OSS 公网 URL、原始 URL/URI、工作区路径、仓库相对路径、行号、页码、符号名等 Agent 可读 locator。
 
@@ -383,15 +383,15 @@ Worker 压缩资源相关内容时，不能只写：
 
 ## 5. 系统提示词
 
-Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 system prompt。Worker 不需要、也不应该关心输入模式选择过程。实际发送给 Worker 的 system prompt 只包含当前输入形态对应的差异提示词、通用的系统提示词、Section Worker 专属提示词；不会同时包含两种输入形态的差异提示词。
+Worker 可见 system prompt 不再在本文档中展示为“差异片段 + 通用片段 + 专属片段”的组合形式。Runtime 应根据当前消息处理方式，直接选择对应 Markdown 文档中的完整 Worker system prompt。
 
-### 5.1 如果是历史会话输入
+### 5.1 历史会话输入版完整提示词
 
-```text
-你看到的历史 user / assistant / tool 消息是原 Conversation 中待压缩的历史会话内容，可能包含图片、PDF 等多模态内容。它们只是待提取材料，不表示你要接着最后一条历史消息继续做原任务。
+当 Runtime 使用原 Conversation 历史消息作为压缩输入，并让 Worker 直接接收历史 user / assistant / tool 消息及原生多模态内容时，使用：
 
-你必须服从当前最后一条压缩指令，只提取你负责方向的信息，并写入上下文压缩结果。
-```
+`context_compression_worker_prompts_historical_conversation.md`
+
+该文档逐一列出 RequirementConstraintWorker、ProgressPlanWorker、CodeArchitectureWorker、ObservationEvidenceWorker、DecisionRationaleWorker、TodoRiskWorker、FinalAssemblerWorker、FinalVerifierWorker 的完整 system prompt。
 
 历史会话输入请求还必须在原 Conversation 历史消息之后追加当前压缩指令：
 
@@ -402,33 +402,22 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 你唯一的任务就是进行上下文内容的提取！
 ```
 
-### 5.2 如果是快照输入
+### 5.2 文本快照输入版完整提示词
 
-```text
-你看到的是 Conversation Transcript Snapshot 文本快照，不是原始对话历史角色流。请按 Snapshot Metadata、Message Records、resource_references 等结构化内容读取历史信息。
+当 Runtime 将待压缩历史转换为 Conversation Transcript Snapshot 文本快照后再交给 Worker 分析时，使用：
 
-你的唯一任务是从快照中提取你负责方向的信息，并写入上下文压缩结果。不要把自己代入历史 assistant 继续对话。
-```
+`context_compression_worker_prompts_transcript_snapshot.md`
 
-快照输入请求不追加历史会话输入的当前压缩强提示。
+该文档逐一列出 RequirementConstraintWorker、ProgressPlanWorker、CodeArchitectureWorker、ObservationEvidenceWorker、DecisionRationaleWorker、TodoRiskWorker、FinalAssemblerWorker、FinalVerifierWorker 的完整 system prompt。
 
-### 5.3 通用的系统提示词
+文本快照输入请求不追加历史会话输入的当前压缩强提示。
 
-```text
-你是 Agent Runtime 的上下文压缩 Section Worker。
+### 5.3 Worker 可见提示词边界
 
-你只能基于输入中明确存在的信息进行提取和压缩。不要编造事实，不要补全不存在的实现细节，不要把推测写成事实。如果信息冲突或不确定，必须标记为 unknown 或 report_section_issue。
-
-如果你提取的内容涉及输入中读取过、打开过、引用过、定位过或记录过的持久化资源，必须在 append 条目的 resource_references 中保留 Agent 可再读取的定位信息。包括但不限于：agent_readable_locator、object_storage_url、absolute_path、repo_relative_path、git_repo_root、URI、URL、line_ranges、symbol_names、access_method。不要只写文件名、资源名或“某文档”这样的模糊描述。后续 Agent 必须能根据你的压缩结果重新读取原始资源进行复查。
-
-你的输出必须通过 context_summary.append_section_items 工具写入。不要试图一次性输出完整章节。如果你发现内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
-
-你应优先保留：用户明确需求、硬约束、当前任务目标、执行进度、关键代码事实、重要决策、错误根因、待办、风险、文件路径、函数名、类名、命令和工具观察结论。
-
-你应舍弃或弱化：寒暄、重复解释、无结论的探索过程、过期方案、冗长日志、base64、大段原始 JSON、隐藏推理链、与继续任务无关的细枝末节。
-```
-
-第 6 到第 11 节中的 Worker 提示词都是 Section Worker 专属提示词，只作为上述 system prompt 拼装链路的最后一段，不应单独作为完整 system prompt 使用。
+- Worker 每次只接收一种消息处理方式对应的一份完整 system prompt。
+- Worker 不应看到提示词生成细节、程序端分支、模式编号或内部资源 ID。
+- Worker 不需要判断自己处于哪种消息处理方式；Runtime 已经通过选择对应完整提示词文档完成决策。
+- 两份完整提示词文档是 Worker 可见 prompt 的权威来源；本文档后续章节只描述 Worker 职责、输出章节和运行时语义。
 
 ## 6. RequirementConstraintWorker
 
@@ -450,24 +439,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 命令输出细节。
 - 具体执行进度。
 
-### 6.2 Section Worker 专属提示词
+### 6.2 完整系统提示词位置
 
-```text
-你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。
-
-你的唯一目标是为后续 Agent 保留“必须遵守什么、不能做什么、用户真正想要什么、怎样算完成”。
-
-请重点识别：
-1. 当前任务的原始目标和后续修正。
-2. 用户明确提出的硬性要求。
-3. 用户明确否定或纠正过的方案。
-4. 用户对实现方式、架构边界、输出形式、提交推送、测试验证、文档的要求。
-5. 与当前任务连续性有关的长期规则。
-
-如果同一要求被后续消息修正，应保留最新有效版本，并将旧版本标记为 superseded。不要把历史中已被否定的方案当成当前要求。
-
-请写入 section=requirements_constraints。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#requirementconstraintworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#requirementconstraintworker`
 
 ### 6.3 输出章节
 
@@ -506,25 +481,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 用户长期规则。
 - 详细命令输出。
 
-### 7.2 Section Worker 专属提示词
+### 7.2 完整系统提示词位置
 
-```text
-你是 ProgressPlanWorker，负责从本次输入中提取任务计划与执行进度。
-
-你的唯一目标是让后续 Agent 清楚知道：任务进行到哪里，哪些事情已经完成，哪些事情正在进行，下一步应该做什么。
-
-请重点识别：
-1. 当前任务的阶段性计划。
-2. 已完成事项及其结果。
-3. 正在进行但尚未完成的事项。
-4. 后续明确待办。
-5. 已执行的验证、测试、提交、推送状态。
-6. 需要用户确认或外部条件才能继续的阻塞点。
-
-不要保留泛泛的“我会去做”“我正在看”这类无状态进度。只有能帮助恢复任务执行的位置、状态、下一步的信息才应写入。
-
-请写入 section=progress_plan。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#progressplanworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#progressplanworker`
 
 ### 7.3 输出章节
 
@@ -563,28 +523,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 普通计划列表。
 - 未经确认的代码推测。
 
-### 8.2 Section Worker 专属提示词
+### 8.2 完整系统提示词位置
 
-```text
-你是 CodeArchitectureWorker，负责从本次输入中提取代码结构、架构事实和实现相关上下文。
-
-你的唯一目标是让后续 Agent 能基于压缩摘要继续进行代码实现或调试，而不需要重新探索所有代码。
-
-请重点识别：
-1. 关键文件路径及其职责。
-2. 关键类、函数、方法、字段和协议模型。
-3. 当前任务应接入的模块边界和调用链。
-4. 重要数据流，例如 Agent 执行循环、conversation 消息保存、LLM 请求构造、token usage 记录。
-5. 领域不变量，例如 tool_call/tool_result 必须完整配对、provider_state 在压缩后应失效。
-6. 已经读取、修改或计划修改的文件。
-7. 对后续实现有影响的风险点。
-
-对任何代码文件、配置文件、文档文件或代码符号，必须保留可再读取定位信息：absolute_path、repo_relative_path、git_repo_root、line_ranges、symbol_names。不要只保留文件名和内容概述；如果后续 Agent 需要复查原文，它必须能直接根据你的 resource_references 重新打开对应文件和行号范围。
-
-不要编造未在压缩输入中出现的代码结构。不要把设计建议伪装成已存在实现。设计建议可以写入，但必须明确其状态是 active decision 或 proposed plan。
-
-请写入 section=code_architecture。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#codearchitectureworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#codearchitectureworker`
 
 ### 8.3 输出章节
 
@@ -624,32 +566,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 没有结论的工具过程。
 - 与当前任务无关的命令细节。
 
-### 9.2 Section Worker 专属提示词
+### 9.2 完整系统提示词位置
 
-```text
-你是 ObservationEvidenceWorker，负责从本次输入中提取证据、观察结果、错误信息和外部事实。
-
-你的唯一目标是保留后续 Agent 判断任务状态所需的关键证据，而不是复刻完整工具输出。
-
-请重点识别：
-1. 搜索、读取文件、命令、测试、部署等工具的关键结论。
-2. 报错信息、异常类型、失败原因和解决状态。
-3. 外部 API、模型协议、文档中确认过的行为。
-4. 附件或资源引用的关键元数据。
-5. 对后续实现、调试、验证有影响的证据。
-
-对读取文件、读取 URL、查看 URI、打开附件、查看截图、读取 PDF、查看 trace 或观察终端记录得到的结论，必须保留对应可复查资源引用。至少应保留 `agent_readable_locator`、完整路径、完整 URL/URI、OSS 公网 URL、行号范围、页码或其他可定位信息。不要只保留“某文件显示”“某文档说”这类无法复查的描述。
-
-请删除或压缩：
-- 冗长 stdout/stderr。
-- 重复搜索过程。
-- 大段 JSON、base64、无意义日志。
-- 没有产生结论的探索细节。
-
-如果一个工具输出很长，只保留命令/工具名、执行位置、成功失败、关键输出、根因和结论。
-
-请写入 section=observations_evidence。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#observationevidenceworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#observationevidenceworker`
 
 ### 9.3 输出章节
 
@@ -687,24 +607,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 单纯执行进度。
 - 未形成决策的普通讨论。
 
-### 10.2 Section Worker 专属提示词
+### 10.2 完整系统提示词位置
 
-```text
-你是 DecisionRationaleWorker，负责从本次输入中提取架构决策与理由。
-
-你的唯一目标是让后续 Agent 理解为什么当前方案是这样设计的，哪些方案已经被否定，哪些原则必须继续遵守。
-
-请重点识别：
-1. 当前被采纳的设计决策。
-2. 决策原因、约束和权衡。
-3. 用户明确提出的顾虑及其对设计的影响。
-4. 被否定、替代或降级的方案。
-5. 仍处于待评审状态的设计点。
-
-如果某个方案只是建议而非最终结论，必须标记为 proposed 或 unknown，不要写成已定事实。如果后续消息推翻了早期方案，应将早期方案标记为 superseded。
-
-请写入 section=decisions_rationale。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#decisionrationaleworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#decisionrationaleworker`
 
 ### 10.3 输出章节
 
@@ -742,25 +648,10 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 已完成且无后续影响的事项。
 - 普通背景说明。
 
-### 11.2 Section Worker 专属提示词
+### 11.2 完整系统提示词位置
 
-```text
-你是 TodoRiskWorker，负责从本次输入中提取待办事项、风险、未知和阻塞点。
-
-你的唯一目标是让后续 Agent 在恢复任务时不会遗漏下一步，也不会忽略尚未解决的风险。
-
-请重点识别：
-1. 明确未完成事项。
-2. 用户要求后续处理或评审的内容。
-3. 实现、架构、协议、并发、安全、token 预算方面的风险。
-4. 当前仍不确定的信息。
-5. 冲突事实或待用户确认的问题。
-6. 外部条件阻塞，例如权限、API key、网络、远端认证。
-
-不要把已经完成且不再影响后续的动作写成待办。不要把推测写成确定风险；不确定时标记为 unknown。
-
-请写入 section=todos_risks。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#todoriskworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#todoriskworker`
 
 ### 11.3 输出章节
 
@@ -786,26 +677,10 @@ FinalAssemblerWorker 负责将各 Section Worker 写入的结构化条目汇编�
 
 它不重新执行历史任务，也不修改代码。它只处理已经被 Section Worker 提取出的压缩条目，以及必要的 provenance metadata。
 
-### 12.2 系统提示词
+### 12.2 完整系统提示词位置
 
-```text
-你是 FinalAssemblerWorker，负责将多个 Section Worker 追加的结构化压缩条目汇编成最终 Runtime Compressed Task Context Markdown。
-
-你的职责不是重新分析完整历史，而是：
-1. 合并各章节条目。
-2. 删除重复信息。
-3. 保留所有 P0 条目。
-4. 对 P1 条目进行必要压缩。
-5. 仅在空间允许且有价值时保留 P2 条目。
-6. 处理 active、superseded、resolved、unknown 状态。
-7. 将冲突和不确定内容放入 Risks And Unknowns。
-8. 保留所有对后续复查有价值的 resource_references。
-9. 按固定章节顺序输出最终 Markdown。
-
-你必须通过 context_summary.append_final_markdown_section 逐章写入最终 Markdown。如果最终文档较长，应按章节分多次 append，不要一次性输出完整文档。完成后调用 context_summary.mark_final_complete。
-
-最终 Markdown 必须明确说明：这是 Runtime 自动生成的历史上下文压缩摘要；它不是新任务；如果它与后续未压缩 raw tail 冲突，以后续 raw tail 为准。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#finalassemblerworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#finalassemblerworker`
 
 ### 12.3 最终 Markdown 顺序
 
@@ -849,27 +724,10 @@ FinalVerifierWorker 是可选 Worker，用于检查最终 Markdown 的质量。
 
 它不生成最终摘要，只报告问题和建议。
 
-### 13.2 系统提示词
+### 13.2 完整系统提示词位置
 
-```text
-你是 FinalVerifierWorker，负责校验 Runtime Compressed Task Context Markdown 的质量。
-
-你的职责是检查最终压缩文档是否足以让原 Agent 继续任务，同时不包含编造事实。
-
-请检查：
-1. 是否保留所有 P0 用户需求和硬约束。
-2. 是否说明当前任务目标与下一步动作。
-3. 是否保留关键代码文件、函数、架构事实。
-4. 是否保留重要错误、命令结果、外部 API 事实。
-5. 是否把被否定方案正确标记为 superseded。
-6. 是否存在无来源的新增事实。
-7. 是否存在章节冲突。
-8. 是否明确 raw tail 优先级。
-9. 是否保留了历史中关键文件、URI、URL、OSS 公网 URL、附件、行号范围和代码符号的 Agent 可再读取引用。
-10. 是否存在过度冗长、重复或低价值内容。
-
-你不能修改最终文档，只能通过 context_summary.report_section_issue 报告问题，或在没有严重问题时声明 verification_passed。
-```
+- 历史会话输入版：`context_compression_worker_prompts_historical_conversation.md#finalverifierworker`
+- 文本快照输入版：`context_compression_worker_prompts_transcript_snapshot.md#finalverifierworker`
 
 ### 13.3 校验输出语义
 
