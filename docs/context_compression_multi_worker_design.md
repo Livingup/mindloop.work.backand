@@ -1281,20 +1281,93 @@ Archive 必须保存本次压缩开始时实际生效的 Worker 设置快照，�
 
 ### 15.9 事件、Trace 与用户中断
 
-Runtime 应发布独立事件，不伪装成普通 Agent assistant message：
+上下文压缩事件通过现有 `communication` 通信流发布。SSE 帧层仍使用统一事件名：
+
+```text
+event: communication.message
+data: CommunicationMessage
+```
+
+前端不应监听新的原生 SSE event name，而应读取 `CommunicationMessage.type` 中的业务事件类型。也就是说，新增的是通信消息的 `type = context_compression.*`，不是新增一套独立 SSE endpoint。
+
+Runtime 应发布独立压缩事件，不伪装成普通 Agent assistant message，也不写入 Conversation 消息流：
 
 ```text
 context_compression.started
+context_compression.range_planned
+context_compression.worker.queued
+context_compression.worker.started
+context_compression.worker.progress
+context_compression.worker.completed
+context_compression.worker.failed
 context_compression.section.started
 context_compression.section.completed
 context_compression.assembly.started
+context_compression.assembly.completed
+context_compression.verification.started
 context_compression.verification.completed
+context_compression.conversation.rebind.completed
 context_compression.completed
 context_compression.failed
+context_compression.cancelled
 context_compression.skipped
 ```
 
-事件 payload 应包含：
+事件语义：
+
+- `context_compression.started`
+  - 压缩 job 已创建，Runtime 即将规划压缩范围。
+  - 前端创建或更新当前执行过程气泡中的“上下文压缩”阶段。
+- `context_compression.range_planned`
+  - 已确定 compressed range 和 retained raw tail。
+  - 前端展示压缩范围、保留尾部锚点和预计 compression index。
+- `context_compression.worker.queued`
+  - 某个 Worker 正在等待全局或 provider 并发许可。
+  - 前端将该 Worker 显示为“等待并发许可”。
+- `context_compression.worker.started`
+  - 某个 Worker 已获得并发许可并开始 LLM 请求。
+  - Section Worker、FinalAssemblerWorker、FinalVerifierWorker 都使用这个事件。
+- `context_compression.worker.progress`
+  - Worker 在本轮或多轮中已追加 section items 或 final markdown chunk。
+  - 为避免泄露大量压缩内容，payload 默认只包含计数、轮次和状态，不包含完整条目内容。
+- `context_compression.worker.completed`
+  - 某个 Worker 完成。
+  - 前端显示耗时、追加条目数、使用的 provider/model 和 input mode。
+- `context_compression.worker.failed`
+  - 某个 Worker 失败或重试耗尽。
+  - 前端显示错误摘要；是否继续由 Runtime failure policy 决定。
+- `context_compression.section.started`
+  - Section 阶段开始，可选事件。
+  - 如果已发布 `worker.started`，该事件可用于兼容旧 UI 或统计，不要求前端重复展示。
+- `context_compression.section.completed`
+  - Section 阶段完成，可选事件。
+  - 如果已发布 `worker.completed`，前端应去重展示。
+- `context_compression.assembly.started`
+  - FinalAssemblerWorker 即将汇编最终 Markdown。
+- `context_compression.assembly.completed`
+  - 最终 Markdown 已汇编完成，但 target Conversation 可能尚未创建或绑定。
+- `context_compression.verification.started`
+  - FinalVerifierWorker 即将校验最终 Markdown。
+  - `verifier_enabled=false` 时不发布。
+- `context_compression.verification.completed`
+  - 校验完成。
+  - payload 只包含 `verification_status`、issue count 和简短 issue 摘要，不包含完整 summary。
+- `context_compression.conversation.rebind.completed`
+  - target Conversation 已创建，AgentInstance 已重新绑定到新的 `target_conversation_id`。
+  - 这是“压缩结果已成为后续主 Agent 上下文”的关键确认事件。
+- `context_compression.completed`
+  - 本次压缩闭环完成，下一步可以继续主 Agent LLM 请求。
+- `context_compression.failed`
+  - 压缩失败。
+  - 如果 failure policy 是 `pause_agent`，前端应将执行过程标记为暂停/失败并等待用户下一步输入。
+- `context_compression.cancelled`
+  - 用户中断或 Runtime 取消本次压缩。
+  - 不创建或不绑定 target Conversation，除非此前已发布 `context_compression.conversation.rebind.completed`。
+- `context_compression.skipped`
+  - Runtime 判断无需或不能执行压缩。
+  - 普通“未达到阈值”的检查不应发布 `skipped`，避免每轮主 LLM 请求前制造噪音；只有达到阈值但因为配置关闭、压缩区间不足、工具协议不安全等业务原因跳过时才发布。
+
+所有压缩事件的公共 payload 应包含：
 
 - task_id
 - agent_instance_id
@@ -1308,7 +1381,266 @@ context_compression.skipped
 - reason
 - status
 
+公共 payload 建议结构：
+
+```json
+{
+  "job_id": "ccjob-...",
+  "task_id": "task-...",
+  "agent_instance_id": "agentinst-...",
+  "root_conversation_id": "conv-root",
+  "source_conversation_id": "conv-source",
+  "target_conversation_id": null,
+  "compression_index": 3,
+  "phase": "workers",
+  "status": "running",
+  "reason": "context_usage_exceeded_threshold",
+  "compressed_range": {
+    "start_index": 0,
+    "end_index": 42
+  },
+  "retained_tail_range": {
+    "start_index": 43,
+    "end_index": 58,
+    "anchor": "latest_assistant_message"
+  },
+  "worker": null,
+  "metrics": {
+    "elapsed_ms": 1200,
+    "worker_total": 6,
+    "worker_completed": 2,
+    "worker_failed": 0
+  }
+}
+```
+
+Worker 事件 payload 追加：
+
+```json
+{
+  "worker": {
+    "name": "RequirementConstraintWorker",
+    "role": "section_worker",
+    "output_section": "requirements_constraints",
+    "input_mode": "transcript_snapshot",
+    "round_index": 2,
+    "max_rounds": 8,
+    "provider_id": "glm",
+    "model_binding_id": "glm-5.1",
+    "concurrency": {
+      "global_limit": 6,
+      "provider_key": "glm",
+      "provider_limit": 4,
+      "waited_ms": 320
+    },
+    "prompt_revision": {
+      "use_default": false,
+      "revision": 3
+    },
+    "progress": {
+      "section_items_appended": 8,
+      "total_section_items": 21,
+      "final_markdown_chunks_appended": 0
+    }
+  }
+}
+```
+
+完成事件 payload 追加：
+
+```json
+{
+  "target_conversation_id": "conv-target",
+  "source_message_count": 59,
+  "target_message_count": 12,
+  "compressed_message_count": 43,
+  "retained_tail_message_count": 16,
+  "summary_message_id": "msg-summary",
+  "archive_job_id": "ccjob-...",
+  "token_usage_before": {
+    "used_tokens": 180000,
+    "context_window": 200000
+  },
+  "estimated_token_usage_after": {
+    "estimated_tokens": 42000,
+    "context_window": 200000
+  }
+}
+```
+
 不应在事件中暴露 API key、provider raw、完整压缩输入或大段中间摘要。
+
+也不应默认在 SSE 事件中推送完整最终 summary Markdown。完整 summary 已写入 target Conversation 的 synthetic user message，并由 Archive 持久化；前端如需查看详情，应通过后续压缩 job 查询接口或 Conversation 查询接口读取，而不是依赖实时事件承载大段内容。
+
+#### 15.9.1 事件 envelope 与推荐顺序
+
+上下文压缩事件应沿用现有 `RuntimeEventPublisher.publish(...)` 机制：
+
+- `CommunicationMessage.type` 使用上文的 `context_compression.*`。
+- `CommunicationMessage.topic` 沿用当前 Agent 执行通信流 topic，例如 `agent.task` 或 `agent.scene`。
+- `source` 建议使用：
+  - `context_compression_service`
+  - `context_compression_worker_runner`
+  - `context_compression_final_assembler`
+  - `context_compression_archive`
+- `actor_id` 使用当前 `agent_instance_id`。
+- `correlation_id` 使用 `job_id`，便于前端和日志按一次压缩聚合。
+- `metadata` 至少包含 `run_id`、`task_id`、`agent_instance_id`、`trace_id`、`conversation_id`。
+- `schema_version` 沿用 `CommunicationMessage` 的版本；payload 内可额外带 `payload_version: "1.0"`。
+
+推荐正常完成顺序：
+
+```text
+context_compression.started
+context_compression.range_planned
+
+context_compression.worker.queued        RequirementConstraintWorker
+context_compression.worker.queued        ProgressPlanWorker
+context_compression.worker.queued        CodeArchitectureWorker
+...
+
+context_compression.worker.started       RequirementConstraintWorker
+context_compression.worker.progress      RequirementConstraintWorker
+context_compression.worker.completed     RequirementConstraintWorker
+
+context_compression.worker.started       ProgressPlanWorker
+context_compression.worker.progress      ProgressPlanWorker
+context_compression.worker.completed     ProgressPlanWorker
+
+...
+
+context_compression.assembly.started
+context_compression.worker.started       FinalAssemblerWorker
+context_compression.worker.progress      FinalAssemblerWorker
+context_compression.worker.completed     FinalAssemblerWorker
+context_compression.assembly.completed
+
+context_compression.verification.started
+context_compression.worker.started       FinalVerifierWorker
+context_compression.worker.completed     FinalVerifierWorker
+context_compression.verification.completed
+
+context_compression.conversation.rebind.completed
+context_compression.completed
+```
+
+并发场景下，多个 Section Worker 的 `started/progress/completed` 可以交错到达。前端不得假设 Worker 严格按固定顺序完成，只能按 `job_id`、`worker.name` 和 SSE `seq` 合并。
+
+失败顺序：
+
+```text
+context_compression.started
+context_compression.range_planned
+context_compression.worker.started
+context_compression.worker.failed
+context_compression.failed
+```
+
+取消顺序：
+
+```text
+context_compression.started
+context_compression.worker.queued | context_compression.worker.started
+context_compression.cancelled
+```
+
+跳过顺序：
+
+```text
+context_compression.skipped
+```
+
+如果 Runtime 尚未创建 job，只能发布 `skipped`，并使用一个临时 `job_id` 或空 `job_id`。如果已经创建 job，则 `skipped` 必须携带真实 `job_id` 并写入 Archive 状态。
+
+#### 15.9.2 前端展示设计
+
+前端应把上下文压缩渲染为 Agent 执行过程的一部分，而不是渲染为普通 user/assistant 聊天气泡。
+
+展示原则：
+
+- 上下文压缩开始后，在当前 Agent process bubble 中增加一个“上下文压缩”阶段块。
+- 不为每个 Worker 创建独立聊天气泡。
+- 不把 Worker 中间 LLM assistant 内容直接显示成 Agent 回复。
+- 不展示完整压缩输入、完整 prompt、API key 或 provider raw。
+- 如果用户打开详情，可以展示 Worker 名称、状态、耗时、模型、input mode、并发等待原因、追加条目数量和简短错误摘要。
+
+推荐 process bubble 结构：
+
+```text
+Agent process bubble
+  上下文压缩 #3 · 运行中
+    触发原因：上下文窗口超过阈值
+    压缩范围：0..42
+    保留尾部：43..58 · latest_assistant_message
+    Worker 进度：2/6 完成
+    并发限制：global 6 · glm 4
+
+    RequirementConstraintWorker  完成  1.8s  glm-5.1  transcript_snapshot  8 items
+    ProgressPlanWorker           运行中 2.1s  glm-5.1  transcript_snapshot
+    CodeArchitectureWorker       等待并发许可 320ms  provider=glm limit=4
+    ObservationEvidenceWorker    完成  2.3s  glm-5.1  transcript_snapshot  11 items
+    DecisionRationaleWorker      运行中
+    TodoRiskWorker               运行中
+
+  汇编最终摘要
+  校验最终摘要
+  已创建压缩 Conversation
+  继续主 Agent LLM 请求
+```
+
+完成态展示：
+
+```text
+上下文压缩 #3 完成 · 6/6 workers · 12.4s
+已从 source Conversation 创建 target Conversation
+压缩 43 条历史消息，保留最近 16 条 raw tail
+预计上下文从 180k 降至 42k tokens
+```
+
+失败态展示：
+
+```text
+上下文压缩失败 · CodeArchitectureWorker
+原因：worker_model_unavailable
+Agent 已暂停，等待用户输入或调整上下文压缩设置
+```
+
+取消态展示：
+
+```text
+上下文压缩已取消
+未创建新的 target Conversation
+当前 Agent 仍绑定原 source Conversation
+```
+
+跳过态展示：
+
+- 如果只是普通未达到阈值，不显示任何 UI。
+- 如果达到阈值但因为配置关闭或协议不安全跳过，应在 process bubble 中显示一行轻量 warning。
+- 如果跳过会导致主 LLM 请求继续存在超限风险，应显示为 warning，并给出建议：调整设置、减少上下文或手动重试。
+
+前端状态聚合规则：
+
+- 以 `job_id` 作为一次上下文压缩 UI 块的稳定 key。
+- 以 `worker.name` 作为 Worker 行 key。
+- 事件可能因为 SSE 重连而重放，前端必须按 `seq` 去重，并按 `job_id + worker.name` 合并状态。
+- `worker.progress` 事件只更新计数，不追加聊天文本。
+- `context_compression.conversation.rebind.completed` 到达后，前端可更新当前 AgentInstance 的 active conversation 标识，但不应清空当前聊天 UI；历史查询应通过 Conversation lineage 和 Archive 进行。
+- `context_compression.completed` 到达后，该阶段折叠为摘要行；用户可展开查看 Worker 明细。
+- `context_compression.failed` 或 `cancelled` 到达后，该阶段保持展开，便于用户看到失败 Worker 和原因。
+
+#### 15.9.3 与 Chat Bubble 持久化的关系
+
+上下文压缩 SSE 事件属于运行过程事件，不是 Conversation 消息，也不是普通 Agent 回复。
+
+前端可以将其纳入现有 process bubble 的前端持久化结果，但后端不应把这些事件自动转成 Chat Bubble 作为恢复真相来源。可恢复的业务真相应来自：
+
+- Conversation lineage。
+- `ContextCompressionArchiveRepository`。
+- target Conversation synthetic summary message。
+- 通信流事件日志。
+
+如果前端断线导致 process bubble 中的压缩展示丢失，恢复时可通过通信流历史消息和压缩 Archive 重建展示。
 
 用户中断语义：
 
@@ -1805,7 +2137,8 @@ Context Compression Settings
 10. 实现 Section WorkerRunner 和 context_summary 受限工具。
 11. 实现 FinalAssemblerWorker。
 12. 接入 AgentExecutionEngine 主循环。
-13. 添加单元测试覆盖触发、区间、raw tail 从最近 assistant 开始保留、target Conversation 新建、AgentInstance 重新绑定、target provider_state 为空、多次 compression_index 递增、Worker LLM 选择优先级、全局/服务商并发限制、prompt override revision 记录。
+13. 实现基础 `context_compression.*` 通信流事件，并在前端 process bubble 中展示压缩开始、Worker 进度、汇编、校验、Conversation 重新绑定、完成/失败/取消状态。
+14. 添加单元测试覆盖触发、区间、raw tail 从最近 assistant 开始保留、target Conversation 新建、AgentInstance 重新绑定、target provider_state 为空、多次 compression_index 递增、Worker LLM 选择优先级、全局/服务商并发限制、prompt override revision 记录、压缩事件顺序和 payload 安全性。
 
 Phase 1 可以先不启用原生多模态历史输入，只实现 transcript snapshot；但 prompt 文档和接口必须保留两种输入能力，避免后续接口重构。
 
@@ -1831,8 +2164,8 @@ Phase 1 可以先不启用原生多模态历史输入，只实现 transcript sna
 2. context window exceeded 失败后的压缩重试。
 3. 更准确的 token 估算。
 4. 压缩 job REST 查询接口。
-5. 前端展示压缩进度事件。
-6. 前端展示历史压缩链路、source/target Conversation、compression_index、Worker 配置快照和 prompt revision。
+5. 前端展示历史压缩链路、source/target Conversation、compression_index、Worker 配置快照和 prompt revision。
+6. 前端支持从压缩 job REST 查询接口重建历史压缩详情、查看完整 summary、查看 Worker 明细和失败原因。
 
 ## 16. 失败处理
 
