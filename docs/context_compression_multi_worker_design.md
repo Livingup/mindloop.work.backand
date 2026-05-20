@@ -55,6 +55,8 @@ Runtime 应由 `CompressionInputPlanner` 为每个 Section Worker 选择输入�
 
 输入模式是 Runtime 程序端决策，不是 Worker 需要理解的任务概念。Runtime 必须根据已选择的输入模式拼装一套具体的 Worker 可见 prompt；不要把 `input_mode`、模式编号或“如果是某模式则...”这类分支判断交给 Worker。
 
+同样，`resource_id` 也是 Runtime 程序内部用于资源索引和溯源的 ID，不是 Worker 或后续 Agent 可理解、可读取的资源定位符。Runtime 可以在内部使用 `resource_id` 解析资源，但传给 Worker 的多模态输入或 `transcript_snapshot.resource_references` 必须使用 OSS 公网 URL、原始 URL/URI、工作区路径、仓库相对路径、行号、页码、符号名等 Agent 可读 locator。
+
 ### 3.1 优先模式：`native_multimodal_history`
 
 如果压缩 Worker 使用的模型支持对应输入模态，Runtime 应优先把待压缩的原 `Conversation` 片段渲染成 Worker 请求的历史消息，让模型直接感知历史中的图片、PDF 和文本内容。
@@ -84,10 +86,10 @@ final user:
 - 只有在 `native_multimodal_history` 中，也就是把原 `Conversation` 作为压缩 Worker 的历史会话、不是转成文本时，才需要上述当前压缩指令。
 - 因为这种输入看起来就是一段可继续的真实历史对话，Worker 很容易误以为应该继续执行历史对话中的原任务，所以必须在历史消息之后追加当前压缩指令消息，明确要求它立即进行上下文内容提取，且唯一任务是信息提取。
 - 如果使用 `transcript_snapshot` 降级模式，输入本身已经是待分析文本快照，不是原始历史会话流，不需要追加这段防止续做历史任务的强提示。
-- 如果系统已经把文件上传到 OSS 且可公网读取，ResourceResolver 可把内部 `resource_id` 解析为 `object_storage_url`，并把该 URL 作为 image/pdf URL 输入传给支持 URL 多模态的模型。
+- 如果系统已经把文件上传到 OSS 且可公网读取，ResourceResolver 可在 Runtime 内部解析资源，并把 `object_storage_url` 作为 image/pdf URL 输入传给支持 URL 多模态的模型。
 - 如果目标模型不支持 URL 输入，但支持 base64 或文件句柄，Runtime 应转换成该模型支持的原生多模态输入。
 - 如果目标 Worker 模型支持 PDF 输入，应优先让模型直接读取 PDF；只有模型不支持 PDF 或 PDF 超预算时，才使用文本抽取或页码摘要降级。
-- `resource_id` 是 Runtime 内部解析字段，不是 Agent 可理解的主引用。给 Worker 和最终摘要使用的主引用应是 `agent_readable_locator`，例如 OSS 公网 URL、原始 URL/URI、工作区文件路径或仓库相对路径。
+- 给 Worker 和最终摘要使用的主引用应是 Agent 可读 locator，例如 OSS 公网 URL、原始 URL/URI、工作区文件路径或仓库相对路径。
 - 历史 tool call/tool result 必须保持协议完整。若目标 provider 无法安全渲染历史 tool 调用，Runtime 可把历史工具交互降级为普通文本观察，但不应影响 user 消息中的图片/PDF 原生输入。
 - 不应向 Worker 暴露 provider raw、provider_state、cache breakpoint、stream ID、事件 ID、内部 actor metadata 等运行时噪音。
 
@@ -131,7 +133,6 @@ final user:
     agent_readable_locator: ...
     locator_type: oss_url | original_url | workspace_path | repo_relative_path
     object_storage_url: ...
-    resource_id: ... # Runtime 内部溯源字段，不能作为 Agent 主引用。
     label: ...
     mime_type: ...
     page_count: ...
@@ -194,7 +195,6 @@ final user:
 - OSS 公网 URL。
 - 附件资源。
 - 图片、PDF 等多模态资源的 Agent 可读 locator。
-- Runtime 内部 `resource_id`。
 - 外部文档链接。
 - 可重新读取的终端记录、trace、日志文件。
 - 已定位的代码符号、类、函数、方法、配置 key。
@@ -223,7 +223,7 @@ Worker 压缩资源相关内容时，不能只写：
 - 如果资源来自 Git 仓库，应保留 `git_repo_root` 和 `repo_relative_path`。
 - 如果只知道 URI 或 URL，必须保留完整 URI 或 URL。
 - 如果资源是附件，必须优先保留 Agent 可读 locator，例如 `object_storage_url`、原始 URL、工作区路径或仓库相对路径，并尽量保留文件名、mime、页数、图片尺寸等元数据。
-- `resource_id` 只能作为 Runtime 内部溯源或后续解析字段保留，不能作为 Worker 或后续 Agent 的主引用。
+- Runtime 内部资源 ID 不能进入 Worker 可见资源引用，也不能作为后续 Agent 的主引用。
 - 如果历史消息读取了文件的局部内容，应保留相关行号范围。
 - 如果历史消息定位了代码符号，应保留符号名、所在文件和行号范围。
 - 如果资源已被确认无法再次读取，应明确写入风险或未知，不能假装可读取。
@@ -260,7 +260,6 @@ Worker 压缩资源相关内容时，不能只写：
           "uri": "完整 URI；未知时为 null",
           "url": "完整 URL；未知时为 null",
           "object_storage_url": "OSS 公网读取 URL；未知或不适合暴露时为 null",
-          "resource_id": "Runtime 内部附件或文件资源 ID，仅用于系统溯源或解析，不能作为 Agent 主引用；未知时为 null",
           "line_ranges": [[1, 20]],
           "symbol_names": ["相关类名、函数名、方法名、配置 key"],
           "access_method": "后续 Agent 应如何重新读取该资源",
@@ -420,7 +419,7 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 
 你只能基于输入中明确存在的信息进行提取和压缩。不要编造事实，不要补全不存在的实现细节，不要把推测写成事实。如果信息冲突或不确定，必须标记为 unknown 或 report_section_issue。
 
-如果你提取的内容涉及输入中读取过、打开过、引用过、定位过或记录过的持久化资源，必须在 append 条目的 resource_references 中保留 Agent 可再读取的定位信息。包括但不限于：agent_readable_locator、object_storage_url、absolute_path、repo_relative_path、git_repo_root、URI、URL、line_ranges、symbol_names、access_method。`resource_id` 只能作为 Runtime 内部溯源字段附带，不能作为主引用。不要只写文件名、资源名或“某文档”这样的模糊描述。后续 Agent 必须能根据你的压缩结果重新读取原始资源进行复查。
+如果你提取的内容涉及输入中读取过、打开过、引用过、定位过或记录过的持久化资源，必须在 append 条目的 resource_references 中保留 Agent 可再读取的定位信息。包括但不限于：agent_readable_locator、object_storage_url、absolute_path、repo_relative_path、git_repo_root、URI、URL、line_ranges、symbol_names、access_method。不要只写文件名、资源名或“某文档”这样的模糊描述。后续 Agent 必须能根据你的压缩结果重新读取原始资源进行复查。
 
 你的输出必须通过 context_summary.append_section_items 工具写入。不要试图一次性输出完整章节。如果你发现内容较多，应主动分多次 append，直到该方向的重要内容都已写入。完成后调用 context_summary.mark_section_complete。
 
@@ -617,7 +616,7 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 - 测试结果。
 - 报错、异常、失败原因。
 - 外部文档/API 行为事实。
-- 截图、附件、Agent 可读资源定位信息，以及 Runtime 内部 `resource_id` 相关溯源事实。
+- 截图、附件和 Agent 可读资源定位信息。
 
 不包括：
 
@@ -639,7 +638,7 @@ Runtime 在程序端选择输入形态，并按以下规则拼装 Worker 可见 
 4. 附件或资源引用的关键元数据。
 5. 对后续实现、调试、验证有影响的证据。
 
-对读取文件、读取 URL、查看 URI、打开附件、查看截图、读取 PDF、查看 trace 或观察终端记录得到的结论，必须保留对应可复查资源引用。至少应保留 `agent_readable_locator`、完整路径、完整 URL/URI、OSS 公网 URL、行号范围、页码或其他可定位信息；`resource_id` 只能作为 Runtime 内部溯源字段附带。不要只保留“某文件显示”“某文档说”这类无法复查的描述。
+对读取文件、读取 URL、查看 URI、打开附件、查看截图、读取 PDF、查看 trace 或观察终端记录得到的结论，必须保留对应可复查资源引用。至少应保留 `agent_readable_locator`、完整路径、完整 URL/URI、OSS 公网 URL、行号范围、页码或其他可定位信息。不要只保留“某文件显示”“某文档说”这类无法复查的描述。
 
 请删除或压缩：
 - 冗长 stdout/stderr。
@@ -840,7 +839,7 @@ FinalAssemblerWorker 应按以下顺序输出：
 - 如果同一事实在多个章节重复，只保留在最合适的位置，其他章节交叉引用或删除。
 - 如果 raw tail 会保留某些最近细节，最终摘要可以压缩表达这些最近细节。
 - 文件路径、函数名、类名、错误信息、命令、Agent 可读资源 locator 应尽量保持精确。
-- 最终 Markdown 必须包含 `Persistent Resource References` 章节，汇总后续 Agent 可能需要重新读取的文件、URL、URI、附件、OSS 公网 URL、trace、终端记录和代码符号。每个资源应包含可复查定位信息和与任务相关的 observation；`resource_id` 如需保留，只能作为 Runtime 内部溯源字段。
+- 最终 Markdown 必须包含 `Persistent Resource References` 章节，汇总后续 Agent 可能需要重新读取的文件、URL、URI、附件、OSS 公网 URL、trace、终端记录和代码符号。每个资源应包含可复查定位信息和与任务相关的 observation。
 
 ## 13. FinalVerifierWorker
 
@@ -866,7 +865,7 @@ FinalVerifierWorker 是可选 Worker，用于检查最终 Markdown 的质量。
 6. 是否存在无来源的新增事实。
 7. 是否存在章节冲突。
 8. 是否明确 raw tail 优先级。
-9. 是否保留了历史中关键文件、URI、URL、OSS 公网 URL、附件、行号范围和代码符号的 Agent 可再读取引用；`resource_id` 是否只作为 Runtime 内部溯源字段出现。
+9. 是否保留了历史中关键文件、URI、URL、OSS 公网 URL、附件、行号范围和代码符号的 Agent 可再读取引用。
 10. 是否存在过度冗长、重复或低价值内容。
 
 你不能修改最终文档，只能通过 context_summary.report_section_issue 报告问题，或在没有严重问题时声明 verification_passed。
