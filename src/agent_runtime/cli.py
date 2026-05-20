@@ -277,6 +277,14 @@ def serve(host: str | None, port: int | None) -> None:
     tool_gateway = LocalToolFactory.create()
     skill_gateway = SkillFactory.create()
     mcp_gateway = McpClientFactory.create()
+    # 注入 MCP 元工具依赖：5 个 mcp_* 本地元工具通过模块级单例持有 McpClientGateway，
+    # 必须在 Agent 执行任何 mcp_get_service_detail/mcp_list_resources/... 之前完成注入，
+    # 否则元工具会抛 "MCP 元工具未初始化"。注入与 REST 路由共用同一个 gateway 实例，
+    # 共用同一个 McpSessionManager，复用 lifespan 已建立的连接池。
+    from agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools import (
+        configure as configure_mcp_meta_tools,
+    )
+    configure_mcp_meta_tools(mcp_gateway)
     agent_definition_gateway = AgentDefinitionFactory.create()
     communication_gateway = CommunicationFactory.create()
     chat_bubble_service = ChatBubbleFactory.create()
