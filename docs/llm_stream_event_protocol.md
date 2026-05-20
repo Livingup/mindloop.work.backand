@@ -15,7 +15,7 @@
 - 具体文本内容
 - tool arguments 内容
 - item id / call id
-- token usage
+- 具体 token 数值
 - runtime 内部包装事件
 
 ---
@@ -45,7 +45,8 @@ response.output_item.added        # 第 2 个 function_call item 开始
 response.function_call_arguments.delta  # 第 2 个 function_call 参数增量，可重复
 response.function_call_arguments.done   # 第 2 个 function_call 参数完成
 response.output_item.done         # 第 2 个 function_call item 完成
-response.completed                # assistant response 完成
+response.completed + response.usage  # assistant response 完成；携带最终 response 与 token usage
+[DONE]                            # SSE 传输结束标记，如 provider 发送
 ```
 
 ## 节点含义
@@ -62,7 +63,8 @@ response.completed                # assistant response 完成
 | `response.content_part.done` | message 的一个 content part 完成 |
 | `response.function_call_arguments.delta` | function_call 参数增量，可重复 |
 | `response.function_call_arguments.done` | function_call 参数完成 |
-| `response.completed` | 整个 assistant response 完成 |
+| `response.completed` | 整个 assistant response 完成；最终 `response` 对象在该事件中完成，`response.usage` 在该事件上承载 |
+| `[DONE]` | SSE 传输结束标记；不是业务 output item |
 
 ## 多工具调用结构
 
@@ -96,6 +98,8 @@ message + delta.reasoning_content  # thinking 增量，可重复
 message + delta.content            # 普通 content 增量，可重复
 message + delta.tool_calls         # tool_call #1 / #2 增量，可重复，按 index 区分多个工具
 message + finish_reason=tool_calls # assistant response 完成，结束原因是工具调用
+message + usage                    # token usage 统计 chunk，通常在结束阶段出现
+[DONE]                             # SSE 传输结束标记，如 provider 发送
 ```
 
 ## 节点含义
@@ -108,6 +112,8 @@ message + finish_reason=tool_calls # assistant response 完成，结束原因是
 | `delta.content` | 普通 content 增量，可重复 |
 | `delta.tool_calls` | tool call 增量，可重复；通过 `index` 区分多个工具调用 |
 | `finish_reason=tool_calls` | assistant response 完成，下一步需要执行工具 |
+| `usage` | token usage 统计；可能随结束 chunk 返回，也可能作为无 `choices` 的最终 usage chunk 返回 |
+| `[DONE]` | SSE 传输结束标记；不是 Chat Completions choice |
 
 ## 多工具调用结构
 
@@ -119,4 +125,6 @@ message + delta.tool_calls[index=0]  # 第 1 个 tool_call 参数增量，可重
 message + delta.tool_calls[index=1]  # 第 2 个 tool_call 开始/增量
 message + delta.tool_calls[index=1]  # 第 2 个 tool_call 参数增量，可重复
 message + finish_reason=tool_calls   # 所有 tool_call 增量结束
+message + usage                      # token usage 统计
+[DONE]                               # SSE 传输结束标记
 ```
