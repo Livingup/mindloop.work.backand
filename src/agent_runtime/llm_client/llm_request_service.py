@@ -30,6 +30,7 @@ from agent_runtime.llm_api_protocol import (
 from agent_runtime.llm_client.llm_protocol_clients import (
     LlmHttpRequestError,
     LlmProtocolClient,
+    LlmRequestCancelled,
 )
 from agent_runtime.llm_client.llm_request_models import (
     LlmPromptRequest,
@@ -192,6 +193,8 @@ class LlmRequestService:
                 source="llm_client",
                 metadata={"conversation_id": request.conversation.id},
             )
+            if request.request_attempt_observer is not None:
+                request.request_attempt_observer(dict(request_payload))
             max_retries = resolved.retry.max_retries_per_key
             for retry_index in range(max_retries + 1):
                 if retry_index > 0:
@@ -222,6 +225,8 @@ class LlmRequestService:
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    if request.request_attempt_observer is not None:
+                        request.request_attempt_observer(dict(request_payload))
                 stream_state: dict[str, bool] = {"response_started": False, "response_failed": False}
                 try:
                     stream_event_handler = _build_stream_event_handler(
@@ -261,7 +266,25 @@ class LlmRequestService:
                             retry_index=retry_index,
                             attempt_count=attempt_count,
                         ),
+                        cancellation_checker=request.cancellation_checker,
                     )
+                except LlmRequestCancelled as exc:
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.cancelled",
+                        {
+                            **request_payload,
+                            "attempt_count": attempt_count,
+                            "cancelled_by": "user",
+                            "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                            "partial_response": stream_state.get("response_started") is True,
+                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                            "reason": str(exc) or "LLM request cancelled.",
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
+                    raise
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
                     if not _is_llm_service_call_failure(exc):
                         raise

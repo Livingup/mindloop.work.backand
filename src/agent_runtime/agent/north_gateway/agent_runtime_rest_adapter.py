@@ -15,6 +15,7 @@ from agent_runtime.agent.agent_instance import (
 from agent_runtime.agent.agent_execution_engine import (
     AgentExecutionEngine,
     AgentExecutionResult,
+    AgentInterruptResult,
     AgentMessageSubmissionResult,
 )
 from agent_runtime.agent.agent_task import AgentTask
@@ -191,6 +192,19 @@ class SendAgentInstanceMessageBody(BaseModel):
 
 class SwitchAgentInstanceLlmPolicyBody(BaseModel):
     llm_policy_group_id: str
+
+
+class InterruptAgentInstanceBody(BaseModel):
+    reason: str = "user_requested"
+
+
+class AgentInterruptResponse(BaseModel):
+    status: str
+    task_id: str
+    agent_instance_id: str
+    conversation_id: str | None = None
+    interrupt_requested: bool
+    reason: str
 
 
 class AgentExecutionResponse(BaseModel):
@@ -389,6 +403,26 @@ def create_agent_runtime_router(
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
         return await _submission_response(result, conversation_repository, llm_registry_gateway)
+
+    @router.post(
+        "/instances/{instance_id}/interrupt",
+        response_model=AgentInterruptResponse,
+        status_code=202,
+    )
+    async def interrupt_agent_instance(
+        instance_id: str,
+        body: InterruptAgentInstanceBody | None = None,
+    ) -> AgentInterruptResponse:
+        if execution_engine is None:
+            raise HTTPException(status_code=501, detail="Agent 执行引擎未启用。")
+        try:
+            result = execution_engine.interrupt_agent_instance(
+                instance_id,
+                reason=(body.reason if body is not None else "user_requested"),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
+        return _interrupt_response(result)
 
     @router.post(
         "/scenes/{scene_id}/attach",
@@ -1072,6 +1106,17 @@ def _execution_response(result: AgentExecutionResult) -> AgentExecutionResponse:
         trace_file_path=result.trace_file_path,
         communication_stream_id=result.communication_stream_id,
         assistant_message_text=_assistant_message_text(result.assistant_message),
+    )
+
+
+def _interrupt_response(result: AgentInterruptResult) -> AgentInterruptResponse:
+    return AgentInterruptResponse(
+        status=result.status,
+        task_id=result.task_id,
+        agent_instance_id=result.instance_id,
+        conversation_id=result.conversation_id,
+        interrupt_requested=result.interrupt_requested,
+        reason=result.reason,
     )
 
 

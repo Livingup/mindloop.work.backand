@@ -30,7 +30,12 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 
 StreamEventHandler = Callable[[dict[str, Any]], None]
+CancellationChecker = Callable[[], bool]
 _DEFAULT_USER_AGENT = "mindloop.ai"
+
+
+class LlmRequestCancelled(Exception):
+    pass
 
 
 class LlmProtocolClient(Protocol):
@@ -53,6 +58,7 @@ class LlmProtocolClient(Protocol):
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         """发送一次 LLM 请求并返回 JSON 响应。"""
         ...
@@ -77,6 +83,7 @@ class OpenAIResponsesProtocolClient:
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, OpenAIRenderResult):
             raise TypeError("openai_responses 渲染结果类型不正确。")
@@ -110,6 +117,7 @@ class OpenAIResponsesProtocolClient:
             stream_event_handler=stream_event_handler,
             http_trace_service=http_trace_service,
             http_trace_context=http_trace_context,
+            cancellation_checker=cancellation_checker,
         )
 
 
@@ -132,6 +140,7 @@ class OpenAIChatCompletionsProtocolClient:
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, OpenAIChatRenderResult):
             raise TypeError("openai_chat_completions 渲染结果类型不正确。")
@@ -160,6 +169,7 @@ class OpenAIChatCompletionsProtocolClient:
             stream_event_handler=stream_event_handler,
             http_trace_service=http_trace_service,
             http_trace_context=http_trace_context,
+            cancellation_checker=cancellation_checker,
         )
 
 
@@ -182,6 +192,7 @@ class AnthropicMessagesProtocolClient:
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, ClaudeRenderResult):
             raise TypeError("anthropic_messages 渲染结果类型不正确。")
@@ -210,6 +221,7 @@ class AnthropicMessagesProtocolClient:
             stream_event_handler=stream_event_handler,
             http_trace_service=http_trace_service,
             http_trace_context=http_trace_context,
+            cancellation_checker=cancellation_checker,
         )
 
 
@@ -232,6 +244,7 @@ class GeminiGenerateContentProtocolClient:
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         if not isinstance(rendered_messages, GeminiRenderResult):
             raise TypeError("gemini_generate_content 渲染结果类型不正确。")
@@ -271,6 +284,7 @@ class GeminiGenerateContentProtocolClient:
             expect_stream=stream_requested,
             http_trace_service=http_trace_service,
             http_trace_context=http_trace_context,
+            cancellation_checker=cancellation_checker,
         )
 
 
@@ -293,6 +307,7 @@ class ZhipuChatCompletionsProtocolClient:
         stream_event_handler: StreamEventHandler | None = None,
         http_trace_service: LlmHttpTraceService | None = None,
         http_trace_context: LlmHttpTraceContext | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         from agent_runtime.conversation_message.message.zhipu_protocol import (
             ZhipuChatRenderResult,
@@ -328,6 +343,7 @@ class ZhipuChatCompletionsProtocolClient:
             stream_event_handler=stream_event_handler,
             http_trace_service=http_trace_service,
             http_trace_context=http_trace_context,
+            cancellation_checker=cancellation_checker,
         )
 
 
@@ -402,6 +418,7 @@ async def _post_json(
     expect_stream: bool = False,
     http_trace_service: LlmHttpTraceService | None = None,
     http_trace_context: LlmHttpTraceContext | None = None,
+    cancellation_checker: CancellationChecker | None = None,
 ) -> Any:
     """?????????? JSON POST??????? HTTP ??????"""
     import asyncio
@@ -416,6 +433,7 @@ async def _post_json(
         expect_stream,
         http_trace_service,
         http_trace_context,
+        cancellation_checker,
     )
 
 
@@ -428,6 +446,7 @@ def _post_json_sync(
     expect_stream: bool = False,
     http_trace_service: LlmHttpTraceService | None = None,
     http_trace_context: LlmHttpTraceContext | None = None,
+    cancellation_checker: CancellationChecker | None = None,
 ) -> Any:
     """?? JSON POST??? HTTP ?????? status_code ????"""
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -448,14 +467,16 @@ def _post_json_sync(
             is_stream=(body.get("stream") is True or expect_stream),
         )
     try:
+        _raise_if_cancelled(cancellation_checker)
         with urllib.request.urlopen(request, timeout=300) as response:
+            _raise_if_cancelled(cancellation_checker)
             status_code = int(getattr(response, "status", response.getcode()))
             response_headers = dict(response.headers.items())
             content_type = response.headers.get("Content-Type", "")
             if "text/event-stream" in content_type or expect_stream:
                 if sse_aggregator is None:
                     raise RuntimeError("??????????? text/event-stream ?????")
-                text = _read_sse_response_text(response, content_type, stream_event_handler)
+                text = _read_sse_response_text(response, content_type, stream_event_handler, cancellation_checker)
                 response_bytes = text.encode("utf-8")
                 if trace_enabled:
                     http_trace_service.record_completed(
@@ -469,6 +490,7 @@ def _post_json_sync(
                         sse_event_count=_count_sse_events(text),
                     )
                 return sse_aggregator(text)
+            _raise_if_cancelled(cancellation_checker)
             response_bytes = response.read()
             if trace_enabled:
                 http_trace_service.record_completed(
@@ -498,6 +520,16 @@ def _post_json_sync(
             )
         error_text = error_bytes.decode("utf-8", errors="replace")
         raise LlmHttpRequestError(exc.code, error_text) from exc
+    except LlmRequestCancelled:
+        if trace_enabled:
+            http_trace_service.record_failed(
+                started_record=trace_record,
+                context=http_trace_context,
+                error_type="LlmRequestCancelled",
+                error_message="LLM request cancelled.",
+                duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+            )
+        raise
     except Exception as exc:
         if trace_enabled:
             http_trace_service.record_failed(
@@ -539,13 +571,19 @@ def _aggregate_openai_responses_sse(text: str) -> dict[str, Any]:
     return response_body
 
 
-def _read_sse_response_text(response: Any, content_type: str, handler: StreamEventHandler | None) -> str:
+def _read_sse_response_text(
+    response: Any,
+    content_type: str,
+    handler: StreamEventHandler | None,
+    cancellation_checker: CancellationChecker | None,
+) -> str:
     _emit_stream_event(handler, "llm.response.stream.started", {"content_type": content_type})
     event_count = 0
     lines: list[str] = []
     event_lines: list[str] = []
     try:
         while True:
+            _raise_if_cancelled(cancellation_checker)
             raw_line = response.readline()
             if not raw_line:
                 break
@@ -567,6 +605,11 @@ def _read_sse_response_text(response: Any, content_type: str, handler: StreamEve
             {"event_count": event_count, "error_type": exc.__class__.__name__, "error_message": str(exc)},
         )
         raise
+
+
+def _raise_if_cancelled(cancellation_checker: CancellationChecker | None) -> None:
+    if cancellation_checker is not None and cancellation_checker():
+        raise LlmRequestCancelled("LLM request cancelled.")
 
 
 def _emit_sse_block_event(handler: StreamEventHandler | None, event_lines: list[str]) -> int:

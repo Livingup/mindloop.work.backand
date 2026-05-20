@@ -56,6 +56,7 @@ from agent_runtime.conversation_message.message.models import (
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
+from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
 from agent_runtime.llm_client.llm_request_service import (
     LlmProviderModelServiceUnavailable,
@@ -191,6 +192,30 @@ class AgentExecutionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentInterruptResult:
+    status: str
+    task_id: str
+    instance_id: str
+    conversation_id: str | None
+    interrupt_requested: bool
+    reason: str
+
+
+@dataclass(slots=True)
+class _AgentExecutionInterruptState:
+    requested: bool = False
+    reason: str = "user_requested"
+    requested_at: float | None = None
+    current_llm_request: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentExecutionHandle:
+    task: asyncio.Task[AgentExecutionResult]
+    interrupt_state: _AgentExecutionInterruptState
+
+
+@dataclass(frozen=True, slots=True)
 class AgentMessageSubmissionResult:
     status: str
     task_id: str
@@ -257,6 +282,7 @@ class AgentExecutionEngine:
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
+        self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
 
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
@@ -394,7 +420,12 @@ class AgentExecutionEngine:
             pending_message.message_id,
         )
         self._active_instance_ids.add(instance.instance_id)
-        task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request))
+        interrupt_state = _AgentExecutionInterruptState()
+        task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request, interrupt_state=interrupt_state))
+        self._active_execution_handles[instance.instance_id] = _AgentExecutionHandle(
+            task=task_handle,
+            interrupt_state=interrupt_state,
+        )
         self._background_tasks.add(task_handle)
         task_handle.add_done_callback(
             lambda done_task, instance_id=instance.instance_id: self._on_background_task_done(done_task, instance_id)
@@ -411,9 +442,37 @@ class AgentExecutionEngine:
             instance=instance,
         )
 
+    def interrupt_agent_instance(self, instance_id: str, *, reason: str = "user_requested") -> AgentInterruptResult:
+        instance = self._runtime_gateway.get_agent_instance(instance_id)
+        task = self._runtime_gateway.get_task(instance.task_id)
+        handle = self._active_execution_handles.get(instance_id)
+        if handle is None:
+            return AgentInterruptResult(
+                status="not_running",
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                conversation_id=instance.conversation_id,
+                interrupt_requested=False,
+                reason=reason,
+            )
+        handle.interrupt_state.requested = True
+        handle.interrupt_state.reason = reason
+        handle.interrupt_state.requested_at = time.perf_counter()
+        return AgentInterruptResult(
+            status="interrupt_requested",
+            task_id=task.task_id,
+            instance_id=instance.instance_id,
+            conversation_id=instance.conversation_id,
+            interrupt_requested=True,
+            reason=reason,
+        )
+
     def _on_background_task_done(self, task: asyncio.Task[AgentExecutionResult], instance_id: str) -> None:
         self._background_tasks.discard(task)
         self._active_instance_ids.discard(instance_id)
+        handle = self._active_execution_handles.get(instance_id)
+        if handle is not None and handle.task is task:
+            self._active_execution_handles.pop(instance_id, None)
         with suppress(asyncio.CancelledError):
             exc = task.exception()
             if exc is not None:
@@ -426,7 +485,10 @@ class AgentExecutionEngine:
         task: AgentTask,
         instance: AgentInstance,
         request: AgentExecutionRequest,
+        *,
+        interrupt_state: _AgentExecutionInterruptState | None = None,
     ) -> AgentExecutionResult:
+        interrupt_state = interrupt_state or _AgentExecutionInterruptState()
         communication_context = self._build_communication_context(request, task, instance)
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         conversation: Any | None = None
@@ -471,25 +533,37 @@ class AgentExecutionEngine:
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
-                llm_response = await _await_with_progress_logging(
-                    self._send_prompt_with_policy_failover(
-                        conversation=conversation,
-                        agent_definition=agent_definition,
+                try:
+                    llm_response = await _await_with_progress_logging(
+                        self._send_prompt_with_policy_failover(
+                            conversation=conversation,
+                            agent_definition=agent_definition,
+                            instance=instance,
+                            resolved_candidates=resolved_candidates,
+                            render_options=request.render_options,
+                            request_overrides=request.request_overrides,
+                            communication_context=communication_context,
+                            interrupt_state=interrupt_state,
+                        ),
+                        stage="llm_prompt",
+                        task_id=task.task_id,
+                        instance_id=instance.instance_id,
+                        metadata={
+                            "loop_index": loop_index,
+                            "conversation_id": conversation.id,
+                            "candidate_count": len(resolved_candidates),
+                        },
+                    )
+                except LlmRequestCancelled:
+                    return await self._pause_for_user_interrupt(
+                        task=task,
                         instance=instance,
-                        resolved_candidates=resolved_candidates,
-                        render_options=request.render_options,
-                        request_overrides=request.request_overrides,
+                        conversation_id=conversation.id,
+                        trace_path=trace_path,
                         communication_context=communication_context,
-                    ),
-                    stage="llm_prompt",
-                    task_id=task.task_id,
-                    instance_id=instance.instance_id,
-                    metadata={
-                        "loop_index": loop_index,
-                        "conversation_id": conversation.id,
-                        "candidate_count": len(resolved_candidates),
-                    },
-                )
+                        interrupt_state=interrupt_state,
+                        assistant_message=None,
+                    )
                 assistant_message = llm_response.assistant_message
                 _record_last_context_usage(conversation, llm_response)
                 await self._conversation_repository.save(conversation)
@@ -505,6 +579,26 @@ class AgentExecutionEngine:
                 )
 
                 tool_uses = _extract_tool_uses(assistant_message)
+                if interrupt_state.requested:
+                    if tool_uses:
+                        tool_result_message, tool_results = await self._build_interrupted_tool_results(
+                            tool_uses,
+                            communication_context,
+                            interrupt_state=interrupt_state,
+                            phase="before_tool_start",
+                        )
+                        conversation.append_message(tool_result_message)
+                        await self._conversation_repository.save(conversation)
+                        self._trace_recorder.record_tool_result(trace_path, tool_result_message)
+                    return await self._pause_for_user_interrupt(
+                        task=task,
+                        instance=instance,
+                        conversation_id=conversation.id,
+                        trace_path=trace_path,
+                        communication_context=communication_context,
+                        interrupt_state=interrupt_state,
+                        assistant_message=assistant_message,
+                    )
                 if not tool_uses:
                     plain_text_fallback_count += 1
                     self._trace_recorder.record_event(
@@ -563,6 +657,7 @@ class AgentExecutionEngine:
                         agent_definition,
                         tool_uses,
                         communication_context,
+                        interrupt_state=interrupt_state,
                     ),
                     stage="tool_batch",
                     task_id=task.task_id,
@@ -585,6 +680,16 @@ class AgentExecutionEngine:
                     len(tool_results),
                     loop_decision,
                 )
+                if interrupt_state.requested:
+                    return await self._pause_for_user_interrupt(
+                        task=task,
+                        instance=instance,
+                        conversation_id=conversation.id,
+                        trace_path=trace_path,
+                        communication_context=communication_context,
+                        interrupt_state=interrupt_state,
+                        assistant_message=assistant_message,
+                    )
                 if loop_decision != "continue":
                     await self._apply_loop_decision(
                         loop_decision=loop_decision,
@@ -847,6 +952,48 @@ class AgentExecutionEngine:
             source="agent_execution_engine",
         )
 
+    async def _pause_for_user_interrupt(
+        self,
+        *,
+        task: AgentTask,
+        instance: AgentInstance,
+        conversation_id: str,
+        trace_path: Any,
+        communication_context: RuntimeCommunicationContext,
+        interrupt_state: _AgentExecutionInterruptState,
+        assistant_message: UniMessage | None,
+    ) -> AgentExecutionResult:
+        self._runtime_gateway.pause_agent_instance(instance.instance_id)
+        self._runtime_gateway.pause_task(task.task_id)
+        self._trace_recorder.record_event(
+            trace_path,
+            "instance_paused_by_user_interrupt",
+            {
+                "reason": interrupt_state.reason,
+                "current_llm_request": interrupt_state.current_llm_request,
+            },
+        )
+        await self._event_publisher.publish(
+            communication_context,
+            "agent.task.paused",
+            {
+                "task_id": task.task_id,
+                "agent_instance_id": instance.instance_id,
+                "reason": "user_interrupted",
+                "interrupt_reason": interrupt_state.reason,
+                "current_llm_request": interrupt_state.current_llm_request,
+            },
+            source="agent_execution_engine",
+        )
+        return AgentExecutionResult(
+            task_id=task.task_id,
+            instance_id=instance.instance_id,
+            conversation_id=conversation_id,
+            trace_file_path=str(trace_path),
+            assistant_message=assistant_message,
+            communication_stream_id=communication_context.stream_id,
+        )
+
     def _load_agent_definition(self, agent_definition_id: str) -> AgentDefinition:
         """加载并校验 Agent 静态定义。"""
         definition = self._agent_definition_gateway.get_agent_definition(agent_definition_id)
@@ -893,6 +1040,7 @@ class AgentExecutionEngine:
         render_options: dict[str, Any],
         request_overrides: dict[str, Any],
         communication_context: RuntimeCommunicationContext,
+        interrupt_state: _AgentExecutionInterruptState,
     ) -> LlmPromptResponse:
         last_error: Exception | None = None
         skipped_for_modalities = False
@@ -949,8 +1097,16 @@ class AgentExecutionEngine:
                         next_resolved_model=resolved_candidates[candidate_index + 1]
                         if candidate_index < len(resolved_candidates) - 1
                         else None,
+                        cancellation_checker=lambda state=interrupt_state: state.requested,
+                        request_attempt_observer=lambda payload, state=interrupt_state: setattr(
+                            state,
+                            "current_llm_request",
+                            payload,
+                        ),
                     )
                 )
+            except LlmRequestCancelled:
+                raise
             except Exception as exc:
                 last_error = exc
                 can_failover = (
@@ -1197,6 +1353,8 @@ class AgentExecutionEngine:
         definition: AgentDefinition,
         tool_uses: list[ToolUsePart],
         communication_context: RuntimeCommunicationContext,
+        *,
+        interrupt_state: _AgentExecutionInterruptState,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
         started_at = time.perf_counter()
@@ -1206,15 +1364,28 @@ class AgentExecutionEngine:
             [tool_use.name for tool_use in tool_uses],
         )
         result_parts = []
-        tasks = [
-            asyncio.create_task(self._execute_single_tool_use(
+        results_by_ref: dict[str, ToolDispatchResult] = {}
+        tasks: list[tuple[ToolUsePart, asyncio.Task[ToolDispatchResult]]] = []
+        for tool_use in tool_uses:
+            if interrupt_state.requested:
+                results_by_ref[_tool_use_ref(tool_use)] = await self._build_cancelled_tool_dispatch_result(
+                    tool_use,
+                    communication_context,
+                    interrupt_state=interrupt_state,
+                    phase="not_started",
+                )
+                continue
+            tool_task = asyncio.create_task(self._execute_single_tool_use(
                 definition,
                 tool_use,
                 communication_context,
             ))
-            for tool_use in tool_uses
-        ]
-        results = await asyncio.gather(*tasks)
+            tasks.append((tool_use, tool_task))
+        if tasks:
+            running_results = await asyncio.gather(*(task for _tool_use, task in tasks))
+            for result in running_results:
+                results_by_ref[result.result_part.tool_use_ref] = result
+        results = [results_by_ref[_tool_use_ref(tool_use)] for tool_use in tool_uses]
         tool_results = []
         for result in results:
             result_parts.append(result.result_part)
@@ -1227,6 +1398,68 @@ class AgentExecutionEngine:
             int((time.perf_counter() - started_at) * 1000),
         )
         return UniMessage(role=ROLE_TOOL, content=result_parts), tool_results
+
+    async def _build_interrupted_tool_results(
+        self,
+        tool_uses: list[ToolUsePart],
+        communication_context: RuntimeCommunicationContext,
+        *,
+        interrupt_state: _AgentExecutionInterruptState,
+        phase: str,
+    ) -> tuple[UniMessage, list[BaseToolResult]]:
+        results = [
+            await self._build_cancelled_tool_dispatch_result(
+                tool_use,
+                communication_context,
+                interrupt_state=interrupt_state,
+                phase=phase,
+            )
+            for tool_use in tool_uses
+        ]
+        return (
+            UniMessage(role=ROLE_TOOL, content=[result.result_part for result in results]),
+            [result.tool_result for result in results],
+        )
+
+    async def _build_cancelled_tool_dispatch_result(
+        self,
+        tool_use: ToolUsePart,
+        communication_context: RuntimeCommunicationContext,
+        *,
+        interrupt_state: _AgentExecutionInterruptState,
+        phase: str,
+    ) -> ToolDispatchResult:
+        tool_call_id = _tool_use_ref(tool_use)
+        tool_result = build_tool_error_result(
+            error_code="UserInterrupted",
+            error_message="Tool execution cancelled by user interruption.",
+        )
+        await self._event_publisher.publish(
+            communication_context,
+            "tool.call.cancelled",
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_use.name,
+                "source": _tool_source(tool_use),
+                "tool_source": _tool_source(tool_use),
+                "cancelled_by": "user",
+                "phase": phase,
+                "reason": interrupt_state.reason,
+                "result_preview": tool_result.to_serializable_dict(),
+            },
+            source="agent_execution_engine",
+            correlation_id=tool_call_id,
+        )
+        return ToolDispatchResult(
+            tool_name=tool_use.name,
+            source=_tool_source(tool_use),
+            result_part=ToolResultPart(
+                tool_use_ref=tool_call_id,
+                is_error=True,
+                output=tool_result.error_message or "Tool execution cancelled.",
+            ),
+            tool_result=tool_result,
+        )
 
     async def _publish_tool_frontend_message(
         self,
@@ -1471,6 +1704,10 @@ def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
 def _tool_use_ref(tool_use: ToolUsePart) -> str:
     """确定工具结果要关联的工具调用引用。"""
     return tool_use.tool_use_id or tool_use.name
+
+
+def _tool_source(tool_use: ToolUsePart) -> str:
+    return "mcp" if tool_use.name.startswith("mcp__") else "local"
 
 
 def _unsupported_input_modality_strategy(instance: AgentInstance) -> str:

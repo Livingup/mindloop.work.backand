@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from agent_runtime.conversation_message.message.models import Conversation, UniMessage
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
@@ -70,6 +70,10 @@ class LlmPromptRequest:
     candidate_index: int = 0
 
     next_resolved_model: ResolvedLlmProviderModel | None = None
+
+    cancellation_checker: Callable[[], bool] | None = None
+
+    request_attempt_observer: Callable[[dict[str, Any]], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
