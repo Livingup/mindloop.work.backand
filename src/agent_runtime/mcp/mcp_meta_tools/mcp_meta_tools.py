@@ -14,7 +14,11 @@ from typing import Any
 
 from pydantic import Field
 
-from agent_runtime.tool.tool_execution_models import BaseToolRequest
+from agent_runtime.tool.tool_execution_models import (
+    BaseToolRequest,
+    BaseToolResult,
+    build_tool_error_result,
+)
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
     McpClientGateway,
@@ -45,8 +49,12 @@ def _get_gateway() -> McpClientGateway:
     return _gateway
 
 
-def _tool_error(message: str) -> str:
-    return json.dumps({"is_error": True, "content": message}, ensure_ascii=False)
+def _tool_error(message: str, *, error_code: str = "McpMetaToolError") -> BaseToolResult:
+    return build_tool_error_result(
+        error_code=error_code,
+        error_message=message,
+        output={"is_error": True, "content": message},
+    )
 
 
 class McpGetServiceDetailRequest(BaseToolRequest):
@@ -85,7 +93,7 @@ class McpCallToolRequest(BaseToolRequest):
     wiki="查询指定 MCP 服务的 capabilities（是否支持 tools/resources）和 instructions（使用指南）。"
     "在调用 MCP 工具前建议先用此工具了解服务的使用策略。",
 )
-async def mcp_get_service_detail(request: McpGetServiceDetailRequest) -> str:
+async def mcp_get_service_detail(request: McpGetServiceDetailRequest) -> str | BaseToolResult:
     """获取 MCP 服务的能力信息和使用指南。
 
     Args:
@@ -118,7 +126,7 @@ async def mcp_get_service_detail(request: McpGetServiceDetailRequest) -> str:
     wiki="列出指定 MCP 服务暴露的所有资源。"
     "返回资源列表，每个资源包含 uri、name、description、mime_type。",
 )
-async def mcp_list_resources(request: McpListResourcesRequest) -> str:
+async def mcp_list_resources(request: McpListResourcesRequest) -> str | BaseToolResult:
     """列出 MCP 服务的可用资源。
 
     Args:
@@ -153,7 +161,7 @@ async def mcp_list_resources(request: McpListResourcesRequest) -> str:
     wiki="读取指定 MCP 服务上某个资源的具体内容。"
     "需要提供 service_id 和资源的 URI（从 mcp_list_resources 获取）。",
 )
-async def mcp_read_resource(request: McpReadResourceRequest) -> str:
+async def mcp_read_resource(request: McpReadResourceRequest) -> str | BaseToolResult:
     """读取 MCP 服务的指定资源内容。
 
     Args:
@@ -187,7 +195,7 @@ async def mcp_read_resource(request: McpReadResourceRequest) -> str:
     "tool_names 是逗号分隔的工具名列表。"
     "在调用 mcp_call_tool 前务必先查看工具参数定义。",
 )
-async def mcp_get_tool_detail(request: McpGetToolDetailRequest) -> str:
+async def mcp_get_tool_detail(request: McpGetToolDetailRequest) -> str | BaseToolResult:
     """获取 MCP 工具的参数定义。
 
     Args:
@@ -224,7 +232,7 @@ async def mcp_get_tool_detail(request: McpGetToolDetailRequest) -> str:
     "arguments 为 JSON 格式的工具参数。"
     "调用前必须先用 mcp_get_tool_detail 查看参数定义。",
 )
-async def mcp_call_tool(request: McpCallToolRequest) -> str:
+async def mcp_call_tool(request: McpCallToolRequest) -> str | BaseToolResult:
     """执行 MCP 工具。
 
     Args:

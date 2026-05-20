@@ -300,7 +300,9 @@ def serve(host: str | None, port: int | None) -> None:
     )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     llm_http_trace_service = LlmHttpTraceFactory.create()
-    agent_execution_engine = AgentExecutionFactory.create()
+    agent_execution_engine = AgentExecutionFactory.create(
+        mcp_client_gateway=mcp_gateway,
+    )
     terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
 

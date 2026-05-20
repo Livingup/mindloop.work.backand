@@ -20,6 +20,9 @@ from agent_runtime.llm_model_registry.llm_model_registry_factory import (
     LlmModelRegistryFactory,
 )
 from agent_runtime.mcp.mcp_client.mcp_client_factory import McpClientFactory
+from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
+    McpClientGateway,
+)
 from agent_runtime.prompt_template import PromptTemplateFactory
 from agent_runtime.skill.skill_factory import SkillFactory
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
@@ -86,7 +89,10 @@ class AgentExecutionFactory:
     """
 
     @staticmethod
-    def create() -> AgentExecutionEngine:
+    def create(
+        *,
+        mcp_client_gateway: McpClientGateway | None = None,
+    ) -> AgentExecutionEngine:
         """创建 Agent 执行循环引擎。"""
         from agent_runtime.config import ConfigRegistry
 
@@ -97,7 +103,8 @@ class AgentExecutionFactory:
         communication_gateway = CommunicationFactory.create()
         event_publisher = CommunicationRuntimeEventPublisher(communication_gateway)
         local_tool_gateway = LocalToolFactory.create()
-        mcp_gateway = McpClientFactory.create()
+        mcp_gateway = mcp_client_gateway or McpClientFactory.create()
+
         tool_dispatcher = AgentToolDispatcher(
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
