@@ -62,7 +62,6 @@ class TextSearchRequest(BaseToolRequest):
     case_sensitive: bool = Field(default=False, description="是否大小写敏感。")
     extensions: list[str] = Field(default_factory=list, description="扩展名过滤，不要求包含点号。")
     path_globs: list[str] = Field(default_factory=list, description="相对 search_root 的文件路径 glob 过滤。")
-    context_lines: int = Field(default=0, ge=0, le=5, description="命中前后各返回的上下文行数；取值范围为 0 到 5。")
     limit: int = Field(default=50, ge=1, le=200, description="本次最多返回的命中数量；取值范围为 1 到 200。")
     offset: int = Field(default=0, ge=0, description="命中结果分页偏移；取值必须大于等于 0。")
     exclude_names: list[str] = Field(default_factory=list, description="额外排除的文件名或目录名。")
@@ -243,34 +242,6 @@ def _matches_text_search_filters(
     return _matches_path_globs(path, root, request.path_globs, request.case_sensitive)
 
 
-def _read_match_context(path: Path, line_number: int, context_lines: int) -> tuple[list[str], list[str]]:
-    if context_lines <= 0:
-        return [], []
-    start_line = max(1, line_number - context_lines)
-    end_line = line_number + context_lines
-    for encoding in _encoding_candidates(None):
-        before: list[str] = []
-        after: list[str] = []
-        try:
-            with path.open("r", encoding=encoding, errors="strict") as file:
-                for current_line_number, raw_line in enumerate(file, start=1):
-                    if current_line_number < start_line:
-                        continue
-                    if current_line_number > end_line:
-                        break
-                    if current_line_number == line_number:
-                        continue
-                    line = raw_line.rstrip("\n")
-                    if current_line_number < line_number:
-                        before.append(line)
-                    else:
-                        after.append(line)
-            return before, after
-        except (OSError, UnicodeDecodeError, LookupError):
-            continue
-    return [], []
-
-
 def _text_from_ripgrep_json_field(value: dict[str, Any]) -> str:
     text = value.get("text")
     if isinstance(text, str):
@@ -348,14 +319,11 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
         if not isinstance(line_number, int):
             continue
         line = _text_from_ripgrep_json_field(data.get("lines", {})).rstrip("\r\n")
-        before, after = _read_match_context(path, line_number, request.context_lines)
         matches.append(
             {
                 "path": str(path),
                 "line_number": line_number,
                 "line": line,
-                "before": before,
-                "after": after,
             }
         )
 
@@ -493,8 +461,6 @@ def _collect_text_search_matches_with_encoding(
     global_seen_start: int,
     returned_count: int,
 ) -> dict[str, Any]:
-    lines_before: list[str] = []
-    pending_matches: list[dict[str, Any]] = []
     matches: list[dict[str, Any]] = []
     seen_count = 0
     has_more = False
@@ -502,20 +468,8 @@ def _collect_text_search_matches_with_encoding(
     with path.open("r", encoding=encoding, errors="strict") as file:
         for line_number, raw_line in enumerate(file, start=1):
             line = raw_line.rstrip("\n")
-            for pending_match in list(pending_matches):
-                if len(pending_match["after"]) < request.context_lines:
-                    pending_match["after"].append(line)
-                if len(pending_match["after"]) >= request.context_lines:
-                    pending_matches.remove(pending_match)
-
             if has_more:
-                if not pending_matches:
-                    break
-                if request.context_lines > 0:
-                    lines_before.append(line)
-                    if len(lines_before) > request.context_lines:
-                        lines_before.pop(0)
-                continue
+                break
 
             if _line_matches(line, request.query, compiled_regex, request.case_sensitive):
                 global_match_index = global_seen_start + seen_count
@@ -524,24 +478,14 @@ def _collect_text_search_matches_with_encoding(
                     pass
                 elif returned_count + len(matches) >= request.limit:
                     has_more = True
-                    if not pending_matches:
-                        break
+                    break
                 else:
                     match = {
                         "path": str(path),
                         "line_number": line_number,
                         "line": line,
-                        "before": list(lines_before),
-                        "after": [],
                     }
                     matches.append(match)
-                    if request.context_lines > 0:
-                        pending_matches.append(match)
-
-            if request.context_lines > 0:
-                lines_before.append(line)
-                if len(lines_before) > request.context_lines:
-                    lines_before.pop(0)
 
     return {"seen_count": seen_count, "matches": matches, "has_more": has_more}
 
