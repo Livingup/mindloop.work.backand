@@ -10,7 +10,7 @@
 - 保留用户需求、硬约束、任务进度、关键代码事实、重要发现、风险与待办。
 - 避免单次 LLM 输出过长导致截断、遗漏、质量下降。
 - 避免压缩 Worker 误执行历史任务。
-- 压缩完成后由 Runtime 将最终 Markdown 作为运行时生成的 user message 放回原 conversation 开头，并保留最近 raw tail。
+- 压缩完成后由 Runtime 新建一个压缩后的 Conversation，将最终 Markdown 作为运行时生成的 user message 放入新 Conversation 开头，并保留最近 raw tail。
 
 ## 2. 总体架构
 
@@ -26,7 +26,8 @@ Agent Execution Loop
   -> Section Workers 并发压缩
   -> FinalAssembler
   -> Optional Verifier
-  -> Replace Conversation.messages
+  -> Create Compressed Conversation
+  -> Rebind AgentInstance to New Conversation
 ```
 
 默认 Worker 划分：
@@ -747,30 +748,32 @@ Verifier 可以使用 `context_summary.report_section_issue` 报告：
 ```json
 {
   "verification_status": "passed",
-  "notes": "最终压缩文档可用于替换历史上下文。"
+  "notes": "最终压缩文档可用于创建压缩后的新 Conversation。"
 }
 ```
 
-## 14. Runtime 替换策略
+## 14. Runtime 新建压缩 Conversation 策略
 
-压缩完成后，Runtime 构造新的 conversation messages：
+压缩完成后，Runtime 不覆盖旧 Conversation，而是构造一个新的压缩后 Conversation：
 
 ```text
-[
+new Conversation.messages = [
   synthetic user message: final Runtime Compressed Task Context Markdown,
   ...retained raw tail messages
 ]
 ```
 
-替换规则：
+新建规则：
 
-- `conversation_id` 保持不变。
-- `task_id` 和 `agent_instance_id` 保持不变。
-- `provider_state` 清空，因为 message index 和 provider cache 状态已失效。
-- `conversation.state` 根据新 messages 重算。
+- 旧 `source_conversation_id` 保持不变，旧 Conversation 继续作为压缩前完整历史持久化记录存在。
+- 新建 `target_conversation_id`，新 Conversation 绑定同一个 `task_id`、`thread_id`、`agent_id` 和 `agent_instance_id`。
+- 当前 AgentInstance 的 `conversation_id` 更新为新的 `target_conversation_id`。
+- 新 Conversation 的 `provider_state` 为空，因为 message index 和 provider cache 状态不能跨压缩后的新消息窗口继承。
+- 新 Conversation 的 `conversation.state` 根据新 messages 重算。
 - 压缩摘要的 user message 必须带运行时生成标记。
 - 最近 raw tail 中的信息优先于压缩摘要。
 - 压缩摘要必须保留可再读取的资源引用，确保后续 Agent 能重新打开历史中用过的文件、URL、URI、附件或代码符号。
+- 压缩归档必须记录 `source_conversation_id`、`target_conversation_id`、`root_conversation_id` 和 `compression_index`，用于多次压缩后的有序查询与恢复。
 
 ## 15. 当前系统接入设计
 
@@ -800,8 +803,10 @@ src/agent_runtime/agent/agent_execution_engine.py
   - `messages` 是 LLM 历史真相源。
   - `provider_state` 保存 provider cache / thinking / prompt cache 等协议状态。
   - `state.last_context_usage` 保存最新 LLM 请求 token usage 快照。
-- `SqliteConversationRepository.save`
-  - 可全量覆写 JSONL 消息文件、派生状态和 provider_state，适合作为压缩完成后的原子持久化入口。
+- `SqliteConversationRepository.create`
+  - 可为压缩结果创建新的 Conversation 元数据和 JSONL 消息文件。
+- `AgentRuntimeGateway.bind_agent_instance_conversation`
+  - 可将当前 AgentInstance 重新绑定到压缩后的新 `target_conversation_id`。
 
 因此，上下文压缩闸门应插入 `_run_agent_instance` 中每轮主 Agent LLM 请求之前：
 
@@ -810,7 +815,7 @@ while True:
   drain pending user messages into conversation
   resolve LLM candidates
   load agent definition
-  maybe run context compression and rewrite conversation
+  maybe run context compression, create new conversation, and rebind instance
   send main Agent LLM prompt
   record last_context_usage
   execute tools if any
@@ -872,12 +877,13 @@ src/agent_runtime/context_compression/
 - `final_assembler.py`
   - 调用 FinalAssemblerWorker 和可选 FinalVerifierWorker。
 - `conversation_rewriter.py`
-  - 将最终压缩 Markdown 写成 synthetic user message，并与 retained raw tail 组成新的 `conversation.messages`。
-  - 清空 `conversation.provider_state`。
-  - 重建 `conversation.state`。
+  - 将最终压缩 Markdown 写成 synthetic user message，并与 retained raw tail 组成新的压缩后 Conversation。
+  - 新 Conversation 使用新的 `target_conversation_id`。
+  - 新 Conversation 的 `provider_state` 为空。
+  - 重建新 Conversation 的 `state`。
 - `compression_service.py`
   - 对外提供 `compress_if_needed(...)`。
-  - 由 `AgentExecutionEngine` 在主 Agent LLM 请求前调用。
+  - 由 `AgentExecutionEngine` 在主 Agent LLM 请求前调用，成功时返回新的压缩后 Conversation。
 
 ### 15.3 执行引擎接入方式
 
@@ -895,6 +901,8 @@ llm_request_service = LlmClientFactory.create(resource_resolver, event_publisher
 context_compression_service = ContextCompressionService(
   llm_request_service=llm_request_service,
   llm_registry_gateway=LlmModelRegistryFactory.create(),
+  conversation_repository=conversation_repository,
+  runtime_gateway=AgentRuntimeFactory.create(),
   resource_resolver=resource_resolver,
   event_publisher=event_publisher,
   config_accessor=lambda: ConfigRegistry.instance().context_compression,
@@ -919,17 +927,27 @@ if context_compression_service is not None:
   compression_result = await context_compression_service.compress_if_needed(
     task=task,
     instance=instance,
-    conversation=conversation,
+    source_conversation=conversation,
     resolved_candidates=resolved_candidates,
     communication_context=communication_context,
     interrupt_checker=lambda: interrupt_state.requested,
   )
-  if compression_result.replaced:
-    await conversation_repository.save(conversation)
+  if compression_result.created:
+    conversation = compression_result.target_conversation
+    communication_context = communication_context.with_metadata(conversation_id=conversation.id)
     trace_recorder.record_event(...)
 
 llm_response = await send_prompt_with_policy_failover(...)
 ```
+
+触发节点的完整语义：
+
+- 每轮主 Agent LLM 请求前都可以检查一次上下文是否需要压缩。
+- 检查必须发生在 `_drain_pending_user_messages_to_conversation` 之后，确保本轮用户最新输入已经进入 `Conversation.messages`。
+- 检查必须发生在 `_send_prompt_with_policy_failover` 之前，避免在上下文已经超限时仍然发起主 Agent LLM 请求。
+- 检查不得发生在主 Agent assistant tool_use 与 tool_result 之间，避免破坏 LLM 工具协议完整性。
+- 检查不得发生在主 Agent LLM 流式响应过程中；流式响应中如果收到用户中断，应走现有中断语义，而不是边流式边压缩。
+- 如果主 Agent 上一轮 LLM 请求返回的 `last_context_usage` 已超过阈值，则下一轮进入主 Agent LLM 请求前优先执行压缩。
 
 ### 15.4 触发策略
 
@@ -958,7 +976,7 @@ effective_threshold =
 
 闸门必须具备幂等性：
 
-- 如果上一轮已经压缩到只剩 synthetic summary + raw tail，且没有新的可压缩历史，必须跳过。
+- 如果当前 active Conversation 已经只剩 synthetic summary + raw tail，且没有新的可压缩历史，必须跳过。
 - 不得因为旧的 `last_context_usage` 数值仍然较高而反复压缩同一段消息。
 - 判断是否可压缩应以 `CompressionRangePlanner` 返回的有效区间为准。
 
@@ -979,19 +997,24 @@ effective_threshold =
   "compressed_end_index": 42,
   "retained_tail_start_index": 43,
   "retained_tail_end_index": 58,
-  "reason": "context_usage_exceeded_threshold"
+  "retained_tail_anchor": "latest_assistant_message",
+  "reason": "context_usage_exceeded_threshold",
+  "compression_index": 3
 }
 ```
 
 规则：
 
 - 默认从消息 0 开始压缩较早历史。
-- 如果消息 0 已经是旧的 Runtime Compressed Task Context，也应纳入新的压缩输入，由新 summary 替代旧 summary，避免多层嵌套摘要。
-- retained raw tail 至少保留最近用户消息。
-- 如果最近一轮是 assistant tool_use + tool_result，raw tail 必须同时保留 assistant tool_use 消息和对应 tool_result 消息。
+- 如果消息 0 已经是旧的 Runtime Compressed Task Context，也应纳入新的压缩输入，由新 target Conversation 中的新 summary 替代旧 summary，避免多层嵌套摘要。
+- retained raw tail 默认从最近一次 assistant 消息开始，保留该 assistant 消息及其之后的所有消息。
+- 如果最近一次 assistant 消息之后还有 user 消息、tool 消息或后续 assistant 消息，必须全部保留，不能只保留最新 user。
+- 如果最近一次 assistant 消息包含 tool_use，raw tail 必须同时保留该 assistant tool_use 消息和对应 tool_result 消息。
+- 如果 Conversation 中还没有 assistant 消息，retained raw tail 至少从最近一次 user 消息开始保留。
 - 不允许 compressed range 与 raw tail 拆开同一组 tool_use/tool_result 配对。
 - 如果发现已有历史存在未配对 tool_use/tool_result，优先降级为 transcript snapshot；仍无法安全处理时暂停主 Agent 并报告 `context_compression_unsafe_tool_protocol`。
 - 如果可压缩区间消息数低于配置阈值，应跳过压缩。
+- retained raw tail 选择完成后，compressed range 才能确定；压缩区间永远是 retained raw tail 之前的较早历史。
 
 ### 15.6 Worker LLM 执行方式
 
@@ -1021,7 +1044,7 @@ while not section_complete and round_count < max_rounds:
 - Worker 不写主 Conversation。
 - Worker 不消费 AgentInstance.pending_user_messages。
 - Worker 中间 assistant/tool 消息不持久化到主 Conversation。
-- Worker 被用户中断时，应取消当前 Worker LLM 请求，不替换主 Conversation，并让主 Agent 暂停在安全边界。
+- Worker 被用户中断时，应取消当前 Worker LLM 请求，不创建或绑定 target Conversation，并让主 Agent 暂停在安全边界。
 
 ### 15.7 Section 并发与汇编
 
@@ -1042,45 +1065,177 @@ TodoRiskWorker
 2. FinalAssemblerWorker 基于 SectionItem 和 provenance metadata 生成最终 Markdown。
 3. 如果启用 FinalVerifierWorker，则校验最终 Markdown。
 4. Verifier 发现 P0 缺失或无来源事实时，Runtime 可重跑相关 Section Worker 或 FinalAssembler。
-5. 多次失败后不替换 Conversation，并暂停主 Agent。
+5. 多次失败后不创建 target Conversation，并暂停主 Agent。
 
-### 15.8 Conversation 替换与状态更新
+### 15.8 Conversation 新建、绑定与状态更新
 
-压缩成功后，`conversation_rewriter` 构造：
+压缩成功后必须新建业务 Conversation，不允许覆盖或复用旧 `conversation_id`。
+
+本次压缩开始时，当前 active Conversation 记为 `source_conversation`：
 
 ```text
-conversation.messages = [
+source_conversation_id = conversation.id
+```
+
+压缩完成后，`conversation_rewriter` 构造一个新的 `target_conversation`：
+
+```text
+target_conversation = create_conversation()
+target_conversation.messages = [
   synthetic user message: "# Runtime Compressed Task Context\n...",
   ...retained raw tail messages
 ]
+target_conversation.provider_state = {}
+target_conversation.state = recompute from target_conversation.messages
 ```
+
+随后 Runtime 必须：
+
+```text
+ConversationRepository.create(
+  target_conversation,
+  task_id=source task_id,
+  thread_id=source thread_id,
+  agent_id=source agent_id,
+  agent_instance_id=source agent_instance_id,
+)
+AgentRuntimeGateway.bind_agent_instance_conversation(
+  agent_instance_id,
+  target_conversation.id,
+)
+conversation = target_conversation
+communication_context = communication_context.with_metadata(conversation_id=target_conversation.id)
+```
+
+旧 `source_conversation` 保持不变：
+
+- 不重写旧 JSONL 消息文件。
+- 不清空旧 `provider_state`。
+- 不删除旧 Conversation 元数据。
+- 旧 Conversation 作为压缩前窗口和审计数据继续保留。
+
+新 `target_conversation` 的规则：
+
+- 使用新的 `target_conversation_id`。
+- 绑定同一个 `task_id`、`thread_id`、`agent_id` 和 `agent_instance_id`。
+- `provider_state` 为空，因为 provider cache、thinking 续接、message index 和 cache breakpoint 都不能跨压缩后的新消息窗口继承。
+- `conversation.state` 根据新 messages 重算。
+- `conversation.state.last_context_usage` 初始可以为空；下一次主 Agent LLM 请求成功后由 `_record_last_context_usage` 写入新快照。
 
 synthetic user message 的 Markdown 必须包含 Usage Contract，并明确：
 
 - 这是 Runtime 自动生成的历史上下文压缩摘要。
 - 它不是新用户任务。
 - 如果它与后续 retained raw tail 冲突，以 raw tail 为准。
+- 本摘要对应的 `job_id`、`root_conversation_id`、`source_conversation_id`、`target_conversation_id`、`compression_index`、压缩消息范围和 retained raw tail 范围。
 
-替换后必须：
+`Conversation` 领域对象本身不承载 `task_id`、`agent_instance_id` 或 `compression_index`。当前代码中 task / thread / agent / agent_instance 绑定存在 `SqliteConversationRepository` 的 `conversations` 表中；压缩链路、压缩次数和压缩历史应由独立的 `ContextCompressionArchiveRepository` 维护。
 
-- 保持 `conversation.id` 不变。
-- 保持 task / thread / agent / agent_instance 绑定不变。
-- 清空 `conversation.provider_state`，因为 provider cache、thinking 续接、message index 和 cache breakpoint 都已失效。
-- 重建 `conversation.state`。
-- 保留或重写 `conversation.state.last_context_usage` 时必须避免触发重复压缩；第一阶段建议由 gate 的区间幂等判断解决重复触发问题，不把旧 usage 当作唯一触发依据。
-- 调用 `ConversationRepository.save(conversation)` 全量覆写 JSONL 消息文件、派生状态和 provider_state。
-
-如果实现 `ContextCompressionArchiveRepository`，应在替换前额外保存：
+`ContextCompressionArchiveRepository` 是 Phase 1 必须能力。每次压缩在新建 target Conversation 前后必须归档：
 
 - job_id
-- conversation_id
-- compressed message index range
-- retained tail range
+- task_id
+- thread_id
+- agent_id
+- agent_instance_id
+- root_conversation_id
+- source_conversation_id
+- target_conversation_id
+- compression_index
+- created_at
+- completed_at
+- status
+- compressed message index range in source conversation
+- retained tail range in source conversation
+- retained_tail_anchor
 - final summary markdown
 - verifier result
-- 压缩前消息快照或其持久化位置
+- source conversation messages snapshot path
+- target conversation messages snapshot path
+- synthetic summary message metadata
 
-Archive 只用于 Runtime 内部审计和可能的恢复，不作为后续 Agent 的主上下文来源。
+`compression_index` 规则：
+
+- 对同一个压缩链路按 `(task_id, agent_instance_id, root_conversation_id)` 从 1 开始递增。
+- `root_conversation_id` 是该 AgentInstance 初始未压缩 Conversation 的 ID。
+- 第一次压缩时，如果 source Conversation 没有既有压缩链路，则 `root_conversation_id = source_conversation_id`，`compression_index = 1`。
+- 第 N 次压缩时，`source_conversation_id` 通常是上一次压缩生成的 `target_conversation_id`，`root_conversation_id` 沿用链路根 ID，`compression_index = previous_successful_index + 1`。
+- 每次成功创建并绑定 target Conversation 时消耗一个新的 successful `compression_index`。
+- 失败但已经创建 job 的压缩可记录为 failed/cancelled，但不得占用 successful compression 的有序恢复语义；查询时可同时返回所有 job 状态。
+- synthetic summary message 中写入的 `compression_index` 必须与 archive 中一致。
+
+Archive 用于 Runtime 内部审计、恢复和未来 UI 查询，不作为后续 Agent 的主上下文来源。后续 Agent 继续只读取当前 active `target_conversation.messages`。
+
+### 15.8.1 多次压缩后的历史查询模型
+
+Agent 多轮对话过程中可能触发多次上下文压缩。持久化数据必须能回答以下查询：
+
+- 按 `task_id` 查看该任务下所有 Agent 实例的 Conversation 链路和压缩节点。
+- 按 `agent_instance_id` 查看单个 Agent 实例当前 active Conversation 以及从 root Conversation 到当前 Conversation 的压缩链路。
+- 按 `root_conversation_id` 查看该 Agent 实例从初始 Conversation 开始发生过的所有压缩 job。
+- 按 `source_conversation_id` 或 `target_conversation_id` 定位某次压缩 job。
+- 按 `root_conversation_id + compression_index` 查看某次压缩前的 source 消息快照、压缩区间、保留尾部、最终 summary 和 target 消息快照。
+
+建议 archive 表按以下键组织：
+
+```text
+context_compression_jobs
+  job_id primary key
+  task_id
+  thread_id
+  agent_id
+  agent_instance_id
+  root_conversation_id
+  source_conversation_id
+  target_conversation_id
+  compression_index
+  status
+  compressed_start_index
+  compressed_end_index
+  retained_tail_start_index
+  retained_tail_end_index
+  retained_tail_anchor
+  input_mode
+  final_summary_path or final_summary_json
+  before_messages_snapshot_path
+  after_messages_snapshot_path
+  created_at
+  completed_at
+```
+
+推荐索引：
+
+```text
+(task_id, agent_instance_id, root_conversation_id, compression_index)
+(root_conversation_id, compression_index)
+(source_conversation_id)
+(target_conversation_id)
+(job_id)
+```
+
+这样未来通过 task / agent_instance 查看任务过程时，可以将 Conversation 链路与压缩归档按 `compression_index` 有序分组：
+
+```text
+Task
+  AgentInstance
+    Conversation C0 root
+    Compression #1
+      source_conversation_id: C0
+      target_conversation_id: C1
+      before/source snapshot
+      final summary
+      retained tail
+    Conversation C1
+    Compression #2
+      source_conversation_id: C1
+      target_conversation_id: C2
+      before/source snapshot
+      final summary
+      retained tail
+    Conversation C2 active
+```
+
+AgentInstance 始终只绑定一个当前 active `conversation_id`，用于后续 LLM 执行；Archive 则保存 Conversation 链路、每次压缩的 source/target 边界和压缩前后快照。
 
 ### 15.9 事件、Trace 与用户中断
 
@@ -1101,7 +1256,10 @@ context_compression.skipped
 
 - task_id
 - agent_instance_id
-- conversation_id
+- root_conversation_id
+- source_conversation_id
+- target_conversation_id
+- compression_index
 - job_id
 - compressed_range
 - retained_tail_range
@@ -1113,9 +1271,9 @@ context_compression.skipped
 用户中断语义：
 
 - 如果中断发生在 Worker LLM 请求中，取消 Worker 请求，不保存部分 Worker assistant。
-- 如果中断发生在 Section 已写入 job store 但 Conversation 尚未替换前，丢弃本次未完成 job，主 Conversation 保持原样。
-- 如果中断发生在替换已完成后，Conversation 已处于新的完整状态，主 Agent 在下一安全点暂停。
-- 不允许留下 assistant tool_use 没有 tool_result 的主 Conversation。
+- 如果中断发生在 Section 已写入 job store 但 target Conversation 尚未创建或尚未绑定前，丢弃本次未完成 job，AgentInstance 继续绑定原 source Conversation。
+- 如果中断发生在 target Conversation 已创建并绑定完成后，新 Conversation 已处于完整状态，主 Agent 在下一安全点暂停。
+- 不允许在 source 或 target Conversation 中留下 assistant tool_use 没有 tool_result 的不完整协议状态。
 
 ### 15.10 配置设计
 
@@ -1153,18 +1311,19 @@ context_compression:
 
 #### Phase 1：最小可用上下文压缩闭环
 
-目标：在主 Agent LLM 请求前，当 `last_context_usage` 超过阈值时，完成一次可用压缩并替换 Conversation。
+目标：在主 Agent LLM 请求前，当 `last_context_usage` 超过阈值时，完成一次可用压缩，创建新的 target Conversation，并把当前 AgentInstance 绑定到新 Conversation。
 
 实现内容：
 
 1. 新增 `context_compression` 包和内存 job store。
 2. 新增 ContextCompressionConfig，并接入 ConfigRegistry。
 3. 新增 Gate、RangePlanner、ConversationRewriter。
-4. 实现 transcript snapshot 输入路径。
-5. 实现 Section WorkerRunner 和 context_summary 受限工具。
-6. 实现 FinalAssemblerWorker。
-7. 接入 AgentExecutionEngine 主循环。
-8. 添加单元测试覆盖触发、区间、替换、provider_state 清空。
+4. 新增 ContextCompressionArchiveRepository，记录 task / agent_instance / root_conversation / source_conversation / target_conversation / compression_index 和压缩前后快照。
+5. 实现 transcript snapshot 输入路径。
+6. 实现 Section WorkerRunner 和 context_summary 受限工具。
+7. 实现 FinalAssemblerWorker。
+8. 接入 AgentExecutionEngine 主循环。
+9. 添加单元测试覆盖触发、区间、raw tail 从最近 assistant 开始保留、target Conversation 新建、AgentInstance 重新绑定、target provider_state 为空、多次 compression_index 递增。
 
 Phase 1 可以先不启用原生多模态历史输入，只实现 transcript snapshot；但 prompt 文档和接口必须保留两种输入能力，避免后续接口重构。
 
@@ -1187,11 +1346,10 @@ Phase 1 可以先不启用原生多模态历史输入，只实现 transcript sna
 实现内容：
 
 1. FinalVerifierWorker。
-2. ContextCompressionArchiveRepository。
-3. context window exceeded 失败后的压缩重试。
-4. 更准确的 token 估算。
-5. 压缩 job REST 查询接口。
-6. 前端展示压缩进度事件。
+2. context window exceeded 失败后的压缩重试。
+3. 更准确的 token 估算。
+4. 压缩 job REST 查询接口。
+5. 前端展示压缩进度事件。
 
 ## 16. 失败处理
 
@@ -1203,8 +1361,8 @@ Phase 1 可以先不启用原生多模态历史输入，只实现 transcript sna
 
 如果 FinalAssembler 失败：
 
-- 不替换 conversation。
-- 保持原 conversation 完整状态。
+- 不创建 target Conversation。
+- 保持 source Conversation 完整状态，AgentInstance 继续绑定 source Conversation。
 - 暂停 Agent 并报告 `context_compression_failed`。
 
 如果 Verifier 失败：
@@ -1221,5 +1379,5 @@ Phase 1 可以先不启用原生多模态历史输入，只实现 transcript sna
 - 所有 Worker 通过 append 工具增量写入，不要求一次性完整输出。
 - 不写死每次 append 的条数或 token 限制，由提示词要求模型在内容较多时自行分批。
 - 持久化资源必须以可再读取形式保留，不能只保留文件名、资源名或模糊摘要。
-- Runtime 统一汇编和替换 conversation，Worker 不直接修改原会话。
+- Runtime 统一汇编并创建压缩后的 target Conversation，Worker 不直接修改原会话。
 - 最终产物是一份完整任务恢复 Markdown 加最近 raw tail，而不是普通聊天摘要。
