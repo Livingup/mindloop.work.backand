@@ -1351,7 +1351,7 @@ context_compression.skipped
   - `verifier_enabled=false` 时不发布。
 - `context_compression.verification.completed`
   - 校验完成。
-  - payload 只包含 `verification_status`、issue count 和简短 issue 摘要，不包含完整 summary。
+  - payload 只包含 `verification_status`、issue count 和简短 issue 摘要，不包含完整压缩 Markdown。
 - `context_compression.conversation.rebind.completed`
   - target Conversation 已创建，AgentInstance 已重新绑定到新的 `target_conversation_id`。
   - 这是“压缩结果已成为后续主 Agent 上下文”的关键确认事件。
@@ -1470,7 +1470,7 @@ Worker 事件 payload 追加：
 
 不应在事件中暴露 API key、provider raw、完整压缩输入或大段中间摘要。
 
-也不应默认在 SSE 事件中推送完整最终 summary Markdown。完整 summary 已写入 target Conversation 的 synthetic user message，并由 Archive 持久化；前端如需查看详情，应通过后续压缩 job 查询接口或 Conversation 查询接口读取，而不是依赖实时事件承载大段内容。
+也不应默认在 SSE 事件中推送完整最终压缩 Markdown。完整压缩 Markdown 已写入 target Conversation 的 synthetic user message，并由 Archive 持久化；压缩最终成功后，前端必须根据 `target_conversation_id`、`summary_message_id` 或 `archive_job_id` 拉取完整 Markdown，并在上下文压缩阶段气泡中全文展示，而不是依赖实时事件承载大段内容。
 
 #### 15.9.1 事件 envelope 与推荐顺序
 
@@ -1554,21 +1554,24 @@ context_compression.skipped
 
 #### 15.9.2 前端展示设计
 
-前端应把上下文压缩渲染为 Agent 执行过程的一部分，而不是渲染为普通 user/assistant 聊天气泡。
+前端应把上下文压缩渲染为当前 Agent 执行过程的一部分。一次上下文压缩对应当前 Agent process bubble 中的一个独立“上下文压缩阶段气泡”，该气泡承载压缩过程、Worker 状态和最终压缩结果。它不是普通 user/assistant 聊天气泡，也不是每个 Worker 各自生成一个聊天气泡。
 
 展示原则：
 
-- 上下文压缩开始后，在当前 Agent process bubble 中增加一个“上下文压缩”阶段块。
+- 上下文压缩开始后，在当前 Agent process bubble 中增加一个独立“上下文压缩”阶段气泡。
+- 一个 compression job 只对应一个阶段气泡，以 `job_id` 作为稳定 key。
 - 不为每个 Worker 创建独立聊天气泡。
 - 不把 Worker 中间 LLM assistant 内容直接显示成 Agent 回复。
 - 不展示完整压缩输入、完整 prompt、API key 或 provider raw。
-- 如果用户打开详情，可以展示 Worker 名称、状态、耗时、模型、input mode、并发等待原因、追加条目数量和简短错误摘要。
+- 前端关注的是上下文压缩阶段过程：触发、范围规划、并发等待、Worker 进度、汇编、校验、Conversation 重新绑定、完成/失败/取消。
+- Worker 只作为阶段气泡内部的进度行展示。如果用户打开详情，可以展示 Worker 名称、状态、耗时、模型、input mode、并发等待原因、追加条目数量和简短错误摘要。
+- 压缩最终成功后，阶段气泡必须展示压缩后的完整 Markdown 内容；该 Markdown 是最终压缩结果，不是 Worker 中间 LLM 内容，也不是新的 Agent assistant 回复。
 
 推荐 process bubble 结构：
 
 ```text
 Agent process bubble
-  上下文压缩 #3 · 运行中
+  [独立阶段气泡] 上下文压缩 #3 · 运行中
     触发原因：上下文窗口超过阈值
     压缩范围：0..42
     保留尾部：43..58 · latest_assistant_message
@@ -1591,11 +1594,21 @@ Agent process bubble
 完成态展示：
 
 ```text
-上下文压缩 #3 完成 · 6/6 workers · 12.4s
+[独立阶段气泡] 上下文压缩 #3 完成 · 6/6 workers · 12.4s
 已从 source Conversation 创建 target Conversation
 压缩 43 条历史消息，保留最近 16 条 raw tail
 预计上下文从 180k 降至 42k tokens
+
+压缩后的完整上下文 Markdown：
+<全文渲染 Runtime Compressed Task Context Markdown>
 ```
+
+完成态 Markdown 展示规则：
+
+- `context_compression.completed` 到达后，前端应使用事件中的 `target_conversation_id`、`summary_message_id` 或 `archive_job_id` 读取最终 Markdown。
+- 完整 Markdown 在同一个“上下文压缩”阶段气泡中渲染，可默认展开或显示“查看完整压缩内容”折叠区，但内容必须可全文查看。
+- 完整 Markdown 不应作为普通 assistant message 气泡插入聊天流，避免用户误以为这是主 Agent 对任务的业务回答。
+- 如果完整 Markdown 读取失败，阶段气泡显示读取失败提示，并保留重试入口；不应把压缩 job 误标记为失败，因为压缩本身已经完成。
 
 失败态展示：
 
@@ -1621,19 +1634,19 @@ Agent 已暂停，等待用户输入或调整上下文压缩设置
 
 前端状态聚合规则：
 
-- 以 `job_id` 作为一次上下文压缩 UI 块的稳定 key。
+- 以 `job_id` 作为一次上下文压缩阶段气泡的稳定 key。
 - 以 `worker.name` 作为 Worker 行 key。
 - 事件可能因为 SSE 重连而重放，前端必须按 `seq` 去重，并按 `job_id + worker.name` 合并状态。
 - `worker.progress` 事件只更新计数，不追加聊天文本。
 - `context_compression.conversation.rebind.completed` 到达后，前端可更新当前 AgentInstance 的 active conversation 标识，但不应清空当前聊天 UI；历史查询应通过 Conversation lineage 和 Archive 进行。
-- `context_compression.completed` 到达后，该阶段折叠为摘要行；用户可展开查看 Worker 明细。
+- `context_compression.completed` 到达后，该阶段气泡进入完成态，展示完成摘要并加载完整压缩 Markdown；用户可展开查看 Worker 明细和完整 Markdown。
 - `context_compression.failed` 或 `cancelled` 到达后，该阶段保持展开，便于用户看到失败 Worker 和原因。
 
 #### 15.9.3 与 Chat Bubble 持久化的关系
 
 上下文压缩 SSE 事件属于运行过程事件，不是 Conversation 消息，也不是普通 Agent 回复。
 
-前端可以将其纳入现有 process bubble 的前端持久化结果，但后端不应把这些事件自动转成 Chat Bubble 作为恢复真相来源。可恢复的业务真相应来自：
+前端可以将其纳入现有 process bubble 的前端持久化结果，并把完整压缩 Markdown 作为该阶段气泡的最终展示内容。但后端不应把这些事件自动转成 Chat Bubble 作为恢复真相来源。可恢复的业务真相应来自：
 
 - Conversation lineage。
 - `ContextCompressionArchiveRepository`。
@@ -2137,7 +2150,7 @@ Context Compression Settings
 10. 实现 Section WorkerRunner 和 context_summary 受限工具。
 11. 实现 FinalAssemblerWorker。
 12. 接入 AgentExecutionEngine 主循环。
-13. 实现基础 `context_compression.*` 通信流事件，并在前端 process bubble 中展示压缩开始、Worker 进度、汇编、校验、Conversation 重新绑定、完成/失败/取消状态。
+13. 实现基础 `context_compression.*` 通信流事件，并在当前 Agent process bubble 中以独立“上下文压缩”阶段气泡展示压缩开始、Worker 进度、汇编、校验、Conversation 重新绑定、完成/失败/取消状态；压缩成功后在该阶段气泡中全文展示最终压缩 Markdown。
 14. 添加单元测试覆盖触发、区间、raw tail 从最近 assistant 开始保留、target Conversation 新建、AgentInstance 重新绑定、target provider_state 为空、多次 compression_index 递增、Worker LLM 选择优先级、全局/服务商并发限制、prompt override revision 记录、压缩事件顺序和 payload 安全性。
 
 Phase 1 可以先不启用原生多模态历史输入，只实现 transcript snapshot；但 prompt 文档和接口必须保留两种输入能力，避免后续接口重构。
@@ -2165,7 +2178,7 @@ Phase 1 可以先不启用原生多模态历史输入，只实现 transcript sna
 3. 更准确的 token 估算。
 4. 压缩 job REST 查询接口。
 5. 前端展示历史压缩链路、source/target Conversation、compression_index、Worker 配置快照和 prompt revision。
-6. 前端支持从压缩 job REST 查询接口重建历史压缩详情、查看完整 summary、查看 Worker 明细和失败原因。
+6. 前端支持从压缩 job REST 查询接口重建历史压缩详情、查看完整压缩 Markdown、查看 Worker 明细和失败原因。
 
 ## 16. 失败处理
 
