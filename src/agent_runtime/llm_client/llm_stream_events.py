@@ -91,6 +91,8 @@ class LlmSemanticStreamParser:
             if item_type == "reasoning":
                 events.extend(self._start_thinking(provider_event_type=data_type, part_id=_text_or_none(item.get("id"))))
             elif item_type == "function_call":
+                events.extend(self._complete_thinking(provider_event_type=data_type, part_id=None))
+                events.extend(self._complete_content(provider_event_type=data_type, part_id=None))
                 state = self._openai_response_tool_state(data, item)
                 events.append(LlmSemanticStreamEvent(
                     "llm.tool_call.started",
@@ -120,6 +122,7 @@ class LlmSemanticStreamParser:
         elif data_type == "response.output_text.delta":
             delta = _text_or_none(data.get("delta"))
             if delta:
+                events.extend(self._complete_thinking(provider_event_type=data_type, part_id=None))
                 events.extend(self._start_content(provider_event_type=data_type, part_id=_text_or_none(data.get("item_id"))))
                 events.append(LlmSemanticStreamEvent(
                     "llm.content.delta",
@@ -136,6 +139,7 @@ class LlmSemanticStreamParser:
             state = self._find_openai_response_tool_state(data)
             delta = _text_or_none(data.get("delta"))
             if state and delta:
+                events.extend(self._complete_thinking(provider_event_type=data_type, part_id=None))
                 state.arguments_parts.append(delta)
                 events.append(LlmSemanticStreamEvent(
                     "llm.tool_call.arguments.delta",
@@ -246,6 +250,7 @@ class LlmSemanticStreamParser:
                 ))
             content_delta = _text_or_none(delta.get("content"))
             if content_delta:
+                events.extend(self._complete_thinking(provider_event_type=event_name, part_id=None))
                 events.extend(self._start_content(provider_event_type=event_name, part_id=None))
                 events.append(LlmSemanticStreamEvent(
                     "llm.content.delta",
@@ -254,6 +259,8 @@ class LlmSemanticStreamParser:
             for tool_call_delta in delta.get("tool_calls") or []:
                 if not isinstance(tool_call_delta, dict):
                     continue
+                events.extend(self._complete_thinking(provider_event_type=event_name, part_id=None))
+                events.extend(self._complete_content(provider_event_type=event_name, part_id=None))
                 events.extend(self._parse_chat_tool_call_delta(event_name, tool_call_delta))
             finish_reason = choice.get("finish_reason")
             if finish_reason == "tool_calls":

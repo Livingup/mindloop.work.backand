@@ -22,6 +22,60 @@
 
 ---
 
+# 后端统一语义事件
+
+前端不直接消费 provider 原始事件。后端必须把原始事件转换成以下统一语义事件：
+
+```text
+llm.response.started
+llm.thinking.started
+llm.thinking.completed
+llm.content.started
+llm.content.delta
+llm.content.completed
+llm.tool_call.started
+llm.tool_call.completed
+llm.response.completed
+```
+
+`llm.thinking.delta` 不推给前端；前端只关心 thinking 是否开始和结束。
+
+`llm.response.completed` 最终由 LLM 请求服务在 provider 响应完成、assistant message 写回 conversation 后发布。parser 可识别 provider 完成事件，但该语义事件不直接透传给前端，避免和最终落库完成事件重复。
+
+## GPT-5.5 判定规则
+
+| 前端语义节点 | 原始事件判定条件 | 说明 |
+| --- | --- | --- |
+| `llm.response.started` | 收到 SSE stream started / HTTP stream headers | LLM 开始有流式响应，不等第一个 token |
+| `llm.thinking.started` | `response.output_item.added` + `item.type=reasoning` | reasoning item 开始 |
+| `llm.thinking.completed` | `response.output_item.done` + `item.type=reasoning`；或已 thinking 后首次进入 `output_text` / `function_call` 阶段时兜底完成 | 前端不展示 reasoning 内容 |
+| `llm.content.started` | 首个 `response.output_text.delta` | 普通文本开始流式输出 |
+| `llm.content.delta` | 每个 `response.output_text.delta` | 前端实时追加普通文本 |
+| `llm.content.completed` | `response.output_text.done` / `response.content_part.done`；或已 content 后首次进入 `function_call` 阶段时兜底完成 | 普通文本流结束 |
+| `llm.tool_call.started` | `response.output_item.added` + `item.type=function_call` | 每个 function_call item 都单独开始；用 `output_index` / `item.id` / `call_id` 关联 |
+| `llm.tool_call.completed` | `response.output_item.done` + `item.type=function_call` | 单个工具调用生成结束；参数可由之前的 `response.function_call_arguments.*` 聚合 |
+| `llm.response.completed` | provider `response.completed` 后，runtime 完成 assistant message ingest | 整个 assistant response 完成；usage 在最终 response 上 |
+
+GPT-5.5 的工具调用是多个独立 `function_call` output item，因此可以准确判断每个工具的开始和结束。
+
+## DeepSeek v4 判定规则
+
+| 前端语义节点 | 原始事件判定条件 | 说明 |
+| --- | --- | --- |
+| `llm.response.started` | 收到 SSE stream started / HTTP stream headers | LLM 开始有流式响应，不等第一个 token |
+| `llm.thinking.started` | 首个 `message[choices[0].delta.reasoning_content]` | thinking 开始 |
+| `llm.thinking.completed` | 已 thinking 后首次出现 `delta.content` / `delta.tool_calls` / `finish_reason` | Chat Completions 没有单独 thinking done 事件，只能根据阶段切换判断 |
+| `llm.content.started` | 首个 `message[choices[0].delta.content]` | 普通文本开始流式输出 |
+| `llm.content.delta` | 每个 `message[choices[0].delta.content]` | 前端实时追加普通文本 |
+| `llm.content.completed` | 已 content 后首次出现 `delta.tool_calls` / `finish_reason` | Chat Completions 没有单独 content done 事件，只能根据阶段切换判断 |
+| `llm.tool_call.started` | 某个 `tool_calls[].index` 首次出现 | 每个 index 对应一个工具调用；用 `index` / `id` 关联 |
+| `llm.tool_call.completed` | `finish_reason=tool_calls` 时，对已出现的所有 `tool_calls[].index` 逐个补完成 | DeepSeek 兼容协议没有单个 tool_call done 事件，不能在协议层精确知道某个工具何时结束，只能在工具调用流整体结束时按 index 完成 |
+| `llm.response.completed` | provider `finish_reason` 非空后，runtime 完成 assistant message ingest；usage chunk 只补 token 统计 | assistant response 完成 |
+
+DeepSeek v4 的工具调用增量都挂在 `message[choices[0].delta.tool_calls]` 下。协议没有 GPT-5.5 那种 `function_call_arguments.done` / `output_item.done[item.type=function_call]`，所以“一个工具生成结束”只能由后端状态机在整体 `finish_reason=tool_calls` 到达时补齐，不能从 provider 原始事件中逐个精确读取。
+
+---
+
 # GPT-5.5
 
 协议：OpenAI Responses API

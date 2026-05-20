@@ -43,6 +43,7 @@ _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
 _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
     "llm.response.completed",
     "llm.response.failed",
+    "llm.thinking.delta",
     "llm.tool_call.arguments.delta",
     "llm.tool_call.arguments.completed",
 }
