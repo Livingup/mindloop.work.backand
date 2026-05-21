@@ -489,7 +489,14 @@ def _post_json_sync(
                         duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
                         sse_event_count=_count_sse_events(text),
                     )
-                return sse_aggregator(text)
+                try:
+                    return sse_aggregator(text)
+                except LlmProviderResponseError:
+                    raise
+                except Exception as exc:
+                    raise LlmProviderResponseError(
+                        f"LLM 流式响应未成功聚合完整回复: {exc.__class__.__name__}: {exc}"
+                    ) from exc
             _raise_if_cancelled(cancellation_checker)
             response_bytes = response.read()
             if trace_enabled:
@@ -503,7 +510,12 @@ def _post_json_sync(
                     duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
                 )
             text = response_bytes.decode("utf-8")
-            return json.loads(text) if text else {}
+            try:
+                return json.loads(text) if text else {}
+            except json.JSONDecodeError as exc:
+                raise LlmProviderResponseError(
+                    f"LLM JSON 响应未成功解析为完整回复: {exc}"
+                ) from exc
     except urllib.error.HTTPError as exc:
         error_bytes = exc.read()
         if trace_enabled:
@@ -563,12 +575,8 @@ def _aggregate_openai_responses_sse(text: str) -> dict[str, Any]:
                 response_body["output"] = output_items
             return response_body
         elif data_type in {"response.failed", "response.incomplete", "error"}:
-            raise RuntimeError(f"OpenAI Responses 流式响应失败: {data_text[:500]}")
-    if response_body is None:
-        response_body = {}
-    if not response_body.get("output") and output_items:
-        response_body["output"] = output_items
-    return response_body
+            raise LlmProviderResponseError(f"OpenAI Responses 流式响应失败: {data_text[:500]}")
+    raise LlmProviderResponseError("OpenAI Responses 流式响应未完整完成。")
 
 
 def _read_sse_response_text(
@@ -656,12 +664,16 @@ def _aggregate_chat_completions_sse(text: str) -> dict[str, Any]:
     reasoning_parts: list[str] = []
     tool_calls_by_index: dict[int, dict[str, Any]] = {}
     finish_reason: Any = None
+    done_received = False
     for _, data_text in _iter_sse_events(text):
         if data_text == "[DONE]":
+            done_received = True
             continue
         data = json.loads(data_text)
         if not isinstance(data, dict):
             continue
+        if data.get("error") is not None:
+            raise LlmProviderResponseError(f"Chat Completions 流式响应失败: {data_text[:500]}")
         for key in ("id", "object", "created", "model", "system_fingerprint"):
             if key in data:
                 response[key] = data[key]
@@ -699,6 +711,8 @@ def _aggregate_chat_completions_sse(text: str) -> dict[str, Any]:
     if tool_calls_by_index:
         message["tool_calls"] = [tool_calls_by_index[index] for index in sorted(tool_calls_by_index)]
     response["choices"][0]["finish_reason"] = finish_reason
+    if not done_received or finish_reason is None:
+        raise LlmProviderResponseError("Chat Completions 流式响应未完整完成。")
     return response
 
 
@@ -706,6 +720,7 @@ def _aggregate_anthropic_messages_sse(text: str) -> dict[str, Any]:
     response: dict[str, Any] = {}
     content_blocks: dict[int, dict[str, Any]] = {}
     input_json_parts: dict[int, list[str]] = {}
+    message_stopped = False
     for _, data_text in _iter_sse_events(text):
         if data_text == "[DONE]":
             continue
@@ -713,6 +728,8 @@ def _aggregate_anthropic_messages_sse(text: str) -> dict[str, Any]:
         if not isinstance(data, dict):
             continue
         data_type = data.get("type")
+        if data_type == "error":
+            raise LlmProviderResponseError(f"Anthropic Messages 流式响应失败: {data_text[:500]}")
         if data_type == "message_start" and isinstance(data.get("message"), dict):
             response = copy.deepcopy(data["message"])
         elif data_type == "content_block_start" and isinstance(data.get("content_block"), dict):
@@ -734,6 +751,8 @@ def _aggregate_anthropic_messages_sse(text: str) -> dict[str, Any]:
             response.update(data.get("delta") or {})
             if data.get("usage") is not None:
                 response["usage"] = data["usage"]
+        elif data_type == "message_stop":
+            message_stopped = True
     for index, parts in input_json_parts.items():
         block = content_blocks.setdefault(index, {"type": "tool_use"})
         partial_json = "".join(parts)
@@ -742,6 +761,8 @@ def _aggregate_anthropic_messages_sse(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             block["input"] = partial_json
     response["content"] = [content_blocks[index] for index in sorted(content_blocks)]
+    if not message_stopped:
+        raise LlmProviderResponseError("Anthropic Messages 流式响应未完整完成。")
     return response
 
 
@@ -750,18 +771,23 @@ def _aggregate_gemini_generate_content_sse(text: str) -> dict[str, Any]:
     output_candidate = response["candidates"][0]
     output_content = output_candidate["content"]
     output_parts = output_content["parts"]
+    finish_reason: Any = None
     for _, data_text in _iter_sse_events(text):
         if data_text == "[DONE]":
             continue
         data = json.loads(data_text)
         if not isinstance(data, dict):
             continue
+        if data.get("error") is not None:
+            raise LlmProviderResponseError(f"Gemini generateContent 流式响应失败: {data_text[:500]}")
         if data.get("usageMetadata") is not None:
             response["usageMetadata"] = data["usageMetadata"]
         candidates = data.get("candidates") or []
         if not candidates:
             continue
         candidate = candidates[0]
+        if candidate.get("finishReason") is not None:
+            finish_reason = candidate.get("finishReason")
         for key, value in candidate.items():
             if key != "content":
                 output_candidate[key] = value
@@ -770,6 +796,8 @@ def _aggregate_gemini_generate_content_sse(text: str) -> dict[str, Any]:
             output_content["role"] = content["role"]
         for part in content.get("parts") or []:
             _append_gemini_part(output_parts, part)
+    if finish_reason is None:
+        raise LlmProviderResponseError("Gemini generateContent 流式响应未完整完成。")
     return response
 
 
@@ -822,3 +850,7 @@ class LlmHttpRequestError(RuntimeError):
         self.status_code = status_code
         self.response_text = response_text
         super().__init__(f"LLM HTTP 请求失败: status={status_code}, body={response_text[:500]}")
+
+
+class LlmProviderResponseError(RuntimeError):
+    pass

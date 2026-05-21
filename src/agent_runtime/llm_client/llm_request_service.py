@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -29,6 +30,7 @@ from agent_runtime.llm_api_protocol import (
 )
 from agent_runtime.llm_client.llm_protocol_clients import (
     LlmHttpRequestError,
+    LlmProviderResponseError,
     LlmProtocolClient,
     LlmRequestCancelled,
 )
@@ -228,6 +230,10 @@ class LlmRequestService:
                     if request.request_attempt_observer is not None:
                         request.request_attempt_observer(dict(request_payload))
                 stream_state: dict[str, bool] = {"response_started": False, "response_failed": False}
+                api_response_received = False
+                messages_snapshot = len(request.conversation.messages)
+                provider_state_snapshot = copy.deepcopy(request.conversation.provider_state)
+                conversation_state_snapshot = copy.deepcopy(request.conversation.state)
                 try:
                     stream_event_handler = _build_stream_event_handler(
                         publisher=self._event_publisher,
@@ -268,61 +274,9 @@ class LlmRequestService:
                         ),
                         cancellation_checker=request.cancellation_checker,
                     )
-                except LlmRequestCancelled as exc:
-                    await self._event_publisher.publish(
-                        request.communication_context,
-                        "llm.request.cancelled",
-                        {
-                            **request_payload,
-                            "attempt_count": attempt_count,
-                            "cancelled_by": "user",
-                            "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                            "partial_response": stream_state.get("response_started") is True,
-                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                            "reason": str(exc) or "LLM request cancelled.",
-                        },
-                        source="llm_client",
-                        metadata={"conversation_id": request.conversation.id},
-                    )
-                    raise
-                except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
-                    if not _is_llm_service_call_failure(exc):
-                        raise
-                    last_error = exc
-                    last_service_call_error = exc
-                    retry_target = _build_retry_target_payload(
-                        resolved=resolved,
-                        candidate_index=request.candidate_index,
-                        api_key_index=key_index,
-                        retry_index=retry_index,
-                        max_retries=max_retries,
-                        api_key_count=len(api_keys),
-                        next_resolved_model=request.next_resolved_model,
-                        retryable=_should_retry(exc, resolved.retry.retryable_status_codes),
-                    )
-                    await self._event_publisher.publish(
-                        request.communication_context,
-                        "llm.request.failed",
-                        {
-                            **request_payload,
-                            "attempt_count": attempt_count,
-                            "error_type": exc.__class__.__name__,
-                            "error_message": str(exc),
-                            "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                            "partial_response": stream_state.get("response_started") is True,
-                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                            **retry_target,
-                        },
-                        source="llm_client",
-                        metadata={"conversation_id": request.conversation.id},
-                    )
-                    if not _should_retry(exc, resolved.retry.retryable_status_codes):
-                        break
-                    if retry_index >= max_retries:
-                        break
-                    await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
-                else:
+                    api_response_received = True
                     if not stream_state.get("response_started"):
+                        stream_state["response_started"] = True
                         await self._event_publisher.publish(
                             request.communication_context,
                             "llm.response.started",
@@ -341,7 +295,80 @@ class LlmRequestService:
                         raw_response,
                         {**render_options, "vendor": resolved.provider_id},
                     )
+                    _ensure_complete_assistant_message(assistant_message)
                     token_usage = _extract_token_usage(resolved.api_format, raw_response)
+                except LlmRequestCancelled as exc:
+                    _restore_conversation_snapshot(
+                        request.conversation,
+                        messages_snapshot,
+                        provider_state_snapshot,
+                        conversation_state_snapshot,
+                    )
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.cancelled",
+                        {
+                            **request_payload,
+                            "attempt_count": attempt_count,
+                            "cancelled_by": "user",
+                            "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                            "partial_response": stream_state.get("response_started") is True,
+                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                            "reason": str(exc) or "LLM request cancelled.",
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
+                    _restore_conversation_snapshot(
+                        request.conversation,
+                        messages_snapshot,
+                        provider_state_snapshot,
+                        conversation_state_snapshot,
+                    )
+                    service_failure = (
+                        api_response_received
+                        or stream_state.get("response_started") is True
+                        or _is_llm_service_call_failure(exc)
+                    )
+                    if not service_failure:
+                        raise
+                    service_error = _as_llm_service_failure(exc)
+                    last_error = service_error
+                    last_service_call_error = service_error
+                    retry_target = _build_retry_target_payload(
+                        resolved=resolved,
+                        candidate_index=request.candidate_index,
+                        api_key_index=key_index,
+                        retry_index=retry_index,
+                        max_retries=max_retries,
+                        api_key_count=len(api_keys),
+                        next_resolved_model=request.next_resolved_model,
+                        retryable=_should_retry(service_error, resolved.retry.retryable_status_codes),
+                    )
+                    await self._event_publisher.publish(
+                        request.communication_context,
+                        "llm.request.failed",
+                        {
+                            **request_payload,
+                            "attempt_count": attempt_count,
+                            "error_type": service_error.__class__.__name__,
+                            "error_message": str(service_error),
+                            "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                            "partial_response": stream_state.get("response_started") is True,
+                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                            **retry_target,
+                        },
+                        source="llm_client",
+                        metadata={"conversation_id": request.conversation.id},
+                    )
+                    if not _should_retry(service_error, resolved.retry.retryable_status_codes):
+                        break
+                    if retry_index >= max_retries:
+                        break
+                    await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
+                else:
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.response.completed",
@@ -680,15 +707,43 @@ def _apply_render_side_effects(conversation: Any, api_format: str, rendered_mess
         }
 
 
+def _restore_conversation_snapshot(
+    conversation: Any,
+    messages_snapshot: int,
+    provider_state_snapshot: dict[str, Any],
+    conversation_state_snapshot: Any,
+) -> None:
+    del conversation.messages[messages_snapshot:]
+    conversation.provider_state.clear()
+    conversation.provider_state.update(provider_state_snapshot)
+    conversation.state = conversation_state_snapshot
+
+
+def _ensure_complete_assistant_message(assistant_message: Any) -> None:
+    if getattr(assistant_message, "role", None) != "assistant":
+        raise LlmProviderResponseError("LLM 响应未生成 assistant 消息。")
+    content = getattr(assistant_message, "content", None)
+    if not isinstance(content, list) or not content:
+        raise LlmProviderResponseError("LLM 响应未生成有效 assistant 内容。")
+
+
 def _should_retry(exc: Exception, retryable_status_codes: tuple[int, ...]) -> bool:
     """判断异常是否应该按重试策略重试。"""
-    if isinstance(exc, LlmHttpRequestError):
-        return exc.status_code in retryable_status_codes
-    return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+    return _is_llm_service_call_failure(exc)
 
 
 def _is_llm_service_call_failure(exc: Exception) -> bool:
-    return isinstance(exc, (LlmHttpRequestError, TimeoutError, ConnectionError, OSError))
+    return isinstance(exc, (LlmHttpRequestError, LlmProviderResponseError, TimeoutError, ConnectionError, OSError))
+
+
+def _as_llm_service_failure(exc: Exception) -> Exception:
+    if _is_llm_service_call_failure(exc):
+        return exc
+    service_error = LlmProviderResponseError(
+        f"LLM API 响应未成功生成完整 assistant 回复: {exc.__class__.__name__}: {exc}"
+    )
+    service_error.__cause__ = exc
+    return service_error
 
 
 def _retry_delay(initial: float, maximum: float, retry_index: int) -> float:
