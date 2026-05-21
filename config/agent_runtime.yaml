@@ -110,10 +110,9 @@ llm_http_trace:
 
 context_compression:
   enabled: true
+  agent_definition_id: "context_compression"
   default_threshold_ratio: 0.75
-  min_compressible_messages: 12
-  retained_tail_min_messages: 8
-  max_worker_rounds: 8
+  max_worker_rounds: 128
   input_mode: "transcript_snapshot"
   verifier_enabled: false
   archive_data_dir: "~/.spread-ai/context-compression"

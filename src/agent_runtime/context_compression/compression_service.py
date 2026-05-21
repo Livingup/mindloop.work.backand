@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
-from agent_runtime.agent.agent_instance import AgentInstance
-from agent_runtime.agent.agent_task import AgentTask
-from agent_runtime.agent.north_gateway.agent_runtime_contracts import AgentRuntimeGateway
+from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import AgentDefinitionNorthGateway
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext, RuntimeEventPublisher
 from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.config import ContextCompressionConfig
@@ -45,6 +43,12 @@ from agent_runtime.conversation_message.message.models import Conversation
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
+from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
+
+if TYPE_CHECKING:
+    from agent_runtime.agent.agent_instance import AgentInstance
+    from agent_runtime.agent.agent_task import AgentTask
+    from agent_runtime.agent.north_gateway.agent_runtime_contracts import AgentRuntimeGateway
 
 
 class ContextCompressionService:
@@ -54,6 +58,8 @@ class ContextCompressionService:
         llm_request_service: LlmRequestService,
         conversation_repository: ConversationRepository,
         runtime_gateway: AgentRuntimeGateway,
+        agent_definition_gateway: AgentDefinitionNorthGateway,
+        llm_registry_gateway: LlmModelRegistryGateway,
         archive_repository: ContextCompressionArchiveRepository,
         event_publisher: RuntimeEventPublisher,
         config_accessor: Callable[[], ContextCompressionConfig],
@@ -61,6 +67,8 @@ class ContextCompressionService:
     ) -> None:
         self._conversation_repository = conversation_repository
         self._runtime_gateway = runtime_gateway
+        self._agent_definition_gateway = agent_definition_gateway
+        self._llm_registry_gateway = llm_registry_gateway
         self._archive_repository = archive_repository
         self._config_accessor = config_accessor
         self._event_publisher = ContextCompressionEventPublisher(event_publisher)
@@ -80,28 +88,38 @@ class ContextCompressionService:
         task: AgentTask,
         instance: AgentInstance,
         source_conversation: Conversation,
-        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
+        trigger_model: ResolvedLlmProviderModel,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None = None,
     ) -> CompressionResult:
         config = self._config_accessor()
-        decision = decide_context_compression(source_conversation, resolved_candidates, config)
+        if instance.agent_definition_id == config.agent_definition_id:
+            return CompressionResult(created=False, reason="context_compression_agent_skipped")
+        decision = decide_context_compression(source_conversation, trigger_model, config)
         if not decision.should_compress:
             return CompressionResult(created=False, reason=decision.reason)
-        worker_model = _select_worker_model(resolved_candidates)
-        if worker_model is None:
-            await self._event_publisher.publish(
-                communication_context,
-                CONTEXT_COMPRESSION_SKIPPED,
-                {
-                    "task_id": task.task_id,
-                    "agent_instance_id": instance.instance_id,
-                    "source_conversation_id": source_conversation.id,
-                    "reason": "no_tool_calling_worker_model",
-                    "status": "skipped",
-                },
+        try:
+            worker_candidates = self._resolve_worker_candidates(config)
+        except (KeyError, ValueError) as exc:
+            await self._publish_skipped(
+                task=task,
+                instance=instance,
+                source_conversation=source_conversation,
+                communication_context=communication_context,
+                reason="context_compression_worker_model_unavailable",
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
             )
-            return CompressionResult(created=False, reason="no_tool_calling_worker_model")
+            return CompressionResult(created=False, reason="context_compression_worker_model_unavailable")
+        if not any(candidate.supports_tool_calling for candidate in worker_candidates):
+            await self._publish_skipped(
+                task=task,
+                instance=instance,
+                source_conversation=source_conversation,
+                communication_context=communication_context,
+                reason="context_compression_worker_model_unavailable",
+            )
+            return CompressionResult(created=False, reason="context_compression_worker_model_unavailable")
         if interrupt_checker is not None and interrupt_checker():
             return CompressionResult(created=False, reason="interrupted")
         root_conversation_id = self._archive_repository.root_conversation_id_for(
@@ -129,7 +147,6 @@ class ContextCompressionService:
         try:
             range_plan = plan_compression_range(
                 source_conversation,
-                config=config,
                 compression_index=compression_index,
                 reason=decision.reason,
             )
@@ -145,7 +162,7 @@ class ContextCompressionService:
                 job=job,
                 input_text=input_text,
                 input_mode=config.input_mode,
-                resolved_model=worker_model,
+                resolved_candidates=worker_candidates,
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
                 interrupt_checker=interrupt_checker,
@@ -155,7 +172,7 @@ class ContextCompressionService:
             await self._assemble_final_markdown(
                 job=job,
                 input_mode=config.input_mode,
-                resolved_model=worker_model,
+                resolved_candidates=worker_candidates,
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
                 interrupt_checker=interrupt_checker,
@@ -167,7 +184,7 @@ class ContextCompressionService:
                 await self._verify_final_markdown(
                     job=job,
                     input_mode=config.input_mode,
-                    resolved_model=worker_model,
+                    resolved_candidates=worker_candidates,
                     max_rounds=config.max_worker_rounds,
                     communication_context=communication_context,
                     interrupt_checker=interrupt_checker,
@@ -200,7 +217,7 @@ class ContextCompressionService:
                 CONTEXT_COMPRESSION_CANCELLED,
                 _base_payload(job, status="cancelled", phase="cancelled", reason="interrupted"),
             )
-            return CompressionResult(created=False, job=job, reason="interrupted")
+            return CompressionResult(created=False, reason="interrupted")
         except asyncio.CancelledError:
             job.status = "cancelled"
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
@@ -221,7 +238,7 @@ class ContextCompressionService:
         job: CompressionJob,
         input_text: str,
         input_mode: str,
-        resolved_model: ResolvedLlmProviderModel,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
@@ -236,7 +253,7 @@ class ContextCompressionService:
                 input_mode=input_mode,
                 system_prompt=prompt,
                 input_text=input_text,
-                resolved_model=resolved_model,
+                resolved_candidates=resolved_candidates,
                 max_rounds=max_rounds,
                 communication_context=communication_context,
                 allowed_tool_names={
@@ -252,7 +269,7 @@ class ContextCompressionService:
         *,
         job: CompressionJob,
         input_mode: str,
-        resolved_model: ResolvedLlmProviderModel,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
@@ -268,7 +285,7 @@ class ContextCompressionService:
             input_mode=input_mode,
             system_prompt=prompt,
             input_text=input_text,
-            resolved_model=resolved_model,
+            resolved_candidates=resolved_candidates,
             max_rounds=max_rounds,
             communication_context=communication_context,
             allowed_tool_names={
@@ -285,7 +302,7 @@ class ContextCompressionService:
         *,
         job: CompressionJob,
         input_mode: str,
-        resolved_model: ResolvedLlmProviderModel,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
@@ -300,7 +317,7 @@ class ContextCompressionService:
             input_mode=input_mode,
             system_prompt=prompt,
             input_text=_verifier_input(job),
-            resolved_model=resolved_model,
+            resolved_candidates=resolved_candidates,
             max_rounds=max_rounds,
             communication_context=communication_context,
             allowed_tool_names={REPORT_SECTION_ISSUE},
@@ -308,12 +325,42 @@ class ContextCompressionService:
         )
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_COMPLETED, _base_payload(job, status="running", phase="verification_completed"))
 
+    def _resolve_worker_candidates(self, config: ContextCompressionConfig) -> tuple[ResolvedLlmProviderModel, ...]:
+        definition = self._agent_definition_gateway.get_agent_definition(config.agent_definition_id)
+        if definition.disabled:
+            raise ValueError(f"上下文压缩 Agent 定义已禁用: {config.agent_definition_id}")
+        policy_group_id = definition.default_llm_policy_group_id
+        if not policy_group_id:
+            raise ValueError(f"上下文压缩 Agent 未配置默认 LLM 执行策略组: {config.agent_definition_id}")
+        policy = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
+        candidates = tuple(candidate.resolved_model for candidate in policy.candidates)
+        if not candidates:
+            raise ValueError(f"上下文压缩 Agent 默认 LLM 执行策略组没有可用候选项: {policy_group_id}")
+        return candidates
 
-def _select_worker_model(candidates: tuple[ResolvedLlmProviderModel, ...]) -> ResolvedLlmProviderModel | None:
-    for candidate in candidates:
-        if candidate.supports_tool_calling:
-            return candidate
-    return None
+    async def _publish_skipped(
+        self,
+        *,
+        task: AgentTask,
+        instance: AgentInstance,
+        source_conversation: Conversation,
+        communication_context: RuntimeCommunicationContext | None,
+        reason: str,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        payload = {
+            "task_id": task.task_id,
+            "agent_instance_id": instance.instance_id,
+            "source_conversation_id": source_conversation.id,
+            "reason": reason,
+            "status": "skipped",
+        }
+        if error_type is not None:
+            payload["error_type"] = error_type
+        if error_message is not None:
+            payload["error_message"] = error_message
+        await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, payload)
 
 
 def _assembler_input(job: CompressionJob) -> str:

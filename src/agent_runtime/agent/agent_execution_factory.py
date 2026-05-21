@@ -121,10 +121,14 @@ class AgentExecutionFactory:
         trace_recorder = AgentTraceRecorder(
             trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
         )
+        agent_definition_gateway = AgentDefinitionFactory.create()
+        llm_registry_gateway = LlmModelRegistryFactory.create()
         context_compression_service = ContextCompressionService(
             llm_request_service=llm_request_service,
             conversation_repository=conversation_repository,
             runtime_gateway=runtime_gateway,
+            agent_definition_gateway=agent_definition_gateway,
+            llm_registry_gateway=llm_registry_gateway,
             archive_repository=ContextCompressionArchiveRepository(
                 config.context_compression.archive_data_dir,
             ),
@@ -133,8 +137,8 @@ class AgentExecutionFactory:
         )
         return AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
-            agent_definition_gateway=AgentDefinitionFactory.create(),
-            llm_registry_gateway=LlmModelRegistryFactory.create(),
+            agent_definition_gateway=agent_definition_gateway,
+            llm_registry_gateway=llm_registry_gateway,
             conversation_repository=conversation_repository,
             prompt_snippet_gateway=PromptTemplateFactory.create(),
             local_tool_gateway=local_tool_gateway,

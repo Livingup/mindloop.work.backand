@@ -217,6 +217,13 @@ class _AgentExecutionHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class _PromptWithConversationResult:
+    response: LlmPromptResponse
+    conversation: Any
+    instance: AgentInstance
+
+
+@dataclass(frozen=True, slots=True)
 class AgentMessageSubmissionResult:
     status: str
     task_id: str
@@ -536,29 +543,11 @@ class AgentExecutionEngine:
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
-                if self._context_compression_service is not None:
-                    compression_result = await self._context_compression_service.compress_if_needed(
-                        task=task,
-                        instance=instance,
-                        source_conversation=conversation,
-                        resolved_candidates=resolved_candidates,
-                        communication_context=communication_context,
-                        interrupt_checker=lambda state=interrupt_state: state.requested,
-                    )
-                    if compression_result.created and compression_result.target_conversation is not None:
-                        conversation = compression_result.target_conversation
-                        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
-                        self._trace_recorder.record_event(
-                            trace_path,
-                            "context_compression_completed",
-                            {
-                                "job_id": compression_result.job.job_id if compression_result.job else None,
-                                "target_conversation_id": conversation.id,
-                            },
-                        )
                 try:
-                    llm_response = await _await_with_progress_logging(
+                    prompt_result = await _await_with_progress_logging(
                         self._send_prompt_with_policy_failover(
+                            task=task,
+                            trace_path=trace_path,
                             conversation=conversation,
                             agent_definition=agent_definition,
                             instance=instance,
@@ -587,6 +576,10 @@ class AgentExecutionEngine:
                         interrupt_state=interrupt_state,
                         assistant_message=None,
                     )
+                llm_response = prompt_result.response
+                conversation = prompt_result.conversation
+                instance = prompt_result.instance
+                communication_context = communication_context.with_metadata(conversation_id=conversation.id)
                 assistant_message = llm_response.assistant_message
                 _record_last_context_usage(conversation, llm_response)
                 await self._conversation_repository.save(conversation)
@@ -1056,6 +1049,8 @@ class AgentExecutionEngine:
     async def _send_prompt_with_policy_failover(
         self,
         *,
+        task: AgentTask,
+        trace_path: Any,
         conversation: Any,
         agent_definition: AgentDefinition,
         instance: AgentInstance,
@@ -1064,7 +1059,7 @@ class AgentExecutionEngine:
         request_overrides: dict[str, Any],
         communication_context: RuntimeCommunicationContext,
         interrupt_state: _AgentExecutionInterruptState,
-    ) -> LlmPromptResponse:
+    ) -> _PromptWithConversationResult:
         last_error: Exception | None = None
         skipped_for_modalities = False
         unsupported_modality_strategy = _unsupported_input_modality_strategy(instance)
@@ -1103,7 +1098,28 @@ class AgentExecutionEngine:
                 api_format=resolved_model.api_format,
             )
             try:
-                return await self._llm_request_service.send_prompt(
+                if self._context_compression_service is not None:
+                    compression_result = await self._context_compression_service.compress_if_needed(
+                        task=task,
+                        instance=instance,
+                        source_conversation=conversation,
+                        trigger_model=resolved_model,
+                        communication_context=communication_context,
+                        interrupt_checker=lambda state=interrupt_state: state.requested,
+                    )
+                    if compression_result.created and compression_result.target_conversation is not None:
+                        conversation = compression_result.target_conversation
+                        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                        communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+                        self._trace_recorder.record_event(
+                            trace_path,
+                            "context_compression_completed",
+                            {
+                                "job_id": compression_result.job.job_id if compression_result.job else None,
+                                "target_conversation_id": conversation.id,
+                            },
+                        )
+                response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
                         conversation=conversation,
                         resolved_model=resolved_model,
@@ -1127,6 +1143,11 @@ class AgentExecutionEngine:
                             payload,
                         ),
                     )
+                )
+                return _PromptWithConversationResult(
+                    response=response,
+                    conversation=conversation,
+                    instance=instance,
                 )
             except LlmRequestCancelled:
                 raise

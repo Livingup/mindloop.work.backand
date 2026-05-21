@@ -854,14 +854,14 @@ src/agent_runtime/context_compression/
 
 - `config.py`
   - 定义 `ContextCompressionConfig`。
-  - 包含 enabled、默认阈值比例、最小可压缩消息数、raw tail 保留策略、Worker 模型选择策略、是否启用 verifier、失败策略等。
+  - 包含 enabled、上下文压缩 Agent 定义 ID、默认阈值比例、Worker 安全最大轮次、输入模式、是否启用 verifier、归档目录等。
 - `models.py`
   - 定义 `CompressionJob`、`CompressionDecision`、`CompressionRange`、`CompressionInputPlan`、`SectionItem`、`FinalSummary`、`CompressionResult`。
 - `gate.py`
-  - 根据当前 Conversation、候选模型和 token usage 决定是否触发压缩。
+  - 根据当前 Conversation、当前即将请求的实际 `resolved_model` 和上一次 LLM 请求记录的 token usage 决定是否触发压缩。
 - `range_planner.py`
   - 选择待压缩消息区间和 retained raw tail。
-  - 保证不拆分 tool_use/tool_result 协议配对。
+  - retained raw tail 严格从最近一次 assistant 消息开始，并保留该 assistant 消息及其之后的所有消息。
 - `input_planner.py`
   - 为每个 Worker 选择历史会话输入或文本快照输入。
   - Worker 不感知选择过程。
@@ -869,7 +869,7 @@ src/agent_runtime/context_compression/
   - 生成 Conversation Transcript Snapshot。
   - 将图片/PDF/附件资源转换为 Agent 可再读取 locator。
 - `prompt_loader.py`
-  - 加载两套完整 Worker prompt 文档。
+  - 从源码内置默认 prompt 常量和用户持久化 override 中加载 Worker prompt。
 - `job_store.py`
   - 保存压缩 job 的中间 Section 条目、最终 Markdown、校验问题和运行状态。
   - 第一阶段可使用内存实现；后续可增加 SQLite/JSON 持久化。
@@ -882,10 +882,10 @@ src/agent_runtime/context_compression/
 - `final_assembler.py`
   - 调用 FinalAssemblerWorker 和可选 FinalVerifierWorker。
 - `settings.py`
-  - 定义上下文压缩设置聚合，包括 Worker 列表、Worker LLM 选择、最大并发、prompt override 和 prompt revision。
+  - 定义上下文压缩设置聚合，包括 Worker 列表、最大并发、prompt override 和 prompt revision。
 - `settings_repository.py`
-  - 持久化用户在前端上下文压缩设置页中修改的 Worker LLM 服务商、模型接入、最大并发和系统提示词。
-  - 只保存 `provider_id`、`model_binding_id`、prompt 文本和 revision，不保存 API key。
+  - 持久化用户在前端上下文压缩设置页中修改的最大并发、系统提示词和 prompt revision。
+  - Worker LLM 服务商策略不由该仓储保存；用户应像配置其他 Agent 一样配置上下文压缩 Agent 的 `default_llm_policy_group_id`。
 - `concurrency_limiter.py`
   - 为上下文压缩 Worker LLM 请求提供全局并发闸门。
   - 以 provider 或 provider+model 为 key 创建 `asyncio.Semaphore`，限制多 AgentInstance 同时触发压缩时的 Worker 请求并发。
@@ -896,7 +896,8 @@ src/agent_runtime/context_compression/
   - 重建新 Conversation 的 `state`。
 - `compression_service.py`
   - 对外提供 `compress_if_needed(...)`。
-  - 由 `AgentExecutionEngine` 在主 Agent LLM 请求前调用，成功时返回新的压缩后 Conversation。
+  - 由 `AgentExecutionEngine` 在每个非上下文压缩 Agent 实际请求某个 `resolved_model` 前调用，成功时返回新的压缩后 Conversation。
+  - Worker LLM 使用上下文压缩 Agent 自己的默认 LLM 执行策略组，不复用当前主/子 Agent 的候选模型。
 - `north_gateway/context_compression_rest_adapter.py`
   - 提供前端上下文压缩设置页使用的 REST API。
   - 支持读取 Worker 列表、读取/保存 Worker prompt override、设置 Worker LLM 服务商与模型接入、设置最大并发和恢复默认 prompt。
@@ -916,10 +917,10 @@ resource_resolver = _LazyFileResourceResolver()
 llm_request_service = LlmClientFactory.create(resource_resolver, event_publisher=event_publisher)
 context_compression_service = ContextCompressionService(
   llm_request_service=llm_request_service,
+  agent_definition_gateway=AgentDefinitionFactory.create(),
   llm_registry_gateway=LlmModelRegistryFactory.create(),
   conversation_repository=conversation_repository,
   runtime_gateway=AgentRuntimeFactory.create(),
-  resource_resolver=resource_resolver,
   event_publisher=event_publisher,
   config_accessor=lambda: ConfigRegistry.instance().context_compression,
 )
@@ -939,31 +940,49 @@ await drain_pending_user_messages_to_conversation(...)
 resolved_candidates = resolve_instance_llm_candidates(instance)
 agent_definition = load_agent_definition(instance.agent_definition_id)
 
-if context_compression_service is not None:
-  compression_result = await context_compression_service.compress_if_needed(
-    task=task,
-    instance=instance,
-    source_conversation=conversation,
-    resolved_candidates=resolved_candidates,
-    communication_context=communication_context,
-    interrupt_checker=lambda: interrupt_state.requested,
-  )
-  if compression_result.created:
-    conversation = compression_result.target_conversation
-    communication_context = communication_context.with_metadata(conversation_id=conversation.id)
-    trace_recorder.record_event(...)
+prompt_result = await send_prompt_with_policy_failover(...)
+conversation = prompt_result.conversation
+instance = prompt_result.instance
+llm_response = prompt_result.response
+```
 
-llm_response = await send_prompt_with_policy_failover(...)
+`send_prompt_with_policy_failover(...)` 内部必须在每个候选模型真正发起请求前执行压缩判断：
+
+```text
+for resolved_model in resolved_candidates:
+  if candidate is skipped by modality policy:
+    continue
+
+  if context_compression_service is not None:
+    compression_result = await context_compression_service.compress_if_needed(
+      task=task,
+      instance=instance,
+      source_conversation=conversation,
+      trigger_model=resolved_model,
+      communication_context=communication_context,
+      interrupt_checker=lambda: interrupt_state.requested,
+    )
+    if compression_result.created:
+      conversation = compression_result.target_conversation
+      instance = runtime_gateway.get_agent_instance(instance.instance_id)
+      communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+
+  response = await llm_request_service.send_prompt(
+    conversation=conversation,
+    resolved_model=resolved_model,
+    ...
+  )
 ```
 
 触发节点的完整语义：
 
-- 每轮主 Agent LLM 请求前都可以检查一次上下文是否需要压缩。
+- 每个非上下文压缩 Agent 在实际请求某个 `resolved_model` 前都必须检查一次上下文是否需要压缩；包括主 Agent 和子 Agent。
+- 上下文压缩 Agent 自身不做上下文压缩检查，避免递归触发。
 - 检查必须发生在 `_drain_pending_user_messages_to_conversation` 之后，确保本轮用户最新输入已经进入 `Conversation.messages`。
-- 检查必须发生在 `_send_prompt_with_policy_failover` 之前，避免在上下文已经超限时仍然发起主 Agent LLM 请求。
-- 检查不得发生在主 Agent assistant tool_use 与 tool_result 之间，避免破坏 LLM 工具协议完整性。
-- 检查不得发生在主 Agent LLM 流式响应过程中；流式响应中如果收到用户中断，应走现有中断语义，而不是边流式边压缩。
-- 如果主 Agent 上一轮 LLM 请求返回的 `last_context_usage` 已超过阈值，则下一轮进入主 Agent LLM 请求前优先执行压缩。
+- 检查必须发生在当前候选模型真正调用 `LlmRequestService.send_prompt(...)` 之前，不能在候选集合外提前用猜测模型判断。
+- 检查不得发生在任意 Agent 的 assistant tool_use 与 tool_result 之间，避免破坏 LLM 工具协议完整性。
+- 检查不得发生在 LLM 流式响应过程中；流式响应中如果收到用户中断，应走现有中断语义，而不是边流式边压缩。
+- 如果上一轮 LLM 请求返回的 `last_context_usage` 已超过当前实际请求模型阈值，则下一轮请求该模型前优先执行压缩。
 
 ### 15.4 触发策略
 
@@ -975,14 +994,15 @@ effective_threshold =
   or floor(resolved_model.context_window * config.default_threshold_ratio)
 ```
 
-当存在多个 failover candidates 时，闸门应使用当前可用候选中的最小 effective threshold，避免主候选失败后降级到更小上下文模型时才发现历史过长。
+闸门只能使用本次即将请求的实际 `resolved_model` 计算阈值。不得对候选集合取最小阈值，也不得用“主候选”或其他猜测模型提前判断。发生 failover 时，下一个候选模型会在真正请求前再次用自己的 `compression_threshold/context_window` 做判断。
 
 第一阶段触发条件：
 
 - `conversation.state.last_context_usage` 存在。
-- `last_context_usage.context_window_used_tokens >= min_effective_threshold`。
-- Conversation 中存在足够长、可安全压缩的历史区间。
+- `last_context_usage.context_window_used_tokens >= effective_threshold`。
+- Conversation 中存在可压缩历史区间。
 - 当前没有用户中断请求。
+- 当前执行的 Agent 不是 `context_compression.agent_definition_id` 指向的上下文压缩 Agent。
 
 后续阶段可增强：
 
@@ -1025,11 +1045,8 @@ effective_threshold =
 - 如果消息 0 已经是旧的 Runtime Compressed Task Context，也应纳入新的压缩输入，由新 target Conversation 中的新 summary 替代旧 summary，避免多层嵌套摘要。
 - retained raw tail 默认从最近一次 assistant 消息开始，保留该 assistant 消息及其之后的所有消息。
 - 如果最近一次 assistant 消息之后还有 user 消息、tool 消息或后续 assistant 消息，必须全部保留，不能只保留最新 user。
-- 如果最近一次 assistant 消息包含 tool_use，raw tail 必须同时保留该 assistant tool_use 消息和对应 tool_result 消息。
-- 如果 Conversation 中还没有 assistant 消息，retained raw tail 至少从最近一次 user 消息开始保留。
-- 不允许 compressed range 与 raw tail 拆开同一组 tool_use/tool_result 配对。
-- 如果发现已有历史存在未配对 tool_use/tool_result，优先降级为 transcript snapshot；仍无法安全处理时暂停主 Agent 并报告 `context_compression_unsafe_tool_protocol`。
-- 如果可压缩区间消息数低于配置阈值，应跳过压缩。
+- 不做额外 tool protocol 边界扩展；range planner 不因为 tool_use/tool_result 关系把 retained tail 起点提前。
+- 如果 Conversation 中还没有 assistant 消息，则没有符合规则的 retained raw tail 起点，应跳过压缩。
 - retained raw tail 选择完成后，compressed range 才能确定；压缩区间永远是 retained raw tail 之前的较早历史。
 
 ### 15.6 Worker LLM 执行方式
@@ -1039,10 +1056,10 @@ effective_threshold =
 - 历史会话输入版：
   - 临时 Conversation 包含待压缩区间的原始历史消息拷贝。
   - 末尾追加当前压缩强指令 user message。
-  - system prompt 来自 `context_compression_worker_prompts_historical_conversation.md` 中对应 Worker 的完整 prompt。
+  - system prompt 来自源码内置默认 prompt 常量或用户持久化 override 中对应 Worker 的完整 prompt。
 - 文本快照输入版：
   - 临时 Conversation 只包含一条 user message，内容为 Conversation Transcript Snapshot。
-  - system prompt 来自 `context_compression_worker_prompts_transcript_snapshot.md` 中对应 Worker 的完整 prompt。
+  - system prompt 来自源码内置默认 prompt 常量或用户持久化 override 中对应 Worker 的完整 prompt。
 
 WorkerRunner 执行循环：
 
@@ -1265,16 +1282,17 @@ Archive 必须保存本次压缩开始时实际生效的 Worker 设置快照，�
 
 - `worker_config_json`
   - `enabled`
+  - `agent_definition_id`
+  - `default_threshold_ratio`
   - `max_global_worker_concurrency`
   - `provider_concurrency_limits`
-  - `worker_model_policy`
-  - `default_worker_llm`
-  - 每个 Worker 的启用状态和模型覆盖配置。
+  - 每个 Worker 的启用状态。
 - `worker_prompt_revision_json`
   - 每个 Worker 在每种 input mode 下使用的 prompt revision。
   - 是否使用默认 prompt 或用户 override。
 - `worker_model_selection_json`
-  - 每个 Worker 实际使用的 `provider_id`、`model_binding_id`、resolved model id、api format 和 input mode。
+  - 上下文压缩 Agent 默认 LLM 策略组 ID。
+  - 每个 Worker 实际使用的候选 `provider_id`、`model_binding_id`、resolved model id、api format 和 input mode。
   - 不保存 API key 或 provider raw secret。
 - `provider_concurrency_limit_json`
   - 本次 job 获取并发许可时使用的 provider / provider+model 限流 key 和 limit。
@@ -1677,7 +1695,7 @@ Agent 已暂停，等待用户输入或调整上下文压缩设置
 - 支持点击 Worker 查看和编辑对应 system prompt。
 - 支持分别编辑 `native_multimodal_history` 和 `transcript_snapshot` 两套 prompt。
 - 支持恢复单个 Worker 的默认 prompt。
-- 支持设置上下文压缩 Worker 使用的 LLM 服务商和模型接入。
+- 支持配置上下文压缩 Agent 的默认 LLM 执行策略组；Worker 执行统一使用该 Agent 的默认策略组。
 - 支持设置全局最大 Worker 并发数。
 - 支持设置按服务商或服务商模型接入维度的最大并发数，避免超过第三方 LLM 服务商并发上限。
 
@@ -1688,30 +1706,19 @@ Agent 已暂停，等待用户输入或调整上下文压缩设置
 ```yaml
 context_compression:
   enabled: true
+  agent_definition_id: context_compression
   default_threshold_ratio: 0.75
-  min_compressible_messages: 12
-  retained_tail_min_messages: 8
-  retained_tail_max_estimated_tokens: 12000
-  section_worker_max_rounds: 8
-  assembler_max_rounds: 8
+  max_worker_rounds: 128
   verifier_enabled: true
-  max_retries_per_section: 1
   failure_policy: pause_agent
-
-  # Worker 模型选择策略。
-  # reuse_agent_policy: 默认复用当前 AgentInstance 的 LLM candidates。
-  # dedicated_worker_model: 使用 default_worker_llm 或 workers.<worker>.llm 中指定的模型接入。
-  worker_model_policy: dedicated_worker_model
 
   # 所有上下文压缩 Worker 请求的全局并发上限。
   # 该限制跨 task、跨 agent_instance、跨 compression job 生效。
   max_global_worker_concurrency: 6
 
-  # 当某个 Worker 没有单独覆盖时使用的默认 Worker LLM。
-  # 这里只保存 LLM registry 中的 provider_id 和 model_binding_id，不保存 API key。
-  default_worker_llm:
-    provider_id: "glm"
-    model_binding_id: "glm-5.1"
+  # Worker LLM 不在 context_compression YAML 中配置 provider/model。
+  # Runtime 使用 agent_definition_id 指向的上下文压缩 Agent 的 default_llm_policy_group_id。
+  # 用户像配置其他 Agent 一样，在 Agent 设置中给上下文压缩 Agent 指定默认服务商策略。
 
   # 按服务商或服务商模型接入控制并发，防止多 Agent 同时压缩时超过服务商限流。
   provider_concurrency_limits:
@@ -1722,13 +1729,10 @@ context_compression:
       model_binding_id: "gpt-5.5"
       max_concurrency: 2
 
-  # 每个 Worker 的开关、模型覆盖和 prompt override。
+  # 每个 Worker 的开关和 prompt override。
   workers:
     RequirementConstraintWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1740,9 +1744,6 @@ context_compression:
           override_text: null
     ProgressPlanWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1754,9 +1755,6 @@ context_compression:
           override_text: null
     CodeArchitectureWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1768,9 +1766,6 @@ context_compression:
           override_text: null
     ObservationEvidenceWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1782,9 +1777,6 @@ context_compression:
           override_text: null
     DecisionRationaleWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1796,9 +1788,6 @@ context_compression:
           override_text: null
     TodoRiskWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1810,9 +1799,6 @@ context_compression:
           override_text: null
     FinalAssemblerWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1824,9 +1810,6 @@ context_compression:
           override_text: null
     FinalVerifierWorker:
       enabled: true
-      llm:
-        provider_id: null
-        model_binding_id: null
       prompts:
         native_multimodal_history:
           use_default: true
@@ -1842,8 +1825,8 @@ context_compression:
 
 - `max_global_worker_concurrency` 控制所有上下文压缩 Worker LLM 请求的总并发。
 - `provider_concurrency_limits` 控制某个服务商或某个服务商模型接入的并发。
-- `workers.<worker>.llm` 为空时使用 `default_worker_llm`。
-- `default_worker_llm` 为空且 `worker_model_policy = reuse_agent_policy` 时，复用当前 AgentInstance 的 LLM candidates。
+- `agent_definition_id` 指向上下文压缩 Agent 定义；Runtime 读取该 Agent 的 `default_llm_policy_group_id` 作为 Worker LLM 执行策略。
+- Worker 不复用当前主/子 Agent 的 LLM candidates，也不在 `context_compression` YAML 中保存 provider/model。
 - prompt override 只覆盖 Worker 的 system prompt 文本，不改变 Worker 输入模式、工具 schema 或 Runtime 约束。
 - prompt revision 每次保存自增，Archive 必须记录 job 使用的 revision。
 - 配置中不应保存 API key；真实 API key 仍由 LLM registry provider 配置管理。
@@ -1869,10 +1852,7 @@ FinalVerifierWorker
 - Worker 职责摘要。
 - 输出 section 或职责类型。
 - 启用状态。
-- 当前 LLM 来源：
-  - 使用默认 Worker LLM。
-  - 使用该 Worker 覆盖的 provider/model。
-  - 复用 Agent LLM policy。
+- 当前 LLM 来源：上下文压缩 Agent 的默认 LLM 执行策略组。
 - 当前 prompt 状态：
   - 使用内置默认 prompt。
   - 使用用户 override prompt。
@@ -1880,7 +1860,7 @@ FinalVerifierWorker
 
 点击 Worker 后进入详情面板：
 
-- 左侧显示 Worker 元数据和 LLM 选择。
+- 左侧显示 Worker 元数据和当前上下文压缩 Agent 默认 LLM 策略摘要。
 - 右侧显示 system prompt 编辑器。
 - prompt 编辑器必须有 input mode 切换：
   - `native_multimodal_history`
@@ -1917,21 +1897,13 @@ POST /api/context-compression/workers/{worker_name}/prompts/{input_mode}/reset
 ```json
 {
   "enabled": true,
+  "agent_definition_id": "context_compression",
+  "compression_agent_default_llm_policy_group_id": "context_compression_default",
   "default_threshold_ratio": 0.75,
-  "min_compressible_messages": 12,
-  "retained_tail_min_messages": 8,
-  "retained_tail_max_estimated_tokens": 12000,
-  "section_worker_max_rounds": 8,
-  "assembler_max_rounds": 8,
+  "max_worker_rounds": 128,
   "verifier_enabled": true,
-  "max_retries_per_section": 1,
   "failure_policy": "pause_agent",
-  "worker_model_policy": "dedicated_worker_model",
   "max_global_worker_concurrency": 6,
-  "default_worker_llm": {
-    "provider_id": "glm",
-    "model_binding_id": "glm-5.1"
-  },
   "provider_concurrency_limits": [
     {
       "provider_id": "glm",
@@ -1942,10 +1914,6 @@ POST /api/context-compression/workers/{worker_name}/prompts/{input_mode}/reset
   "workers": {
     "RequirementConstraintWorker": {
       "enabled": true,
-      "llm": {
-        "provider_id": null,
-        "model_binding_id": null
-      },
       "prompt_status": {
         "native_multimodal_history": {
           "use_default": true,
@@ -1973,9 +1941,8 @@ POST /api/context-compression/workers/{worker_name}/prompts/{input_mode}/reset
     "enabled": true,
     "supports_input_modes": ["native_multimodal_history", "transcript_snapshot"],
     "llm": {
-      "effective_provider_id": "glm",
-      "effective_model_binding_id": "glm-5.1",
-      "source": "default_worker_llm"
+      "policy_group_id": "context_compression_default",
+      "source": "context_compression_agent_default_policy"
     },
     "prompt_status": {
       "native_multimodal_history": {
@@ -2018,33 +1985,29 @@ REST 校验规则：
 
 - `worker_name` 必须是 Runtime 支持的固定 Worker 名称。
 - `input_mode` 只能是 `native_multimodal_history` 或 `transcript_snapshot`。
-- `provider_id` 和 `model_binding_id` 必须存在于 LLM registry。
-- 如果指定 Worker 使用原生多模态历史输入，模型接入必须支持对应输入模态；否则 Runtime 执行时仍可降级 transcript snapshot。
+- 上下文压缩 Agent 的默认 LLM 执行策略组必须存在、启用且至少包含一个支持 tool calling 的候选模型。
+- 如果使用原生多模态历史输入，最终候选模型必须支持对应输入模态；否则 Runtime 执行时仍可降级 transcript snapshot。
 - `max_global_worker_concurrency` 必须大于等于 1。
 - 每个 `provider_concurrency_limits.max_concurrency` 必须大于等于 1。
 - API 响应不得返回 API key、环境变量解析后的 secret 或 provider raw secret。
 
 #### 15.10.4 Worker LLM 选择优先级
 
-每次压缩开始时，Runtime 为每个 Worker 决定实际 LLM candidate：
+每次压缩开始时，Runtime 为 Worker 解析上下文压缩 Agent 的默认 LLM 执行策略组：
 
 ```text
-if worker.llm.provider_id and worker.llm.model_binding_id:
-  use worker override
-else if default_worker_llm is configured:
-  use default_worker_llm
-else if worker_model_policy == reuse_agent_policy:
-  use current AgentInstance resolved candidates
-else:
-  fail configuration validation
+compression_agent = AgentDefinition(config.context_compression.agent_definition_id)
+policy_group_id = compression_agent.default_llm_policy_group_id
+worker_candidates = LlmRegistry.resolve_execution_policy(policy_group_id).candidates
 ```
 
 选择后仍必须检查：
 
-- 目标模型是否支持工具调用，因为 Worker 需要调用 `context_summary` 工具。
-- 目标模型是否支持当前输入模式需要的输入模态。
+- 候选模型是否支持工具调用，因为 Worker 需要调用 `context_summary` 工具。
+- 候选模型是否支持当前输入模式需要的输入模态。
 - 如果不支持 `native_multimodal_history`，则降级到 `transcript_snapshot`。
 - 如果模型无法支持工具调用，应跳过该模型并按候选策略选择下一个；没有可用模型时暂停 Agent 并报告 `context_compression_worker_model_unavailable`。
+- Worker 不允许复用当前主/子 Agent 的候选模型，避免压缩执行策略被主任务策略隐式改变。
 
 #### 15.10.5 最大并发与服务商限流
 
@@ -2101,7 +2064,7 @@ Context Compression Settings
   │   ├─ enabled
   │   ├─ threshold ratio
   │   ├─ max global worker concurrency
-  │   ├─ default worker provider/model
+  │   ├─ context compression agent default LLM policy
   │   └─ provider concurrency limits
   ├─ Worker List
   │   ├─ RequirementConstraintWorker
@@ -2114,7 +2077,7 @@ Context Compression Settings
   │   └─ FinalVerifierWorker
   └─ Worker Detail
       ├─ enabled
-      ├─ provider/model override
+      ├─ context compression agent policy summary
       ├─ input mode tabs
       ├─ system prompt editor
       ├─ save prompt
@@ -2123,8 +2086,7 @@ Context Compression Settings
 
 交互规则：
 
-- LLM 服务商和模型接入下拉框必须从现有 LLM Registry API 获取。
-- `provider_id` 选择后，`model_binding_id` 下拉框只展示该服务商下的模型接入。
+- 上下文压缩 Agent 的默认 LLM 策略应复用现有 Agent 设置方式配置；该页面只展示当前策略摘要或跳转到 Agent 设置页。
 - 最大并发设置应清晰说明它是后端真实并发闸门，不是 UI 并发显示。
 - prompt 编辑器保存成功后显示 revision 变化。
 - 默认 prompt 和 override prompt 可以对比查看，但保存时只保存 override。

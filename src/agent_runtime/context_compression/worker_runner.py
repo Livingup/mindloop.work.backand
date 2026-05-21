@@ -17,7 +17,7 @@ from agent_runtime.conversation_message.message.models import Conversation, ROLE
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
-from agent_runtime.llm_client.llm_request_service import LlmRequestService
+from agent_runtime.llm_client.llm_request_service import LlmProviderModelServiceUnavailable, LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 
@@ -45,11 +45,65 @@ class ContextCompressionWorkerRunner:
         input_mode: str,
         system_prompt: str,
         input_text: str,
-        resolved_model: ResolvedLlmProviderModel,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         allowed_tool_names: set[str] | None = None,
         interrupt_checker: Callable[[], bool] | None = None,
+    ) -> None:
+        last_error: Exception | None = None
+        skipped_tool_calling = False
+        for candidate_index, resolved_model in enumerate(resolved_candidates):
+            if not resolved_model.supports_tool_calling:
+                skipped_tool_calling = True
+                continue
+            try:
+                await self._run_worker_with_model(
+                    job=job,
+                    worker_name=worker_name,
+                    worker_role=worker_role,
+                    output_section=output_section,
+                    input_mode=input_mode,
+                    system_prompt=system_prompt,
+                    input_text=input_text,
+                    resolved_model=resolved_model,
+                    max_rounds=max_rounds,
+                    communication_context=communication_context,
+                    allowed_tool_names=allowed_tool_names,
+                    interrupt_checker=interrupt_checker,
+                )
+                return
+            except LlmRequestCancelled:
+                raise
+            except Exception as exc:
+                last_error = exc
+                can_failover = (
+                    candidate_index < len(resolved_candidates) - 1
+                    and isinstance(exc, LlmProviderModelServiceUnavailable)
+                )
+                if not can_failover:
+                    raise
+        if last_error is not None:
+            raise last_error
+        if skipped_tool_calling:
+            raise RuntimeError("上下文压缩 Agent 默认 LLM 执行策略组没有支持 tool calling 的可用候选。")
+        raise RuntimeError("上下文压缩 Agent 默认 LLM 执行策略组没有可用候选。")
+
+    async def _run_worker_with_model(
+        self,
+        *,
+        job: CompressionJob,
+        worker_name: str,
+        worker_role: str,
+        output_section: str | None,
+        input_mode: str,
+        system_prompt: str,
+        input_text: str,
+        resolved_model: ResolvedLlmProviderModel,
+        max_rounds: int,
+        communication_context: RuntimeCommunicationContext | None,
+        allowed_tool_names: set[str] | None,
+        interrupt_checker: Callable[[], bool] | None,
     ) -> None:
         started_at = time.perf_counter()
         await self._publish_worker_event(
@@ -66,6 +120,7 @@ class ContextCompressionWorkerRunner:
         )
         conversation = create_conversation()
         conversation.add_user_message([TextPart(text=input_text)], [TextPartMeta()])
+        completed_without_marker = False
         try:
             for round_index in range(1, max_rounds + 1):
                 if interrupt_checker is not None and interrupt_checker():
@@ -87,6 +142,8 @@ class ContextCompressionWorkerRunner:
                 if not tool_uses:
                     if worker_role == "final_assembler" and response.assistant_message.content:
                         self._job_store.append_final_markdown(job.job_id, _assistant_text(response.assistant_message))
+                    if worker_role == "final_verifier":
+                        completed_without_marker = True
                     break
                 result_parts = [
                     self._summary_tools.execute(
@@ -112,6 +169,10 @@ class ContextCompressionWorkerRunner:
                 )
                 if _worker_finished(job, worker_role, output_section):
                     break
+            if not completed_without_marker and not _worker_finished(job, worker_role, output_section):
+                raise RuntimeError(
+                    f"上下文压缩 Worker 未在安全轮次内完成: worker={worker_name}, max_rounds={max_rounds}"
+                )
             await self._publish_worker_event(
                 communication_context,
                 CONTEXT_COMPRESSION_WORKER_COMPLETED,

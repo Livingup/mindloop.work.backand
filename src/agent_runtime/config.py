@@ -609,10 +609,9 @@ def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
 def _build_context_compression_config(data: dict[str, Any]) -> ContextCompressionConfig:
     return ContextCompressionConfig(
         enabled=bool(data.get("enabled", True)),
+        agent_definition_id=str(data.get("agent_definition_id", "context_compression")),
         default_threshold_ratio=float(data.get("default_threshold_ratio", 0.75)),
-        min_compressible_messages=int(data.get("min_compressible_messages", 12)),
-        retained_tail_min_messages=int(data.get("retained_tail_min_messages", 8)),
-        max_worker_rounds=int(data.get("max_worker_rounds", data.get("section_worker_max_rounds", 8))),
+        max_worker_rounds=int(data.get("max_worker_rounds", data.get("section_worker_max_rounds", 128))),
         input_mode=str(data.get("input_mode", "transcript_snapshot")),
         verifier_enabled=bool(data.get("verifier_enabled", False)),
         archive_data_dir=str(data.get("archive_data_dir", "~/.spread-ai/context-compression")),
