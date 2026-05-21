@@ -9,9 +9,9 @@ from dataclasses import dataclass
 class LlmModelRegistryConfig:
     """LLM 服务商与模型注册模块配置。
 
-    该配置只保存用户自定义注册数据的根目录位置。具体模型元数据和服务商配置
-    由 llm_model_registry 模块自己的 YAML 仓储按需读写，不写死在系统主配置中。
+    该配置只保存用户自定义注册数据的根目录位置。运行期 SQLite 数据库文件由
+    llm_model_registry 模块在该目录下解析，不把具体模型、服务商或策略数据写死在系统主配置中。
     """
 
-    # LLM 模型与服务商注册数据根目录。目录下按 models/ 和 providers/ 拆分存储 YAML 文件。
+    # LLM 模型、服务商与执行策略注册数据根目录；SQLite 文件名为 llm_model_registry.sqlite3。
     registry_dir: str

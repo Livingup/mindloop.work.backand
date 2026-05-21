@@ -32,11 +32,11 @@ from agent_runtime.llm_model_registry.llm_provider_definition import (
 class LlmModelMetadataSaveRequest:
     """保存模型元数据请求。
 
-    调用方提交完整模型型号能力数据，由领域实体校验 model_id 文件名安全、token 容量字段和输入模态数组后，
-    持久化为用户目录 YAML 文件。
+    调用方提交完整模型型号能力数据，由领域实体校验 model_id、token 容量字段和输入模态数组后，
+    交给领域服务保存到运行期仓储。
     """
 
-    # 模型型号唯一标识，同时也是 models/{model_id}.yaml 文件名主名。
+    # 模型型号唯一标识，同时作为 REST/CLI 路径参数和仓储主键。
     model_id: str
 
     # 模型最大上下文窗口 token 数。
@@ -95,7 +95,7 @@ class LlmProviderSaveRequest:
     和 API Key 等结构后，再由领域服务校验所有 model_id 引用均已存在。
     """
 
-    # 服务商唯一标识，同时也是 providers/{provider_id}.yaml 文件名主名。
+    # 服务商唯一标识，同时作为 REST/CLI 路径参数和仓储主键。
     provider_id: str
 
     # 服务商自定义分组，用于管理界面聚合展示。
@@ -180,7 +180,7 @@ class LlmModelRegistryGateway(Protocol):
     """LLM 服务商与模型注册模块北向网关接口。
 
     CLI、REST、后续 Agent 执行引擎和 LLM 统一调用客户端都应通过该接口访问用户自定义注册数据，
-    不直接依赖领域服务或 YAML 仓储实现。
+    不直接依赖领域服务或具体仓储实现。
     """
 
     # ── 模型元数据管理 ──────────────────────────────────────

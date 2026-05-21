@@ -24,8 +24,8 @@ class LlmModelRegistryGatewayImpl:
     """LLM 服务商与模型注册北向网关。
 
     网关是 LLM 注册模块的唯一对外入口。CLI、REST、后续 Agent 执行引擎和 LLM 统一调用客户端
-    统一通过本网关访问模型元数据、服务商定义和解析后的服务商模型调用配置，避免外部调用方直接依赖
-    领域服务或 YAML 仓储实现。
+    统一通过本网关访问模型元数据、服务商定义、执行策略组和解析后的服务商模型调用配置，避免外部调用方直接依赖
+    领域服务或具体仓储实现。
     """
 
     def __init__(self, service: LlmModelRegistryService) -> None:

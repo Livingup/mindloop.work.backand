@@ -37,7 +37,7 @@ class LlmApiKey:
         validate_optional_text(self.name, "api_keys.name")
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为 YAML 友好的字典结构。"""
+        """转换为外部接口和迁移脚本可复用的字典结构。"""
         data: dict[str, Any] = {"key": self.key}
         if self.name is not None:
             data["name"] = self.name
@@ -45,7 +45,7 @@ class LlmApiKey:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LlmApiKey:
-        """从 YAML 字典创建 API Key 值对象。"""
+        """从外部接口或 legacy YAML 字典创建 API Key 值对象。"""
         return cls(key=str(data.get("key", "")), name=data.get("name"))
 
 
@@ -91,7 +91,7 @@ class LlmRetryPolicy:
         object.__setattr__(self, "retryable_status_codes", tuple(status_codes))
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为 YAML 友好的字典结构。"""
+        """转换为外部接口和迁移脚本可复用的字典结构。"""
         return {
             "max_retries_per_key": self.max_retries_per_key,
             "initial_delay_seconds": self.initial_delay_seconds,
@@ -101,7 +101,7 @@ class LlmRetryPolicy:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> LlmRetryPolicy:
-        """从 YAML 字典创建重试策略；缺省时使用安全默认值。"""
+        """从外部接口或 legacy YAML 字典创建重试策略；缺省时使用安全默认值。"""
         data = data or {}
         return cls(
             max_retries_per_key=int(data.get("max_retries_per_key", 3)),
@@ -127,7 +127,7 @@ class LlmProviderModelBinding:
     # 接入项唯一标识，在同一 provider 内唯一；用于 Agent 后续选择具体服务商模型配置。
     id: str
 
-    # 关联的模型元数据 ID，对应 llm-model-registry/models/{model_id}.yaml。
+    # 关联的模型元数据 ID，对应 LlmModelMetadata.model_id。
     model_id: str
 
     # 服务商请求时实际使用的模型名。例如同一个模型元数据在不同中转服务里可能叫不同别名。
@@ -173,7 +173,7 @@ class LlmProviderModelBinding:
         object.__setattr__(self, "api_keys", tuple(self.api_keys))
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为 YAML 友好的字典结构。"""
+        """转换为外部接口和迁移脚本可复用的字典结构。"""
         data: dict[str, Any] = {
             "id": self.id,
             "model_id": self.model_id,
@@ -196,7 +196,7 @@ class LlmProviderModelBinding:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LlmProviderModelBinding:
-        """从 YAML 字典创建服务商模型接入项。"""
+        """从外部接口或 legacy YAML 字典创建服务商模型接入项。"""
         return cls(
             id=str(data.get("id", "")),
             model_id=str(data.get("model_id", "")),
@@ -224,7 +224,7 @@ class LlmProviderDefinition:
     以及每个模型接入项的协议格式、请求参数和覆盖配置。
     """
 
-    # 服务商唯一标识，同时作为 ~/.spread-ai/llm-model-registry/providers/{provider_id}.yaml 的文件名主名。
+    # 服务商唯一标识，同时作为 REST/CLI 路径参数和仓储主键。
     provider_id: str
 
     # 服务商自定义分组，用于管理界面按用户定义的供应方类别聚合展示。
@@ -258,7 +258,7 @@ class LlmProviderDefinition:
         validate_unique_registry_ids((item.id for item in self.models), "provider_model.id")
 
     def to_dict(self) -> dict[str, Any]:
-        """将服务商定义转换为 YAML 友好的字典结构。"""
+        """将服务商定义转换为外部接口和迁移脚本可复用的字典结构。"""
         data: dict[str, Any] = {
             "provider_id": self.provider_id,
             "group": self.group,
@@ -274,7 +274,7 @@ class LlmProviderDefinition:
 
     @classmethod
     def from_dict(cls, provider_id: str, data: dict[str, Any]) -> LlmProviderDefinition:
-        """从 YAML 字典创建服务商定义。"""
+        """从外部接口或 legacy YAML 字典创建服务商定义。"""
         return cls(
             provider_id=str(data.get("provider_id") or provider_id),
             group=str(data.get("group") or "default"),

@@ -23,7 +23,7 @@ class LlmModelMetadata:
     以及支持 text/image 等输入模态。具体请求时的 thinking 参数由服务商模型接入项维护。
     """
 
-    # 模型型号唯一标识，同时作为 ~/.spread-ai/llm-model-registry/models/{model_id}.yaml 的文件名主名。
+    # 模型型号唯一标识，同时作为 REST/CLI 路径参数和仓储主键。
     model_id: str
 
     # 模型最大上下文窗口 token 数，用于 Agent 执行引擎判断历史消息是否需要压缩或裁剪。
@@ -66,7 +66,7 @@ class LlmModelMetadata:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        """将模型元数据转换为 YAML 友好的字典结构。"""
+        """将模型元数据转换为外部接口和迁移脚本可复用的字典结构。"""
         data: dict[str, Any] = {
             "model_id": self.model_id,
             "context_window": self.context_window,
@@ -82,7 +82,7 @@ class LlmModelMetadata:
 
     @classmethod
     def from_dict(cls, model_id: str, data: dict[str, Any]) -> LlmModelMetadata:
-        """从 YAML 字典创建模型元数据实体。"""
+        """从外部接口或 legacy YAML 字典创建模型元数据实体。"""
         return cls(
             model_id=str(data.get("model_id") or model_id),
             context_window=int(data.get("context_window", 0)),

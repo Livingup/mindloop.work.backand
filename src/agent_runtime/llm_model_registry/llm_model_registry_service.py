@@ -157,12 +157,13 @@ class LlmModelRegistryService:
     - 服务商定义引用模型元数据，不复制模型能力字段；
     - 保存服务商时校验每个 model_id 已存在，防止后续调用解析失败；
     - 删除模型元数据时阻止删除仍被服务商引用的模型；
+    - 保存执行策略组时校验每个候选项引用的 provider/binding 已存在；
     - 解析服务商模型接入项时应用 base URL、API Keys、headers 等覆盖规则。
     """
 
     def __init__(self, repository: LlmModelRegistryRepository) -> None:
-        # LLM 注册仓储。该仓储负责用户自定义模型元数据和服务商 YAML 文件的持久化与查询，
-        # 是后续 Agent 执行引擎选择 LLM 服务商、模型和协议参数的数据基础。
+        # LLM 注册仓储。该仓储负责用户自定义模型元数据、服务商定义和执行策略组的持久化与查询，
+        # 是后续 Agent 执行引擎选择 LLM 服务商、模型、策略和协议参数的数据基础。
         self._repository = repository
 
     # ── 模型元数据管理 ──────────────────────────────────────

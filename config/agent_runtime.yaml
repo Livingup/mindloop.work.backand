@@ -99,8 +99,8 @@ agent_definition:
   definitions_dir: "~/.spread-ai/agents"
 
 llm_model_registry:
-  # LLM 模型元数据与服务商定义 YAML 文件存放根目录。
-  # 具体数据按 models/{model_id}.yaml 和 providers/{provider_id}.yaml 分目录存储。
+  # LLM 模型注册 SQLite 数据库所在根目录。运行期权威数据文件为 llm_model_registry.sqlite3。
+  # legacy YAML 只作为一次性迁移输入，不会在应用启动或仓储初始化时自动导入。
   registry_dir: "~/.spread-ai/llm-model-registry"
 
 llm_http_trace:

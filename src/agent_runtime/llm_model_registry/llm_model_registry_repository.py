@@ -15,9 +15,10 @@ from agent_runtime.llm_model_registry.llm_provider_definition import LlmProvider
 class LlmModelRegistryRepository(Protocol):
     """LLM 服务商与模型注册仓储接口。
 
-    仓储以集合语义管理两类聚合根：
+    仓储以集合语义管理三类聚合根：
     - LlmModelMetadata：模型型号元数据，model_id 全局唯一；
-    - LlmProviderDefinition：服务商定义，provider_id 全局唯一。
+    - LlmProviderDefinition：服务商定义，provider_id 全局唯一；
+    - LlmExecutionPolicy：执行策略组，policy_group_id 全局唯一。
     """
 
     # ── 模型元数据集合 ──────────────────────────────────────
