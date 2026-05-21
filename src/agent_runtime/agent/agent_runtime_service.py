@@ -525,6 +525,19 @@ class AgentRuntimeService:
                 self._repository.save_agent_instance(updated)
             return updated, drained_messages
 
+    def remove_agent_instance_user_message(
+        self,
+        instance_id: str,
+        message_id: str,
+    ) -> tuple[AgentInstance, PendingAgentUserMessage | None]:
+        _require_non_blank(message_id, "message_id")
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            updated, removed_message = instance.remove_pending_user_message(message_id)
+            if removed_message is not None:
+                self._repository.save_agent_instance(updated)
+            return updated, removed_message
+
     def switch_agent_instance_llm_policy(
         self,
         instance_id: str,

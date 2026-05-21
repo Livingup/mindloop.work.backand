@@ -227,6 +227,13 @@ class AgentMessageSubmissionResponse(BaseModel):
     client_message_id: str | None = None
     queued_for_later: bool = False
     root_agent_instance: AgentInstanceResponse | None = None
+
+
+class RemovePendingUserMessageResponse(BaseModel):
+    status: str
+    agent_instance: AgentInstanceResponse
+    removed_message: PendingUserMessageResponse
+
 class AttachSceneBody(BaseModel):
     """attach scene 入参。
 
@@ -423,6 +430,35 @@ def create_agent_runtime_router(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
         return _interrupt_response(result)
+
+    @router.delete(
+        "/instances/{instance_id}/pending-user-messages/{pending_message_id}",
+        response_model=RemovePendingUserMessageResponse,
+        status_code=200,
+    )
+    async def remove_agent_instance_pending_user_message(
+        instance_id: str,
+        pending_message_id: str,
+    ) -> RemovePendingUserMessageResponse:
+        try:
+            updated, removed_message = gateway.remove_agent_instance_user_message(
+                instance_id,
+                pending_message_id,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if removed_message is None:
+            raise HTTPException(
+                status_code=409,
+                detail="待发送消息不存在或已进入会话发送，无法撤回。",
+            )
+        return RemovePendingUserMessageResponse(
+            status="removed",
+            agent_instance=await _instance_response(updated, conversation_repository, llm_registry_gateway),
+            removed_message=_pending_user_message_response(removed_message),
+        )
 
     @router.post(
         "/scenes/{scene_id}/attach",

@@ -366,6 +366,13 @@ class AgentRuntimeGateway(Protocol):
         """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
         ...
 
+    def remove_agent_instance_user_message(
+        self,
+        instance_id: str,
+        message_id: str,
+    ) -> tuple[AgentInstance, PendingAgentUserMessage | None]:
+        ...
+
     def switch_agent_instance_llm_policy(
         self,
         instance_id: str,

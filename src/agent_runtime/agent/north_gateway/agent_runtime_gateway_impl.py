@@ -265,6 +265,13 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
         return self._service.drain_agent_instance_user_messages(instance_id)
 
+    def remove_agent_instance_user_message(
+        self,
+        instance_id: str,
+        message_id: str,
+    ):
+        return self._service.remove_agent_instance_user_message(instance_id, message_id)
+
     def switch_agent_instance_llm_policy(
         self,
         instance_id: str,

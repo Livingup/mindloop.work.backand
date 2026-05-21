@@ -373,6 +373,33 @@ class AgentInstance:
             updated_at=at or _utc_now(),
         ), drained
 
+    def remove_pending_user_message(
+        self,
+        message_id: str,
+        *,
+        at: datetime | None = None,
+    ) -> tuple[AgentInstance, PendingAgentUserMessage | None]:
+        _require_non_blank(message_id, "message_id")
+        removed_message = next(
+            (
+                pending_message
+                for pending_message in self.pending_user_messages
+                if pending_message.message_id == message_id
+            ),
+            None,
+        )
+        if removed_message is None:
+            return self, None
+        return replace(
+            self,
+            pending_user_messages=tuple(
+                pending_message
+                for pending_message in self.pending_user_messages
+                if pending_message.message_id != message_id
+            ),
+            updated_at=at or _utc_now(),
+        ), removed_message
+
     def transition_to(
         self,
         target_status: AgentInstanceStatus,
