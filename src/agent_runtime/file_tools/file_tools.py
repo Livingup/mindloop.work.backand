@@ -16,13 +16,22 @@ from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult
 
 
+MAX_FILE_READ_LINE_COUNT = 1500
+MAX_CHARS_PER_LINE = 50000
+
+
 class FileReadRequest(BaseToolRequest):
     file_path: str = Field(description="要读取的文件绝对路径或当前进程可解析的文件路径。")
     start_line: int = Field(default=1, ge=1, description="1-based 起始行号；取值必须大于等于 1。")
-    line_count: int = Field(default=200, ge=1, le=500, description="最多读取的行数；取值范围为 1 到 500。")
-    max_chars: int = Field(default=20000, ge=1000, le=50000, description="最多返回的内容字符数；取值范围为 1000 到 50000。")
+    line_count: int = Field(default=200, ge=1, le=MAX_FILE_READ_LINE_COUNT, description=f"最多读取的行数；取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。")
     encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
-    include_line_numbers: bool = Field(default=True, description="是否在返回内容中包含行号。")
+
+
+class FileReadLineSliceRequest(BaseToolRequest):
+    file_path: str = Field(description="要读取超大行的文件绝对路径或当前进程可解析的文件路径。")
+    line_number: int = Field(ge=1, description="1-based 目标行号；取值必须大于等于 1。")
+    char_start: int = Field(ge=1, description=f"1-based 起始字符位置；取值必须大于等于 1。每次调用由工具内部固定最多返回 {MAX_CHARS_PER_LINE} 个字符，不能由 Agent 调整。")
+    encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
 
 
 class ContextDocumentDiscoverRequest(BaseToolRequest):
@@ -392,9 +401,9 @@ def _read_text_window(path: Path, request: FileReadRequest) -> tuple[dict[str, A
 
 
 def _read_text_window_with_encoding(path: Path, request: FileReadRequest, encoding: str) -> dict[str, Any]:
-    selected_lines: list[str] = []
-    current_chars = 0
-    truncation_reason: str | None = None
+    selected_lines: list[dict[str, Any]] = []
+    line_truncations: list[dict[str, Any]] = []
+    has_more_lines = False
     total_lines = 0
     start_line = request.start_line
     last_requested_line = request.start_line + request.line_count - 1
@@ -404,29 +413,42 @@ def _read_text_window_with_encoding(path: Path, request: FileReadRequest, encodi
             if total_lines < start_line:
                 continue
             if total_lines > last_requested_line:
-                if truncation_reason is None:
-                    truncation_reason = "line_count_limit"
-                continue
-            if truncation_reason is not None:
+                has_more_lines = True
                 continue
 
             line = raw_line.rstrip("\n")
-            rendered_line = f"{total_lines}→{line}" if request.include_line_numbers else line
-            additional_chars = len(rendered_line) + (1 if selected_lines else 0)
-            if selected_lines and current_chars + additional_chars > request.max_chars:
-                truncation_reason = "max_chars_limit"
-                continue
-            if not selected_lines and len(rendered_line) > request.max_chars:
-                selected_lines.append(rendered_line[: request.max_chars])
-                truncation_reason = "max_chars_limit"
-                continue
-            selected_lines.append(rendered_line)
-            current_chars += additional_chars
+            line_char_count = len(line)
+            truncated_line = line_char_count > MAX_CHARS_PER_LINE
+            line_item: dict[str, Any] = {
+                "line_number": total_lines,
+                "text": line[:MAX_CHARS_PER_LINE] if truncated_line else line,
+                "truncated": truncated_line,
+            }
+            if truncated_line:
+                truncation = {
+                    "line_number": total_lines,
+                    "char_start": 1,
+                    "char_end": MAX_CHARS_PER_LINE,
+                    "line_char_count": line_char_count,
+                    "next_char_start": MAX_CHARS_PER_LINE + 1,
+                    "continue_with": "file_read_line_slice",
+                }
+                line_item.update(truncation)
+                line_truncations.append(truncation)
+            selected_lines.append(line_item)
 
     returned_line_count = len(selected_lines)
     end_line = start_line + returned_line_count - 1 if returned_line_count else start_line - 1
-    truncated = truncation_reason is not None
-    next_start_line = end_line + 1 if truncated and end_line < total_lines else None
+    truncated = has_more_lines or bool(line_truncations)
+    next_start_line = end_line + 1 if has_more_lines and end_line < total_lines else None
+    if has_more_lines and line_truncations:
+        truncation_reason = "line_count_limit_and_max_chars_per_line_limit"
+    elif has_more_lines:
+        truncation_reason = "line_count_limit"
+    elif line_truncations:
+        truncation_reason = "max_chars_per_line_limit"
+    else:
+        truncation_reason = None
 
     return {
         "file_path": str(path),
@@ -439,8 +461,67 @@ def _read_text_window_with_encoding(path: Path, request: FileReadRequest, encodi
         "truncated": truncated,
         "truncation_reason": truncation_reason,
         "size_bytes": path.stat().st_size,
-        "content": "\n".join(selected_lines),
+        "lines": selected_lines,
+        "line_truncations": line_truncations,
         "warnings": [],
+    }
+
+
+def _read_line_slice(path: Path, request: FileReadLineSliceRequest) -> tuple[dict[str, Any], str]:
+    last_error: UnicodeDecodeError | LookupError | None = None
+    for candidate in _encoding_candidates(request.encoding):
+        try:
+            return _read_line_slice_with_encoding(path, request, candidate), candidate
+        except (UnicodeDecodeError, LookupError) as exc:
+            last_error = exc
+
+    message = "文件编码无法识别。"
+    if last_error is not None:
+        message = f"文件编码无法识别: {last_error}"
+    raise UnicodeDecodeError("unknown", b"", 0, 1, message)
+
+
+def _read_line_slice_with_encoding(path: Path, request: FileReadLineSliceRequest, encoding: str) -> dict[str, Any]:
+    total_lines = 0
+    target_line: str | None = None
+
+    with path.open("r", encoding=encoding, errors="strict") as file:
+        for total_lines, raw_line in enumerate(file, start=1):
+            if total_lines == request.line_number:
+                target_line = raw_line.rstrip("\n")
+                break
+
+    output_base = {
+        "file_path": str(path),
+        "line_number": request.line_number,
+        "char_start": request.char_start,
+        "total_lines": total_lines,
+    }
+    if target_line is None:
+        return {**output_base, "line_found": False}
+
+    line_char_count = len(target_line)
+    start_index = request.char_start - 1
+    if start_index > line_char_count:
+        return {
+            **output_base,
+            "line_found": True,
+            "char_start_valid": False,
+            "line_char_count": line_char_count,
+        }
+
+    text = target_line[start_index : start_index + MAX_CHARS_PER_LINE]
+    char_end = start_index + len(text)
+    has_more = char_end < line_char_count
+    return {
+        **output_base,
+        "line_found": True,
+        "char_start_valid": True,
+        "char_end": char_end,
+        "line_char_count": line_char_count,
+        "has_more": has_more,
+        "next_char_start": char_end + 1 if has_more else None,
+        "text": text,
     }
 
 
@@ -522,7 +603,7 @@ def _collect_text_search_matches(
 
 @tool(
     name="file_read",
-    description="按行范围读取指定文本文件内容，使用 line_count 与 max_chars 控制输出大小。",
+    description="按行范围读取指定文本文件内容，返回结构化 lines 数组，行号与文本分离。line_count 取值范围为 1 到 1500；工具内部会固定截断超大单行并返回 line_truncations，可用 file_read_line_slice 继续读取超大行。",
     group="file",
     category="system",
 )
@@ -568,6 +649,56 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
 
     output["encoding"] = used_encoding
     output.update(_detect_text_newline_info(path, used_encoding))
+    return BaseToolResult(output=output)
+
+
+@tool(
+    name="file_read_line_slice",
+    description="仅当 file_read 返回 line_truncations 表示遇到超大行时，才使用本工具单独续读该超大行的后续字符片段；不要用于普通多行文件读取。每次调用从指定 line_number 和 char_start 开始，由工具内部固定最多返回 50000 个字符，不能由 Agent 调整。",
+    group="file",
+    category="system",
+)
+def file_read_line_slice(request: FileReadLineSliceRequest) -> BaseToolResult:
+    path = Path(request.file_path).expanduser().resolve()
+    output_base = {"file_path": str(path), "line_number": request.line_number, "char_start": request.char_start}
+
+    if not path.exists():
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="PathNotFound",
+            error_message=f"文件不存在: {path}",
+            output=output_base,
+        )
+    if not path.is_file():
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="NotAFile",
+            error_message=f"路径不是文件: {path}",
+            output=output_base,
+        )
+    if _is_binary_file(path):
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="BinaryFileNotReadable",
+            error_message=f"文件可能是二进制文件，默认不读取: {path}",
+            output=output_base,
+        )
+
+    try:
+        output, used_encoding = _read_line_slice(path, request)
+    except UnicodeDecodeError as exc:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DecodeError",
+            error_message=str(exc),
+            output=output_base,
+        )
+
+    output["encoding"] = used_encoding
     return BaseToolResult(output=output)
 
 
