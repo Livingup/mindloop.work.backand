@@ -40,6 +40,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"agent_runtime.terminal" = ["terminal_xterm_snapshot.js"]
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

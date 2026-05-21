@@ -19,13 +19,42 @@ def render_terminal_text(
 ) -> str:
     if not raw_text:
         return ""
-    renderer = _TerminalTextRenderer(
-        columns=max(1, columns),
-        rows=max(1, rows),
-        scrollback_limit=max(0, scrollback_limit),
-    )
-    renderer.write(raw_text)
-    return renderer.text()
+    projector = TerminalTextProjector(columns=columns, rows=rows, scrollback_limit=scrollback_limit)
+    projector.write(raw_text)
+    return projector.text()
+
+
+class TerminalTextProjector:
+    def __init__(
+        self,
+        *,
+        columns: int = _DEFAULT_COLUMNS,
+        rows: int = _DEFAULT_ROWS,
+        scrollback_limit: int = _DEFAULT_SCROLLBACK_LIMIT,
+    ) -> None:
+        self._renderer = _TerminalTextRenderer(
+            columns=max(1, columns),
+            rows=max(1, rows),
+            scrollback_limit=max(0, scrollback_limit),
+        )
+
+    def write(self, text: str) -> None:
+        if text:
+            self._renderer.write(text)
+
+    def text(self) -> str:
+        return self._renderer.text()
+
+    def tail_text(self, tail_lines: int) -> str:
+        text = self.text()
+        if not text:
+            return ""
+        lines = text.splitlines(keepends=True)
+        return "".join(lines[-max(1, tail_lines):])
+
+    def line_count(self) -> int:
+        text = self.text()
+        return len(text.splitlines()) if text else 0
 
 
 @dataclass(slots=True)

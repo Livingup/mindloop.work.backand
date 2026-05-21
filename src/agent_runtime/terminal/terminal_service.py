@@ -25,7 +25,7 @@ from agent_runtime.terminal.terminal_command import TerminalCommand
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 from agent_runtime.terminal.terminal_process import TerminalProcessManager, TerminalProcessStartRequest, TerminalSessionStartRequest
 from agent_runtime.terminal.terminal_repository import TerminalRepository
-from agent_runtime.terminal.terminal_text_projection import render_terminal_text
+from agent_runtime.terminal.terminal_rendering import render_terminal_chunks
 
 ReadMode = Literal["tail", "page", "since", "search"]
 logger = logging.getLogger(__name__)
@@ -382,18 +382,23 @@ class TerminalService:
                 limit=limit_lines,
             )
         else:
-            all_chunks = self._repo.list_output_chunks(terminal_id, command_id=command_id, limit=5000)
-            text = render_terminal_text("".join(chunk.chunk for chunk in all_chunks))
-            lines = text.splitlines(keepends=True)
+            terminal_chunks = self._repo.list_output_chunks(terminal_id, limit=5000)
+            command_chunks = (
+                self._repo.list_output_chunks(terminal_id, command_id=command_id, limit=5000)
+                if command_id is not None
+                else terminal_chunks
+            )
+            rendered = await asyncio.to_thread(render_terminal_chunks, [chunk.chunk for chunk in terminal_chunks])
+            lines = rendered.text.splitlines(keepends=True)
             tail_text = "".join(lines[-max(1, tail_lines):])
             result = _build_read_result(
                 terminal_id=terminal_id,
                 command_id=command_id,
                 status=terminal.status,
-                chunks=all_chunks[-max(1, min(tail_lines, len(all_chunks))):],
+                chunks=command_chunks,
                 text=tail_text,
                 limit_chars=effective_limit_chars,
-                has_more=len(lines) > tail_lines,
+                has_more=rendered.line_count > tail_lines,
             )
             logger.info(
                 "读取终端输出完成: terminal_id=%s, command_id=%s, mode=%s, chunks_returned=%s, text_chars=%s, truncated=%s, has_more=%s, status=%s, 耗时=%sms",
@@ -408,13 +413,13 @@ class TerminalService:
                 int((time.perf_counter() - started_at) * 1000),
             )
             return result
-        text = render_terminal_text("".join(chunk.chunk for chunk in chunks))
+        rendered = await asyncio.to_thread(render_terminal_chunks, [chunk.chunk for chunk in chunks])
         result = _build_read_result(
             terminal_id=terminal_id,
             command_id=command_id,
             status=terminal.status,
             chunks=chunks,
-            text=text,
+            text=rendered.text,
             limit_chars=effective_limit_chars,
             has_more=len(chunks) >= limit_lines,
         )
