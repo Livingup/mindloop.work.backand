@@ -278,6 +278,9 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.context_compression.prompt_repository import (
         ContextCompressionWorkerPromptRepository,
     )
+    from agent_runtime.context_compression.settings_repository import (
+        ContextCompressionSettingsRepository,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -298,6 +301,9 @@ def serve(host: str | None, port: int | None) -> None:
         ConfigRegistry.instance().conversation_repository.data_dir,
     )
     context_compression_prompt_repository = ContextCompressionWorkerPromptRepository(
+        lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+    )
+    context_compression_settings_repository = ContextCompressionSettingsRepository(
         lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
     )
     # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
@@ -460,6 +466,9 @@ def serve(host: str | None, port: int | None) -> None:
         create_context_compression_router(
             conversation_repository,
             prompt_repository=context_compression_prompt_repository,
+            settings_repository=context_compression_settings_repository,
+            llm_registry_gateway=llm_model_registry_gateway,
+            config_accessor=lambda: ConfigRegistry.instance().context_compression,
         ),
         prefix="/api/context-compression",
         tags=["上下文压缩"],

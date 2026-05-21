@@ -291,7 +291,7 @@ DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transc
                                                 '\n'
                                                 '你不能修改最终文档，只能通过 context_summary.report_section_issue 报告问题，或在没有严重问题时声明 '
                                                 'verification_passed。'},
- 'historical_conversation': {'RequirementConstraintWorker': '你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。\n'
+ 'native_multimodal_history': {'RequirementConstraintWorker': '你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。\n'
                                                             '\n'
                                                             '你看到的历史 user / assistant / tool 消息是原 Conversation '
                                                             '中待压缩的历史会话内容，可能包含图片、PDF '

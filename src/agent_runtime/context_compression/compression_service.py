@@ -4,10 +4,10 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
-from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import AgentDefinitionNorthGateway
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext, RuntimeEventPublisher
 from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.config import ContextCompressionConfig
+from agent_runtime.context_compression.settings_repository import ContextCompressionSettingsRepository
 from agent_runtime.context_compression.conversation_rewriter import rewrite_conversation_with_summary
 from agent_runtime.context_compression.event_publisher import (
     CONTEXT_COMPRESSION_ASSEMBLY_COMPLETED,
@@ -58,19 +58,19 @@ class ContextCompressionService:
         llm_request_service: LlmRequestService,
         conversation_repository: ConversationRepository,
         runtime_gateway: AgentRuntimeGateway,
-        agent_definition_gateway: AgentDefinitionNorthGateway,
         llm_registry_gateway: LlmModelRegistryGateway,
         archive_repository: ContextCompressionArchiveRepository,
         event_publisher: RuntimeEventPublisher,
         config_accessor: Callable[[], ContextCompressionConfig],
+        settings_repository: ContextCompressionSettingsRepository,
         prompt_repository: ContextCompressionWorkerPromptRepository | None = None,
     ) -> None:
         self._conversation_repository = conversation_repository
         self._runtime_gateway = runtime_gateway
-        self._agent_definition_gateway = agent_definition_gateway
         self._llm_registry_gateway = llm_registry_gateway
         self._archive_repository = archive_repository
         self._config_accessor = config_accessor
+        self._settings_repository = settings_repository
         self._event_publisher = ContextCompressionEventPublisher(event_publisher)
         self._job_store = InMemoryCompressionJobStore()
         self._prompt_loader = ContextCompressionPromptLoader(
@@ -93,8 +93,6 @@ class ContextCompressionService:
         interrupt_checker: Callable[[], bool] | None = None,
     ) -> CompressionResult:
         config = self._config_accessor()
-        if instance.agent_definition_id == config.agent_definition_id:
-            return CompressionResult(created=False, reason="context_compression_agent_skipped")
         decision = decide_context_compression(source_conversation, trigger_model, config)
         if not decision.should_compress:
             return CompressionResult(created=False, reason=decision.reason)
@@ -326,16 +324,18 @@ class ContextCompressionService:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_COMPLETED, _base_payload(job, status="running", phase="verification_completed"))
 
     def _resolve_worker_candidates(self, config: ContextCompressionConfig) -> tuple[ResolvedLlmProviderModel, ...]:
-        definition = self._agent_definition_gateway.get_agent_definition(config.agent_definition_id)
-        if definition.disabled:
-            raise ValueError(f"上下文压缩 Agent 定义已禁用: {config.agent_definition_id}")
-        policy_group_id = definition.default_llm_policy_group_id
+        del config  # 预留参数，未来可能从 config 读取退让策略
+        policy_group_id = self._settings_repository.get_llm_policy_group_id()
         if not policy_group_id:
-            raise ValueError(f"上下文压缩 Agent 未配置默认 LLM 执行策略组: {config.agent_definition_id}")
+            raise ValueError(
+                "上下文压缩未配置 LLM 执行策略组，请到「上下文压缩」设置页选择策略组。"
+            )
         policy = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
         candidates = tuple(candidate.resolved_model for candidate in policy.candidates)
         if not candidates:
-            raise ValueError(f"上下文压缩 Agent 默认 LLM 执行策略组没有可用候选项: {policy_group_id}")
+            raise ValueError(
+                f"上下文压缩绑定的 LLM 执行策略组没有可用候选项: {policy_group_id}"
+            )
         return candidates
 
     async def _publish_skipped(

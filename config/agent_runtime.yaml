@@ -110,7 +110,6 @@ llm_http_trace:
 
 context_compression:
   enabled: true
-  agent_definition_id: "context_compression"
   default_threshold_ratio: 0.75
   max_worker_rounds: 128
   input_mode: "transcript_snapshot"

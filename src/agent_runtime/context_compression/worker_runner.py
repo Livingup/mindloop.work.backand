@@ -86,8 +86,8 @@ class ContextCompressionWorkerRunner:
         if last_error is not None:
             raise last_error
         if skipped_tool_calling:
-            raise RuntimeError("上下文压缩 Agent 默认 LLM 执行策略组没有支持 tool calling 的可用候选。")
-        raise RuntimeError("上下文压缩 Agent 默认 LLM 执行策略组没有可用候选。")
+            raise RuntimeError("上下文压缩流水线绑定的 LLM 执行策略组没有支持 tool calling 的可用候选。")
+        raise RuntimeError("上下文压缩流水线绑定的 LLM 执行策略组没有可用候选。")
 
     async def _run_worker_with_model(
         self,

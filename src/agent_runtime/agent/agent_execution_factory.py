@@ -11,6 +11,7 @@ from agent_runtime.communication.communication_factory import CommunicationFacto
 from agent_runtime.communication.runtime_event_publisher import CommunicationRuntimeEventPublisher
 from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.compression_service import ContextCompressionService
+from agent_runtime.context_compression.settings_repository import ContextCompressionSettingsRepository
 from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
 
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
@@ -123,17 +124,20 @@ class AgentExecutionFactory:
         )
         agent_definition_gateway = AgentDefinitionFactory.create()
         llm_registry_gateway = LlmModelRegistryFactory.create()
+        context_compression_settings_repository = ContextCompressionSettingsRepository(
+            lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+        )
         context_compression_service = ContextCompressionService(
             llm_request_service=llm_request_service,
             conversation_repository=conversation_repository,
             runtime_gateway=runtime_gateway,
-            agent_definition_gateway=agent_definition_gateway,
             llm_registry_gateway=llm_registry_gateway,
             archive_repository=ContextCompressionArchiveRepository(
                 config.context_compression.archive_data_dir,
             ),
             event_publisher=event_publisher,
             config_accessor=lambda: ConfigRegistry.instance().context_compression,
+            settings_repository=context_compression_settings_repository,
         )
         return AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
