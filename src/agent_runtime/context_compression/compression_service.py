@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
@@ -17,10 +18,14 @@ from agent_runtime.context_compression.event_publisher import (
     CONTEXT_COMPRESSION_CONVERSATION_REBIND_COMPLETED,
     CONTEXT_COMPRESSION_FAILED,
     CONTEXT_COMPRESSION_RANGE_PLANNED,
+    CONTEXT_COMPRESSION_SECTION_COMPLETED,
+    CONTEXT_COMPRESSION_SECTION_STARTED,
     CONTEXT_COMPRESSION_SKIPPED,
     CONTEXT_COMPRESSION_STARTED,
     CONTEXT_COMPRESSION_VERIFICATION_COMPLETED,
     CONTEXT_COMPRESSION_VERIFICATION_STARTED,
+    CONTEXT_COMPRESSION_WORKER_CANCELLED,
+    CONTEXT_COMPRESSION_WORKER_QUEUED,
     ContextCompressionEventPublisher,
 )
 from agent_runtime.context_compression.gate import decide_context_compression
@@ -49,6 +54,13 @@ if TYPE_CHECKING:
     from agent_runtime.agent.agent_instance import AgentInstance
     from agent_runtime.agent.agent_task import AgentTask
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import AgentRuntimeGateway
+
+
+@dataclass(frozen=True, slots=True)
+class _SectionWorkerRun:
+    worker_name: str
+    section: str
+    system_prompt: str
 
 
 class ContextCompressionService:
@@ -141,6 +153,7 @@ class ContextCompressionService:
             input_mode=config.input_mode,
         )
         self._job_store.create_job(job)
+        self._job_store.update_status(job.job_id, "running")
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_STARTED, _base_payload(job, status="running", phase="started"))
         try:
             range_plan = plan_compression_range(
@@ -149,7 +162,7 @@ class ContextCompressionService:
                 reason=decision.reason,
             )
             if range_plan is None:
-                job.status = "skipped"
+                self._job_store.update_status(job.job_id, "skipped")
                 await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, _base_payload(job, status="skipped", phase="range_planning", reason="insufficient_compressible_range"))
                 return CompressionResult(created=False, job=job, reason="insufficient_compressible_range")
             job.range = range_plan
@@ -208,7 +221,7 @@ class ContextCompressionService:
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_COMPLETED, _completion_payload(job, source_conversation, target_conversation, summary_message_id))
             return CompressionResult(created=True, target_conversation=target_conversation, job=job)
         except LlmRequestCancelled:
-            job.status = "cancelled"
+            self._job_store.update_status(job.job_id, "cancelled")
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(
                 communication_context,
@@ -217,12 +230,12 @@ class ContextCompressionService:
             )
             return CompressionResult(created=False, reason="interrupted")
         except asyncio.CancelledError:
-            job.status = "cancelled"
+            self._job_store.update_status(job.job_id, "cancelled")
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_CANCELLED, _base_payload(job, status="cancelled", phase="cancelled"))
             raise
         except Exception as exc:
-            job.status = "failed"
+            self._job_store.update_status(job.job_id, "failed")
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             payload = _base_payload(job, status="failed", phase="failed")
             payload["error_type"] = exc.__class__.__name__
@@ -241,15 +254,113 @@ class ContextCompressionService:
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
     ) -> None:
-        for worker_name, section in SECTION_WORKERS:
-            prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name=worker_name)
+        workers = tuple(
+            _SectionWorkerRun(
+                worker_name=worker_name,
+                section=section,
+                system_prompt=self._prompt_loader.load_prompt(input_mode=input_mode, worker_name=worker_name),
+            )
+            for worker_name, section in SECTION_WORKERS
+        )
+        for worker in workers:
+            await self._publish_section_worker_lifecycle_event(
+                communication_context,
+                CONTEXT_COMPRESSION_WORKER_QUEUED,
+                job,
+                worker=worker,
+                input_mode=input_mode,
+                reason="waiting_for_concurrent_start",
+            )
+        tasks = {
+            asyncio.create_task(
+                self._run_one_section_worker(
+                    job=job,
+                    worker=worker,
+                    input_text=input_text,
+                    input_mode=input_mode,
+                    resolved_candidates=resolved_candidates,
+                    max_rounds=max_rounds,
+                    communication_context=communication_context,
+                    interrupt_checker=interrupt_checker,
+                )
+            ): worker
+            for worker in workers
+        }
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
+                failure_error: BaseException | None = None
+                cancellation_error: BaseException | None = None
+                for task in done:
+                    try:
+                        await task
+                    except LlmRequestCancelled as exc:
+                        cancellation_error = cancellation_error or exc
+                    except asyncio.CancelledError as exc:
+                        cancellation_error = cancellation_error or exc
+                    except Exception as exc:
+                        failure_error = failure_error or exc
+                first_error = failure_error or cancellation_error
+                if first_error is not None:
+                    self._job_store.update_status(job.job_id, "failed" if failure_error is not None else "cancelled")
+                    await self._cancel_pending_section_workers(
+                        job=job,
+                        pending_tasks=pending,
+                        task_workers=tasks,
+                        input_mode=input_mode,
+                        communication_context=communication_context,
+                        reason="sibling_worker_failed" if job.status == "failed" else "context_compression_cancelled",
+                    )
+                    pending = set()
+                    if failure_error is None and isinstance(first_error, asyncio.CancelledError):
+                        raise first_error
+                    raise first_error
+        except asyncio.CancelledError:
+            self._job_store.update_status(job.job_id, "cancelled")
+            await self._cancel_pending_section_workers(
+                job=job,
+                pending_tasks=pending,
+                task_workers=tasks,
+                input_mode=input_mode,
+                communication_context=communication_context,
+                reason="context_compression_cancelled",
+            )
+            raise
+        finally:
+            remaining = [task for task in tasks if not task.done()]
+            if remaining:
+                for task in remaining:
+                    task.cancel()
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+    async def _run_one_section_worker(
+        self,
+        *,
+        job: CompressionJob,
+        worker: _SectionWorkerRun,
+        input_text: str,
+        input_mode: str,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
+        max_rounds: int,
+        communication_context: RuntimeCommunicationContext | None,
+        interrupt_checker: Callable[[], bool] | None,
+    ) -> None:
+        try:
+            await self._publish_section_worker_lifecycle_event(
+                communication_context,
+                CONTEXT_COMPRESSION_SECTION_STARTED,
+                job,
+                worker=worker,
+                input_mode=input_mode,
+            )
             await self._worker_runner.run_worker(
                 job=job,
-                worker_name=worker_name,
+                worker_name=worker.worker_name,
                 worker_role="section_worker",
-                output_section=section,
+                output_section=worker.section,
                 input_mode=input_mode,
-                system_prompt=prompt,
+                system_prompt=worker.system_prompt,
                 input_text=input_text,
                 resolved_candidates=resolved_candidates,
                 max_rounds=max_rounds,
@@ -261,6 +372,73 @@ class ContextCompressionService:
                 },
                 interrupt_checker=interrupt_checker,
             )
+            await self._publish_section_worker_lifecycle_event(
+                communication_context,
+                CONTEXT_COMPRESSION_SECTION_COMPLETED,
+                job,
+                worker=worker,
+                input_mode=input_mode,
+            )
+        except LlmRequestCancelled:
+            await self._publish_section_worker_lifecycle_event(
+                communication_context,
+                CONTEXT_COMPRESSION_WORKER_CANCELLED,
+                job,
+                worker=worker,
+                input_mode=input_mode,
+                reason="interrupted",
+            )
+            raise
+
+    async def _cancel_pending_section_workers(
+        self,
+        *,
+        job: CompressionJob,
+        pending_tasks: set[asyncio.Task[None]],
+        task_workers: dict[asyncio.Task[None], _SectionWorkerRun],
+        input_mode: str,
+        communication_context: RuntimeCommunicationContext | None,
+        reason: str,
+    ) -> None:
+        for task in pending_tasks:
+            worker = task_workers[task]
+            await self._publish_section_worker_lifecycle_event(
+                communication_context,
+                CONTEXT_COMPRESSION_WORKER_CANCELLED,
+                job,
+                worker=worker,
+                input_mode=input_mode,
+                reason=reason,
+            )
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    async def _publish_section_worker_lifecycle_event(
+        self,
+        communication_context: RuntimeCommunicationContext | None,
+        event_type: str,
+        job: CompressionJob,
+        *,
+        worker: _SectionWorkerRun,
+        input_mode: str,
+        reason: str | None = None,
+    ) -> None:
+        payload = _base_payload(job, status=job.status, phase="workers")
+        payload["worker"] = {
+            "name": worker.worker_name,
+            "role": "section_worker",
+            "output_section": worker.section,
+            "input_mode": input_mode,
+        }
+        if reason is not None:
+            payload["worker"]["reason"] = reason
+        await self._event_publisher.publish(
+            communication_context,
+            event_type,
+            payload,
+            source="context_compression_service",
+        )
 
     async def _assemble_final_markdown(
         self,

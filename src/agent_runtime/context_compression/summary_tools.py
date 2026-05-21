@@ -42,13 +42,14 @@ class ContextSummaryToolExecutor:
         *,
         job_id: str,
         worker_name: str,
+        expected_section: str | None = None,
         tool_use: ToolUsePart,
         allowed_tool_names: set[str] | None = None,
     ) -> ToolResultPart:
         try:
             if allowed_tool_names is not None and tool_use.name not in allowed_tool_names:
                 raise PermissionError(f"当前 Worker 不允许调用上下文压缩工具: {tool_use.name}")
-            result = self._execute(job_id=job_id, worker_name=worker_name, tool_use=tool_use)
+            result = self._execute(job_id=job_id, worker_name=worker_name, expected_section=expected_section, tool_use=tool_use)
             return ToolResultPart(tool_use_ref=tool_use.tool_use_id or tool_use.name, is_error=False, output=result)
         except Exception as exc:
             return ToolResultPart(
@@ -57,7 +58,7 @@ class ContextSummaryToolExecutor:
                 output={"error_type": exc.__class__.__name__, "error_message": str(exc)},
             )
 
-    def _execute(self, *, job_id: str, worker_name: str, tool_use: ToolUsePart) -> dict[str, Any]:
+    def _execute(self, *, job_id: str, worker_name: str, expected_section: str | None, tool_use: ToolUsePart) -> dict[str, Any]:
         arguments = _ensure_dict(tool_use.input)
         if tool_use.name == APPEND_SECTION_ITEMS:
             section = str(arguments.get("section") or "").strip()
@@ -66,13 +67,13 @@ class ContextSummaryToolExecutor:
                 raise ValueError("section 必须是非空字符串。")
             if not isinstance(items, list):
                 raise ValueError("items 必须是数组。")
-            total = self._job_store.append_section_items(job_id, worker_name=worker_name, section=section, items=items)
+            total = self._job_store.append_section_items(job_id, worker_name=worker_name, section=section, expected_section=expected_section, items=items)
             return {"success": True, "total_section_items": total}
         if tool_use.name == MARK_SECTION_COMPLETE:
             section = str(arguments.get("section") or "").strip()
             if not section:
                 raise ValueError("section 必须是非空字符串。")
-            completed = self._job_store.mark_section_complete(job_id, section)
+            completed = self._job_store.mark_section_complete(job_id, section, expected_section=expected_section)
             return {"success": True, "completed_section_count": completed}
         if tool_use.name == APPEND_FINAL_MARKDOWN_SECTION:
             markdown = str(arguments.get("markdown") or "").strip()

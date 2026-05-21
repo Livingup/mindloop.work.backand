@@ -149,6 +149,7 @@ class ContextCompressionWorkerRunner:
                     self._summary_tools.execute(
                         job_id=job.job_id,
                         worker_name=worker_name,
+                        expected_section=output_section if worker_role == "section_worker" else None,
                         tool_use=tool_use,
                         allowed_tool_names=allowed_tool_names,
                     )
@@ -242,10 +243,13 @@ class ContextCompressionWorkerRunner:
             },
         }
         if duration_ms is not None:
+            payload["worker"]["duration_ms"] = duration_ms
             payload.setdefault("metrics", {})["duration_ms"] = duration_ms
         if error_type is not None:
+            payload["worker"]["error_type"] = error_type
             payload["error_type"] = error_type
         if error_message is not None:
+            payload["worker"]["error_message"] = error_message
             payload["error_message"] = error_message
         await self._event_publisher.publish(context, event_type, payload, source="context_compression_worker_runner")
 

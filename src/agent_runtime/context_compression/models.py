@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agent_runtime.conversation_message.message.models import Conversation
+if TYPE_CHECKING:
+    from agent_runtime.conversation_message.message.models import Conversation
 
 
 SECTION_WORKERS: tuple[tuple[str, str], ...] = (
