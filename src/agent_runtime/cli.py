@@ -275,6 +275,9 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.context_compression.north_gateway.context_compression_rest_adapter import (
         create_context_compression_router,
     )
+    from agent_runtime.context_compression.prompt_repository import (
+        ContextCompressionWorkerPromptRepository,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -293,6 +296,9 @@ def serve(host: str | None, port: int | None) -> None:
     chat_bubble_service = ChatBubbleFactory.create()
     conversation_repository = SqliteConversationRepository(
         ConfigRegistry.instance().conversation_repository.data_dir,
+    )
+    context_compression_prompt_repository = ContextCompressionWorkerPromptRepository(
+        lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
     )
     # scene_gateway 必须在 agent_runtime_gateway 之前创建，并注入给 AgentRuntimeFactory
     # 以支持 attach_scene 编排（前端进入 scene 的统一入口）。
@@ -451,7 +457,10 @@ def serve(host: str | None, port: int | None) -> None:
         tags=["统一文件资源"],
     )
     app.include_router(
-        create_context_compression_router(conversation_repository),
+        create_context_compression_router(
+            conversation_repository,
+            prompt_repository=context_compression_prompt_repository,
+        ),
         prefix="/api/context-compression",
         tags=["上下文压缩"],
     )

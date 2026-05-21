@@ -9,7 +9,10 @@ from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatche
 from agent_runtime.agent_definition.agent_definition_factory import AgentDefinitionFactory
 from agent_runtime.communication.communication_factory import CommunicationFactory
 from agent_runtime.communication.runtime_event_publisher import CommunicationRuntimeEventPublisher
+from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
+from agent_runtime.context_compression.compression_service import ContextCompressionService
 from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
+
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResolvedResource,
     ResourceMeta,
@@ -104,6 +107,11 @@ class AgentExecutionFactory:
         event_publisher = CommunicationRuntimeEventPublisher(communication_gateway)
         local_tool_gateway = LocalToolFactory.create()
         mcp_gateway = mcp_client_gateway or McpClientFactory.create()
+        runtime_gateway = AgentRuntimeFactory.create()
+        llm_request_service = LlmClientFactory.create(
+            _LazyFileResourceResolver(),
+            event_publisher=event_publisher,
+        )
 
         tool_dispatcher = AgentToolDispatcher(
             local_tool_gateway=local_tool_gateway,
@@ -113,8 +121,18 @@ class AgentExecutionFactory:
         trace_recorder = AgentTraceRecorder(
             trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
         )
+        context_compression_service = ContextCompressionService(
+            llm_request_service=llm_request_service,
+            conversation_repository=conversation_repository,
+            runtime_gateway=runtime_gateway,
+            archive_repository=ContextCompressionArchiveRepository(
+                config.context_compression.archive_data_dir,
+            ),
+            event_publisher=event_publisher,
+            config_accessor=lambda: ConfigRegistry.instance().context_compression,
+        )
         return AgentExecutionEngine(
-            runtime_gateway=AgentRuntimeFactory.create(),
+            runtime_gateway=runtime_gateway,
             agent_definition_gateway=AgentDefinitionFactory.create(),
             llm_registry_gateway=LlmModelRegistryFactory.create(),
             conversation_repository=conversation_repository,
@@ -122,12 +140,10 @@ class AgentExecutionFactory:
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
             skill_gateway=SkillFactory.create(),
-            llm_request_service=LlmClientFactory.create(
-                _LazyFileResourceResolver(),
-                event_publisher=event_publisher,
-            ),
+            llm_request_service=llm_request_service,
             tool_dispatcher=tool_dispatcher,
             trace_recorder=trace_recorder,
             communication_gateway=communication_gateway,
             event_publisher=event_publisher,
+            context_compression_service=context_compression_service,
         )

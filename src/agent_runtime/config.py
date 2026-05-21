@@ -47,6 +47,7 @@ from agent_runtime.llm_model_registry.llm_model_registry_config import LlmModelR
 from agent_runtime.llm_http_trace.config import LlmHttpTraceConfig
 from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
 from agent_runtime.communication.communication_config import CommunicationConfig
+from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
 
 
@@ -133,6 +134,10 @@ class AgentRuntimeConfig:
 
     llm_http_trace: LlmHttpTraceConfig = field(
         default_factory=LlmHttpTraceConfig,
+    )
+
+    context_compression: ContextCompressionConfig = field(
+        default_factory=ContextCompressionConfig,
     )
 
 
@@ -363,6 +368,16 @@ class ConfigRegistry:
         )
 
     @property
+    def context_compression(self) -> ContextCompressionConfig:
+        if self._config is not None:
+            return self._config.context_compression
+        if self._raw_config_data is not None and "context_compression" not in self._raw_config_data:
+            return ContextCompressionConfig()
+        return self._get_section_config(
+            "context_compression", _build_context_compression_config,
+        )
+
+    @property
     def communication(self) -> CommunicationConfig:
         """实时读取通用通信模块配置（通信流与消息日志数据目录等）。"""
         if self._config is not None:
@@ -588,6 +603,19 @@ def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
         enabled=bool(data.get("enabled", True)),
         data_dir=str(data.get("data_dir", "~/.spread-ai/llm-http-traces")),
         max_body_bytes=int(data.get("max_body_bytes", 20 * 1024 * 1024)),
+    )
+
+
+def _build_context_compression_config(data: dict[str, Any]) -> ContextCompressionConfig:
+    return ContextCompressionConfig(
+        enabled=bool(data.get("enabled", True)),
+        default_threshold_ratio=float(data.get("default_threshold_ratio", 0.75)),
+        min_compressible_messages=int(data.get("min_compressible_messages", 12)),
+        retained_tail_min_messages=int(data.get("retained_tail_min_messages", 8)),
+        max_worker_rounds=int(data.get("max_worker_rounds", data.get("section_worker_max_rounds", 8))),
+        input_mode=str(data.get("input_mode", "transcript_snapshot")),
+        verifier_enabled=bool(data.get("verifier_enabled", False)),
+        archive_data_dir=str(data.get("archive_data_dir", "~/.spread-ai/context-compression")),
     )
 
 

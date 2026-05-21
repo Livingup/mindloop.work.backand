@@ -230,6 +230,16 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             conversation_id,
         )
 
+    def switch_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        return self._service.switch_agent_instance_conversation(
+            instance_id,
+            conversation_id,
+        )
+
     def enqueue_agent_instance_user_message(
         self,
         instance_id: str,

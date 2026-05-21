@@ -55,6 +55,7 @@ from agent_runtime.conversation_message.message.models import (
     ROLE_TOOL,
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.context_compression.compression_service import ContextCompressionService
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
@@ -256,6 +257,7 @@ class AgentExecutionEngine:
         trace_recorder: AgentTraceRecorder,
         communication_gateway: CommunicationGateway | None = None,
         event_publisher: RuntimeEventPublisher | None = None,
+        context_compression_service: ContextCompressionService | None = None,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -280,6 +282,7 @@ class AgentExecutionEngine:
         self._communication_gateway = communication_gateway
         # 运行时事件发布器。所有 Agent/LLM/Tool 关键节点都通过逻辑 stream_id 发布。
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
+        self._context_compression_service = context_compression_service
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
@@ -533,6 +536,26 @@ class AgentExecutionEngine:
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
+                if self._context_compression_service is not None:
+                    compression_result = await self._context_compression_service.compress_if_needed(
+                        task=task,
+                        instance=instance,
+                        source_conversation=conversation,
+                        resolved_candidates=resolved_candidates,
+                        communication_context=communication_context,
+                        interrupt_checker=lambda state=interrupt_state: state.requested,
+                    )
+                    if compression_result.created and compression_result.target_conversation is not None:
+                        conversation = compression_result.target_conversation
+                        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                        self._trace_recorder.record_event(
+                            trace_path,
+                            "context_compression_completed",
+                            {
+                                "job_id": compression_result.job.job_id if compression_result.job else None,
+                                "target_conversation_id": conversation.id,
+                            },
+                        )
                 try:
                     llm_response = await _await_with_progress_logging(
                         self._send_prompt_with_policy_failover(

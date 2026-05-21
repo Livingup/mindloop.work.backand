@@ -246,6 +246,17 @@ class AgentInstance:
             raise ValueError("Agent 实例已经绑定其他 conversation_id，不能覆盖。")
         return replace(self, conversation_id=conversation_id, updated_at=at or _utc_now())
 
+    def switch_conversation(
+        self,
+        conversation_id: str,
+        *,
+        at: datetime | None = None,
+    ) -> "AgentInstance":
+        _require_non_blank(conversation_id, "conversation_id")
+        if self.conversation_id == conversation_id:
+            return self
+        return replace(self, conversation_id=conversation_id, updated_at=at or _utc_now())
+
     def reset_for_next_scene_task(
         self,
         *,

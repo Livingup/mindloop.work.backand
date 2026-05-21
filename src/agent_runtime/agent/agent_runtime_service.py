@@ -470,6 +470,17 @@ class AgentRuntimeService:
             self._repository.save_agent_instance(updated)
             return updated
 
+    def switch_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            updated = instance.switch_conversation(conversation_id)
+            self._repository.save_agent_instance(updated)
+            return updated
+
     def enqueue_agent_instance_user_message(
         self,
         instance_id: str,

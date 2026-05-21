@@ -340,6 +340,13 @@ class AgentRuntimeGateway(Protocol):
         """为 Agent 实例绑定历史会话 ID。"""
         ...
 
+    def switch_agent_instance_conversation(
+        self,
+        instance_id: str,
+        conversation_id: str,
+    ) -> AgentInstance:
+        ...
+
     def enqueue_agent_instance_user_message(
         self,
         instance_id: str,

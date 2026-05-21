@@ -107,3 +107,13 @@ llm_http_trace:
   enabled: true
   data_dir: "~/.spread-ai/llm-http-traces"
   max_body_bytes: 20971520
+
+context_compression:
+  enabled: true
+  default_threshold_ratio: 0.75
+  min_compressible_messages: 12
+  retained_tail_min_messages: 8
+  max_worker_rounds: 8
+  input_mode: "transcript_snapshot"
+  verifier_enabled: false
+  archive_data_dir: "~/.spread-ai/context-compression"
