@@ -417,6 +417,62 @@ metadata
 
 后续所有与该任务相关的操作都依赖 `taskId` 和 `contextId`。
 
+### 10.3 多客户端并发调用同一 Agent Server 时怎么区分
+
+同一个 AgentCard 或同一个 A2A Server 定义可以被多个客户端同时调用，也可以被同一个客户端同时发起多个任务。AgentCard 只说明“这个服务端 Agent 是谁、会什么、从哪里调用”，不代表某一次具体调用。
+
+客户端区分并发调用时，核心依赖：
+
+```text
+remote_agent_id / interface_url：区分调用的是哪个远端 Agent 服务
+messageId：区分客户端发出的某一条消息，也用于重试幂等
+taskId：区分服务端创建的某一个具体任务
+contextId：区分一组相关任务和消息所属的连续上下文
+auth account / local workspace：客户端本地的账号、工作区或权限隔离维度
+```
+
+服务端每创建一个新 Task，都必须返回该 Task 的 `id`。客户端应把 `taskId` 当作服务端作用域内的不透明 ID，不要假设它在所有远端 Agent 之间全局唯一。
+
+推荐客户端本地映射键：
+
+```text
+remote_task_key = interface_url + taskId
+```
+
+如果同一个 Agent Server 会被多个账号、多个工作区或多个本地 Agent 实例同时调用，客户端可以扩展为：
+
+```text
+remote_task_key = local_workspace_id + local_agent_instance_id + interface_url + taskId
+```
+
+收到 streaming event、polling 结果或 artifact chunk 时，客户端都应按 `interface_url + taskId` 路由到本地对应任务 UI、状态机和 artifact 缓冲区。
+
+### 10.4 `tenant` 是什么，A2A 会返回吗
+
+`tenant` 不是 A2A v1.0 标准要求返回的字段，也不是 Task 续接机制的一部分。它通常是客户端平台或服务端平台自己的多租户隔离概念，例如：
+
+- 本地工作区 ID。
+- 用户账号 ID。
+- 组织 ID。
+- 项目 ID。
+- API Key 所属主体。
+- OAuth token claim 中的 `sub`、`org_id`、`tenant_id` 等自定义声明。
+- 服务端自定义 URL、Header 或 metadata 中携带的租户维度。
+
+A2A 标准响应里，客户端应该稳定依赖的是：
+
+```text
+Task.id
+Task.contextId
+Task.status
+Task.artifacts
+Message.messageId
+Message.contextId
+Message.taskId
+```
+
+因此客户端不能等待服务端“返回 tenant”后再区分任务。更稳妥的做法是：客户端在发起请求前就知道自己正在用哪个本地工作区、哪个账号凭据、哪个远端 Agent endpoint，并把这些本地维度和服务端返回的 `taskId/contextId` 一起存入本地映射表。
+
 ## 11. 第八步：任务状态生命周期
 
 A2A TaskState：
@@ -714,6 +770,48 @@ COMPLETED / FAILED / CANCELED / REJECTED
 contextId = 原 contextId
 referenceTaskIds = [旧 taskId]
 ```
+
+### 15.4 已完成任务后继续优化怎么续上
+
+如果一个有状态的 Agent Server 已经完成了任务，客户端想让它“接着刚才的结果继续优化”，协议层不要向旧 `taskId` 继续发送消息。正确方式是创建一个新 Task，并让它继承同一个 `contextId`，同时用 `referenceTaskIds` 明确引用已完成任务。
+
+示例：
+
+```json
+{
+  "message": {
+    "messageId": "msg-user-optimize-001",
+    "contextId": "ctx-abc",
+    "role": "ROLE_USER",
+    "parts": [
+      {
+        "text": "基于刚才完成的架构报告，继续优化性能分析章节，并补充数据库瓶颈建议。"
+      }
+    ],
+    "referenceTaskIds": ["task-123"]
+  },
+  "configuration": {
+    "acceptedOutputModes": ["text/markdown", "text/plain"],
+    "returnImmediately": true
+  }
+}
+```
+
+服务端如果保留了 `ctx-abc` 对应的上下文，就可以把新任务理解为“在刚才上下文中继续优化”。它应返回一个新的 `taskId`：
+
+```text
+旧任务：task-123，contextId = ctx-abc，状态 = COMPLETED
+新任务：task-456，contextId = ctx-abc，referenceTaskIds = [task-123]
+```
+
+这意味着：
+
+```text
+续上的是 context，不是旧 task。
+优化是一个新 task，不是 completed task 重新变成 working。
+```
+
+A2A 提供 `contextId` 和 `referenceTaskIds` 来表达这种连续性，但不强制服务端永久保存上下文。客户端应同时保存最终 artifacts。如果服务端上下文过期、旧任务被清理或无法访问，客户端应把上一次 artifacts 的关键内容重新作为新 Message 的输入，或者提示用户无法继续原上下文。
 
 ## 16. 第十三步：服务端 Agent 某次 LLM 返回普通文本但没有函数调用怎么办
 
