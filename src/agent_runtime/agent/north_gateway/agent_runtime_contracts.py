@@ -355,6 +355,7 @@ class AgentRuntimeGateway(Protocol):
         attachments: tuple[PendingUserMessageAttachment, ...] = (),
         client_message_id: str | None = None,
         message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> tuple[AgentInstance, PendingAgentUserMessage]:
         """把用户消息追加到 Agent 实例待处理队列。"""
         ...

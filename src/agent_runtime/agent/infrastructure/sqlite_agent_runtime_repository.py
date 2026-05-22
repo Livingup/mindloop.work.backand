@@ -541,6 +541,7 @@ def _pending_user_messages_to_json(messages: tuple[PendingAgentUserMessage, ...]
                     for attachment in message.attachments
                 ],
                 "received_at": _datetime_to_text(message.received_at),
+                "metadata": message.metadata,
             }
             for message in messages
         ],
@@ -569,6 +570,7 @@ def _pending_user_messages_from_json(value: str | None) -> tuple[PendingAgentUse
                 user_text=user_text,
                 attachments=attachments,
                 client_message_id=item.get("client_message_id"),
+                metadata=item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
                 received_at=_text_to_datetime(item["received_at"]) if item.get("received_at") else None,
             )
         )

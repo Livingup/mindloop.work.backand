@@ -281,6 +281,8 @@ def serve(host: str | None, port: int | None) -> None:
     from agent_runtime.context_compression.settings_repository import (
         ContextCompressionSettingsRepository,
     )
+    from agent_runtime.lacp.lacp_factory import LacpFactory
+    from agent_runtime.lacp.north_gateway.lacp_rest_adapter import create_lacp_router
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -318,6 +320,12 @@ def serve(host: str | None, port: int | None) -> None:
     agent_execution_engine = AgentExecutionFactory.create(
         mcp_client_gateway=mcp_gateway,
     )
+    lacp_bridge = LacpFactory.create_bridge(
+        runtime_gateway=agent_runtime_gateway,
+        agent_definition_gateway=agent_definition_gateway,
+        execution_engine=agent_execution_engine,
+    )
+    lacp_client = LacpFactory.create_client()
     terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
 
@@ -377,6 +385,7 @@ def serve(host: str | None, port: int | None) -> None:
 
         scene_session_registry.start()
         auto_connect_task = _asyncio.create_task(auto_connect_mcp_services())
+        lacp_start_task = _asyncio.create_task(lacp_client.start())
         try:
             yield
         finally:
@@ -384,6 +393,11 @@ def serve(host: str | None, port: int | None) -> None:
                 auto_connect_task.cancel()
                 with suppress(Exception, _asyncio.CancelledError):
                     await auto_connect_task
+            if not lacp_start_task.done():
+                lacp_start_task.cancel()
+                with suppress(Exception, _asyncio.CancelledError):
+                    await lacp_start_task
+            await lacp_client.shutdown()
             await mcp_gateway.shutdown()
             scene_session_registry.stop()
 
@@ -431,6 +445,11 @@ def serve(host: str | None, port: int | None) -> None:
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],
+    )
+    app.include_router(
+        create_lacp_router(lacp_bridge),
+        prefix="/api/lacp",
+        tags=["LACP"],
     )
     app.include_router(
         create_llm_model_registry_router(llm_model_registry_gateway),

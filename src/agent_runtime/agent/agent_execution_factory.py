@@ -99,13 +99,26 @@ class AgentExecutionFactory:
     ) -> AgentExecutionEngine:
         """创建 Agent 执行循环引擎。"""
         from agent_runtime.config import ConfigRegistry
+        from agent_runtime.lacp.lacp_factory import LacpFactory
+        from agent_runtime.lacp.runtime_event_publisher import (
+            CompositeRuntimeEventPublisher,
+            LacpFilteringRuntimeEventPublisher,
+        )
 
         config = ConfigRegistry.instance()
         conversation_repository = SqliteConversationRepository(
             config.conversation_repository.data_dir,
         )
         communication_gateway = CommunicationFactory.create()
-        event_publisher = CommunicationRuntimeEventPublisher(communication_gateway)
+        communication_event_publisher = CommunicationRuntimeEventPublisher(communication_gateway)
+        lacp_client = LacpFactory.create_client()
+        event_publisher = CompositeRuntimeEventPublisher(
+            communication_event_publisher,
+            LacpFilteringRuntimeEventPublisher(
+                lacp_client=lacp_client,
+                registration_registry=LacpFactory.create_registry(),
+            ),
+        )
         local_tool_gateway = LocalToolFactory.create()
         mcp_gateway = mcp_client_gateway or McpClientFactory.create()
         runtime_gateway = AgentRuntimeFactory.create()
@@ -123,6 +136,10 @@ class AgentExecutionFactory:
             trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
         )
         agent_definition_gateway = AgentDefinitionFactory.create()
+        LacpFactory.create_bridge(
+            runtime_gateway=runtime_gateway,
+            agent_definition_gateway=agent_definition_gateway,
+        )
         llm_registry_gateway = LlmModelRegistryFactory.create()
         context_compression_settings_repository = ContextCompressionSettingsRepository(
             lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
@@ -139,7 +156,7 @@ class AgentExecutionFactory:
             config_accessor=lambda: ConfigRegistry.instance().context_compression,
             settings_repository=context_compression_settings_repository,
         )
-        return AgentExecutionEngine(
+        engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
             agent_definition_gateway=agent_definition_gateway,
             llm_registry_gateway=llm_registry_gateway,
@@ -155,3 +172,9 @@ class AgentExecutionFactory:
             event_publisher=event_publisher,
             context_compression_service=context_compression_service,
         )
+        LacpFactory.create_bridge(
+            runtime_gateway=runtime_gateway,
+            agent_definition_gateway=agent_definition_gateway,
+            execution_engine=engine,
+        )
+        return engine

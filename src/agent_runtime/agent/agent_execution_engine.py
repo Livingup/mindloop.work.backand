@@ -240,6 +240,8 @@ class AgentMessageSubmissionResult:
     # 当后端自动创建下一轮 task 时，前端需要用该快照同步 task_id/thread_id/trace_id。
     instance: AgentInstance
 
+    message_metadata: dict[str, Any] = field(default_factory=dict)
+
 
 class AgentExecutionEngine:
     """真正 Agent 执行循环。
@@ -366,6 +368,7 @@ class AgentExecutionEngine:
         communication_stream_id: str | None = None,
         client_message_id: str | None = None,
         attachments: tuple[PendingUserMessageAttachment, ...] = (),
+        message_metadata: dict[str, Any] | None = None,
     ) -> AgentMessageSubmissionResult:
         instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
         task = self._runtime_gateway.get_task(instance.task_id)
@@ -380,6 +383,7 @@ class AgentExecutionEngine:
             user_text=user_text,
             attachments=attachments,
             client_message_id=client_message_id,
+            metadata=message_metadata,
         )
         request = AgentExecutionRequest.from_text(
             thread_id=instance.thread_id,
@@ -420,6 +424,7 @@ class AgentExecutionEngine:
                 communication_stream_id=communication_context.stream_id,
                 pending_message_id=pending_message.message_id,
                 client_message_id=pending_message.client_message_id,
+                message_metadata=dict(pending_message.metadata),
                 queued_for_later=True,
                 instance=instance,
             )
@@ -448,6 +453,7 @@ class AgentExecutionEngine:
             communication_stream_id=communication_context.stream_id,
             pending_message_id=pending_message.message_id,
             client_message_id=pending_message.client_message_id,
+            message_metadata=dict(pending_message.metadata),
             queued_for_later=False,
             instance=instance,
         )
@@ -1251,6 +1257,8 @@ class AgentExecutionEngine:
                     "user_message_id": f"{conversation.id}:message:{len(conversation.messages) - 1}",
                     "text": _message_text(user_message),
                     "attachments": _pending_user_message_attachments_payload(pending_message),
+                    "channel": pending_message.metadata.get("channel") or pending_message.metadata.get("transport") or "web",
+                    "metadata": dict(pending_message.metadata),
                     "part_count": len(user_message.content),
                     "queued_received_at": pending_message.received_at.isoformat(),
                 },

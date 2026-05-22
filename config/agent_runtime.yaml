@@ -115,3 +115,14 @@ context_compression:
   input_mode: "transcript_snapshot"
   verifier_enabled: false
   archive_data_dir: "~/.spread-ai/context-compression"
+
+
+lacp:
+  enabled: false
+  registry_url: "https://lacp.mindloop.chat:48831"
+  api_key: "${LACP_API_KEY:-}"
+  data_dir: "~/.spread-ai/lacp"
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 5
+  reconnect_initial_delay_seconds: 1
+  reconnect_max_delay_seconds: 30

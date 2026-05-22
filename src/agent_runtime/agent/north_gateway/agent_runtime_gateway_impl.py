@@ -248,6 +248,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         attachments=(),
         client_message_id: str | None = None,
         message_id: str | None = None,
+        metadata: dict[str, object] | None = None,
     ):
         """把用户消息追加到 Agent 实例待处理队列。"""
         return self._service.enqueue_agent_instance_user_message(
@@ -256,6 +257,7 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             attachments=attachments,
             client_message_id=client_message_id,
             message_id=message_id,
+            metadata=metadata,
         )
 
     def drain_agent_instance_user_messages(

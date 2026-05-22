@@ -49,6 +49,7 @@ from agent_runtime.agent.agent_runtime_config import AgentRuntimeStateConfig
 from agent_runtime.communication.communication_config import CommunicationConfig
 from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
+from agent_runtime.lacp.config import LacpConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -138,6 +139,10 @@ class AgentRuntimeConfig:
 
     context_compression: ContextCompressionConfig = field(
         default_factory=ContextCompressionConfig,
+    )
+
+    lacp: LacpConfig = field(
+        default_factory=LacpConfig,
     )
 
 
@@ -400,6 +405,16 @@ class ConfigRegistry:
         )
 
     @property
+    def lacp(self) -> LacpConfig:
+        if self._config is not None:
+            return self._config.lacp
+        if self._raw_config_data is not None and "lacp" not in self._raw_config_data:
+            return LacpConfig()
+        return self._get_section_config(
+            "lacp", _build_lacp_config,
+        )
+
+    @property
     def terminal(self) -> TerminalConfig:
         """实时读取 Terminal 模块配置（终端状态与输出数据目录等）。"""
         if self._config is not None:
@@ -623,6 +638,19 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
         data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
         replay_buffer_size=int(data.get("replay_buffer_size", 5000)),
         subscriber_queue_size=int(data.get("subscriber_queue_size", 1000)),
+    )
+
+
+def _build_lacp_config(data: dict[str, Any]) -> LacpConfig:
+    return LacpConfig(
+        enabled=bool(data.get("enabled", False)),
+        registry_url=str(data.get("registry_url", "https://lacp.mindloop.chat:48831")),
+        api_key=(str(data["api_key"]) if data.get("api_key") is not None else None),
+        data_dir=str(data.get("data_dir", "~/.spread-ai/lacp")),
+        connect_timeout_seconds=float(data.get("connect_timeout_seconds", 10.0)),
+        request_timeout_seconds=float(data.get("request_timeout_seconds", 5.0)),
+        reconnect_initial_delay_seconds=float(data.get("reconnect_initial_delay_seconds", 1.0)),
+        reconnect_max_delay_seconds=float(data.get("reconnect_max_delay_seconds", 30.0)),
     )
 
 

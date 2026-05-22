@@ -89,6 +89,7 @@ class PendingUserMessageResponse(BaseModel):
     client_message_id: str | None = None
     attachments: list[UserMessageAttachmentModel] = Field(default_factory=list)
     received_at: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentInstanceResponse(BaseModel):
@@ -188,6 +189,7 @@ class SendAgentInstanceMessageBody(BaseModel):
     render_options: dict[str, Any] = Field(default_factory=dict)
     request_overrides: dict[str, Any] = Field(default_factory=dict)
     communication_stream_id: str | None = None
+    message_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SwitchAgentInstanceLlmPolicyBody(BaseModel):
@@ -227,6 +229,7 @@ class AgentMessageSubmissionResponse(BaseModel):
     client_message_id: str | None = None
     queued_for_later: bool = False
     root_agent_instance: AgentInstanceResponse | None = None
+    message_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class RemovePendingUserMessageResponse(BaseModel):
@@ -404,6 +407,7 @@ def create_agent_runtime_router(
                 request_overrides=body.request_overrides,
                 communication_stream_id=body.communication_stream_id,
                 client_message_id=body.client_message_id,
+                message_metadata=body.message_metadata,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Agent 实例不存在: {instance_id}")
@@ -1065,6 +1069,7 @@ def _pending_user_message_response(message: PendingAgentUserMessage) -> PendingU
         client_message_id=message.client_message_id,
         attachments=[_attachment_model(attachment) for attachment in message.attachments],
         received_at=_datetime_text(message.received_at),
+        metadata=message.metadata,
     )
 
 
@@ -1171,6 +1176,7 @@ async def _submission_response(
         pending_message_id=result.pending_message_id,
         client_message_id=result.client_message_id,
         queued_for_later=result.queued_for_later,
+        message_metadata=result.message_metadata,
         root_agent_instance=await _instance_response(
             result.instance,
             conversation_repository,

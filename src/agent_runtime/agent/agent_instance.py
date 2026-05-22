@@ -101,6 +101,8 @@ class PendingAgentUserMessage:
 
     attachments: tuple[PendingUserMessageAttachment, ...] = ()
 
+    metadata: dict[str, Any] = field(default_factory=dict)
+
     # 后端接收消息的时间，用于审计与 FIFO 排序辅助。
     received_at: datetime = None  # type: ignore[assignment]
 
@@ -119,6 +121,8 @@ class PendingAgentUserMessage:
             if not isinstance(attachment, PendingUserMessageAttachment):
                 raise ValueError("attachments 必须由 PendingUserMessageAttachment 组成。")
         object.__setattr__(self, "attachments", tuple(self.attachments))
+        if not isinstance(self.metadata, dict):
+            raise ValueError("metadata must be a dict.")
         if self.received_at is None:
             object.__setattr__(self, "received_at", _utc_now())
 
