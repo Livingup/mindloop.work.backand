@@ -116,12 +116,11 @@ registry 返回多个 AgentCard 或 AgentCard URL。A2A 允许这种模式，但
 
 ### 4.4 本地 Agent 的特殊情况
 
-本地 Claude Code、Codex CLI 等没有公网暴露能力时，通常不能直接作为公网 A2A Server 被远程 Agent 调用。它们可以采用以下模式参与 A2A：
+本地 Claude Code、Codex CLI 等没有公网暴露能力时，本文档只按 localhost A2A Server 处理，不考虑通过公网入口暴露给远端 Agent 调用。
 
-- 作为 A2A Client 主动调用外部 Agent。
-- 作为 localhost A2A Server，仅供本机 AgentRuntime 或 IDE 调用。
-- 通过 tunnel、gateway、relay 暴露给远端。
-- 被 AgentRuntime 包装成 A2A Server 背后的本地执行器。
+- 作为 localhost A2A Server，仅供本机 AgentRuntime、IDE 或本机 orchestrator 调用。
+- 被 AgentRuntime 包装成 localhost A2A Server 背后的本地执行器。
+- 不设计通过 tunnel、gateway、relay 或公网域名把本地 Agent 暴露给远端。
 
 ## 5. 第二步：建立连接与协议确认
 
@@ -1115,11 +1114,11 @@ AgentRuntime 如果作为 A2A Server，必须显式定义内部 Agent 输出到 
 
 ### 22.1 A2A 有中心注册中心
 
-A2A 不强制中心化注册中心。AgentCard 可以来自 well-known、直接配置、私有 registry、企业 catalog 或 gateway。
+A2A 不强制中心化注册中心。AgentCard 可以来自 well-known、直接配置、私有 registry 或企业 catalog。
 
 ### 22.2 本地 Agent 必须公网暴露
 
-本地 Agent 可以作为 A2A Client，也可以作为 localhost/private A2A Server。远程可调用需要 tunnel、relay、gateway 或内网可达性。
+本文档中本地 Agent 只按 localhost/private A2A Server 处理，仅供本机 AgentRuntime、IDE 或本机 orchestrator 调用，不设计远端可调用路径。
 
 ### 22.3 断开流就是暂停任务
 
@@ -1166,10 +1165,16 @@ AgentRuntime 第一阶段 A2A Server 可先实现：
 ```text
 1. Push notification
 2. AgentCard JWS 签名
-3. 公网 gateway/relay
-4. 私有 registry/catalog
-5. gRPC binding
-6. 多租户路径
+3. 私有 registry/catalog
+4. gRPC binding
+5. 多租户路径
+```
+
+不纳入范围：
+
+```text
+1. 本地 Agent 的公网暴露
+2. tunnel / gateway / relay 远端暴露方案
 ```
 
 ## 24. 一句话总结
