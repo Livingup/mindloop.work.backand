@@ -1304,7 +1304,198 @@ AgentRuntime 需要：
 - 把内部工具/LLM/生命周期事件映射到 TaskStatusUpdateEvent。
 - 把文件、报告、结构化输出映射到 Artifact。
 
-### 21.3 不要把 A2A Message 等同于本地聊天消息
+### 21.3 同一个 AgentCard 下的多个 Agent 实例怎么管理
+
+`AgentCard` 描述的是一个 A2A Server 对外暴露的 Agent 能力、技能、协议入口和认证方式。它不是某一个正在运行的 Agent 实例。
+
+当多个客户端同时调用同一个 AgentCard 时，服务端内部通常需要拆成几层：
+
+```text
+AgentCard / AgentDefinition
+  -> 描述这个服务端 Agent 是谁、会什么、从哪里调用
+
+Context
+  -> 由 contextId 标识，保存一组相关任务和消息的连续上下文
+
+Task
+  -> 由 taskId 标识，表示某一次具体工作单元和生命周期
+
+ExecutionInstance / Run / Worker
+  -> 服务端内部真正执行该 Task 的 Agent 实例、线程、进程、协程或 worker
+```
+
+因此同一个 AgentCard 可以对应很多并发任务：
+
+```text
+AgentCard: code-review-agent
+
+client-a -> task-001 -> execution-instance-001
+client-b -> task-002 -> execution-instance-002
+client-c -> task-003 -> execution-instance-003
+```
+
+A2A 协议层只要求客户端看到：
+
+```text
+taskId
+contextId
+status
+messages
+artifacts
+```
+
+至于服务端内部是创建独立进程、复用线程池、使用 actor、还是按 context 维护长生命周期 Agent 实例，属于服务端实现细节，不应暴露给客户端作为协议依赖。
+
+#### 21.3.1 首次调用时的服务端流程
+
+客户端第一次调用某个 AgentCard 时，通常不带 `taskId` 和 `contextId`：
+
+```text
+SendMessage(message without taskId/contextId)
+```
+
+服务端应执行：
+
+```text
+1. 根据 endpoint / AgentCard 找到 AgentDefinition
+2. 校验认证、权限、输入类型、能力和扩展
+3. 创建新的 contextId，或接受客户端提供且可验证的 contextId
+4. 创建新的 taskId
+5. 创建或调度内部 ExecutionInstance
+6. 建立 taskId -> contextId -> executionInstance 的映射
+7. 返回 Task，其中包含 taskId 和 contextId
+```
+
+服务端内部可以保存类似映射：
+
+```text
+TaskRecord
+  task_id
+  context_id
+  agent_card_id
+  agent_definition_id
+  execution_instance_id
+  auth_subject
+  local_workspace_id
+  status
+  created_at
+  updated_at
+```
+
+#### 21.3.2 未终结任务的后续消息怎么路由
+
+如果客户端继续一个未终结任务，会发送：
+
+```text
+SendMessage(taskId + contextId + new messageId)
+```
+
+服务端应根据 `taskId` 查到原 Task，再校验：
+
+```text
+1. taskId 是否存在
+2. 调用者是否有权限访问该 task
+3. 请求中的 contextId 是否和 TaskRecord.context_id 匹配
+4. task 是否处于可继续接收输入的 non-terminal state
+5. executionInstance 是否仍在运行
+```
+
+如果内部执行实例还在运行，服务端可以把新 Message 投递给该实例。如果执行实例已经释放但 Task 仍可继续，服务端可以根据 `taskId/contextId/history/artifacts` 重新加载上下文并创建新的内部实例。
+
+#### 21.3.3 已完成任务后的优化怎么路由
+
+如果旧任务已经 `COMPLETED`，客户端不应继续旧 `taskId`。客户端应发送：
+
+```text
+contextId + referenceTaskIds
+```
+
+服务端应创建新的 `taskId`，并根据同一个 `contextId` 和 `referenceTaskIds` 加载旧任务结果：
+
+```text
+task-123: COMPLETED，生成第一版报告
+task-456: WORKING，基于 task-123 继续优化
+```
+
+这时服务端可能创建一个新的 ExecutionInstance：
+
+```text
+task-456 -> execution-instance-456
+```
+
+也可以复用同一个 context 下的长生命周期 Agent actor：
+
+```text
+context-abc -> context-agent-actor-abc
+task-123 -> run-001
+task-456 -> run-002
+```
+
+两种方式都可以，只要对外维持正确的 `Task`、`Message`、`Artifact` 和 `TaskState`。
+
+#### 21.3.4 服务端常见实例管理策略
+
+服务端可以选择不同的内部实例模型。
+
+第一种是每个 Task 一个执行实例：
+
+```text
+taskId -> executionInstance
+```
+
+优点是隔离清晰，适合并发任务。缺点是同一 `contextId` 下的多个任务需要从持久化 history/artifacts 重新加载上下文。
+
+第二种是每个 Context 一个长生命周期 actor：
+
+```text
+contextId -> contextAgentActor
+contextAgentActor -> 多个 task run
+```
+
+优点是更像有状态 Agent，会话连续性更强。缺点是同一 context 下并发任务需要排队、加锁或做冲突控制。
+
+第三种是无长生命周期实例，只持久化状态：
+
+```text
+每次请求 -> worker pool -> 加载 context/task/history -> 执行一步 -> 保存状态
+```
+
+优点是容易横向扩展和故障恢复。缺点是要把上下文、artifact、history 和中间状态设计得足够完整。
+
+第四种是混合模式：
+
+```text
+active task 使用内存 executionInstance
+terminal task 只保留持久化 TaskRecord、history、artifacts
+后续优化时重新创建 executionInstance
+```
+
+这是 AgentRuntime 比较适合的第一阶段模型。
+
+如果 A2A Server 是多副本部署，同一个 AgentCard 可能由多个服务实例共同承载。此时不能只依赖单进程内存保存任务映射，应把 `TaskRecord`、`ContextRecord`、history、artifact 索引和状态事件写入共享存储或事件总线。任意副本收到 `GetTask`、`SubscribeToTask` 或后续 `SendMessage` 时，都应能通过 `taskId/contextId` 找回任务状态，并把消息投递到正确的 worker、队列或 actor。
+
+#### 21.3.5 多客户端隔离
+
+多个客户端调用同一个 AgentCard 时，服务端必须用认证主体、工作区或权限域隔离 Task：
+
+```text
+auth_subject + taskId
+workspace_id + taskId
+agent_card_id + taskId
+```
+
+服务端不能只因为客户端知道一个 `taskId` 就允许访问对应任务。`GetTask`、`CancelTask`、`SubscribeToTask`、继续发送 Message 时都必须校验调用者是否有权访问该 Task 和 Context。
+
+对外看：
+
+```text
+同一个 AgentCard 可以服务多个客户端。
+每个具体请求会落到不同 taskId。
+每组连续交互会落到对应 contextId。
+每个 taskId/contextId 在服务端内部再绑定到执行实例或持久化状态。
+```
+
+### 21.4 不要把 A2A Message 等同于本地聊天消息
 
 A2A Message 是协议通信单元；本地 Chat Bubble 是 UI 表达；Conversation Message 是运行时上下文。三者不能混为一个模型。
 
@@ -1324,7 +1515,7 @@ A2A TaskStatusUpdateEvent
   -> UI Process Bubble / Progress Row
 ```
 
-### 21.4 服务端普通文本无工具调用的策略
+### 21.5 服务端普通文本无工具调用的策略
 
 AgentRuntime 如果作为 A2A Server，必须显式定义内部 Agent 输出到 A2A 状态的映射策略。不能让任务因为“LLM 没有 tool call”而无限保持 WORKING。
 
