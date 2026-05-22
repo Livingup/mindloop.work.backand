@@ -417,7 +417,139 @@ metadata
 
 后续所有与该任务相关的操作都依赖 `taskId` 和 `contextId`。
 
-### 10.3 多客户端并发调用同一 Agent Server 时怎么区分
+### 10.3 `contextId` 是什么，服务端什么时候返回
+
+`contextId` 是 A2A 用来表示“连续上下文”的标识。它把多条相关 Message 和多个相关 Task 归到同一组交互里，类似一次跨任务的会话上下文。
+
+它不是：
+
+- 客户端 ID。
+- 租户 ID。
+- 任务 ID。
+- 网络连接 ID。
+- HTTP session ID。
+
+它表达的是：
+
+```text
+这些 Message / Task 属于同一段连续业务上下文
+```
+
+例如：
+
+```text
+contextId = ctx-abc
+  task-123：生成第一版架构报告
+  task-456：基于第一版架构报告优化性能分析
+  task-789：基于优化结果生成迁移计划
+```
+
+#### 10.3.1 谁生成 `contextId`
+
+A2A 允许服务端生成 `contextId`。实战中推荐由服务端生成，并由客户端保存和复用。
+
+首次请求时，客户端通常不传 `contextId`：
+
+```json
+{
+  "message": {
+    "messageId": "msg-user-001",
+    "role": "ROLE_USER",
+    "parts": [
+      {
+        "text": "请生成架构报告。"
+      }
+    ]
+  }
+}
+```
+
+服务端创建上下文后，在响应里返回：
+
+```json
+{
+  "task": {
+    "id": "task-123",
+    "contextId": "ctx-abc",
+    "status": {
+      "state": "TASK_STATE_WORKING"
+    }
+  }
+}
+```
+
+如果服务端直接返回 Message，也可以在 Message 里返回 `contextId`：
+
+```json
+{
+  "message": {
+    "messageId": "msg-agent-001",
+    "contextId": "ctx-abc",
+    "role": "ROLE_AGENT",
+    "parts": [
+      {
+        "text": "我需要更多信息才能开始。"
+      }
+    ]
+  }
+}
+```
+
+#### 10.3.2 客户端能不能自己传 `contextId`
+
+客户端可以传 `contextId`，但不应随意自己生成。更安全的规则是：
+
+```text
+第一次请求：不传 contextId，等服务端生成。
+后续请求：复用服务端返回的 contextId。
+```
+
+如果客户端传了服务端不接受的 `contextId`，服务端应拒绝请求，而不是悄悄换成另一个上下文。
+
+服务端生成的 `contextId` 对客户端来说应视为不透明字符串。客户端只保存、传回、关联本地 UI 和任务，不解析其中含义。
+
+#### 10.3.3 服务端会维护 `contextId` 对应的状态吗
+
+有状态 Agent Server 通常会用 `contextId` 维护：
+
+- 对话历史。
+- 任务历史。
+- LLM 上下文。
+- 已生成 artifact 的索引。
+- 用户输入和中间决策。
+- 服务端内部执行状态。
+
+但 A2A 不强制服务端永久保存这些状态。服务端可以有过期、清理、容量限制和权限隔离策略。客户端不能假设 `contextId` 永远有效。
+
+因此客户端应同时保存：
+
+```text
+contextId
+taskId
+最终 artifacts
+关键 history
+本地会话记录
+```
+
+如果后续继续优化时服务端上下文已过期，客户端应把上一次结果的关键内容重新作为新 Message 输入。
+
+#### 10.3.4 后续请求怎么使用 `contextId`
+
+如果继续一个未终结任务，客户端发送：
+
+```text
+taskId + contextId
+```
+
+如果基于已完成任务继续做新任务，客户端发送：
+
+```text
+contextId + referenceTaskIds
+```
+
+如果只传 `taskId`，服务端应能从任务推导出对应 `contextId`。如果客户端同时传了 `taskId` 和不匹配的 `contextId`，服务端应拒绝请求。
+
+### 10.4 多客户端并发调用同一 Agent Server 时怎么区分
 
 同一个 AgentCard 或同一个 A2A Server 定义可以被多个客户端同时调用，也可以被同一个客户端同时发起多个任务。AgentCard 只说明“这个服务端 Agent 是谁、会什么、从哪里调用”，不代表某一次具体调用。
 
@@ -447,7 +579,7 @@ remote_task_key = local_workspace_id + local_agent_instance_id + interface_url +
 
 收到 streaming event、polling 结果或 artifact chunk 时，客户端都应按 `interface_url + taskId` 路由到本地对应任务 UI、状态机和 artifact 缓冲区。
 
-### 10.4 `tenant` 是什么，A2A 会返回吗
+### 10.5 `tenant` 是什么，A2A 会返回吗
 
 `tenant` 不是 A2A v1.0 标准要求返回的字段，也不是 Task 续接机制的一部分。它通常是客户端平台或服务端平台自己的多租户隔离概念，例如：
 
