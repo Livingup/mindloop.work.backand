@@ -1495,6 +1495,92 @@ agent_card_id + taskId
 每个 taskId/contextId 在服务端内部再绑定到执行实例或持久化状态。
 ```
 
+#### 21.3.6 Agent 实例的工作目录怎么确定
+
+A2A 标准不规定 Agent 实例的工作目录，`AgentCard` 也不等于工作目录配置。`AgentCard` 只描述 Agent 能力、入口、技能、认证和协议能力。工作目录属于服务端实现细节，应由服务端根据部署配置、认证主体、工作区、context 和 task 安全地解析出来。
+
+客户端不能假设远端服务端存在某个本地路径，也不能直接要求远端 Agent 进入客户端机器上的路径。跨机器 A2A 调用时，客户端应通过 Message Parts、文件 URL、bytes、artifact 引用或服务端支持的资源机制传递输入数据。
+
+服务端推荐按以下层次决定工作目录：
+
+```text
+AgentDefinition / AgentCard 对应的服务端定义
+  -> 声明默认运行根目录、允许访问的资源范围、是否需要 sandbox
+
+AuthSubject / Workspace
+  -> 根据调用者账号、组织、项目或本地 workspace 解析权限域
+
+ContextRecord
+  -> 保存 contextId 对应的上下文工作区或会话级 workspace
+
+TaskRecord
+  -> 保存 taskId 对应的本次任务运行目录、输出目录和 artifact 目录
+
+ExecutionInstance
+  -> 启动时使用 TaskRecord 或 ContextRecord 解析出的 cwd
+```
+
+第一阶段建议采用混合隔离模型：
+
+```text
+context_workspace = runtime_data/a2a/{agent_card_id}/{auth_subject}/{contextId}
+task_run_dir      = runtime_data/a2a/{agent_card_id}/{auth_subject}/{contextId}/tasks/{taskId}
+artifact_dir      = runtime_data/a2a/{agent_card_id}/{auth_subject}/{contextId}/artifacts/{taskId}
+```
+
+如果同一个 `contextId` 下有多个连续任务，可以共享 context 级工作区：
+
+```text
+ctx-abc/
+  context_state.json
+  shared/
+  tasks/
+    task-123/
+    task-456/
+  artifacts/
+    task-123/
+    task-456/
+```
+
+这样 `task-456` 基于 `task-123` 继续优化时，可以读取同一 context 下允许复用的状态和 artifacts，但每个 task 仍有自己的运行目录和输出目录。
+
+工作目录的确定时机通常是：
+
+```text
+首次 SendMessage:
+  1. 根据 AgentCard endpoint 找到 AgentDefinition
+  2. 根据 auth_subject / workspace / request metadata 解析权限域
+  3. 创建 contextId 和 ContextRecord
+  4. 创建 taskId 和 TaskRecord
+  5. 为 TaskRecord 分配 task_run_dir / artifact_dir
+  6. 启动 ExecutionInstance，并把 cwd 设置为 task_run_dir 或 context_workspace
+
+后续 SendMessage(taskId + contextId):
+  1. 根据 taskId 找到 TaskRecord
+  2. 校验 contextId、auth_subject、workspace 权限
+  3. 复用 TaskRecord 中保存的工作目录，或根据 ContextRecord 重新创建执行实例
+
+已完成任务后的继续优化:
+  1. 使用同一个 contextId 创建新 taskId
+  2. 新建 task_run_dir
+  3. 允许读取 referenceTaskIds 对应 artifacts
+  4. 不复用旧 completed task 的运行目录作为新任务 cwd
+```
+
+如果客户端传入“期望工作目录”之类的自定义参数，只能作为业务请求或 metadata，由服务端做白名单映射和权限校验。服务端不能直接信任客户端传入的绝对路径，尤其不能允许路径穿越、访问宿主机敏感目录或越权访问其他用户的 workspace。
+
+对于本地 Claude Code、Codex CLI 这类 localhost A2A Server，工作目录可以来自本机 AgentRuntime 或 IDE 当前 workspace，但仍应在服务端侧解析和固定：
+
+```text
+IDE workspace root / AgentRuntime workspace root
+  -> AgentDefinition.allowed_roots
+  -> ContextRecord.workspace_root
+  -> TaskRecord.task_run_dir
+  -> ExecutionInstance.cwd
+```
+
+客户端只传“我要处理哪个项目/资源”的语义，服务端把它映射为安全的本地工作目录。最终返回给客户端的应是 artifacts、resource references 或可读取文件路径，而不是要求客户端理解服务端内部 cwd。
+
 ### 21.4 不要把 A2A Message 等同于本地聊天消息
 
 A2A Message 是协议通信单元；本地 Chat Bubble 是 UI 表达；Conversation Message 是运行时上下文。三者不能混为一个模型。
