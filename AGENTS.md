@@ -39,7 +39,7 @@ dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐�
 
 正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式后端监听 `127.0.0.1`，端口由 Electron 主进程动态分配并通过命令行参数传入，避免和 dev 后端固定端口冲突。
 
-正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`；正式版 `.env` 位于同一 `runtime-config` 目录。正式版运行数据根目录由 Electron 注入 `SPREAD_AI_DATA_ROOT=<userData>/runtime-data`，因此默认不会和 dev 的 `~/.spread-ai` 数据目录冲突。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：dev 不设置该变量时使用 `~/.spread-ai`，正式版设置该变量时使用应用自己的用户数据目录。
+正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`；正式版 `.env` 位于同一 `runtime-config` 目录。Electron packaged 主进程只负责传入配置文件、env 文件、host 与动态端口，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未在 `.env` 或系统环境显式设置 `SPREAD_AI_DATA_ROOT` 时，dev 与正式版都默认使用同一套 `~/.spread-ai` 用户业务数据；如果确实需要隔离某个部署环境的数据目录，必须在对应 `.env` 文件中显式配置 `SPREAD_AI_DATA_ROOT`。
 
 构建正式版后端 sidecar：
 
