@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     output_dir = args.output.resolve()
     build_dir = repo_root / "build" / "pyinstaller"
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -28,7 +30,7 @@ def main() -> None:
         "PyInstaller",
         "--noconfirm",
         "--clean",
-        "--onefile",
+        "--onedir",
         "--name",
         "spread-ai-runtime",
         "--distpath",
