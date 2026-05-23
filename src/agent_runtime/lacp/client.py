@@ -75,6 +75,10 @@ class LacpClient:
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
 
+    async def reload_from_config(self) -> None:
+        await self.shutdown()
+        await self.start()
+
     async def shutdown(self) -> None:
         self._running = False
         task = self._task
@@ -91,6 +95,7 @@ class LacpClient:
         self._fail_pending(RuntimeError("LACP client stopped."))
 
     async def register_instance(self, registration: LacpInstanceRegistration) -> LacpInstanceRegistration:
+        self._validate_registration_config()
         updated = self._registration_registry.upsert_enabled(registration)
         await self.start()
         if self._ws is not None:
@@ -125,6 +130,11 @@ class LacpClient:
         while self._running:
             config = self._config_accessor()
             if not config.enabled:
+                await asyncio.sleep(1)
+                continue
+            config_error = self._connection_config_error(config)
+            if config_error is not None:
+                self._last_error = config_error
                 await asyncio.sleep(1)
                 continue
             try:
@@ -289,6 +299,22 @@ class LacpClient:
         if not config.api_key:
             return {}
         return {"Authorization": f"Bearer {config.api_key}"}
+
+    def _validate_registration_config(self) -> None:
+        config = self._config_accessor()
+        config_error = self._connection_config_error(config)
+        if config_error is not None:
+            raise ValueError(config_error)
+
+    @staticmethod
+    def _connection_config_error(config: LacpConfig) -> str | None:
+        if not config.enabled:
+            return "LACP service is disabled. Enable LACP before registering an agent instance."
+        if not config.registry_url.strip():
+            return "LACP registry URL is not configured."
+        if not (config.api_key or "").strip():
+            return "LACP API key is not configured."
+        return None
 
     @staticmethod
     def _new_request_id(prefix: str) -> str:

@@ -61,6 +61,9 @@ class AgentRuntimeLacpBridge:
     def client_status(self) -> LacpClientStatus:
         return self._lacp_client.status()
 
+    async def reload_client_from_config(self) -> None:
+        await self._lacp_client.reload_from_config()
+
     async def handle_inbound_message(self, message: LacpInboundMessage) -> bool:
         if self._execution_engine is None:
             logger.warning("LACP inbound message ignored because execution engine is not configured.")

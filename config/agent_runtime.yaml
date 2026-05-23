@@ -119,7 +119,7 @@ context_compression:
 
 lacp:
   enabled: false
-  registry_url: "https://lacp.mindloop.chat:48831"
+  registry_url: ""
   api_key: "${LACP_API_KEY:-}"
   data_dir: "~/.spread-ai/lacp"
   connect_timeout_seconds: 10

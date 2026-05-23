@@ -644,7 +644,7 @@ def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
 def _build_lacp_config(data: dict[str, Any]) -> LacpConfig:
     return LacpConfig(
         enabled=bool(data.get("enabled", False)),
-        registry_url=str(data.get("registry_url", "https://lacp.mindloop.chat:48831")),
+        registry_url=str(data.get("registry_url", "")),
         api_key=(str(data["api_key"]) if data.get("api_key") is not None else None),
         data_dir=str(data.get("data_dir", "~/.spread-ai/lacp")),
         connect_timeout_seconds=float(data.get("connect_timeout_seconds", 10.0)),
