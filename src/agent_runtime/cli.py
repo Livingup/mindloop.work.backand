@@ -26,16 +26,20 @@ def _runtime_config_path() -> Path:
     return Path.home() / ".spread-ai" / "agent_runtime.yaml"
 
 
-def _load_initialized_runtime_config(env_file_path: Path | None = None) -> None:
+def _load_initialized_runtime_config(
+    env_file_path: Path | None = None,
+    config_file_path: Path | None = None,
+) -> None:
     """加载已经初始化好的运行配置；不存在时提示用户先执行 config init。"""
-    config_path = _runtime_config_path()
+    config_path = config_file_path or _runtime_config_path()
     if not config_path.is_file():
         raise click.ClickException(
             f"运行配置文件不存在: {config_path}。请先执行 "
-            "spread-ai config init --source <agent_runtime.yaml> 初始化服务配置。"
+            "spread-ai config init --source <agent_runtime.yaml> 初始化服务配置，"
+            "或通过 --config-file 指定服务配置文件。"
         )
     ConfigRegistry.load(
-        str(config_path),
+        str(config_path.resolve()),
         str(env_file_path.resolve()) if env_file_path is not None else None,
         watch=True,
     )
@@ -197,6 +201,13 @@ main.add_command(
 
 @main.command("serve")
 @click.option(
+    "--config-file",
+    "config_file_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="用于本次服务启动的 agent_runtime.yaml 配置文件路径。",
+)
+@click.option(
     "--env-file",
     "env_file_path",
     default=None,
@@ -205,7 +216,12 @@ main.add_command(
 )
 @click.option("--host", default=None, help="监听地址（覆盖配置文件）。")
 @click.option("--port", default=None, type=int, help="监听端口（覆盖配置文件）。")
-def serve(env_file_path: Path | None, host: str | None, port: int | None) -> None:
+def serve(
+    config_file_path: Path | None,
+    env_file_path: Path | None,
+    host: str | None,
+    port: int | None,
+) -> None:
     """启动 REST API 服务器。"""
     import asyncio as _asyncio
     import logging as _logging
@@ -220,7 +236,10 @@ def serve(env_file_path: Path | None, host: str | None, port: int | None) -> Non
         datefmt="%H:%M:%S",
     )
     _serve_logger = _logging.getLogger("agent_runtime.serve")
-    _load_initialized_runtime_config(env_file_path)
+    _load_initialized_runtime_config(
+        env_file_path=env_file_path,
+        config_file_path=config_file_path,
+    )
 
     # 各模块网关通过无参工厂创建，配置由工厂内部从 ConfigRegistry 实时读取。
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory

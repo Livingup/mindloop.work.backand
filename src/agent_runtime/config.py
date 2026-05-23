@@ -695,27 +695,40 @@ def _load_dot_env(yaml_config_path: Path, env_file_path: str | None) -> None:
     使用 python-dotenv（如已安装），否则用内置简易解析兜底。
     .env 文件不存在时静默跳过。不覆盖已有的系统环境变量。
     """
+    protected_keys = set(os.environ)
+    common_env_path = yaml_config_path.parent / ".env"
+    _load_single_dot_env(common_env_path, protected_keys=protected_keys, override=False)
     if env_file_path is not None:
-        dot_env_path = Path(env_file_path)
-    else:
-        dot_env_path = yaml_config_path.parent / ".env"
+        _load_single_dot_env(Path(env_file_path), protected_keys=protected_keys, override=True)
 
+
+def _load_single_dot_env(dot_env_path: Path, *, protected_keys: set[str], override: bool) -> None:
     if not dot_env_path.exists():
         return
 
     try:
-        from dotenv import load_dotenv
-        load_dotenv(dot_env_path, override=False)
+        from dotenv import dotenv_values
+        values = dotenv_values(dot_env_path)
     except ImportError:
-        for line in dot_env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key not in os.environ:
-                os.environ[key] = value
+        values = _parse_dot_env_file(dot_env_path)
+    for key, value in values.items():
+        if key in protected_keys or value is None:
+            continue
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = str(value)
+
+
+def _parse_dot_env_file(dot_env_path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in dot_env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        values[key] = value.strip().strip('"').strip("'")
+    return values
 
 
 def _resolve_env_vars(value: Any) -> Any:
