@@ -19,8 +19,14 @@ from agent_runtime.prompt_template.north_gateway.prompt_snippet_gateway import (
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
 
 
+class SnippetSummaryResponse(BaseModel):
+    """片段列表项响应体，不包含提示词正文。"""
+    name: str
+    category: str = "default"
+
+
 class SnippetResponse(BaseModel):
-    """片段响应体。"""
+    """片段详情响应体。"""
     name: str
     text: str
     category: str = "default"
@@ -54,12 +60,12 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
     """
     router = APIRouter()
 
-    @router.get("/", response_model=list[SnippetResponse])
-    def list_snippets() -> list[SnippetResponse]:
-        """列出所有提示词片段。"""
+    @router.get("/", response_model=list[SnippetSummaryResponse])
+    def list_snippets() -> list[SnippetSummaryResponse]:
+        """列出所有提示词片段摘要。"""
         snippets = gateway.list_snippets()
         return [
-            SnippetResponse(name=s.name, text=s.text, category=s.category)
+            SnippetSummaryResponse(name=s.name, category=s.category)
             for s in snippets
         ]
 

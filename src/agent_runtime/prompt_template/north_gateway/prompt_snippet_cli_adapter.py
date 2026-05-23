@@ -85,7 +85,7 @@ def create_prompt_cli_group(gateway_factory: Callable[[], object]) -> click.Grou
         gateway = ctx.obj["gateway"]
         snippets = gateway.list_snippets()
         result = [
-            {"name": s.name, "text": s.text, "category": s.category}
+            {"name": s.name, "category": s.category}
             for s in snippets
         ]
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
