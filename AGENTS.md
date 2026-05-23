@@ -1,4 +1,4 @@
-# Agent Runtime — 通用 Agent 运行时环境服务
+﻿# Agent Runtime — 通用 Agent 运行时环境服务
 
 为 AI Agent 提供完整的运行基础设施，包括 LLM 调用、工具执行、消息管理、文件资源管理等核心能力。
 
@@ -25,6 +25,31 @@ python -m pip install -e .
 
 ---
 
+## dev 与正式版启动/打包边界
+
+`spread-ai serve` 只作为开发、调试、CI 和后端诊断入口，不作为正式 Windows 桌面产品的用户启动入口。正式版用户只启动前端仓库打包出来的 `Spread AI.exe`；该 Electron exe 会在 packaged 模式下自动拉起随包携带的后端 sidecar `spread-ai-runtime.exe`，等待 `/api/health` 成功后再打开窗口，并在应用退出时关闭后端进程。
+
+dev 后端在本仓库独立启动，推荐使用项目内配置目录：
+
+```powershell
+spread-ai serve --config-file config/agent_runtime.yaml --env-file config/.env.dev
+```
+
+dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`。`config/.env` 用于公共敏感配置和外部服务配置，`config/.env.dev` 只保存 dev 环境差异；配置加载顺序是先加载 `config/.env`，再加载 `--env-file` 指定文件，系统环境变量优先级最高。
+
+正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式后端监听 `127.0.0.1`，端口由 Electron 主进程动态分配并通过命令行参数传入，避免和 dev 后端固定端口冲突。
+
+正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`；正式版 `.env` 位于同一 `runtime-config` 目录。正式版运行数据根目录由 Electron 注入 `SPREAD_AI_DATA_ROOT=<userData>/runtime-data`，因此默认不会和 dev 的 `~/.spread-ai` 数据目录冲突。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：dev 不设置该变量时使用 `~/.spread-ai`，正式版设置该变量时使用应用自己的用户数据目录。
+
+构建正式版后端 sidecar：
+
+```powershell
+python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resources\backend
+```
+
+该命令生成 `build-resources/backend/spread-ai-runtime.exe`，随后由前端仓库的 Windows 打包脚本作为 `extraResources/backend` 打入正式桌面 exe。
+
+---
 ## 已完成模块
 
 ### 统一文件资源服务（file_resource）
@@ -33,7 +58,7 @@ python -m pip install -e .
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；除 `config init` 外，`spread-ai serve` 和所有 CLI 管理命令都固定加载这一个初始化后的运行配置文件，不再支持 `--config` / `SPREAD_AI_CONFIG`，也不再从包内 defaults 模板自动生成配置。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。serve 命令同样从 ConfigRegistry 取配置创建网关。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；普通 CLI 管理命令默认加载这一份初始化后的运行配置。`spread-ai serve` 是开发/诊断入口，默认同样加载 `~/.spread-ai/agent_runtime.yaml`，但允许通过 `--config-file` 与 `--env-file` 显式指定开发态配置源。正式 Windows 桌面版不通过 `spread-ai serve` 启动，而由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。运行时 REST 服务装配在 `agent_runtime.server` 中，供 `spread-ai serve` 与正式版内部后端入口复用。
 
 ### 会话消息模块（conversation_message）
 
