@@ -12,9 +12,11 @@ from uuid import uuid4
 
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.models import (
+    LacpClientStatus,
     LacpExecutionObservation,
     LacpInboundMessage,
     LacpInstanceRegistration,
+    utc_now_iso,
 )
 from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
 
@@ -38,6 +40,11 @@ class LacpClient:
         self._ws: Any = None
         self._send_lock = asyncio.Lock()
         self._pending_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._last_ws_endpoint: str | None = None
+        self._last_error: str | None = None
+        self._last_connected_at: str | None = None
+        self._last_disconnected_at: str | None = None
+        self._reconnect_attempt = 0
 
     def set_message_handler(self, handler: InboundMessageHandler) -> None:
         self._message_handler = handler
@@ -45,6 +52,20 @@ class LacpClient:
     @property
     def enabled(self) -> bool:
         return self._config_accessor().enabled
+
+    def status(self) -> LacpClientStatus:
+        config = self._config_accessor()
+        return LacpClientStatus(
+            enabled=config.enabled,
+            running=self._running,
+            connected=self._ws is not None,
+            registry_url=config.registry_url,
+            ws_endpoint=self._last_ws_endpoint,
+            last_error=self._last_error,
+            last_connected_at=self._last_connected_at,
+            last_disconnected_at=self._last_disconnected_at,
+            reconnect_attempt=self._reconnect_attempt,
+        )
 
     async def start(self) -> None:
         if not self.enabled:
@@ -108,6 +129,7 @@ class LacpClient:
                 continue
             try:
                 ws_endpoint = await self._resolve_ws_endpoint(config)
+                self._last_ws_endpoint = ws_endpoint
                 headers = self._auth_headers(config)
                 import websockets
 
@@ -122,16 +144,21 @@ class LacpClient:
                     **connect_kwargs,
                 ) as ws:
                     self._ws = ws
+                    self._last_error = None
+                    self._last_connected_at = utc_now_iso()
                     retry_count = 0
+                    self._reconnect_attempt = 0
                     reader_task = asyncio.create_task(self._reader_loop(ws))
                     await self._register_desired_instances()
                     await reader_task
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._last_error = str(exc)
                 logger.exception("LACP WebSocket connection failed.")
             finally:
                 self._ws = None
+                self._last_disconnected_at = utc_now_iso()
                 self._registration_registry.mark_disconnected()
                 self._fail_pending(RuntimeError("LACP WebSocket disconnected."))
             delay = min(
@@ -139,6 +166,7 @@ class LacpClient:
                 config.reconnect_max_delay_seconds,
             )
             retry_count += 1
+            self._reconnect_attempt = retry_count
             await asyncio.sleep(delay)
 
     async def _reader_loop(self, ws: Any) -> None:

@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from agent_runtime.lacp.bridge import AgentRuntimeLacpBridge
-from agent_runtime.lacp.models import LacpInstanceRegistration
+from agent_runtime.lacp.models import LacpClientStatus, LacpInstanceRegistration
 
 
 class LacpRegistrationResponse(BaseModel):
@@ -29,6 +29,20 @@ class LacpRegistrationListResponse(BaseModel):
     registrations: list[LacpRegistrationResponse] = Field(default_factory=list)
 
 
+class LacpClientStatusResponse(BaseModel):
+    enabled: bool
+    running: bool
+    connected: bool
+    registry_url: str
+    ws_endpoint: str | None = None
+    last_error: str | None = None
+    last_connected_at: str | None = None
+    last_disconnected_at: str | None = None
+    reconnect_attempt: int = 0
+    registration_count: int
+    registered_count: int
+
+
 def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
     router = APIRouter()
 
@@ -36,6 +50,15 @@ def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
     def list_registrations() -> LacpRegistrationListResponse:
         return LacpRegistrationListResponse(
             registrations=[_registration_response(item) for item in bridge.list_registrations()],
+        )
+
+    @router.get("/status", response_model=LacpClientStatusResponse)
+    def get_client_status() -> LacpClientStatusResponse:
+        registrations = bridge.list_registrations()
+        return _client_status_response(
+            bridge.client_status(),
+            registration_count=len(registrations),
+            registered_count=sum(1 for item in registrations if item.enabled and item.status == "registered"),
         )
 
     @router.get("/instances/{instance_id}/registration", response_model=LacpRegistrationResponse)
@@ -74,4 +97,25 @@ def _registration_response(item: LacpInstanceRegistration) -> LacpRegistrationRe
         error_code=item.error_code,
         error_message=item.error_message,
         updated_at=item.updated_at,
+    )
+
+
+def _client_status_response(
+    item: LacpClientStatus,
+    *,
+    registration_count: int,
+    registered_count: int,
+) -> LacpClientStatusResponse:
+    return LacpClientStatusResponse(
+        enabled=item.enabled,
+        running=item.running,
+        connected=item.connected,
+        registry_url=item.registry_url,
+        ws_endpoint=item.ws_endpoint,
+        last_error=item.last_error,
+        last_connected_at=item.last_connected_at,
+        last_disconnected_at=item.last_disconnected_at,
+        reconnect_attempt=item.reconnect_attempt,
+        registration_count=registration_count,
+        registered_count=registered_count,
     )

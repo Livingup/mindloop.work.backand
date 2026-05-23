@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from agent_runtime.lacp.client import LacpClient
-from agent_runtime.lacp.models import LacpInboundMessage, LacpInstanceRegistration
+from agent_runtime.lacp.models import LacpClientStatus, LacpInboundMessage, LacpInstanceRegistration
 from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,9 @@ class AgentRuntimeLacpBridge:
 
     def get_registration(self, instance_id: str) -> LacpInstanceRegistration | None:
         return self._registration_registry.get_registration(instance_id)
+
+    def client_status(self) -> LacpClientStatus:
+        return self._lacp_client.status()
 
     async def handle_inbound_message(self, message: LacpInboundMessage) -> bool:
         if self._execution_engine is None:

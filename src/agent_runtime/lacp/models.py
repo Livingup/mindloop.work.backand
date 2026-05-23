@@ -126,3 +126,16 @@ class LacpExecutionObservation:
         if self.caller_instance_id is not None:
             frame["caller_instance_id"] = self.caller_instance_id
         return frame
+
+
+@dataclass(frozen=True, slots=True)
+class LacpClientStatus:
+    enabled: bool
+    running: bool
+    connected: bool
+    registry_url: str
+    ws_endpoint: str | None = None
+    last_error: str | None = None
+    last_connected_at: str | None = None
+    last_disconnected_at: str | None = None
+    reconnect_attempt: int = 0
