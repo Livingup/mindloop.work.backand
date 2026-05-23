@@ -58,7 +58,11 @@ from agent_runtime.conversation_message.message.operations import create_convers
 from agent_runtime.context_compression.compression_service import ContextCompressionService
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
-from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmPromptResponse
+from agent_runtime.llm_client.llm_request_models import (
+    LlmPromptRequest,
+    LlmPromptResponse,
+    LlmToolDefinition,
+)
 from agent_runtime.llm_client.llm_request_service import (
     LlmProviderModelServiceUnavailable,
     LlmRequestService,
@@ -1094,14 +1098,15 @@ class AgentExecutionEngine:
                 )
                 skipped_for_modalities = True
                 continue
+            tools = await self._tool_dispatcher.build_llm_tools(
+                agent_definition=agent_definition,
+                api_format=resolved_model.api_format,
+            )
             system_prompt = self._render_system_prompt(
                 agent_definition,
                 instance.current_working_directory,
                 render_options,
-            )
-            tools = await self._tool_dispatcher.build_llm_tools(
-                agent_definition=agent_definition,
-                api_format=resolved_model.api_format,
+                tools,
             )
             try:
                 if self._context_compression_service is not None:
@@ -1272,6 +1277,7 @@ class AgentExecutionEngine:
         definition: AgentDefinition,
         current_working_directory: str,
         render_options: dict[str, Any],
+        llm_tools: tuple[LlmToolDefinition, ...],
     ) -> str | None:
         """按 AgentDefinition.system_prompt 顺序拼接最终系统提示词。"""
         segments: list[str] = []
@@ -1283,7 +1289,7 @@ class AgentExecutionEngine:
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
         runtime_context_prompt = _build_runtime_context_prompt(current_working_directory)
-        mcp_services_prompt = self._build_mcp_services_prompt(definition)
+        mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
         skills_prompt = self._build_skills_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
         lifecycle_tool_notice = self._build_lifecycle_tool_notice(definition)
@@ -1300,7 +1306,11 @@ class AgentExecutionEngine:
             if item.strip()
         ) or None
 
-    def _build_mcp_services_prompt(self, definition: AgentDefinition) -> str:
+    def _build_mcp_services_prompt(
+        self,
+        definition: AgentDefinition,
+        llm_tools: tuple[LlmToolDefinition, ...],
+    ) -> str:
         if not definition.mcp_tools or self._mcp_client_gateway is None:
             return ""
         service_ids = []
@@ -1314,16 +1324,51 @@ class AgentExecutionEngine:
         available_services = [services[sid] for sid in service_ids if sid in services]
         if not available_services:
             return ""
+
+        tools_by_service: dict[str, list[LlmToolDefinition]] = {sid: [] for sid in service_ids}
+        for tool in llm_tools:
+            if tool.source != "mcp" or not tool.mcp_service_id or not tool.mcp_tool_name:
+                continue
+            if tool.mcp_service_id in tools_by_service:
+                tools_by_service[tool.mcp_service_id].append(tool)
+
         lines = ["# 可用的 MCP 服务列表"]
         for service in available_services:
             description = service.description or ""
-            lines.append(f"- `{service.service_id}`：`{description}`")
+            if description:
+                lines.append(f"- `{service.service_id}`：{description}")
+            else:
+                lines.append(f"- `{service.service_id}`")
+            service_tools = tools_by_service.get(service.service_id, [])
+            if not service_tools:
+                continue
+            lines.append("  - 可用工具：")
+            for tool in service_tools:
+                tool_name = tool.mcp_tool_name or tool.name
+                tool_description = self._tool_schema_description(tool.schema)
+                if tool_description:
+                    lines.append(f"    - `{tool_name}`：{tool_description}")
+                else:
+                    lines.append(f"    - `{tool_name}`")
         lines.append("## 使用方式")
         lines.append(
-            "用 MCP 服务相关工具读取服务详情和 MCP tool 详情，了解 MCP 服务的功能和使用方式，"
-            "然后使用 MCP tool 调用工具调用对应 MCP tool 并获取执行结果。"
+            "上方只列出 MCP 服务和可用工具摘要；工具参数 schema 不写入系统提示词，"
+            "以本轮工具定义中对应 MCP tool 的参数 schema 为准。"
         )
         return "\n".join(lines)
+
+
+    def _tool_schema_description(self, schema: dict[str, Any]) -> str:
+        """从已转换的 LLM 工具 schema 中提取工具描述。"""
+        description = schema.get("description")
+        if isinstance(description, str):
+            return description
+        function = schema.get("function")
+        if isinstance(function, dict):
+            function_description = function.get("description")
+            if isinstance(function_description, str):
+                return function_description
+        return ""
 
     def _build_skills_prompt(self, definition: AgentDefinition) -> str:
         if not definition.skill_ids or self._skill_gateway is None:
