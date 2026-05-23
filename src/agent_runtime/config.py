@@ -730,11 +730,19 @@ def _resolve_env_vars(value: Any) -> Any:
             )
         resolved = _ENV_VAR_PATTERN.sub(_replace, value)
         # 展开 ~ 为用户主目录（跨平台：Windows → %USERPROFILE%，Unix → $HOME）。
-        return os.path.expanduser(resolved)
+        return _normalize_path_like_config_value(os.path.expanduser(resolved))
     if isinstance(value, dict):
         return {k: _resolve_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_resolve_env_vars(item) for item in value]
+    return value
+
+
+def _normalize_path_like_config_value(value: str) -> str:
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        return value
+    if os.path.isabs(value) or re.match(r"^[a-zA-Z]:[\\/]", value):
+        return os.path.normpath(value)
     return value
 
 
