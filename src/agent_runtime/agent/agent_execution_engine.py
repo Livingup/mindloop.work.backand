@@ -1332,6 +1332,7 @@ class AgentExecutionEngine:
             if tool.mcp_service_id in tools_by_service:
                 tools_by_service[tool.mcp_service_id].append(tool)
 
+        # system prompt 仅注入 MCP 服务与可用工具摘要；参数 schema 仍通过正式 tool schema 暴露给模型。
         lines = ["# 可用的 MCP 服务列表"]
         for service in available_services:
             description = service.description or ""
