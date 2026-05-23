@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from agent_runtime.config import ConfigRegistry
 from agent_runtime.lacp.bridge import AgentRuntimeLacpBridge
 from agent_runtime.lacp.models import LacpClientStatus, LacpInstanceRegistration
+from agent_runtime.lacp.settings_repository import LacpSettingsRepository
 
 
 class LacpRegistrationResponse(BaseModel):
@@ -36,8 +34,8 @@ class LacpSettingsResponse(BaseModel):
     enabled: bool
     registry_url: str
     api_key_configured: bool
-    config_path: str
-    env_file_path: str
+    db_path: str
+    updated_at: str | None = None
 
 
 class LacpSettingsUpdateBody(BaseModel):
@@ -60,7 +58,10 @@ class LacpClientStatusResponse(BaseModel):
     registered_count: int
 
 
-def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
+def create_lacp_router(
+    bridge: AgentRuntimeLacpBridge,
+    settings_repository: LacpSettingsRepository,
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/registrations", response_model=LacpRegistrationListResponse)
@@ -80,12 +81,12 @@ def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
 
     @router.get("/settings", response_model=LacpSettingsResponse)
     def get_settings() -> LacpSettingsResponse:
-        return _settings_response()
+        return _settings_response(settings_repository)
 
     @router.put("/settings", response_model=LacpSettingsResponse)
     async def update_settings(body: LacpSettingsUpdateBody) -> LacpSettingsResponse:
         registry_url = body.registry_url.strip()
-        current = ConfigRegistry.instance().lacp
+        current = settings_repository.get_settings()
         next_api_key = current.api_key if body.api_key is None else body.api_key.strip()
         if body.enabled:
             if not registry_url:
@@ -93,17 +94,17 @@ def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
             if not next_api_key:
                 raise HTTPException(status_code=400, detail="LACP API key is required when LACP is enabled.")
         try:
-            snapshot = ConfigRegistry.instance().snapshot()
-            _write_lacp_yaml_section(snapshot.yaml_path, enabled=body.enabled, registry_url=registry_url)
-            if body.api_key is not None:
-                _write_lacp_env_key(snapshot.yaml_path, snapshot.env_file_path, next_api_key or "")
-            ConfigRegistry.reload()
+            settings_repository.save_settings(
+                enabled=body.enabled,
+                registry_url=registry_url,
+                api_key=next_api_key,
+            )
             await bridge.reload_client_from_config()
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"LACP settings update failed: {exc}") from exc
-        return _settings_response()
+        return _settings_response(settings_repository)
 
     @router.get("/instances/{instance_id}/registration", response_model=LacpRegistrationResponse)
     def get_instance_registration(instance_id: str) -> LacpRegistrationResponse:
@@ -165,70 +166,12 @@ def _client_status_response(
     )
 
 
-def _settings_response() -> LacpSettingsResponse:
-    registry = ConfigRegistry.instance()
-    snapshot = registry.snapshot()
-    config = registry.lacp
-    env_path = _lacp_env_path(snapshot.yaml_path, snapshot.env_file_path)
+def _settings_response(settings_repository: LacpSettingsRepository) -> LacpSettingsResponse:
+    settings = settings_repository.get_settings()
     return LacpSettingsResponse(
-        enabled=config.enabled,
-        registry_url=config.registry_url,
-        api_key_configured=bool((config.api_key or "").strip()),
-        config_path=snapshot.yaml_path,
-        env_file_path=str(env_path),
+        enabled=settings.enabled,
+        registry_url=settings.registry_url,
+        api_key_configured=bool((settings.api_key or "").strip()),
+        db_path=str(settings_repository.db_path()),
+        updated_at=settings.updated_at,
     )
-
-
-def _write_lacp_yaml_section(config_path: str, *, enabled: bool, registry_url: str) -> None:
-    path = Path(config_path)
-    raw_lines = path.read_text(encoding="utf-8").splitlines()
-    start_index = next((index for index, line in enumerate(raw_lines) if line.strip() == "lacp:" and not line.startswith((" ", "\t"))), None)
-    replacement = [
-        "lacp:",
-        f"  enabled: {'true' if enabled else 'false'}",
-        f"  registry_url: {_yaml_double_quote(registry_url)}",
-        '  api_key: "${LACP_API_KEY:-}"',
-        "  data_dir: \"~/.spread-ai/lacp\"",
-        "  connect_timeout_seconds: 10",
-        "  request_timeout_seconds: 5",
-        "  reconnect_initial_delay_seconds: 1",
-        "  reconnect_max_delay_seconds: 30",
-    ]
-    if start_index is None:
-        next_lines = raw_lines + ["", *replacement]
-    else:
-        end_index = start_index + 1
-        while end_index < len(raw_lines):
-            line = raw_lines[end_index]
-            if line.strip() and not line.startswith((" ", "\t")):
-                break
-            end_index += 1
-        next_lines = raw_lines[:start_index] + replacement + raw_lines[end_index:]
-    path.write_text("\n".join(next_lines) + "\n", encoding="utf-8")
-
-
-def _write_lacp_env_key(config_path: str, env_file_path: str | None, api_key: str) -> None:
-    path = _lacp_env_path(config_path, env_file_path)
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    replacement = f"LACP_API_KEY={api_key}"
-    for index, line in enumerate(lines):
-        if line.startswith("LACP_API_KEY="):
-            lines[index] = replacement
-            break
-    else:
-        lines.append(replacement)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if api_key:
-        os.environ["LACP_API_KEY"] = api_key
-    else:
-        os.environ.pop("LACP_API_KEY", None)
-
-
-def _lacp_env_path(config_path: str, env_file_path: str | None) -> Path:
-    if env_file_path:
-        return Path(env_file_path)
-    return Path(config_path).resolve().parent / ".env"
-
-
-def _yaml_double_quote(value: str) -> str:
-    return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""

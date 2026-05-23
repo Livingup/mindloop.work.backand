@@ -118,9 +118,6 @@ context_compression:
 
 
 lacp:
-  enabled: false
-  registry_url: ""
-  api_key: "${LACP_API_KEY:-}"
   data_dir: "~/.spread-ai/lacp"
   connect_timeout_seconds: 10
   request_timeout_seconds: 5

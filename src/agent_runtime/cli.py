@@ -326,6 +326,7 @@ def serve(host: str | None, port: int | None) -> None:
         execution_engine=agent_execution_engine,
     )
     lacp_client = LacpFactory.create_client()
+    lacp_settings_repository = LacpFactory.create_settings_repository()
     terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
 
@@ -447,7 +448,7 @@ def serve(host: str | None, port: int | None) -> None:
         tags=["Agent 运行态"],
     )
     app.include_router(
-        create_lacp_router(lacp_bridge),
+        create_lacp_router(lacp_bridge, lacp_settings_repository),
         prefix="/api/lacp",
         tags=["LACP"],
     )

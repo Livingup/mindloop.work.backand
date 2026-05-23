@@ -7,6 +7,7 @@ from agent_runtime.config import ConfigRegistry
 from agent_runtime.lacp.client import LacpClient
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
+from agent_runtime.lacp.settings_repository import LacpSettingsRepository
 
 if TYPE_CHECKING:
     from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
@@ -18,8 +19,18 @@ if TYPE_CHECKING:
 class LacpFactory:
     _lock = RLock()
     _registry: LacpRegistrationRegistry | None = None
+    _settings_repository: LacpSettingsRepository | None = None
     _client: LacpClient | None = None
     _bridge: 'AgentRuntimeLacpBridge' | None = None
+
+    @classmethod
+    def create_settings_repository(cls) -> LacpSettingsRepository:
+        with cls._lock:
+            if cls._settings_repository is None:
+                cls._settings_repository = LacpSettingsRepository(
+                    lambda: ConfigRegistry.instance().lacp.data_dir,
+                )
+            return cls._settings_repository
 
     @classmethod
     def create_registry(cls) -> LacpRegistrationRegistry:
@@ -29,11 +40,26 @@ class LacpFactory:
             return cls._registry
 
     @classmethod
+    def current_config(cls) -> LacpConfig:
+        base = ConfigRegistry.instance().lacp
+        settings = cls.create_settings_repository().get_settings()
+        return LacpConfig(
+            enabled=settings.enabled,
+            registry_url=settings.registry_url,
+            api_key=settings.api_key,
+            data_dir=base.data_dir,
+            connect_timeout_seconds=base.connect_timeout_seconds,
+            request_timeout_seconds=base.request_timeout_seconds,
+            reconnect_initial_delay_seconds=base.reconnect_initial_delay_seconds,
+            reconnect_max_delay_seconds=base.reconnect_max_delay_seconds,
+        )
+
+    @classmethod
     def create_client(cls) -> LacpClient:
         with cls._lock:
             if cls._client is None:
                 cls._client = LacpClient(
-                    config_accessor=lambda: ConfigRegistry.instance().lacp,
+                    config_accessor=cls.current_config,
                     registration_registry=cls.create_registry(),
                 )
             return cls._client
