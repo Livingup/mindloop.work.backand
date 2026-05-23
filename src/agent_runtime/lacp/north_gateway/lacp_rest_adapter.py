@@ -33,6 +33,7 @@ class LacpRegistrationListResponse(BaseModel):
 class LacpSettingsResponse(BaseModel):
     enabled: bool
     registry_url: str
+    api_key: str | None = None
     api_key_configured: bool
     db_path: str
     updated_at: str | None = None
@@ -171,6 +172,7 @@ def _settings_response(settings_repository: LacpSettingsRepository) -> LacpSetti
     return LacpSettingsResponse(
         enabled=settings.enabled,
         registry_url=settings.registry_url,
+        api_key=settings.api_key,
         api_key_configured=bool((settings.api_key or "").strip()),
         db_path=str(settings_repository.db_path()),
         updated_at=settings.updated_at,
