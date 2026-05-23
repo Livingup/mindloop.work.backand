@@ -94,9 +94,9 @@ def create_lacp_router(bridge: AgentRuntimeLacpBridge) -> APIRouter:
                 raise HTTPException(status_code=400, detail="LACP API key is required when LACP is enabled.")
         try:
             snapshot = ConfigRegistry.instance().snapshot()
-            _write_lacp_yaml_section(snapshot.config_path, enabled=body.enabled, registry_url=registry_url)
+            _write_lacp_yaml_section(snapshot.yaml_path, enabled=body.enabled, registry_url=registry_url)
             if body.api_key is not None:
-                _write_lacp_env_key(snapshot.config_path, snapshot.env_file_path, next_api_key or "")
+                _write_lacp_env_key(snapshot.yaml_path, snapshot.env_file_path, next_api_key or "")
             ConfigRegistry.reload()
             await bridge.reload_client_from_config()
         except HTTPException:
@@ -169,12 +169,12 @@ def _settings_response() -> LacpSettingsResponse:
     registry = ConfigRegistry.instance()
     snapshot = registry.snapshot()
     config = registry.lacp
-    env_path = _lacp_env_path(snapshot.config_path, snapshot.env_file_path)
+    env_path = _lacp_env_path(snapshot.yaml_path, snapshot.env_file_path)
     return LacpSettingsResponse(
         enabled=config.enabled,
         registry_url=config.registry_url,
         api_key_configured=bool((config.api_key or "").strip()),
-        config_path=snapshot.config_path,
+        config_path=snapshot.yaml_path,
         env_file_path=str(env_path),
     )
 
