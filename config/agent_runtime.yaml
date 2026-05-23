@@ -5,19 +5,19 @@
 
 agent_runtime_service:
   # 当前运行时服务实例名称，用于区分不同部署环境或不同节点。
-  service_instance_name: "agent-runtime-local"
+  service_instance_name: "${SPREAD_AI_SERVICE_INSTANCE_NAME:-agent-runtime-local}"
 
   # 当前运行时服务环境标识，可选值可继续扩展为 local / dev / test / prod。
-  service_environment: "local"
+  service_environment: "${SPREAD_AI_SERVICE_ENVIRONMENT:-local}"
 
   # API 监听地址（bind address），决定后端进程把 API 绑定到这台电脑的哪个网络入口：
   # - 127.0.0.1：只给本机前端/本机脚本访问。
   # - 0.0.0.0：允许通过本机所有网卡访问，例如本机、局域网 IP、Docker 容器网络。
   # 该字段不填写远端机器地址，也不是权限白名单。
-  service_host: "0.0.0.0"
+  service_host: "${SPREAD_AI_SERVICE_HOST:-127.0.0.1}"
 
   # 当前运行时服务监听端口。
-  service_port: 8000
+  service_port: "${SPREAD_AI_SERVICE_PORT:-8000}"
 
 file_resource_service:
   # 统一文件资源服务单次批量处理上限。

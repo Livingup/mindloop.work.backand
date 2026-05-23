@@ -26,7 +26,7 @@ def _runtime_config_path() -> Path:
     return Path.home() / ".spread-ai" / "agent_runtime.yaml"
 
 
-def _load_initialized_runtime_config() -> None:
+def _load_initialized_runtime_config(env_file_path: Path | None = None) -> None:
     """加载已经初始化好的运行配置；不存在时提示用户先执行 config init。"""
     config_path = _runtime_config_path()
     if not config_path.is_file():
@@ -34,7 +34,11 @@ def _load_initialized_runtime_config() -> None:
             f"运行配置文件不存在: {config_path}。请先执行 "
             "spread-ai config init --source <agent_runtime.yaml> 初始化服务配置。"
         )
-    ConfigRegistry.load(str(config_path), watch=True)
+    ConfigRegistry.load(
+        str(config_path),
+        str(env_file_path.resolve()) if env_file_path is not None else None,
+        watch=True,
+    )
 
 
 def _echo_json(data: dict[str, object], *, err: bool = False) -> None:
@@ -49,7 +53,7 @@ def main(ctx: click.Context) -> None:
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
         ctx.exit()
-    if ctx.invoked_subcommand == "config":
+    if ctx.invoked_subcommand in {"config", "serve"}:
         return
     _load_initialized_runtime_config()
 
@@ -192,9 +196,16 @@ main.add_command(
 
 
 @main.command("serve")
+@click.option(
+    "--env-file",
+    "env_file_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="用于本次服务启动的 .env 文件路径。",
+)
 @click.option("--host", default=None, help="监听地址（覆盖配置文件）。")
 @click.option("--port", default=None, type=int, help="监听端口（覆盖配置文件）。")
-def serve(host: str | None, port: int | None) -> None:
+def serve(env_file_path: Path | None, host: str | None, port: int | None) -> None:
     """启动 REST API 服务器。"""
     import asyncio as _asyncio
     import logging as _logging
@@ -209,6 +220,7 @@ def serve(host: str | None, port: int | None) -> None:
         datefmt="%H:%M:%S",
     )
     _serve_logger = _logging.getLogger("agent_runtime.serve")
+    _load_initialized_runtime_config(env_file_path)
 
     # 各模块网关通过无参工厂创建，配置由工厂内部从 ConfigRegistry 实时读取。
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory
