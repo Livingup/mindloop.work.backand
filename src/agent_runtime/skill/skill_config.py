@@ -14,3 +14,6 @@ class SkillConfig:
 
     # Skill 分组映射文件路径（应用层扩展，非 Skill 标准协议字段）。
     skill_groups_file: str = "~/.spread-ai/skill-groups.yaml"
+
+    # Skill 用户设置数据库目录。
+    settings_dir: str = "~/.spread-ai/skill"

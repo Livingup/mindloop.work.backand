@@ -50,6 +50,18 @@ class SkillGateway(Protocol):
         """触发重新扫描 Skill 仓库目录。"""
         ...
 
+    def get_settings(self):
+        """读取 Skill 用户设置。"""
+        ...
+
+    def save_settings(self, *, skills_dir: str):
+        """保存 Skill 用户设置。"""
+        ...
+
+    def settings_db_path(self):
+        """读取 Skill 用户设置数据库路径。"""
+        ...
+
     def set_skill_group(self, skill_id: str, group: str) -> None:
         """设置指定 Skill 的应用层分组。
 

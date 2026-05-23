@@ -8,23 +8,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_runtime.file_resource.config import (
-    FileResourceServiceConfig,
-    ObjectStorageGatewayConfig,
-)
+from agent_runtime.file_resource.config import FileResourceServiceConfig
 from agent_runtime.file_resource.infrastructure import SqliteFileResourceArchiveRepository
 from agent_runtime.file_resource.local_storage import LocalResourceStorage
 from agent_runtime.file_resource.metadata_parser import FileResourceMetadataParser
 from agent_runtime.file_resource.models import InMemoryFileResourceArchiveRepository
+from agent_runtime.file_resource.settings_repository import ObjectStorageSettingsRepository
 from agent_runtime.file_resource.service import FileResourceService
-from agent_runtime.file_resource.south_gateway.object_storage.aliyun_oss import (
-    AliyunOssObjectStorageGateway,
-)
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
 )
 from agent_runtime.file_resource.south_gateway.object_storage.in_memory import (
     InMemoryObjectStorageGateway,
+)
+from agent_runtime.file_resource.south_gateway.object_storage.runtime_configured import (
+    RuntimeConfiguredObjectStorageGateway,
 )
 
 
@@ -92,9 +90,8 @@ class FileResourceServiceFactory:
                 svc_config,
             ),
             local_storage=FileResourceServiceFactory._create_local_storage(svc_config),
-            object_storage_gateway=FileResourceServiceFactory._create_oss_gateway(
-                provider=svc_config.object_storage_gateway_provider,
-                oss_config=svc_config.object_storage_gateway,
+            object_storage_gateway=FileResourceServiceFactory._create_object_storage_gateway(
+                svc_config,
             ),
             metadata_parser=FileResourceMetadataParser(),
             batch_limit=svc_config.file_resource_batch_limit,
@@ -125,28 +122,10 @@ class FileResourceServiceFactory:
         )
 
     @staticmethod
-    def _create_oss_gateway(
-        provider: str,
-        oss_config: ObjectStorageGatewayConfig,
+    def _create_object_storage_gateway(
+        svc_config: FileResourceServiceConfig,
     ) -> ObjectStorageGateway:
-        """根据提供商配置创建对象存储南向网关。
-
-        当前支持：memory（开发态）、aliyun_oss（生产态）。
-        """
-
-        if provider == "memory":
-            return InMemoryObjectStorageGateway(
-                object_storage_public_base_url=oss_config.object_storage_public_base_url,
-            )
-        if provider == "aliyun_oss":
-            return AliyunOssObjectStorageGateway(
-                object_storage_endpoint=oss_config.object_storage_endpoint,
-                object_storage_region=oss_config.object_storage_region,
-                object_storage_bucket_name=oss_config.object_storage_bucket_name,
-                object_storage_public_base_url=oss_config.object_storage_public_base_url,
-                object_storage_object_key_prefix=oss_config.object_storage_object_key_prefix,
-                object_storage_access_key_id=oss_config.object_storage_access_key_id,
-                object_storage_access_key_secret=oss_config.object_storage_access_key_secret,
-                connect_timeout_seconds=oss_config.connect_timeout_seconds,
-            )
-        raise ValueError(f"不支持的对象存储网关提供商: {provider}")
+        settings_repository = ObjectStorageSettingsRepository(
+            data_dir_accessor=lambda: svc_config.local_resource_storage_root_path,
+        )
+        return RuntimeConfiguredObjectStorageGateway(settings_repository)

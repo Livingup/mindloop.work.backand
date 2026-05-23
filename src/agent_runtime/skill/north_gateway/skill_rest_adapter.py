@@ -43,6 +43,16 @@ class SetGroupBody(BaseModel):
     group: str
 
 
+class SkillSettingsResponse(BaseModel):
+    skills_dir: str
+    db_path: str
+    updated_at: str | None = None
+
+
+class SkillSettingsUpdateBody(BaseModel):
+    skills_dir: str
+
+
 class StatusResponse(BaseModel):
     """通用状态响应。"""
 
@@ -89,6 +99,27 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
             }
             for s in skills
         ]
+
+    @router.get("/settings", response_model=SkillSettingsResponse)
+    def get_settings() -> SkillSettingsResponse:
+        settings = gateway.get_settings()
+        return SkillSettingsResponse(
+            skills_dir=settings.skills_dir,
+            db_path=str(gateway.settings_db_path()),
+            updated_at=settings.updated_at,
+        )
+
+    @router.put("/settings", response_model=SkillSettingsResponse)
+    def update_settings(body: SkillSettingsUpdateBody) -> SkillSettingsResponse:
+        try:
+            settings = gateway.save_settings(skills_dir=body.skills_dir)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        return SkillSettingsResponse(
+            skills_dir=settings.skills_dir,
+            db_path=str(gateway.settings_db_path()),
+            updated_at=settings.updated_at,
+        )
 
     @router.patch("/{skill_id}/group", response_model=StatusResponse)
     def set_skill_group(skill_id: str, body: SetGroupBody) -> dict[str, Any]:

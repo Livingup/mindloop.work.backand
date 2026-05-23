@@ -35,7 +35,7 @@ class FilesystemSkillRepository:
     @property
     def _skills_dir(self) -> Path:
         """实时从配置中心读取 Skill 仓库根目录路径（避免配置数据冗余）。"""
-        return Path(self._skills_dir_accessor())
+        return Path(self._skills_dir_accessor()).expanduser()
 
     def list_all(self) -> list[SkillDefinition]:
         """列出所有已发现的 Skill。"""

@@ -2,8 +2,11 @@
 """Skill 北向网关实现。"""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from agent_runtime.skill.infrastructure.skill_group_store import SkillGroupStore
 from agent_runtime.skill.north_gateway.skill_contracts import SkillInfo
+from agent_runtime.skill.settings_repository import SkillSettingsRepository
 from agent_runtime.skill.skill_service import SkillService
 
 
@@ -14,9 +17,18 @@ class SkillGatewayImpl:
     并合并应用层分组信息（来自 SkillGroupStore）。
     """
 
-    def __init__(self, service: SkillService, group_store: SkillGroupStore) -> None:
+    def __init__(
+        self,
+        service: SkillService,
+        group_store: SkillGroupStore,
+        *,
+        settings_repository: SkillSettingsRepository | None = None,
+        default_skills_dir_accessor: Callable[[], str] | None = None,
+    ) -> None:
         self._service = service
         self._group_store = group_store
+        self._settings_repository = settings_repository
+        self._default_skills_dir_accessor = default_skills_dir_accessor
 
     def list_skills(self) -> list[SkillInfo]:
         """列出所有已发现的 Skill（合并应用层分组）。"""
@@ -40,6 +52,25 @@ class SkillGatewayImpl:
     def refresh(self) -> None:
         """触发重新扫描 Skill 仓库目录。"""
         self._service.refresh()
+
+    def get_settings(self):
+        if self._settings_repository is None or self._default_skills_dir_accessor is None:
+            raise RuntimeError("Skill 设置仓储未初始化。")
+        return self._settings_repository.get_settings(
+            default_skills_dir=self._default_skills_dir_accessor(),
+        )
+
+    def save_settings(self, *, skills_dir: str):
+        if self._settings_repository is None:
+            raise RuntimeError("Skill 设置仓储未初始化。")
+        settings = self._settings_repository.save_settings(skills_dir=skills_dir)
+        self.refresh()
+        return settings
+
+    def settings_db_path(self):
+        if self._settings_repository is None:
+            raise RuntimeError("Skill 设置仓储未初始化。")
+        return self._settings_repository.db_path()
 
     def set_skill_group(self, skill_id: str, group: str) -> None:
         """设置指定 Skill 的应用层分组。"""

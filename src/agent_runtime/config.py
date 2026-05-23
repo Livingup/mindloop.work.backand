@@ -34,10 +34,7 @@ from watchdog.observers import Observer
 logger = logging.getLogger(__name__)
 
 from agent_runtime.agent_definition.agent_definition_config import AgentDefinitionConfig
-from agent_runtime.file_resource.config import (
-    FileResourceServiceConfig,
-    ObjectStorageGatewayConfig,
-)
+from agent_runtime.file_resource.config import FileResourceServiceConfig
 from agent_runtime.mcp.mcp_client.mcp_client_config import McpClientConfig
 from agent_runtime.prompt_template.prompt_template_config import PromptTemplateConfig
 from agent_runtime.skill.skill_config import SkillConfig
@@ -537,34 +534,10 @@ def _build_runtime_config(data: dict[str, Any]) -> AgentRuntimeServiceConfig:
 
 
 def _build_resource_config(data: dict[str, Any]) -> FileResourceServiceConfig:
-    """从 YAML 字典构建统一文件资源服务配置，并校验对象存储提供商一致性。"""
-    oss_data = _require_section(data, "object_storage_gateway")
-    config = FileResourceServiceConfig(
+    """从 YAML 字典构建统一文件资源服务配置。"""
+    return FileResourceServiceConfig(
         file_resource_batch_limit=int(data["file_resource_batch_limit"]),
         local_resource_storage_root_path=str(data["local_resource_storage_root_path"]),
-        object_storage_gateway_provider=str(data["object_storage_gateway_provider"]),
-        object_storage_gateway=_build_oss_config(oss_data),
-    )
-    if config.object_storage_gateway_provider != config.object_storage_gateway.gateway_provider:
-        raise ValueError(
-            "统一文件资源服务配置中的 object_storage_gateway_provider "
-            "与 object_storage_gateway.gateway_provider 必须保持一致。"
-        )
-    return config
-
-
-def _build_oss_config(data: dict[str, Any]) -> ObjectStorageGatewayConfig:
-    """从 YAML 字典构建对象存储南向网关配置。"""
-    return ObjectStorageGatewayConfig(
-        gateway_provider=str(data["gateway_provider"]),
-        object_storage_endpoint=str(data["object_storage_endpoint"]),
-        object_storage_region=str(data["object_storage_region"]),
-        object_storage_bucket_name=str(data["object_storage_bucket_name"]),
-        object_storage_public_base_url=str(data["object_storage_public_base_url"]),
-        object_storage_object_key_prefix=str(data["object_storage_object_key_prefix"]),
-        object_storage_access_key_id=str(data["object_storage_access_key_id"]),
-        object_storage_access_key_secret=str(data["object_storage_access_key_secret"]),
-        connect_timeout_seconds=int(data.get("connect_timeout_seconds", 60)),
     )
 
 
@@ -580,6 +553,8 @@ def _build_skill_config(data: dict[str, Any]) -> SkillConfig:
     kwargs: dict[str, Any] = {"skills_dir": str(data["skills_dir"])}
     if "skill_groups_file" in data:
         kwargs["skill_groups_file"] = str(data["skill_groups_file"])
+    if "settings_dir" in data:
+        kwargs["settings_dir"] = str(data["settings_dir"])
     return SkillConfig(**kwargs)
 
 

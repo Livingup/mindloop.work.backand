@@ -7,6 +7,7 @@ from agent_runtime.skill.infrastructure.filesystem_skill_repository import (
 )
 from agent_runtime.skill.infrastructure.skill_group_store import SkillGroupStore
 from agent_runtime.skill.north_gateway.skill_gateway_impl import SkillGatewayImpl
+from agent_runtime.skill.settings_repository import SkillSettingsRepository
 from agent_runtime.skill.skill_service import SkillService
 
 
@@ -22,11 +23,21 @@ class SkillFactory:
         """
         from agent_runtime.config import ConfigRegistry
 
+        settings_repository = SkillSettingsRepository(
+            data_dir_accessor=lambda: ConfigRegistry.instance().skill_service.settings_dir,
+        )
         repo = FilesystemSkillRepository(
-            skills_dir_accessor=lambda: ConfigRegistry.instance().skill_service.skills_dir,
+            skills_dir_accessor=lambda: settings_repository.get_settings(
+                default_skills_dir=ConfigRegistry.instance().skill_service.skills_dir,
+            ).skills_dir,
         )
         group_store = SkillGroupStore(
             group_file_accessor=lambda: ConfigRegistry.instance().skill_service.skill_groups_file,
         )
         service = SkillService(repo)
-        return SkillGatewayImpl(service, group_store)
+        return SkillGatewayImpl(
+            service,
+            group_store,
+            settings_repository=settings_repository,
+            default_skills_dir_accessor=lambda: ConfigRegistry.instance().skill_service.skills_dir,
+        )
