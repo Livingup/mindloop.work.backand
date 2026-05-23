@@ -266,11 +266,12 @@ class ConfigRegistry:
         raw_config_data = self._raw_config_data
         if raw_config_data is None:
             raw_config_data = {}
+        resolved_config_data = _resolve_env_vars(raw_config_data)
         return ConfigRegistrySnapshot(
             yaml_path=self._yaml_path,
             env_file_path=self._env_file_path,
             raw_yaml=self._raw_yaml,
-            raw_config_data=dict(raw_config_data),
+            raw_config_data=dict(resolved_config_data),
             section_names=list(raw_config_data.keys()),
             loaded_section_names=sorted(self._section_cache.keys()),
             watch_enabled=self._watcher is not None,
