@@ -150,6 +150,7 @@ class LlmRequestService:
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
                 )
+                _notify_request_event(request, "llm.request.started", request_payload)
                 retry_target = _build_retry_target_payload(
                     resolved=resolved,
                     candidate_index=request.candidate_index,
@@ -160,22 +161,24 @@ class LlmRequestService:
                     next_resolved_model=request.next_resolved_model,
                     retryable=False,
                 )
+                failed_payload = {
+                    **request_payload,
+                    "attempt_count": attempt_count,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                    "failed_stage": "api_key_resolution",
+                    "partial_response": False,
+                    "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                    **retry_target,
+                }
                 await self._event_publisher.publish(
                     request.communication_context,
                     "llm.request.failed",
-                    {
-                        **request_payload,
-                        "attempt_count": attempt_count,
-                        "error_type": exc.__class__.__name__,
-                        "error_message": str(exc),
-                        "failed_stage": "api_key_resolution",
-                        "partial_response": False,
-                        "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                        **retry_target,
-                    },
+                    failed_payload,
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
                 )
+                _notify_request_event(request, "llm.request.failed", failed_payload)
                 continue
             request_payload = _build_request_attempt_payload(
                 llm_call_id=llm_call_id,
@@ -196,6 +199,7 @@ class LlmRequestService:
                 source="llm_client",
                 metadata={"conversation_id": request.conversation.id},
             )
+            _notify_request_event(request, "llm.request.started", request_payload)
             if request.request_attempt_observer is not None:
                 request.request_attempt_observer(dict(request_payload))
             max_retries = resolved.retry.max_retries_per_key
@@ -228,6 +232,7 @@ class LlmRequestService:
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    _notify_request_event(request, "llm.request.started", request_payload)
                     if request.request_attempt_observer is not None:
                         request.request_attempt_observer(dict(request_payload))
                 stream_state: dict[str, bool] = {"response_started": False, "response_failed": False}
@@ -241,6 +246,7 @@ class LlmRequestService:
                         context=request.communication_context,
                         event_loop=asyncio.get_running_loop(),
                         conversation_id=request.conversation.id,
+                        request_event_observer=request.request_event_observer,
                         llm_call_id=llm_call_id,
                         llm_request_id=llm_request_id,
                         provider_id=resolved.provider_id,
@@ -278,13 +284,15 @@ class LlmRequestService:
                     api_response_received = True
                     if not stream_state.get("response_started"):
                         stream_state["response_started"] = True
+                        response_started_payload = {**request_payload, "content_type": None}
                         await self._event_publisher.publish(
                             request.communication_context,
                             "llm.response.started",
-                            {**request_payload, "content_type": None},
+                            response_started_payload,
                             source="llm_client",
                             metadata={"conversation_id": request.conversation.id},
                         )
+                        _notify_request_event(request, "llm.response.started", response_started_payload)
                     _apply_render_side_effects(
                         request.conversation,
                         resolved.api_format,
@@ -305,21 +313,23 @@ class LlmRequestService:
                         provider_state_snapshot,
                         conversation_state_snapshot,
                     )
+                    cancelled_payload = {
+                        **request_payload,
+                        "attempt_count": attempt_count,
+                        "cancelled_by": "user",
+                        "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                        "partial_response": stream_state.get("response_started") is True,
+                        "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                        "reason": str(exc) or "LLM request cancelled.",
+                    }
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.cancelled",
-                        {
-                            **request_payload,
-                            "attempt_count": attempt_count,
-                            "cancelled_by": "user",
-                            "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                            "partial_response": stream_state.get("response_started") is True,
-                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                            "reason": str(exc) or "LLM request cancelled.",
-                        },
+                        cancelled_payload,
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    _notify_request_event(request, "llm.request.cancelled", cancelled_payload)
                     raise
                 except Exception as exc:  # noqa: BLE001 - 需要统一处理不同 SDK/HTTP 异常
                     _restore_conversation_snapshot(
@@ -348,44 +358,48 @@ class LlmRequestService:
                         next_resolved_model=request.next_resolved_model,
                         retryable=_should_retry(service_error, resolved.retry.retryable_status_codes),
                     )
+                    failed_payload = {
+                        **request_payload,
+                        "attempt_count": attempt_count,
+                        "error_type": service_error.__class__.__name__,
+                        "error_message": str(service_error),
+                        "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
+                        "partial_response": stream_state.get("response_started") is True,
+                        "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                        **retry_target,
+                    }
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.failed",
-                        {
-                            **request_payload,
-                            "attempt_count": attempt_count,
-                            "error_type": service_error.__class__.__name__,
-                            "error_message": str(service_error),
-                            "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                            "partial_response": stream_state.get("response_started") is True,
-                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                            **retry_target,
-                        },
+                        failed_payload,
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    _notify_request_event(request, "llm.request.failed", failed_payload)
                     if not _should_retry(service_error, resolved.retry.retryable_status_codes):
                         break
                     if retry_index >= max_retries:
                         break
                     await asyncio.sleep(_retry_delay(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index))
                 else:
+                    completed_payload = {
+                        **request_payload,
+                        "assistant_part_count": len(assistant_message.content),
+                        "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
+                        "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
+                        "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
+                        "call_duration_ms": int((time.perf_counter() - call_started_at) * 1000),
+                        "token_usage": token_usage,
+                        "context_window_max": resolved.context_window,
+                    }
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.response.completed",
-                        {
-                            **request_payload,
-                            "assistant_part_count": len(assistant_message.content),
-                            "thinking_part_count": _count_parts(assistant_message.content, ThinkingPart),
-                            "tool_use_part_count": _count_parts(assistant_message.content, ToolUsePart),
-                            "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
-                            "call_duration_ms": int((time.perf_counter() - call_started_at) * 1000),
-                            "token_usage": token_usage,
-                            "context_window_max": resolved.context_window,
-                        },
+                        completed_payload,
                         source="llm_client",
                         metadata={"conversation_id": request.conversation.id},
                     )
+                    _notify_request_event(request, "llm.response.completed", completed_payload)
                     return LlmPromptResponse(
                         raw_response=raw_response,
                         assistant_message=assistant_message,
@@ -448,6 +462,28 @@ def _merge_request_params(request: LlmPromptRequest) -> dict[str, Any]:
     merged.update(request.request_overrides)
     merged["stream"] = True
     return merged
+
+
+def _notify_request_event(request: LlmPromptRequest, event_type: str, payload: dict[str, Any]) -> None:
+    if request.request_event_observer is None:
+        return
+    try:
+        request.request_event_observer(event_type, dict(payload))
+    except Exception:
+        return
+
+
+def _notify_request_observer(
+    observer: Callable[[str, dict[str, Any]], None] | None,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(event_type, dict(payload))
+    except Exception:
+        return
 
 
 def _with_default_relay_session_header(request: LlmPromptRequest):
@@ -607,6 +643,7 @@ def _build_stream_event_handler(
     context: Any,
     event_loop: asyncio.AbstractEventLoop,
     conversation_id: str,
+    request_event_observer: Callable[[str, dict[str, Any]], None] | None,
     llm_call_id: str,
     llm_request_id: str,
     provider_id: str,
@@ -670,6 +707,7 @@ def _build_stream_event_handler(
                 if semantic.event_type not in _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS
             )
         for publish_event_type, publish_payload in events_to_publish:
+            _notify_request_observer(request_event_observer, publish_event_type, publish_payload)
             future = asyncio.run_coroutine_threadsafe(
                 publisher.publish(
                     context,

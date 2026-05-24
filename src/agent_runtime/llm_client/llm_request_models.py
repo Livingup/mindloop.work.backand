@@ -75,6 +75,8 @@ class LlmPromptRequest:
 
     request_attempt_observer: Callable[[dict[str, Any]], None] | None = None
 
+    request_event_observer: Callable[[str, dict[str, Any]], None] | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class LlmPromptResponse:

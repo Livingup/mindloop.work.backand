@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Callable
 
 from agent_runtime.context_compression.event_publisher import (
     CONTEXT_COMPRESSION_WORKER_COMPLETED,
+    CONTEXT_COMPRESSION_WORKER_ACTIVITY,
     CONTEXT_COMPRESSION_WORKER_FAILED,
     CONTEXT_COMPRESSION_WORKER_PROGRESS,
     CONTEXT_COMPRESSION_WORKER_STARTED,
@@ -57,6 +59,7 @@ class ContextCompressionWorkerRunner:
             if not resolved_model.supports_tool_calling:
                 skipped_tool_calling = True
                 continue
+            next_resolved_model = _next_tool_calling_candidate(resolved_candidates, candidate_index)
             try:
                 await self._run_worker_with_model(
                     job=job,
@@ -67,6 +70,7 @@ class ContextCompressionWorkerRunner:
                     system_prompt=system_prompt,
                     input_text=input_text,
                     resolved_model=resolved_model,
+                    next_resolved_model=next_resolved_model,
                     max_rounds=max_rounds,
                     communication_context=communication_context,
                     allowed_tool_names=allowed_tool_names,
@@ -78,9 +82,23 @@ class ContextCompressionWorkerRunner:
             except Exception as exc:
                 last_error = exc
                 can_failover = (
-                    candidate_index < len(resolved_candidates) - 1
+                    next_resolved_model is not None
                     and isinstance(exc, LlmProviderModelServiceUnavailable)
                 )
+                if can_failover:
+                    await self._publish_worker_activity(
+                        communication_context,
+                        job,
+                        worker_name=worker_name,
+                        worker_role=worker_role,
+                        output_section=output_section,
+                        input_mode=input_mode,
+                        resolved_model=next_resolved_model,
+                        kind=_failover_activity_kind(resolved_model, next_resolved_model),
+                        text=_failover_activity_text(resolved_model, next_resolved_model),
+                        details=None,
+                        duration_ms=0,
+                    )
                 if not can_failover:
                     raise
         if last_error is not None:
@@ -100,12 +118,47 @@ class ContextCompressionWorkerRunner:
         system_prompt: str,
         input_text: str,
         resolved_model: ResolvedLlmProviderModel,
+        next_resolved_model: ResolvedLlmProviderModel | None,
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         allowed_tool_names: set[str] | None,
         interrupt_checker: Callable[[], bool] | None,
     ) -> None:
         started_at = time.perf_counter()
+        event_loop = asyncio.get_running_loop()
+        last_activity_signature: tuple[str, str] | None = None
+
+        def schedule_activity(kind: str, text: str, details: dict[str, Any] | None = None) -> None:
+            nonlocal last_activity_signature
+            signature = (kind, text)
+            if signature == last_activity_signature:
+                return
+            last_activity_signature = signature
+
+            async def publish() -> None:
+                await self._publish_worker_activity(
+                    communication_context,
+                    job,
+                    worker_name=worker_name,
+                    worker_role=worker_role,
+                    output_section=output_section,
+                    input_mode=input_mode,
+                    resolved_model=resolved_model,
+                    kind=kind,
+                    text=text,
+                    details=details,
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                )
+
+            event_loop.call_soon_threadsafe(lambda: asyncio.create_task(publish()))
+
+        def observe_llm_event(event_type: str, payload: dict[str, Any]) -> None:
+            activity = _activity_from_llm_event(event_type, payload)
+            if activity is None:
+                return
+            kind, text = activity
+            schedule_activity(kind, text, payload)
+
         await self._publish_worker_event(
             communication_context,
             CONTEXT_COMPRESSION_WORKER_STARTED,
@@ -118,6 +171,7 @@ class ContextCompressionWorkerRunner:
             round_index=0,
             max_rounds=max_rounds,
         )
+        schedule_activity("preparing", "正在准备输入")
         conversation = create_conversation()
         conversation.add_user_message([TextPart(text=input_text)], [TextPartMeta()])
         completed_without_marker = False
@@ -135,16 +189,20 @@ class ContextCompressionWorkerRunner:
                             allowed_tool_names=allowed_tool_names,
                         ),
                         communication_context=None,
+                        next_resolved_model=next_resolved_model,
                         cancellation_checker=interrupt_checker,
+                        request_event_observer=observe_llm_event,
                     )
                 )
                 tool_uses = _extract_tool_uses(response.assistant_message)
                 if not tool_uses:
                     if worker_role == "final_assembler" and response.assistant_message.content:
+                        schedule_activity("writing_result", "正在写入压缩结果")
                         self._job_store.append_final_markdown(job.job_id, _assistant_text(response.assistant_message))
                     if worker_role == "final_verifier":
                         completed_without_marker = True
                     break
+                schedule_activity("writing_result", "正在写入压缩结果")
                 result_parts = [
                     self._summary_tools.execute(
                         job_id=job.job_id,
@@ -207,6 +265,40 @@ class ContextCompressionWorkerRunner:
             )
             raise
 
+    async def _publish_worker_activity(
+        self,
+        context: RuntimeCommunicationContext | None,
+        job: CompressionJob,
+        *,
+        worker_name: str,
+        worker_role: str,
+        output_section: str | None,
+        input_mode: str,
+        resolved_model: ResolvedLlmProviderModel,
+        kind: str,
+        text: str,
+        details: dict[str, Any] | None,
+        duration_ms: int,
+    ) -> None:
+        await self._publish_worker_event(
+            context,
+            CONTEXT_COMPRESSION_WORKER_ACTIVITY,
+            job,
+            worker_name=worker_name,
+            worker_role=worker_role,
+            output_section=output_section,
+            input_mode=input_mode,
+            resolved_model=resolved_model,
+            round_index=int(details.get("retry_index") or 0) if details else 0,
+            max_rounds=0,
+            duration_ms=duration_ms,
+            activity={
+                "kind": kind,
+                "text": text,
+                **_activity_details(details),
+            },
+        )
+
     async def _publish_worker_event(
         self,
         context: RuntimeCommunicationContext | None,
@@ -223,11 +315,16 @@ class ContextCompressionWorkerRunner:
         duration_ms: int | None = None,
         error_type: str | None = None,
         error_message: str | None = None,
+        activity: dict[str, Any] | None = None,
     ) -> None:
         payload = _base_payload(job)
         payload["phase"] = _phase_for_worker_role(worker_role)
+        worker_id = _worker_id(worker_name, worker_role, output_section)
         payload["worker"] = {
+            "worker_id": worker_id,
+            "id": worker_id,
             "name": worker_name,
+            "title": _worker_title(worker_name, worker_role, output_section),
             "role": worker_role,
             "output_section": output_section,
             "input_mode": input_mode,
@@ -242,9 +339,12 @@ class ContextCompressionWorkerRunner:
                 "final_markdown_chunks_appended": len(job.final_markdown_chunks),
             },
         }
+        if activity is not None:
+            payload["worker"]["activity"] = activity
         if duration_ms is not None:
             payload["worker"]["duration_ms"] = duration_ms
-            payload.setdefault("metrics", {})["duration_ms"] = duration_ms
+            if event_type not in {CONTEXT_COMPRESSION_WORKER_ACTIVITY, CONTEXT_COMPRESSION_WORKER_COMPLETED, CONTEXT_COMPRESSION_WORKER_FAILED}:
+                payload.setdefault("metrics", {})["duration_ms"] = duration_ms
         if error_type is not None:
             payload["worker"]["error_type"] = error_type
             payload["error_type"] = error_type
@@ -260,6 +360,136 @@ def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
 
 def _assistant_text(message: UniMessage) -> str:
     return "\n".join(part.text for part in message.content if isinstance(part, TextPart)).strip()
+
+
+def _worker_id(worker_name: str, worker_role: str, output_section: str | None) -> str:
+    if output_section:
+        return output_section
+    return worker_name or worker_role
+
+
+def _worker_title(worker_name: str, worker_role: str, output_section: str | None) -> str:
+    titles = {
+        "requirements_constraints": "用户需求与硬约束",
+        "progress_plan": "任务计划与执行进度",
+        "code_architecture": "代码结构与架构事实",
+        "observations_evidence": "工具观察与外部事实",
+        "decisions_rationale": "决策与理由",
+        "todos_risks": "待办与风险",
+    }
+    if output_section in titles:
+        return titles[output_section]
+    if worker_role == "final_assembler":
+        return "最终 Markdown 汇编"
+    if worker_role == "final_verifier":
+        return "压缩结果校验"
+    return worker_name
+
+
+def _next_tool_calling_candidate(
+    candidates: tuple[ResolvedLlmProviderModel, ...],
+    current_index: int,
+) -> ResolvedLlmProviderModel | None:
+    for candidate in candidates[current_index + 1:]:
+        if candidate.supports_tool_calling:
+            return candidate
+    return None
+
+
+def _activity_from_llm_event(event_type: str, payload: dict[str, Any]) -> tuple[str, str] | None:
+    if event_type == "llm.request.started":
+        return "llm_requesting", f"正在请求 {_model_label(payload)} · {_key_label(payload)}"
+    if event_type == "llm.response.started":
+        return "llm_responding", "模型已响应，正在分析"
+    if event_type == "llm.thinking.started":
+        return "llm_responding", "模型已响应，正在分析"
+    if event_type == "llm.content.started":
+        return "llm_responding", "模型已响应，正在分析"
+    if event_type == "llm.tool_call.started":
+        return "writing_result", "正在写入压缩结果"
+    if event_type == "llm.request.failed":
+        return _failed_activity(payload)
+    if event_type == "llm.request.cancelled":
+        return "cancelled", "已取消"
+    return None
+
+
+def _failed_activity(payload: dict[str, Any]) -> tuple[str, str]:
+    if payload.get("will_retry") is True:
+        next_key = payload.get("next_api_key_index")
+        key = payload.get("api_key_index")
+        next_provider = str(payload.get("next_provider_id") or "")
+        provider = str(payload.get("provider_id") or "")
+        next_model = str(payload.get("next_model_alias") or payload.get("next_model_id") or "")
+        model = str(payload.get("model_alias") or payload.get("model_id") or "")
+        if next_provider and provider and next_provider != provider:
+            return "provider_switching", "请求失败，正在切换服务商"
+        if next_model and model and next_model != model:
+            return "model_switching", "请求失败，正在切换模型"
+        if next_key is not None and next_key != key:
+            return "api_key_switching", "请求失败，正在切换 key"
+        return "llm_failed_recovering", "请求失败，正在重试"
+    return "llm_failed", _short_error_text(payload)
+
+
+def _failover_activity_kind(current: ResolvedLlmProviderModel, next_model: ResolvedLlmProviderModel) -> str:
+    if current.provider_id != next_model.provider_id:
+        return "provider_switching"
+    if current.model_id != next_model.model_id or current.binding_id != next_model.binding_id:
+        return "model_switching"
+    return "llm_failed_recovering"
+
+
+def _failover_activity_text(current: ResolvedLlmProviderModel, next_model: ResolvedLlmProviderModel) -> str:
+    if current.provider_id != next_model.provider_id:
+        return "请求失败，正在切换服务商"
+    if current.model_id != next_model.model_id or current.binding_id != next_model.binding_id:
+        return "请求失败，正在切换模型"
+    return "请求失败，正在恢复"
+
+
+def _activity_details(details: dict[str, Any] | None) -> dict[str, Any]:
+    if not details:
+        return {}
+    result: dict[str, Any] = {}
+    for key in (
+        "provider_id",
+        "model_id",
+        "model_alias",
+        "api_key_index",
+        "api_key_label",
+        "retry_index",
+        "attempt_count",
+        "error_type",
+        "error_message",
+    ):
+        value = details.get(key)
+        if value is not None:
+            result[key] = value
+    return result
+
+
+def _model_label(payload: dict[str, Any]) -> str:
+    value = payload.get("model_alias") or payload.get("model_id")
+    return str(value) if value else "模型"
+
+
+def _key_label(payload: dict[str, Any]) -> str:
+    value = payload.get("api_key_label")
+    if value:
+        return str(value)
+    index = payload.get("api_key_index")
+    if isinstance(index, int):
+        return f"key-{index + 1}"
+    return "key"
+
+
+def _short_error_text(payload: dict[str, Any]) -> str:
+    message = str(payload.get("error_message") or payload.get("error_type") or "请求失败")
+    message = " ".join(message.split())
+    if len(message) > 80:
+        return f"{message[:77]}..."
+    return message
 
 
 def _worker_finished(job: CompressionJob, worker_role: str, output_section: str | None) -> bool:
