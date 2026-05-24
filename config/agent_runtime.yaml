@@ -78,6 +78,10 @@ codex_oauth:
   issuer: "https://auth.openai.com"
   codex_api_base_url: "https://chatgpt.com/backend-api/codex"
   client_originator: "mindloop.spread-ai"
+  oauth_originator: "mindloop.spread-ai"
+  oauth_callback_host: "localhost"
+  oauth_callback_port: 1455
+  oauth_callback_path: "/auth/callback"
   user_agent: "mindloop.spread-ai"
   login_timeout_seconds: 300
 

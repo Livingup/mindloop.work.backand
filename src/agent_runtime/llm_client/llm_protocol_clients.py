@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import copy
+import platform
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -167,13 +169,15 @@ class CodexResponsesProtocolClient:
             body.setdefault("parallel_tool_calls", True)
         url = _join_url(resolved_model.api_base_url, "responses")
         headers = _json_headers(resolved_model.custom_headers)
+        codex_session_id = _header_value(headers, "x-relay-session-id") or token.session_id
         if not _has_header(resolved_model.custom_headers, "User-Agent"):
-            headers["User-Agent"] = token.user_agent
+            headers["User-Agent"] = _codex_user_agent(token.user_agent)
         headers["Authorization"] = f"Bearer {token.access_token}"
         if token.account_id:
             headers["ChatGPT-Account-Id"] = token.account_id
         headers["originator"] = token.originator
-        headers["session_id"] = token.session_id
+        headers["session_id"] = codex_session_id
+        headers["x-session-affinity"] = codex_session_id
         return await _post_json(
             url,
             headers,
@@ -470,6 +474,22 @@ def _setdefault_header(headers: dict[str, str], name: str, value: str) -> None:
 
 def _has_header(headers: dict[str, str], name: str) -> bool:
     return any(key.lower() == name.lower() for key in headers)
+
+
+def _header_value(headers: dict[str, str], name: str) -> str | None:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _codex_user_agent(product: str) -> str:
+    product_name = (product or _DEFAULT_USER_AGENT).strip() or _DEFAULT_USER_AGENT
+    if "/" in product_name:
+        prefix = product_name
+    else:
+        prefix = f"{product_name}/local"
+    return f"{prefix} ({sys.platform} {platform.release()}; {platform.machine()})"
 
 
 def _join_url(base_url: str, path: str) -> str:

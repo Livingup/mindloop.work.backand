@@ -95,7 +95,7 @@ class CodexOAuthService:
             "id_token_add_organizations": "true",
             "codex_cli_simplified_flow": "true",
             "state": state,
-            "originator": config.client_originator,
+            "originator": config.oauth_originator,
         })
         return CodexOAuthLoginStart(
             authorization_url=f"{config.issuer.rstrip('/')}/oauth/authorize?{params}",
@@ -106,8 +106,23 @@ class CodexOAuthService:
 
     def default_redirect_uri(self, request_base_url: str) -> str:
         config = self._config()
+        if not config.oauth_redirect_base_url:
+            return self.local_callback_redirect_uri()
         base_url = (config.oauth_redirect_base_url or request_base_url).rstrip("/")
         return f"{base_url}/api/codex-oauth/login/callback"
+
+    def local_callback_redirect_uri(self) -> str:
+        config = self._config()
+        path = _normalize_callback_path(config.oauth_callback_path)
+        return f"http://{config.oauth_callback_host}:{config.oauth_callback_port}{path}"
+
+    def local_callback_bind_address(self) -> tuple[str, int, str]:
+        config = self._config()
+        return (
+            config.oauth_callback_host,
+            config.oauth_callback_port,
+            _normalize_callback_path(config.oauth_callback_path),
+        )
 
     def complete_login(self, *, state: str, code: str) -> CodexOAuthAccount:
         pending = self._repository.find_pending_login(state)
@@ -316,7 +331,10 @@ def _default_binding(model_id: str) -> LlmProviderModelBinding:
         api_format=API_FORMAT_CODEX_RESPONSES,
         tool_choice=json.dumps({}, ensure_ascii=False),
         thinking=json.dumps({}, ensure_ascii=False),
-        custom_request_params=json.dumps({"stream": True}, ensure_ascii=False),
+        custom_request_params=json.dumps({
+            "stream": True,
+            "reasoning": {"effort": "xhigh"},
+        }, ensure_ascii=False),
     )
 
 
@@ -417,6 +435,11 @@ def _generate_state() -> str:
 
 def _base64_url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _normalize_callback_path(value: str) -> str:
+    text = value.strip().replace("\\", "/") or "/auth/callback"
+    return text if text.startswith("/") else f"/{text}"
 
 
 def _utc_now() -> datetime:

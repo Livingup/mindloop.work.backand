@@ -664,6 +664,10 @@ def _build_codex_oauth_config(data: dict[str, Any]) -> CodexOAuthConfig:
         issuer=str(data.get("issuer", "https://auth.openai.com")),
         codex_api_base_url=str(data.get("codex_api_base_url", "https://chatgpt.com/backend-api/codex")),
         client_originator=str(data.get("client_originator", "mindloop.spread-ai")),
+        oauth_originator=str(data.get("oauth_originator", "opencode")),
+        oauth_callback_host=str(data.get("oauth_callback_host", "localhost")),
+        oauth_callback_port=int(data.get("oauth_callback_port", 1455)),
+        oauth_callback_path=str(data.get("oauth_callback_path", "/auth/callback")),
         user_agent=str(data.get("user_agent", data.get("client_originator", "mindloop.spread-ai"))),
         oauth_redirect_base_url=(
             str(data["oauth_redirect_base_url"])

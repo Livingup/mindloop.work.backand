@@ -103,6 +103,9 @@ def create_app() -> FastAPI:
     from agent_runtime.codex_oauth.north_gateway.codex_oauth_rest_adapter import (
         create_codex_oauth_router,
     )
+    from agent_runtime.codex_oauth.north_gateway.local_callback_server import (
+        CodexOAuthLocalCallbackServer,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -132,6 +135,7 @@ def create_app() -> FastAPI:
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     codex_oauth_service.ensure_builtin_provider()
+    codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
     llm_http_trace_service = LlmHttpTraceFactory.create()
     agent_execution_engine = AgentExecutionFactory.create(
         mcp_client_gateway=mcp_gateway,
@@ -197,6 +201,7 @@ def create_app() -> FastAPI:
                 logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
 
         scene_session_registry.start()
+        codex_oauth_callback_server.start()
         auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
         lacp_start_task = asyncio.create_task(lacp_client.start())
         try:
@@ -212,6 +217,7 @@ def create_app() -> FastAPI:
                     await lacp_start_task
             await lacp_client.shutdown()
             await mcp_gateway.shutdown()
+            codex_oauth_callback_server.stop()
             scene_session_registry.stop()
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
