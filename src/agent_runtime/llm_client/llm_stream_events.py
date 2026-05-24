@@ -7,6 +7,7 @@ from typing import Any
 
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_CODEX_RESPONSES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
@@ -72,7 +73,7 @@ class LlmSemanticStreamParser:
             return []
         if not isinstance(data, dict):
             return []
-        if self._api_format == API_FORMAT_OPENAI_RESPONSES:
+        if self._api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
             return self._parse_openai_responses_event(event_name, data)
         if self._api_format in {API_FORMAT_OPENAI_CHAT_COMPLETIONS, API_FORMAT_ZHIPU_CHAT_COMPLETIONS}:
             return self._parse_chat_completions_event(event_name, data)

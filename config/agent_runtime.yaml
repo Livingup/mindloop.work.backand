@@ -72,6 +72,15 @@ llm_model_registry:
   # legacy YAML 只作为一次性迁移输入，不会在应用启动或仓储初始化时自动导入。
   registry_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-model-registry"
 
+codex_oauth:
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/codex-oauth"
+  client_id: "${CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}"
+  issuer: "https://auth.openai.com"
+  codex_api_base_url: "https://chatgpt.com/backend-api/codex"
+  client_originator: "mindloop.spread-ai"
+  user_agent: "mindloop.spread-ai"
+  login_timeout_seconds: 300
+
 llm_http_trace:
   enabled: true
   data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-http-traces"

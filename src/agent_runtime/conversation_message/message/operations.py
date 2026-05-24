@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeAdapter
+from agent_runtime.conversation_message.message.codex_protocol import CodexAdapter
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiAdapter
 from agent_runtime.conversation_message.message.openai_chat_protocol import OpenAIChatAdapter
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
@@ -54,6 +55,7 @@ _ADAPTERS: list[ProviderAdapter] = [
     GeminiAdapter(),
     OpenAIChatAdapter(),
     OpenAIAdapter(),
+    CodexAdapter(),
     ZhipuChatAdapter(),
 ]
 

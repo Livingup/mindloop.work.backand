@@ -47,6 +47,7 @@ from agent_runtime.communication.communication_config import CommunicationConfig
 from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
 from agent_runtime.lacp.config import LacpConfig
+from agent_runtime.codex_oauth.config import CodexOAuthConfig
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -140,6 +141,10 @@ class AgentRuntimeConfig:
 
     lacp: LacpConfig = field(
         default_factory=LacpConfig,
+    )
+
+    codex_oauth: CodexOAuthConfig = field(
+        default_factory=CodexOAuthConfig,
     )
 
 
@@ -423,6 +428,16 @@ class ConfigRegistry:
             "terminal", _build_terminal_config,
         )
 
+    @property
+    def codex_oauth(self) -> CodexOAuthConfig:
+        if self._config is not None:
+            return self._config.codex_oauth
+        if self._raw_config_data is not None and "codex_oauth" not in self._raw_config_data:
+            return CodexOAuthConfig()
+        return self._get_section_config(
+            "codex_oauth", _build_codex_oauth_config,
+        )
+
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
 
@@ -639,6 +654,23 @@ def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
             else None
         ),
         max_output_chars_per_read=int(data.get("max_output_chars_per_read", 50000)),
+    )
+
+
+def _build_codex_oauth_config(data: dict[str, Any]) -> CodexOAuthConfig:
+    return CodexOAuthConfig(
+        data_dir=str(data.get("data_dir", "~/.spread-ai/codex-oauth")),
+        client_id=str(data.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")),
+        issuer=str(data.get("issuer", "https://auth.openai.com")),
+        codex_api_base_url=str(data.get("codex_api_base_url", "https://chatgpt.com/backend-api/codex")),
+        client_originator=str(data.get("client_originator", "mindloop.spread-ai")),
+        user_agent=str(data.get("user_agent", data.get("client_originator", "mindloop.spread-ai"))),
+        oauth_redirect_base_url=(
+            str(data["oauth_redirect_base_url"])
+            if data.get("oauth_redirect_base_url") is not None
+            else None
+        ),
+        login_timeout_seconds=int(data.get("login_timeout_seconds", 300)),
     )
 
 

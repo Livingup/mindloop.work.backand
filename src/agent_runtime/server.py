@@ -99,6 +99,10 @@ def create_app() -> FastAPI:
     )
     from agent_runtime.lacp.lacp_factory import LacpFactory
     from agent_runtime.lacp.north_gateway.lacp_rest_adapter import create_lacp_router
+    from agent_runtime.codex_oauth.factory import CodexOAuthFactory
+    from agent_runtime.codex_oauth.north_gateway.codex_oauth_rest_adapter import (
+        create_codex_oauth_router,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -126,6 +130,8 @@ def create_app() -> FastAPI:
         communication_gateway=communication_gateway,
     )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
+    codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
+    codex_oauth_service.ensure_builtin_provider()
     llm_http_trace_service = LlmHttpTraceFactory.create()
     agent_execution_engine = AgentExecutionFactory.create(
         mcp_client_gateway=mcp_gateway,
@@ -267,6 +273,11 @@ def create_app() -> FastAPI:
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
+    )
+    app.include_router(
+        create_codex_oauth_router(codex_oauth_service),
+        prefix="/api/codex-oauth",
+        tags=["Codex OAuth"],
     )
     app.include_router(
         create_llm_http_trace_router(llm_http_trace_service),

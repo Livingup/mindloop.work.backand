@@ -23,6 +23,7 @@ from agent_runtime.communication.runtime_event_publisher import (
 )
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_CODEX_RESPONSES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
@@ -827,7 +828,7 @@ def _extract_token_usage(api_format: str, raw_response: Any) -> dict[str, int]:
             "total_tokens": total_tokens,
             "cached_tokens": cached_tokens,
         }
-    if api_format == API_FORMAT_OPENAI_RESPONSES:
+    if api_format in (API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES):
         usage = raw_response.get("usage")
         if not isinstance(usage, dict):
             return {}

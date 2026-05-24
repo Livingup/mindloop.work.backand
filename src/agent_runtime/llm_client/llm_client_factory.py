@@ -9,8 +9,10 @@ from agent_runtime.conversation_message.south_gateway.resource_resolver.contract
     ResourceMeta,
 )
 from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
+from agent_runtime.codex_oauth.factory import CodexOAuthFactory
 from agent_runtime.llm_client.llm_protocol_clients import (
     AnthropicMessagesProtocolClient,
+    CodexResponsesProtocolClient,
     GeminiGenerateContentProtocolClient,
     OpenAIChatCompletionsProtocolClient,
     OpenAIResponsesProtocolClient,
@@ -57,6 +59,7 @@ class LlmClientFactory:
         return LlmRequestService(
             protocol_clients=(
                 OpenAIResponsesProtocolClient(),
+                CodexResponsesProtocolClient(CodexOAuthFactory.create_service()),
                 OpenAIChatCompletionsProtocolClient(),
                 AnthropicMessagesProtocolClient(),
                 GeminiGenerateContentProtocolClient(),
