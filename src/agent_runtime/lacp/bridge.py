@@ -58,6 +58,21 @@ class AgentRuntimeLacpBridge:
     def get_registration(self, instance_id: str) -> LacpInstanceRegistration | None:
         return self._registration_registry.get_registration(instance_id)
 
+    def get_registration_view(self, instance_id: str) -> LacpInstanceRegistration:
+        registration = self._registration_registry.get_registration(instance_id)
+        if registration is not None:
+            return registration
+        instance = self._runtime_gateway.get_agent_instance(instance_id)
+        definition = self._agent_definition_gateway.get_agent_definition(instance.agent_definition_id)
+        return LacpInstanceRegistration(
+            instance_id=instance.instance_id,
+            role_name=definition.name or definition.agent_id,
+            description=definition.description or f"AgentRuntime agent definition {definition.agent_id}",
+            workspace=instance.current_working_directory,
+            enabled=False,
+            status="disabled",
+        )
+
     def client_status(self) -> LacpClientStatus:
         return self._lacp_client.status()
 

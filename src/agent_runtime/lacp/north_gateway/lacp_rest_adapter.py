@@ -109,10 +109,10 @@ def create_lacp_router(
 
     @router.get("/instances/{instance_id}/registration", response_model=LacpRegistrationResponse)
     def get_instance_registration(instance_id: str) -> LacpRegistrationResponse:
-        item = bridge.get_registration(instance_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail=f"LACP registration not found: {instance_id}")
-        return _registration_response(item)
+        try:
+            return _registration_response(bridge.get_registration_view(instance_id))
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Agent instance not found: {instance_id}")
 
     @router.put("/instances/{instance_id}/registration", response_model=LacpRegistrationResponse)
     async def set_instance_registration(instance_id: str, body: LacpInstanceEnableBody) -> LacpRegistrationResponse:
@@ -125,9 +125,7 @@ def create_lacp_router(
             raise HTTPException(status_code=404, detail=f"Agent instance not found: {instance_id}")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        if item is None:
-            raise HTTPException(status_code=404, detail=f"LACP registration not found: {instance_id}")
-        return _registration_response(item)
+        return _registration_response(item or bridge.get_registration_view(instance_id))
 
     return router
 
