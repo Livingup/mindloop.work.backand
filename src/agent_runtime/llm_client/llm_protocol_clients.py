@@ -150,18 +150,24 @@ class CodexResponsesProtocolClient:
         if not isinstance(rendered_messages, OpenAIRenderResult):
             raise TypeError("codex_responses 渲染结果类型不正确。")
         token = self._oauth_service.resolve_api_key_ref(api_key)
+        codex_model, codex_fast_mode = _codex_model_request_name(resolved_model.model_alias)
         body: dict[str, Any] = {
-            "model": resolved_model.model_alias,
+            "model": codex_model,
             "input": rendered_messages.input,
             "include": rendered_messages.include,
             **request_params,
         }
+        body_model, body_fast_mode = _codex_model_request_name(str(body.get("model") or codex_model))
+        body["model"] = body_model
+        codex_fast_mode = codex_fast_mode or body_fast_mode
         body["store"] = False
         body["include"] = _ensure_include_item(body.get("include"), "reasoning.encrypted_content")
         if system_prompt:
             body.setdefault("instructions", system_prompt)
         body.pop("previous_response_id", None)
         body.pop("max_output_tokens", None)
+        if codex_fast_mode:
+            body["service_tier"] = "priority"
         if rendered_messages.prompt_cache_key:
             body["prompt_cache_key"] = rendered_messages.prompt_cache_key
         if tools:
@@ -490,6 +496,14 @@ def _codex_user_agent(product: str) -> str:
     else:
         prefix = f"{product_name}/local"
     return f"{prefix} ({sys.platform} {platform.release()}; {platform.machine()})"
+
+
+def _codex_model_request_name(model_alias: str) -> tuple[str, bool]:
+    if model_alias.endswith("-fast"):
+        base_model = model_alias[:-5]
+        if base_model:
+            return base_model, True
+    return model_alias, False
 
 
 def _join_url(base_url: str, path: str) -> str:
