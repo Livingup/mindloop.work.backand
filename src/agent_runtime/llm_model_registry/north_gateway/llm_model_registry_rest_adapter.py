@@ -37,6 +37,8 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
     LlmProviderSaveRequest,
 )
 
+_BUILTIN_PROVIDER_IDS = {"openai_codex"}
+
 
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
 
@@ -285,8 +287,8 @@ def create_llm_model_registry_router(
     @router.delete("/providers/{provider_id}", status_code=204)
     def delete_provider(provider_id: str) -> None:
         """删除 LLM 服务商定义。不存在时静默返回 204。"""
-        if _is_builtin_oauth_provider_id(provider_id):
-            raise HTTPException(status_code=409, detail=f"内置 OAuth 服务商不能删除: {provider_id}")
+        if _is_builtin_provider_id(provider_id):
+            raise HTTPException(status_code=409, detail=f"内置服务商不能删除: {provider_id}")
         try:
             gateway.delete_provider(provider_id)
         except ValueError as e:
@@ -376,7 +378,7 @@ def _provider_to_response(provider: LlmProviderDefinition) -> LlmProviderRespons
 
 def _provider_runtime_metadata(provider: LlmProviderDefinition) -> dict[str, Any]:
     auth_type = "oauth" if any(item.api_format == API_FORMAT_CODEX_RESPONSES for item in provider.models) else "api_key"
-    builtin = _is_builtin_oauth_provider_id(provider.provider_id)
+    builtin = _is_builtin_provider_id(provider.provider_id)
     return {
         "provider_type": "builtin" if builtin else "custom",
         "auth_type": auth_type,
@@ -385,8 +387,8 @@ def _provider_runtime_metadata(provider: LlmProviderDefinition) -> dict[str, Any
     }
 
 
-def _is_builtin_oauth_provider_id(provider_id: str) -> bool:
-    return provider_id == "openai_codex"
+def _is_builtin_provider_id(provider_id: str) -> bool:
+    return provider_id in _BUILTIN_PROVIDER_IDS
 
 
 def _execution_policy_to_response(policy: LlmExecutionPolicy) -> LlmExecutionPolicyResponse:
