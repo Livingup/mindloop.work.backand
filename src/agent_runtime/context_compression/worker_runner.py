@@ -52,6 +52,7 @@ class ContextCompressionWorkerRunner:
         communication_context: RuntimeCommunicationContext | None,
         allowed_tool_names: set[str] | None = None,
         interrupt_checker: Callable[[], bool] | None = None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None,
     ) -> None:
         last_error: Exception | None = None
         skipped_tool_calling = False
@@ -75,6 +76,7 @@ class ContextCompressionWorkerRunner:
                     communication_context=communication_context,
                     allowed_tool_names=allowed_tool_names,
                     interrupt_checker=interrupt_checker,
+                    request_canceller_observer=request_canceller_observer,
                 )
                 return
             except LlmRequestCancelled:
@@ -123,6 +125,7 @@ class ContextCompressionWorkerRunner:
         communication_context: RuntimeCommunicationContext | None,
         allowed_tool_names: set[str] | None,
         interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         started_at = time.perf_counter()
         event_loop = asyncio.get_running_loop()
@@ -191,6 +194,7 @@ class ContextCompressionWorkerRunner:
                         communication_context=None,
                         next_resolved_model=next_resolved_model,
                         cancellation_checker=interrupt_checker,
+                        request_canceller_observer=request_canceller_observer,
                         request_event_observer=observe_llm_event,
                     )
                 )

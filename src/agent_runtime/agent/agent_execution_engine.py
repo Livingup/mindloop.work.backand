@@ -213,6 +213,19 @@ class _AgentExecutionInterruptState:
     reason: str = "user_requested"
     requested_at: float | None = None
     current_llm_request: dict[str, Any] | None = None
+    current_llm_request_cancellers: set[Callable[[], None]] = field(default_factory=set)
+
+    def register_current_llm_request_canceller(self, canceller: Callable[[], None]) -> Callable[[], None]:
+        self.current_llm_request_cancellers.add(canceller)
+        if self.requested:
+            with suppress(Exception):
+                canceller()
+        return lambda: self.current_llm_request_cancellers.discard(canceller)
+
+    def cancel_current_llm_requests(self) -> None:
+        for canceller in tuple(self.current_llm_request_cancellers):
+            with suppress(Exception):
+                canceller()
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +587,7 @@ class AgentExecutionEngine:
         handle.interrupt_state.requested = True
         handle.interrupt_state.reason = reason
         handle.interrupt_state.requested_at = time.perf_counter()
+        handle.interrupt_state.cancel_current_llm_requests()
         return AgentInterruptResult(
             status="interrupt_requested",
             task_id=task.task_id,
@@ -1335,6 +1349,7 @@ class AgentExecutionEngine:
                         trigger_model=resolved_model,
                         communication_context=communication_context,
                         interrupt_checker=lambda state=interrupt_state: state.requested,
+                        request_canceller_observer=interrupt_state.register_current_llm_request_canceller,
                     )
                     if compression_result.created and compression_result.target_conversation is not None:
                         conversation = compression_result.target_conversation
@@ -1348,6 +1363,8 @@ class AgentExecutionEngine:
                                 "target_conversation_id": conversation.id,
                             },
                         )
+                    if interrupt_state.requested:
+                        raise LlmRequestCancelled("LLM request cancelled.")
                 self._set_execution_phase(
                     task_id=task.task_id,
                     instance_id=instance.instance_id,
@@ -1379,6 +1396,7 @@ class AgentExecutionEngine:
                         if candidate_index < len(resolved_candidates) - 1
                         else None,
                         cancellation_checker=lambda state=interrupt_state: state.requested,
+                        request_canceller_observer=interrupt_state.register_current_llm_request_canceller,
                         request_attempt_observer=lambda payload, state=interrupt_state: setattr(
                             state,
                             "current_llm_request",

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import copy
+import asyncio
 import platform
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import asdict, is_dataclass
 from typing import Any, Callable, Protocol
+
+import httpx
 
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeRenderResult
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiRenderResult
@@ -36,6 +37,8 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 StreamEventHandler = Callable[[dict[str, Any]], None]
 CancellationChecker = Callable[[], bool]
 _DEFAULT_USER_AGENT = "mindloop.ai"
+_DEFAULT_LLM_HTTP_TIMEOUT_SECONDS = 300.0
+_DEFAULT_LLM_HTTP_CONNECT_TIMEOUT_SECONDS = 30.0
 
 
 class LlmRequestCancelled(Exception):
@@ -523,40 +526,12 @@ async def _post_json(
     http_trace_context: LlmHttpTraceContext | None = None,
     cancellation_checker: CancellationChecker | None = None,
 ) -> Any:
-    """?????????? JSON POST??????? HTTP ??????"""
-    import asyncio
-
-    return await asyncio.to_thread(
-        _post_json_sync,
-        url,
-        headers,
-        body,
-        sse_aggregator,
-        stream_event_handler,
-        expect_stream,
-        http_trace_service,
-        http_trace_context,
-        cancellation_checker,
-    )
-
-
-def _post_json_sync(
-    url: str,
-    headers: dict[str, str],
-    body: dict[str, Any],
-    sse_aggregator: Callable[[str], Any] | None = None,
-    stream_event_handler: StreamEventHandler | None = None,
-    expect_stream: bool = False,
-    http_trace_service: LlmHttpTraceService | None = None,
-    http_trace_context: LlmHttpTraceContext | None = None,
-    cancellation_checker: CancellationChecker | None = None,
-) -> Any:
-    """?? JSON POST??? HTTP ?????? status_code ????"""
+    """Send a JSON POST request and allow asyncio cancellation to abort HTTP I/O."""
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request_headers = dict(headers)
-    if body.get("stream") is True or expect_stream:
+    is_stream_request = body.get("stream") is True or expect_stream
+    if is_stream_request:
         request_headers.setdefault("Accept", "text/event-stream")
-    request = urllib.request.Request(url=url, data=payload, headers=request_headers, method="POST")
     trace_started_at = time.perf_counter()
     trace_record = None
     trace_enabled = http_trace_service is not None and http_trace_context is not None
@@ -567,20 +542,62 @@ def _post_json_sync(
             url=url,
             request_headers=request_headers,
             request_body_bytes=payload,
-            is_stream=(body.get("stream") is True or expect_stream),
+            is_stream=is_stream_request,
         )
     try:
         _raise_if_cancelled(cancellation_checker)
-        with urllib.request.urlopen(request, timeout=300) as response:
-            _raise_if_cancelled(cancellation_checker)
-            status_code = int(getattr(response, "status", response.getcode()))
-            response_headers = dict(response.headers.items())
-            content_type = response.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type or expect_stream:
-                if sse_aggregator is None:
-                    raise RuntimeError("??????????? text/event-stream ?????")
-                text = _read_sse_response_text(response, content_type, stream_event_handler, cancellation_checker)
-                response_bytes = text.encode("utf-8")
+        timeout = httpx.Timeout(
+            _DEFAULT_LLM_HTTP_TIMEOUT_SECONDS,
+            connect=_DEFAULT_LLM_HTTP_CONNECT_TIMEOUT_SECONDS,
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, content=payload, headers=request_headers) as response:
+                _raise_if_cancelled(cancellation_checker)
+                status_code = response.status_code
+                response_headers = dict(response.headers.items())
+                content_type = response.headers.get("Content-Type", "")
+                if status_code >= 400:
+                    error_bytes = await response.aread()
+                    if trace_enabled:
+                        http_trace_service.record_failed(
+                            started_record=trace_record,
+                            context=http_trace_context,
+                            error_type="HTTPStatusError",
+                            error_message=response.reason_phrase,
+                            duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+                            status_code=status_code,
+                            response_headers=response_headers,
+                            response_body_bytes=error_bytes,
+                            response_content_type=content_type,
+                        )
+                    error_text = error_bytes.decode("utf-8", errors="replace")
+                    raise LlmHttpRequestError(status_code, error_text)
+                if "text/event-stream" in content_type or expect_stream:
+                    if sse_aggregator is None:
+                        raise RuntimeError("LLM response is text/event-stream but no SSE aggregator was provided.")
+                    text = await _read_sse_response_text(response, content_type, stream_event_handler, cancellation_checker)
+                    response_bytes = text.encode("utf-8")
+                    if trace_enabled:
+                        http_trace_service.record_completed(
+                            started_record=trace_record,
+                            context=http_trace_context,
+                            status_code=status_code,
+                            response_headers=response_headers,
+                            response_body_bytes=response_bytes,
+                            response_content_type=content_type,
+                            duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
+                            sse_event_count=_count_sse_events(text),
+                        )
+                    try:
+                        return sse_aggregator(text)
+                    except LlmProviderResponseError:
+                        raise
+                    except Exception as exc:
+                        raise LlmProviderResponseError(
+                            f"LLM streaming response was not aggregated into a complete reply: {exc.__class__.__name__}: {exc}"
+                        ) from exc
+                _raise_if_cancelled(cancellation_checker)
+                response_bytes = await response.aread()
                 if trace_enabled:
                     http_trace_service.record_completed(
                         started_record=trace_record,
@@ -590,51 +607,26 @@ def _post_json_sync(
                         response_body_bytes=response_bytes,
                         response_content_type=content_type,
                         duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
-                        sse_event_count=_count_sse_events(text),
                     )
+                text = response_bytes.decode("utf-8")
                 try:
-                    return sse_aggregator(text)
-                except LlmProviderResponseError:
-                    raise
-                except Exception as exc:
+                    return json.loads(text) if text else {}
+                except json.JSONDecodeError as exc:
                     raise LlmProviderResponseError(
-                        f"LLM 流式响应未成功聚合完整回复: {exc.__class__.__name__}: {exc}"
+                        f"LLM JSON response was not parsed into a complete reply: {exc}"
                     ) from exc
-            _raise_if_cancelled(cancellation_checker)
-            response_bytes = response.read()
+    except asyncio.CancelledError:
+        if cancellation_checker is not None and cancellation_checker():
             if trace_enabled:
-                http_trace_service.record_completed(
+                http_trace_service.record_failed(
                     started_record=trace_record,
                     context=http_trace_context,
-                    status_code=status_code,
-                    response_headers=response_headers,
-                    response_body_bytes=response_bytes,
-                    response_content_type=content_type,
+                    error_type="LlmRequestCancelled",
+                    error_message="LLM request cancelled.",
                     duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
                 )
-            text = response_bytes.decode("utf-8")
-            try:
-                return json.loads(text) if text else {}
-            except json.JSONDecodeError as exc:
-                raise LlmProviderResponseError(
-                    f"LLM JSON 响应未成功解析为完整回复: {exc}"
-                ) from exc
-    except urllib.error.HTTPError as exc:
-        error_bytes = exc.read()
-        if trace_enabled:
-            http_trace_service.record_failed(
-                started_record=trace_record,
-                context=http_trace_context,
-                error_type=exc.__class__.__name__,
-                error_message=str(exc),
-                duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
-                status_code=exc.code,
-                response_headers=dict(exc.headers.items()) if exc.headers is not None else {},
-                response_body_bytes=error_bytes,
-                response_content_type=exc.headers.get("Content-Type") if exc.headers is not None else None,
-            )
-        error_text = error_bytes.decode("utf-8", errors="replace")
-        raise LlmHttpRequestError(exc.code, error_text) from exc
+            raise LlmRequestCancelled("LLM request cancelled.") from None
+        raise
     except LlmRequestCancelled:
         if trace_enabled:
             http_trace_service.record_failed(
@@ -644,6 +636,8 @@ def _post_json_sync(
                 error_message="LLM request cancelled.",
                 duration_ms=int((time.perf_counter() - trace_started_at) * 1000),
             )
+        raise
+    except LlmHttpRequestError:
         raise
     except Exception as exc:
         if trace_enabled:
@@ -656,6 +650,39 @@ def _post_json_sync(
             )
         raise
 
+
+async def _read_sse_response_text(
+    response: httpx.Response,
+    content_type: str,
+    handler: StreamEventHandler | None,
+    cancellation_checker: CancellationChecker | None,
+) -> str:
+    _emit_stream_event(handler, "llm.response.stream.started", {"content_type": content_type})
+    event_count = 0
+    lines: list[str] = []
+    event_lines: list[str] = []
+    try:
+        async for line in response.aiter_lines():
+            _raise_if_cancelled(cancellation_checker)
+            if line == "":
+                lines.append("\n")
+                event_count += _emit_sse_block_event(handler, event_lines)
+                event_lines = []
+            else:
+                line_with_break = f"{line}\n"
+                lines.append(line_with_break)
+                event_lines.append(line_with_break)
+        if event_lines:
+            event_count += _emit_sse_block_event(handler, event_lines)
+        _emit_stream_event(handler, "llm.response.stream.completed", {"event_count": event_count})
+        return "".join(lines)
+    except Exception as exc:
+        _emit_stream_event(
+            handler,
+            "llm.response.stream.failed",
+            {"event_count": event_count, "error_type": exc.__class__.__name__, "error_message": str(exc)},
+        )
+        raise
 
 def _aggregate_openai_responses_sse(text: str) -> dict[str, Any]:
     response_body: dict[str, Any] | None = None
@@ -680,42 +707,6 @@ def _aggregate_openai_responses_sse(text: str) -> dict[str, Any]:
         elif data_type in {"response.failed", "response.incomplete", "error"}:
             raise LlmProviderResponseError(f"OpenAI Responses 流式响应失败: {data_text[:500]}")
     raise LlmProviderResponseError("OpenAI Responses 流式响应未完整完成。")
-
-
-def _read_sse_response_text(
-    response: Any,
-    content_type: str,
-    handler: StreamEventHandler | None,
-    cancellation_checker: CancellationChecker | None,
-) -> str:
-    _emit_stream_event(handler, "llm.response.stream.started", {"content_type": content_type})
-    event_count = 0
-    lines: list[str] = []
-    event_lines: list[str] = []
-    try:
-        while True:
-            _raise_if_cancelled(cancellation_checker)
-            raw_line = response.readline()
-            if not raw_line:
-                break
-            line = raw_line.decode("utf-8", errors="replace")
-            lines.append(line)
-            if line in ("\n", "\r\n", "\r"):
-                event_count += _emit_sse_block_event(handler, event_lines)
-                event_lines = []
-            else:
-                event_lines.append(line)
-        if event_lines:
-            event_count += _emit_sse_block_event(handler, event_lines)
-        _emit_stream_event(handler, "llm.response.stream.completed", {"event_count": event_count})
-        return "".join(lines)
-    except Exception as exc:
-        _emit_stream_event(
-            handler,
-            "llm.response.stream.failed",
-            {"event_count": event_count, "error_type": exc.__class__.__name__, "error_message": str(exc)},
-        )
-        raise
 
 
 def _raise_if_cancelled(cancellation_checker: CancellationChecker | None) -> None:

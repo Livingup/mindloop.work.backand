@@ -73,6 +73,8 @@ class LlmPromptRequest:
 
     cancellation_checker: Callable[[], bool] | None = None
 
+    request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None
+
     request_attempt_observer: Callable[[dict[str, Any]], None] | None = None
 
     request_event_observer: Callable[[str, dict[str, Any]], None] | None = None

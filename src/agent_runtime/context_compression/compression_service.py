@@ -103,6 +103,7 @@ class ContextCompressionService:
         trigger_model: ResolvedLlmProviderModel,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None = None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None,
     ) -> CompressionResult:
         config = self._config_accessor()
         decision = decide_context_compression(source_conversation, trigger_model, config)
@@ -177,6 +178,7 @@ class ContextCompressionService:
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
                 interrupt_checker=interrupt_checker,
+                request_canceller_observer=request_canceller_observer,
             )
             if not job.section_items:
                 raise RuntimeError("上下文压缩 Section Worker 未写入任何结构化条目。")
@@ -187,6 +189,7 @@ class ContextCompressionService:
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
                 interrupt_checker=interrupt_checker,
+                request_canceller_observer=request_canceller_observer,
             )
             final_markdown = job.final_markdown
             if not final_markdown:
@@ -199,6 +202,7 @@ class ContextCompressionService:
                     max_rounds=config.max_worker_rounds,
                     communication_context=communication_context,
                     interrupt_checker=interrupt_checker,
+                    request_canceller_observer=request_canceller_observer,
                 )
             target_conversation, summary_message_id = rewrite_conversation_with_summary(
                 source_conversation=source_conversation,
@@ -253,6 +257,7 @@ class ContextCompressionService:
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         workers = tuple(
             _SectionWorkerRun(
@@ -282,6 +287,7 @@ class ContextCompressionService:
                     max_rounds=max_rounds,
                     communication_context=communication_context,
                     interrupt_checker=interrupt_checker,
+                    request_canceller_observer=request_canceller_observer,
                 )
             ): worker
             for worker in workers
@@ -345,6 +351,7 @@ class ContextCompressionService:
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         try:
             await self._publish_section_worker_lifecycle_event(
@@ -371,6 +378,7 @@ class ContextCompressionService:
                     REPORT_SECTION_ISSUE,
                 },
                 interrupt_checker=interrupt_checker,
+                request_canceller_observer=request_canceller_observer,
             )
             await self._publish_section_worker_lifecycle_event(
                 communication_context,
@@ -449,6 +457,7 @@ class ContextCompressionService:
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_STARTED, _base_payload(job, status="running", phase="assembly"))
         prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name="FinalAssemblerWorker")
@@ -470,6 +479,7 @@ class ContextCompressionService:
                 REPORT_SECTION_ISSUE,
             },
             interrupt_checker=interrupt_checker,
+            request_canceller_observer=request_canceller_observer,
         )
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_COMPLETED, _base_payload(job, status="running", phase="assembly_completed"))
 
@@ -482,6 +492,7 @@ class ContextCompressionService:
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_STARTED, _base_payload(job, status="running", phase="verification"))
         prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name="FinalVerifierWorker")
@@ -498,6 +509,7 @@ class ContextCompressionService:
             communication_context=communication_context,
             allowed_tool_names={REPORT_SECTION_ISSUE},
             interrupt_checker=interrupt_checker,
+            request_canceller_observer=request_canceller_observer,
         )
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_COMPLETED, _base_payload(job, status="running", phase="verification_completed"))
 

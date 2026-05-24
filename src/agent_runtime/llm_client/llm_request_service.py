@@ -12,6 +12,8 @@ import uuid
 from dataclasses import replace
 from typing import Any, Callable
 
+import httpx
+
 from agent_runtime.conversation_message.message.operations import (
     ingest_response,
     render_messages,
@@ -261,26 +263,31 @@ class LlmRequestService:
                         attempt_count=attempt_count,
                         stream_state=stream_state,
                     )
-                    raw_response = await client.request(
-                        resolved_model=resolved,
-                        rendered_messages=rendered_messages,
-                        system_prompt=request.system_prompt,
-                        tools=tool_schemas,
-                        request_params=request_params,
-                        api_key=api_key,
-                        stream_event_handler=stream_event_handler,
-                        http_trace_service=self._http_trace_service,
-                        http_trace_context=_build_http_trace_context(
-                            request=request,
-                            resolved=resolved,
-                            llm_call_id=llm_call_id,
-                            llm_request_id=llm_request_id,
-                            api_key_index=key_index,
-                            retry_index=retry_index,
-                            attempt_count=attempt_count,
+                    raw_response = await _await_client_request(
+                        client.request(
+                            resolved_model=resolved,
+                            rendered_messages=rendered_messages,
+                            system_prompt=request.system_prompt,
+                            tools=tool_schemas,
+                            request_params=request_params,
+                            api_key=api_key,
+                            stream_event_handler=stream_event_handler,
+                            http_trace_service=self._http_trace_service,
+                            http_trace_context=_build_http_trace_context(
+                                request=request,
+                                resolved=resolved,
+                                llm_call_id=llm_call_id,
+                                llm_request_id=llm_request_id,
+                                api_key_index=key_index,
+                                retry_index=retry_index,
+                                attempt_count=attempt_count,
+                            ),
+                            cancellation_checker=request.cancellation_checker,
                         ),
-                        cancellation_checker=request.cancellation_checker,
+                        request,
                     )
+                    if request.cancellation_checker is not None and request.cancellation_checker():
+                        raise LlmRequestCancelled("LLM request cancelled.")
                     api_response_received = True
                     if not stream_state.get("response_started"):
                         stream_state["response_started"] = True
@@ -772,7 +779,10 @@ def _should_retry(exc: Exception, retryable_status_codes: tuple[int, ...]) -> bo
 
 
 def _is_llm_service_call_failure(exc: Exception) -> bool:
-    return isinstance(exc, (LlmHttpRequestError, LlmProviderResponseError, TimeoutError, ConnectionError, OSError))
+    return isinstance(
+        exc,
+        (LlmHttpRequestError, LlmProviderResponseError, TimeoutError, ConnectionError, OSError, httpx.HTTPError),
+    )
 
 
 def _as_llm_service_failure(exc: Exception) -> Exception:
@@ -783,6 +793,28 @@ def _as_llm_service_failure(exc: Exception) -> Exception:
     )
     service_error.__cause__ = exc
     return service_error
+
+
+async def _await_client_request(awaitable: Any, request: LlmPromptRequest) -> Any:
+    task = asyncio.create_task(awaitable)
+    observer = request.request_canceller_observer
+    unregister: Callable[[], None] | None = None
+    if observer is not None:
+        event_loop = asyncio.get_running_loop()
+
+        def cancel_request() -> None:
+            event_loop.call_soon_threadsafe(task.cancel)
+
+        unregister = observer(cancel_request)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if request.cancellation_checker is not None and request.cancellation_checker():
+            raise LlmRequestCancelled("LLM request cancelled.") from None
+        raise
+    finally:
+        if unregister is not None:
+            unregister()
 
 
 def _retry_delay(initial: float, maximum: float, retry_index: int) -> float:
