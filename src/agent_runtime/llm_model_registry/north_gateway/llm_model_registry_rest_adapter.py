@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
-from agent_runtime.llm_api_protocol import SUPPORTED_LLM_API_FORMATS
+from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_execution_policy import (
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
@@ -121,6 +121,10 @@ class LlmProviderResponse(BaseModel):
 
     provider_id: str
     group: str = "default"
+    provider_type: str = "custom"
+    auth_type: str = "api_key"
+    builtin: bool = False
+    managed: bool = False
     api_base_url: str
     custom_headers: dict[str, str] = Field(default_factory=dict)
     api_keys: list[dict[str, Any]] = Field(default_factory=list)
@@ -281,6 +285,8 @@ def create_llm_model_registry_router(
     @router.delete("/providers/{provider_id}", status_code=204)
     def delete_provider(provider_id: str) -> None:
         """删除 LLM 服务商定义。不存在时静默返回 204。"""
+        if _is_builtin_oauth_provider_id(provider_id):
+            raise HTTPException(status_code=409, detail=f"内置 OAuth 服务商不能删除: {provider_id}")
         try:
             gateway.delete_provider(provider_id)
         except ValueError as e:
@@ -365,7 +371,22 @@ def _metadata_to_response(metadata: LlmModelMetadata) -> LlmModelMetadataRespons
 
 def _provider_to_response(provider: LlmProviderDefinition) -> LlmProviderResponse:
     """将服务商定义领域实体转换为 REST 响应模型。"""
-    return LlmProviderResponse(**provider.to_dict())
+    return LlmProviderResponse(**provider.to_dict(), **_provider_runtime_metadata(provider))
+
+
+def _provider_runtime_metadata(provider: LlmProviderDefinition) -> dict[str, Any]:
+    auth_type = "oauth" if any(item.api_format == API_FORMAT_CODEX_RESPONSES for item in provider.models) else "api_key"
+    builtin = _is_builtin_oauth_provider_id(provider.provider_id)
+    return {
+        "provider_type": "builtin" if builtin else "custom",
+        "auth_type": auth_type,
+        "builtin": builtin,
+        "managed": builtin,
+    }
+
+
+def _is_builtin_oauth_provider_id(provider_id: str) -> bool:
+    return provider_id == "openai_codex"
 
 
 def _execution_policy_to_response(policy: LlmExecutionPolicy) -> LlmExecutionPolicyResponse:
