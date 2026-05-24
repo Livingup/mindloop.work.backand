@@ -31,6 +31,7 @@ def main() -> None:
         "--noconfirm",
         "--clean",
         "--onedir",
+        "--noconsole",
         "--name",
         "spread-ai-runtime",
         "--distpath",

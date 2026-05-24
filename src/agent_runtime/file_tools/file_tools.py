@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal
 
 from pydantic import Field
 
+from agent_runtime.subprocess_utils import hidden_subprocess_kwargs
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult
 
@@ -159,6 +160,7 @@ class GitIgnoreMatcher:
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=5,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -183,6 +185,7 @@ class GitIgnoreMatcher:
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=5,
+                **hidden_subprocess_kwargs(),
             )
         except (OSError, subprocess.TimeoutExpired):
             self.enabled = False
@@ -298,6 +301,7 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
             text=True,
             encoding="utf-8",
             errors="replace",
+            **hidden_subprocess_kwargs(),
         )
     except OSError:
         return None

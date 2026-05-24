@@ -6,6 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_runtime.subprocess_utils import hidden_subprocess_kwargs
 from agent_runtime.terminal.terminal_text_projection import render_terminal_text
 
 _DEFAULT_COLUMNS = 120
@@ -67,6 +68,7 @@ def _render_with_xterm(chunks: list[str], *, columns: int, rows: int, scrollback
             cwd=str(cwd),
             timeout=_XTERM_TIMEOUT_SECONDS,
             check=False,
+            **hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

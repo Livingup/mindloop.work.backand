@@ -1,10 +1,32 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import click
 
 from agent_runtime.server import run_server
+
+
+def _open_fallback_stream(env_name: str):
+    log_path = os.environ.get(env_name)
+    if log_path:
+        try:
+            return open(log_path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            pass
+    return open(os.devnull, "w", encoding="utf-8")
+
+
+def _ensure_standard_streams() -> None:
+    if sys.stdout is None:
+        sys.stdout = _open_fallback_stream("SPREAD_AI_DESKTOP_BACKEND_STDOUT_LOG")
+    if sys.stderr is None:
+        sys.stderr = _open_fallback_stream("SPREAD_AI_DESKTOP_BACKEND_STDERR_LOG")
+
+
+_ensure_standard_streams()
 
 
 @click.command()
