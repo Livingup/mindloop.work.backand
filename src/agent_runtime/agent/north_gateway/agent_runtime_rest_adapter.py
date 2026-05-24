@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -44,6 +45,7 @@ from agent_runtime.chat_bubble.chat_bubble_message import (
     ChatBubbleTextFormat,
 )
 from agent_runtime.chat_bubble.chat_bubble_service import ChatBubbleService
+from agent_runtime.communication.north_gateway.communication_contracts import CommunicationGateway
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
 
@@ -284,6 +286,21 @@ class DetachSceneResponseModel(BaseModel):
     cancelled_instance_count: int
 
 
+class SceneDiagnosticsBody(BaseModel):
+    workspace_path: str | None = None
+    agent_instance_id: str | None = None
+    task_id: str | None = None
+    communication_stream_id: str | None = None
+    frontend_snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class SceneDiagnosticsResponseModel(BaseModel):
+    status: str
+    diagnosis: dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    matched_rules: list[dict[str, Any]] = Field(default_factory=list)
+
+
 
 
 def create_agent_runtime_router(
@@ -295,6 +312,7 @@ def create_agent_runtime_router(
     session_registry: SceneSessionRegistry | None = None,
     chat_bubble_service: ChatBubbleService | None = None,
     conversation_repository: ConversationRepository | None = None,
+    communication_gateway: CommunicationGateway | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -555,6 +573,56 @@ def create_agent_runtime_router(
                 detail=f"Scene session 不存在，请重新 attach: {scene_id}",
             )
 
+    @router.post(
+        "/scenes/{scene_id}/diagnostics",
+        response_model=SceneDiagnosticsResponseModel,
+        status_code=200,
+    )
+    def diagnose_scene(
+        scene_id: str,
+        body: SceneDiagnosticsBody,
+    ) -> SceneDiagnosticsResponseModel:
+        frontend_snapshot = dict(body.frontend_snapshot)
+        instance, task, instance_error = _resolve_diagnostics_instance(
+            gateway,
+            scene_id=scene_id,
+            instance_id=body.agent_instance_id or _optional_text(frontend_snapshot.get("agent_instance_id")),
+            task_id=body.task_id or _optional_text(frontend_snapshot.get("task_id")),
+        )
+        stream_id = (
+            body.communication_stream_id
+            or _optional_text(frontend_snapshot.get("communication_stream_id"))
+            or _optional_text(frontend_snapshot.get("stream_id"))
+            or f"stream-scene-{scene_id}"
+        )
+        runtime_snapshot = (
+            execution_engine.get_agent_execution_diagnostics(instance.instance_id)
+            if execution_engine is not None and instance is not None
+            else None
+        )
+        communication_snapshot = _communication_diagnostics_snapshot(communication_gateway, stream_id)
+        session_snapshot = (
+            session_registry.get_session_diagnostics(scene_id)
+            if session_registry is not None
+            else None
+        )
+        evidence = {
+            "frontend": frontend_snapshot,
+            "backend_instance": _agent_instance_diagnostics(instance) if instance is not None else None,
+            "backend_task": _agent_task_diagnostics(task) if task is not None else None,
+            "backend_instance_error": instance_error,
+            "backend_runtime": runtime_snapshot,
+            "communication": communication_snapshot,
+            "scene_session": session_snapshot,
+        }
+        diagnosis, matched_rules = _analyze_scene_diagnostics(evidence)
+        return SceneDiagnosticsResponseModel(
+            status="analyzed",
+            diagnosis=diagnosis,
+            evidence=evidence,
+            matched_rules=matched_rules,
+        )
+
     @router.post("/scenes/{scene_id}/detach", status_code=200)
     def detach_scene(
         scene_id: str,
@@ -691,6 +759,196 @@ def create_agent_runtime_router(
             raise HTTPException(status_code=400, detail=str(e))
 
     return router
+
+
+def _resolve_diagnostics_instance(
+    gateway: AgentRuntimeGateway,
+    *,
+    scene_id: str,
+    instance_id: str | None,
+    task_id: str | None,
+) -> tuple[AgentInstance | None, AgentTask | None, str | None]:
+    try:
+        if instance_id:
+            instance = gateway.get_agent_instance(instance_id)
+            return instance, gateway.get_task(instance.task_id), None
+        if task_id:
+            task = gateway.get_task(task_id)
+            if not task.agent_instance_ids:
+                return None, task, "任务没有关联 Agent 实例。"
+            instance = gateway.get_agent_instance(task.root_agent_instance_id)
+            return instance, task, None
+        tasks = gateway.list_scene_tasks(scene_id)
+        if not tasks:
+            return None, None, "Scene 下没有 Agent 任务。"
+        task = tasks[0]
+        instance = gateway.get_agent_instance(task.root_agent_instance_id)
+        return instance, task, None
+    except KeyError as exc:
+        return None, None, str(exc)
+
+
+def _communication_diagnostics_snapshot(
+    communication_gateway: CommunicationGateway | None,
+    stream_id: str | None,
+) -> dict[str, Any] | None:
+    if communication_gateway is None or not stream_id:
+        return None
+    try:
+        return dict(communication_gateway.get_stream_diagnostics(stream_id))
+    except KeyError:
+        return {"stream_id": stream_id, "exists": False}
+
+
+def _agent_instance_diagnostics(instance: AgentInstance) -> dict[str, Any]:
+    return {
+        "instance_id": instance.instance_id,
+        "task_id": instance.task_id,
+        "conversation_id": instance.conversation_id,
+        "status": instance.status,
+        "pending_user_message_count": len(instance.pending_user_messages),
+        "updated_at": _datetime_text(instance.updated_at),
+        "created_at": _datetime_text(instance.created_at),
+    }
+
+
+def _agent_task_diagnostics(task: AgentTask) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "root_agent_instance_id": task.root_agent_instance_id,
+        "agent_instance_ids": list(task.agent_instance_ids),
+        "status": task.status,
+        "scene_id": task.scene_id,
+        "updated_at": _datetime_text(task.updated_at),
+        "created_at": _datetime_text(task.created_at),
+    }
+
+
+def _analyze_scene_diagnostics(
+    evidence: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    matched: list[dict[str, Any]] = []
+    frontend = _dict_value(evidence.get("frontend"))
+    backend_instance = _dict_value(evidence.get("backend_instance"))
+    runtime = _dict_value(evidence.get("backend_runtime"))
+    communication = _dict_value(evidence.get("communication"))
+    session = _dict_value(evidence.get("scene_session"))
+
+    frontend_run_status = _optional_text(frontend.get("run_status"))
+    backend_status = _optional_text(backend_instance.get("status"))
+    active_handle = runtime.get("active_handle_exists") is True
+    latest_seq = _int_or_none(communication.get("latest_seq")) if communication else None
+    frontend_last_seq = (
+        _int_or_none(frontend.get("frontend_last_seq"))
+        or _int_or_none(frontend.get("last_seq"))
+        or _int_or_none(frontend.get("cursor"))
+    )
+
+    if evidence.get("backend_instance_error"):
+        matched.append(_diagnostic_rule("backend_instance_missing", "后端没有找到当前 Agent 实例或任务。"))
+        return _diagnosis(
+            "backend_instance_missing",
+            "error",
+            "后端未找到当前 Agent 实例",
+            "诊断请求携带的实例或任务无法在后端运行态中定位。",
+        ), matched
+
+    if frontend_run_status == "running" and backend_status and backend_status != "running" and not active_handle:
+        matched.append(_diagnostic_rule("frontend_stale_running", "前端显示 running，但后端实例不是 running 且没有 active handle。"))
+        return _diagnosis(
+            "frontend_stale_running",
+            "warning",
+            "前端执行中状态陈旧",
+            f"前端 runStatus=running，后端实例 status={backend_status}，执行引擎没有活动任务。",
+        ), matched
+
+    if backend_status == "running" and not active_handle:
+        matched.append(_diagnostic_rule("backend_runtime_state_leak", "后端实例 status=running，但执行引擎内存中没有 active handle。"))
+        return _diagnosis(
+            "backend_runtime_state_leak",
+            "error",
+            "后端运行态不一致",
+            "AgentInstance 持久态为 running，但当前进程执行引擎没有对应执行任务。",
+        ), matched
+
+    if latest_seq is not None and frontend_last_seq is not None and latest_seq > frontend_last_seq:
+        matched.append(_diagnostic_rule("frontend_sse_cursor_lag", "后端通信流 seq 已前进，但前端 cursor 落后。"))
+        return _diagnosis(
+            "frontend_sse_cursor_lag",
+            "warning",
+            "前端事件消费落后",
+            f"后端 latest_seq={latest_seq}，前端 lastSeq={frontend_last_seq}，说明后端已有事件未被前端应用。",
+        ), matched
+
+    if active_handle:
+        progress = _dict_value(runtime.get("progress"))
+        phase = _optional_text(progress.get("phase")) or "unknown"
+        elapsed_ms = _int_or_none(progress.get("phase_elapsed_ms")) or 0
+        if phase == "llm_prompt":
+            matched.append(_diagnostic_rule("backend_llm_waiting", "执行引擎 active handle 存在，当前阶段为 LLM 请求。"))
+            return _diagnosis(
+                "backend_llm_waiting",
+                "warning" if elapsed_ms >= 60000 else "info",
+                "后端正在等待 LLM 响应",
+                f"Agent 执行循环处于 llm_prompt 阶段，已持续 {elapsed_ms // 1000} 秒。",
+            ), matched
+        if phase == "tool_batch":
+            matched.append(_diagnostic_rule("backend_tool_waiting", "执行引擎 active handle 存在，当前阶段为工具批执行。"))
+            return _diagnosis(
+                "backend_tool_waiting",
+                "warning" if elapsed_ms >= 60000 else "info",
+                "后端正在执行工具",
+                f"Agent 执行循环处于 tool_batch 阶段，已持续 {elapsed_ms // 1000} 秒。",
+            ), matched
+        if phase == "context_compression":
+            matched.append(_diagnostic_rule("backend_context_compression", "执行引擎 active handle 存在，当前阶段为上下文压缩。"))
+            return _diagnosis(
+                "backend_context_compression",
+                "info",
+                "后端正在执行上下文压缩",
+                f"Agent 执行循环处于 context_compression 阶段，已持续 {elapsed_ms // 1000} 秒。",
+            ), matched
+        matched.append(_diagnostic_rule("backend_active", "执行引擎 active handle 存在。"))
+        return _diagnosis(
+            "backend_active",
+            "info",
+            "后端 Agent 执行循环仍在运行",
+            f"当前执行阶段为 {phase}，已持续 {elapsed_ms // 1000} 秒。",
+        ), matched
+
+    if session and session.get("is_open") is False:
+        matched.append(_diagnostic_rule("scene_session_missing", "后端 scene session 不存在。"))
+        return _diagnosis(
+            "scene_session_missing",
+            "warning",
+            "后端 Scene session 不存在",
+            "后端没有当前 scene 的 heartbeat session 记录。",
+        ), matched
+
+    matched.append(_diagnostic_rule("state_consistent", "未发现前后端状态机矛盾或活动执行卡点。"))
+    return _diagnosis(
+        "state_consistent",
+        "ok",
+        "未发现明确故障",
+        "前端、后端实例、执行引擎和通信流快照未命中异常规则。",
+    ), matched
+
+
+def _diagnosis(category: str, severity: str, title: str, description: str) -> dict[str, Any]:
+    return {
+        "category": category,
+        "severity": severity,
+        "title": title,
+        "description": description,
+    }
+
+
+def _diagnostic_rule(rule_id: str, reason: str) -> dict[str, Any]:
+    return {"rule_id": rule_id, "reason": reason}
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass(frozen=True, slots=True)

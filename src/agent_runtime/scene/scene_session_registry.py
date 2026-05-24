@@ -120,6 +120,32 @@ class SceneSessionRegistry:
         with self._lock:
             return list(self._sessions.values())
 
+    def get_session_diagnostics(self, scene_id: str) -> dict[str, object]:
+        now = time.time()
+        with self._lock:
+            session = self._sessions.get(scene_id)
+            if session is None:
+                return {
+                    "scene_id": scene_id,
+                    "is_open": False,
+                    "stale_timeout_seconds": self._stale_timeout,
+                    "last_heartbeat_age_seconds": None,
+                    "is_stale": None,
+                }
+            last_heartbeat_age = now - session.last_heartbeat_at
+            return {
+                "scene_id": scene_id,
+                "workspace_path": session.workspace_path,
+                "is_open": True,
+                "opened_at": session.opened_at,
+                "last_heartbeat_at": session.last_heartbeat_at,
+                "opened_at_iso": _iso_from_timestamp(session.opened_at),
+                "last_heartbeat_at_iso": _iso_from_timestamp(session.last_heartbeat_at),
+                "stale_timeout_seconds": self._stale_timeout,
+                "last_heartbeat_age_seconds": last_heartbeat_age,
+                "is_stale": last_heartbeat_age > self._stale_timeout,
+            }
+
     # ── 生命周期 ─────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -196,3 +222,7 @@ class SceneSessionRegistry:
                 logger.exception(
                     "Scene session 过期回调失败: scene_id=%s", session.scene_id
                 )
+
+
+def _iso_from_timestamp(value: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))

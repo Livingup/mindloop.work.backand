@@ -102,6 +102,10 @@ class CommunicationGateway(Protocol):
         """读取某条通信流最新一段历史消息，并按 seq 升序返回。"""
         ...
 
+    def get_stream_diagnostics(self, stream_id: str) -> dict[str, Any]:
+        """读取通信流只读诊断快照。"""
+        ...
+
     async def subscribe_messages(
         self,
         stream_id: str,

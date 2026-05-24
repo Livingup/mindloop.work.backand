@@ -266,6 +266,7 @@ def create_app() -> FastAPI:
             session_registry=scene_session_registry,
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
+            communication_gateway=communication_gateway,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],

@@ -10,8 +10,9 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_RUNNING,
@@ -220,6 +221,20 @@ class _AgentExecutionHandle:
     interrupt_state: _AgentExecutionInterruptState
 
 
+@dataclass(slots=True)
+class _AgentExecutionProgressState:
+    task_id: str
+    instance_id: str
+    stream_id: str | None
+    conversation_id: str | None
+    phase: str
+    loop_index: int | None
+    phase_started_at: float
+    last_progress_at: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+    running_tools: list[dict[str, Any]] = field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class _PromptWithConversationResult:
     response: LlmPromptResponse
@@ -299,6 +314,87 @@ class AgentExecutionEngine:
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
+        self._execution_progress: dict[str, _AgentExecutionProgressState] = {}
+
+    def get_agent_execution_diagnostics(self, instance_id: str) -> dict[str, Any]:
+        handle = self._active_execution_handles.get(instance_id)
+        progress = self._execution_progress.get(instance_id)
+        now = time.time()
+        return {
+            "instance_id": instance_id,
+            "active_instance_registered": instance_id in self._active_instance_ids,
+            "active_handle_exists": handle is not None,
+            "execution_task_done": handle.task.done() if handle is not None else None,
+            "execution_task_cancelled": handle.task.cancelled() if handle is not None else None,
+            "interrupt_requested": handle.interrupt_state.requested if handle is not None else None,
+            "interrupt_reason": handle.interrupt_state.reason if handle is not None else None,
+            "interrupt_requested_elapsed_ms": (
+                int((time.perf_counter() - handle.interrupt_state.requested_at) * 1000)
+                if handle is not None and handle.interrupt_state.requested_at is not None
+                else None
+            ),
+            "current_llm_request": (
+                dict(handle.interrupt_state.current_llm_request)
+                if handle is not None and isinstance(handle.interrupt_state.current_llm_request, dict)
+                else None
+            ),
+            "progress": _execution_progress_snapshot(progress, now) if progress is not None else None,
+            "task_stack": _task_stack_snapshot(handle.task) if handle is not None else [],
+        }
+
+    def _set_execution_phase(
+        self,
+        *,
+        task_id: str,
+        instance_id: str,
+        stream_id: str | None,
+        conversation_id: str | None,
+        phase: str,
+        loop_index: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        now = time.time()
+        previous = self._execution_progress.get(instance_id)
+        running_tools = previous.running_tools if previous is not None and phase == previous.phase else []
+        self._execution_progress[instance_id] = _AgentExecutionProgressState(
+            task_id=task_id,
+            instance_id=instance_id,
+            stream_id=stream_id,
+            conversation_id=conversation_id,
+            phase=phase,
+            loop_index=loop_index,
+            phase_started_at=now,
+            last_progress_at=now,
+            metadata=dict(metadata or {}),
+            running_tools=list(running_tools),
+        )
+
+    def _touch_execution_progress(
+        self,
+        instance_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        progress = self._execution_progress.get(instance_id)
+        if progress is None:
+            return
+        progress.last_progress_at = time.time()
+        if metadata:
+            progress.metadata.update(metadata)
+
+    def _set_execution_running_tools(
+        self,
+        instance_id: str,
+        running_tools: list[dict[str, Any]],
+    ) -> None:
+        progress = self._execution_progress.get(instance_id)
+        if progress is None:
+            return
+        progress.last_progress_at = time.time()
+        progress.running_tools = [dict(item) for item in running_tools]
+
+    def _clear_execution_progress(self, instance_id: str) -> None:
+        self._execution_progress.pop(instance_id, None)
 
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
@@ -493,9 +589,28 @@ class AgentExecutionEngine:
         handle = self._active_execution_handles.get(instance_id)
         if handle is not None and handle.task is task:
             self._active_execution_handles.pop(instance_id, None)
+        if task.cancelled():
+            self._set_execution_phase(
+                task_id="",
+                instance_id=instance_id,
+                stream_id=None,
+                conversation_id=None,
+                phase="execution_cancelled",
+            )
         with suppress(asyncio.CancelledError):
             exc = task.exception()
             if exc is not None:
+                self._set_execution_phase(
+                    task_id="",
+                    instance_id=instance_id,
+                    stream_id=None,
+                    conversation_id=None,
+                    phase="execution_failed",
+                    metadata={
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                    },
+                )
                 logger.error("Agent 后台执行失败。", exc_info=(type(exc), exc, exc.__traceback__))
                 return
             logger.info("Agent 后台执行结束: instance_id=%s", instance_id)
@@ -513,6 +628,13 @@ class AgentExecutionEngine:
         trace_path = self._trace_recorder.start_trace(_trace_identity(instance))
         conversation: Any | None = None
         loop_index = 0
+        self._set_execution_phase(
+            task_id=task.task_id,
+            instance_id=instance.instance_id,
+            stream_id=communication_context.stream_id,
+            conversation_id=request.conversation_id or instance.conversation_id,
+            phase="starting",
+        )
         logger.info(
             "Agent 执行开始: task_id=%s, instance_id=%s, conversation_id=%s, stream_id=%s",
             task.task_id,
@@ -529,13 +651,30 @@ class AgentExecutionEngine:
                 task_id=task.task_id,
                 instance_id=instance.instance_id,
             )
+            self._set_execution_phase(
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                stream_id=communication_context.stream_id,
+                conversation_id=request.conversation_id or instance.conversation_id,
+                phase="load_conversation",
+            )
             conversation = await self._load_or_create_conversation(instance, request)
             communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+            self._touch_execution_progress(instance.instance_id, metadata={"conversation_id": conversation.id})
 
             plain_text_fallback_count = 0
             while True:
                 loop_index += 1
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="loop_start",
+                    loop_index=loop_index,
+                    metadata={"pending_user_messages": len(instance.pending_user_messages)},
+                )
                 logger.info(
                     "Agent 循环轮次开始: task_id=%s, instance_id=%s, loop_index=%s, status=%s, pending_user_messages=%s",
                     task.task_id,
@@ -544,16 +683,36 @@ class AgentExecutionEngine:
                     instance.status,
                     len(instance.pending_user_messages),
                 )
-                await self._drain_pending_user_messages_to_conversation(
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="drain_user_messages",
+                    loop_index=loop_index,
+                )
+                drained_count = await self._drain_pending_user_messages_to_conversation(
                     instance_id=instance.instance_id,
                     conversation=conversation,
                     communication_context=communication_context,
                     trace_path=trace_path,
                 )
+                self._touch_execution_progress(instance.instance_id, metadata={"drained_user_message_count": drained_count})
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates = self._resolve_instance_llm_candidates(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
                 try:
+                    self._set_execution_phase(
+                        task_id=task.task_id,
+                        instance_id=instance.instance_id,
+                        stream_id=communication_context.stream_id,
+                        conversation_id=conversation.id,
+                        phase="llm_prompt",
+                        loop_index=loop_index,
+                        metadata={
+                            "candidate_count": len(resolved_candidates),
+                        },
+                    )
                     prompt_result = await _await_with_progress_logging(
                         self._send_prompt_with_policy_failover(
                             task=task,
@@ -575,6 +734,9 @@ class AgentExecutionEngine:
                             "conversation_id": conversation.id,
                             "candidate_count": len(resolved_candidates),
                         },
+                        progress_callback=lambda _elapsed_ms, instance_id=instance.instance_id: self._touch_execution_progress(
+                            instance_id,
+                        ),
                     )
                 except LlmRequestCancelled:
                     return await self._pause_for_user_interrupt(
@@ -592,6 +754,14 @@ class AgentExecutionEngine:
                 communication_context = communication_context.with_metadata(conversation_id=conversation.id)
                 assistant_message = llm_response.assistant_message
                 _record_last_context_usage(conversation, llm_response)
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="persist_assistant_message",
+                    loop_index=loop_index,
+                )
                 await self._conversation_repository.save(conversation)
                 self._trace_recorder.record_llm_response(trace_path, assistant_message)
                 await self._event_publisher.publish(
@@ -678,6 +848,18 @@ class AgentExecutionEngine:
                     continue
                 plain_text_fallback_count = 0
 
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="tool_batch",
+                    loop_index=loop_index,
+                    metadata={
+                        "tool_count": len(tool_uses),
+                        "tool_names": [tool_use.name for tool_use in tool_uses],
+                    },
+                )
                 tool_result_message, tool_results = await _await_with_progress_logging(
                     self._execute_tool_uses(
                         agent_definition,
@@ -693,6 +875,17 @@ class AgentExecutionEngine:
                         "tool_count": len(tool_uses),
                         "tool_names": [tool_use.name for tool_use in tool_uses],
                     },
+                    progress_callback=lambda _elapsed_ms, instance_id=instance.instance_id: self._touch_execution_progress(
+                        instance_id,
+                    ),
+                )
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="persist_tool_results",
+                    loop_index=loop_index,
                 )
                 conversation.append_message(tool_result_message)
                 await self._conversation_repository.save(conversation)
@@ -750,6 +943,18 @@ class AgentExecutionEngine:
             raise RuntimeError("Agent 执行循环异常结束。")
         except Exception as exc:
             failure_message = str(exc)
+            self._set_execution_phase(
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                stream_id=communication_context.stream_id,
+                conversation_id=conversation.id if conversation is not None else request.conversation_id,
+                phase="execution_failed",
+                loop_index=loop_index or None,
+                metadata={
+                    "error_type": exc.__class__.__name__,
+                    "error_message": failure_message,
+                },
+            )
             logger.exception(
                 "Agent 执行异常中断: task_id=%s, instance_id=%s, error_type=%s, error_message=%s",
                 task.task_id,
@@ -1110,6 +1315,19 @@ class AgentExecutionEngine:
             )
             try:
                 if self._context_compression_service is not None:
+                    self._set_execution_phase(
+                        task_id=task.task_id,
+                        instance_id=instance.instance_id,
+                        stream_id=communication_context.stream_id,
+                        conversation_id=conversation.id,
+                        phase="context_compression",
+                        metadata={
+                            "candidate_index": candidate_index,
+                            "provider_id": resolved_model.provider_id,
+                            "model_id": resolved_model.model_id,
+                            "model_alias": resolved_model.model_alias,
+                        },
+                    )
                     compression_result = await self._context_compression_service.compress_if_needed(
                         task=task,
                         instance=instance,
@@ -1130,6 +1348,19 @@ class AgentExecutionEngine:
                                 "target_conversation_id": conversation.id,
                             },
                         )
+                self._set_execution_phase(
+                    task_id=task.task_id,
+                    instance_id=instance.instance_id,
+                    stream_id=communication_context.stream_id,
+                    conversation_id=conversation.id,
+                    phase="llm_prompt",
+                    metadata={
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "model_id": resolved_model.model_id,
+                        "model_alias": resolved_model.model_alias,
+                    },
+                )
                 response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
                         conversation=conversation,
@@ -1464,6 +1695,8 @@ class AgentExecutionEngine:
         result_parts = []
         results_by_ref: dict[str, ToolDispatchResult] = {}
         tasks: list[tuple[ToolUsePart, asyncio.Task[ToolDispatchResult]]] = []
+        instance_id = str(communication_context.metadata.get("agent_instance_id") or "")
+        running_tools: list[dict[str, Any]] = []
         for tool_use in tool_uses:
             if interrupt_state.requested:
                 results_by_ref[_tool_use_ref(tool_use)] = await self._build_cancelled_tool_dispatch_result(
@@ -1473,6 +1706,14 @@ class AgentExecutionEngine:
                     phase="not_started",
                 )
                 continue
+            running_tools.append({
+                "tool_call_id": _tool_use_ref(tool_use),
+                "tool_name": tool_use.name,
+                "source": _tool_source(tool_use),
+                "started_at": _datetime_from_timestamp(time.time()),
+            })
+            if instance_id:
+                self._set_execution_running_tools(instance_id, running_tools)
             tool_task = asyncio.create_task(self._execute_single_tool_use(
                 definition,
                 tool_use,
@@ -1480,9 +1721,13 @@ class AgentExecutionEngine:
             ))
             tasks.append((tool_use, tool_task))
         if tasks:
-            running_results = await asyncio.gather(*(task for _tool_use, task in tasks))
-            for result in running_results:
-                results_by_ref[result.result_part.tool_use_ref] = result
+            try:
+                running_results = await asyncio.gather(*(task for _tool_use, task in tasks))
+                for result in running_results:
+                    results_by_ref[result.result_part.tool_use_ref] = result
+            finally:
+                if instance_id:
+                    self._set_execution_running_tools(instance_id, [])
         results = [results_by_ref[_tool_use_ref(tool_use)] for tool_use in tool_uses]
         tool_results = []
         for result in results:
@@ -1991,6 +2236,7 @@ async def _await_with_progress_logging(
     task_id: str,
     instance_id: str,
     metadata: dict[str, Any] | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> _T:
     started_at = time.perf_counter()
     task = asyncio.ensure_future(awaitable)
@@ -2019,12 +2265,15 @@ async def _await_with_progress_logging(
                     metadata,
                 )
                 return result
+            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+            if progress_callback is not None:
+                progress_callback(elapsed_ms)
             logger.warning(
                 "Agent 阶段仍在执行: stage=%s, task_id=%s, instance_id=%s, 已耗时=%sms, metadata=%s",
                 stage,
                 task_id,
                 instance_id,
-                int((time.perf_counter() - started_at) * 1000),
+                elapsed_ms,
                 metadata,
             )
     except asyncio.CancelledError:
@@ -2042,3 +2291,39 @@ async def _await_with_progress_logging(
             metadata,
         )
         raise
+
+
+def _execution_progress_snapshot(
+    progress: _AgentExecutionProgressState,
+    now: float,
+) -> dict[str, Any]:
+    return {
+        "task_id": progress.task_id,
+        "instance_id": progress.instance_id,
+        "stream_id": progress.stream_id,
+        "conversation_id": progress.conversation_id,
+        "phase": progress.phase,
+        "loop_index": progress.loop_index,
+        "phase_started_at": _datetime_from_timestamp(progress.phase_started_at),
+        "last_progress_at": _datetime_from_timestamp(progress.last_progress_at),
+        "phase_elapsed_ms": int(max(now - progress.phase_started_at, 0) * 1000),
+        "last_progress_elapsed_ms": int(max(now - progress.last_progress_at, 0) * 1000),
+        "metadata": dict(progress.metadata),
+        "running_tools": [dict(item) for item in progress.running_tools],
+    }
+
+
+def _task_stack_snapshot(task: asyncio.Task[Any]) -> list[dict[str, Any]]:
+    frames = task.get_stack(limit=12)
+    return [
+        {
+            "filename": frame.f_code.co_filename,
+            "function": frame.f_code.co_name,
+            "line_number": frame.f_lineno,
+        }
+        for frame in frames
+    ]
+
+
+def _datetime_from_timestamp(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()

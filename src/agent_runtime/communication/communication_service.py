@@ -180,6 +180,26 @@ class CommunicationService:
             limit=max(min(limit, 5000), 1),
         )
 
+    def get_stream_diagnostics(self, stream_id: str) -> dict[str, Any]:
+        _require_non_blank(stream_id, "stream_id")
+        stream = self.get_stream(stream_id)
+        latest_messages = self._repository.list_latest_messages(stream_id, limit=1)
+        latest_message = latest_messages[-1] if latest_messages else None
+        hub_diagnostics = self._event_hub.get_stream_diagnostics(stream_id)
+        return {
+            "stream_id": stream.stream_id,
+            "topic": stream.topic,
+            "owner_id": stream.owner_id,
+            "status": stream.status,
+            "metadata": dict(stream.metadata),
+            "created_at": stream.created_at.isoformat(),
+            "updated_at": stream.updated_at.isoformat(),
+            "latest_seq": latest_message.seq if latest_message is not None else 0,
+            "latest_message_type": latest_message.type if latest_message is not None else None,
+            "latest_message_created_at": latest_message.created_at.isoformat() if latest_message is not None else None,
+            **hub_diagnostics,
+        }
+
     async def subscribe_messages(
         self,
         stream_id: str,

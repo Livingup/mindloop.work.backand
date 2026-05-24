@@ -91,6 +91,21 @@ class InMemoryCommunicationEventHub:
             messages = list(state.buffer)[-actual_limit:]
             return messages
 
+    def get_stream_diagnostics(self, stream_id: str) -> dict[str, int | None]:
+        state = self._state_for(stream_id)
+        with state.lock:
+            first_seq = state.buffer[0].seq if state.buffer else None
+            last_seq = state.buffer[-1].seq if state.buffer else None
+            return {
+                "subscriber_count": len(state.subscribers),
+                "buffered_message_count": len(state.buffer),
+                "buffer_first_seq": first_seq,
+                "buffer_last_seq": last_seq,
+                "next_seq": state.next_seq,
+                "subscriber_queue_size": self._subscriber_queue_size,
+                "replay_buffer_size": self._replay_buffer_size,
+            }
+
     async def subscribe(self, stream_id: str, *, after_seq: int = 0) -> AsyncIterator[CommunicationMessage]:
         state = self._state_for(stream_id)
         actual_after_seq = max(after_seq, 0)
