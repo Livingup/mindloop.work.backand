@@ -207,6 +207,7 @@ def create_llm_model_registry_router(
     builtin_provider_ids: set[str] | None = None,
     api_formats: tuple[LlmApiFormat, ...] | None = None,
     unsupported_input_modality_strategies: tuple[str, ...] | None = None,
+    readonly_models: bool = False,
 ) -> APIRouter:
     """根据网关实例创建 LLM 注册 REST API 路由。
 
@@ -255,6 +256,8 @@ def create_llm_model_registry_router(
         body: LlmModelMetadataBody,
     ) -> LlmModelMetadataResponse:
         """新增或覆盖保存模型元数据。"""
+        if readonly_models:
+            raise HTTPException(status_code=409, detail="当前 Registry 的模型定义由程序内置维护，不能新增或修改。")
         try:
             metadata = gateway.save_model_metadata(_body_to_model_request(model_id, body))
         except ValueError as e:
@@ -264,6 +267,8 @@ def create_llm_model_registry_router(
     @router.delete("/models/{model_id}", status_code=204)
     def delete_model_metadata(model_id: str) -> None:
         """删除模型元数据。仍被服务商引用时返回 409。"""
+        if readonly_models:
+            raise HTTPException(status_code=409, detail="当前 Registry 的模型定义由程序内置维护，不能删除。")
         try:
             gateway.delete_model_metadata(model_id)
         except ValueError as e:

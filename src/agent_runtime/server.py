@@ -414,6 +414,7 @@ def create_app() -> FastAPI:
             unsupported_input_modality_strategies=(
                 UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
             ),
+            readonly_models=True,
         ),
         prefix="/api/image-generation/llm-registry",
         tags=["图片生成 LLM 服务商与模型注册"],
