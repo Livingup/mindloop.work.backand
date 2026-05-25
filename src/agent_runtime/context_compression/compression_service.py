@@ -30,7 +30,13 @@ from agent_runtime.context_compression.event_publisher import (
 )
 from agent_runtime.context_compression.gate import decide_context_compression
 from agent_runtime.context_compression.job_store import InMemoryCompressionJobStore
-from agent_runtime.context_compression.models import CompressionJob, CompressionResult, SECTION_WORKERS
+from agent_runtime.context_compression.models import (
+    CompressionJob,
+    CompressionResult,
+    SECTION_WORKERS,
+    context_compression_worker_id,
+    context_compression_worker_title,
+)
 from agent_runtime.context_compression.prompt_loader import ContextCompressionPromptLoader
 from agent_runtime.context_compression.prompt_repository import ContextCompressionWorkerPromptRepository
 from agent_runtime.context_compression.range_planner import plan_compression_range
@@ -433,8 +439,12 @@ class ContextCompressionService:
         reason: str | None = None,
     ) -> None:
         payload = _base_payload(job, status=job.status, phase="workers")
+        worker_id = context_compression_worker_id(worker.worker_name, "section_worker", worker.section)
         payload["worker"] = {
+            "worker_id": worker_id,
+            "id": worker_id,
             "name": worker.worker_name,
+            "title": context_compression_worker_title(worker.worker_name, "section_worker", worker.section),
             "role": "section_worker",
             "output_section": worker.section,
             "input_mode": input_mode,

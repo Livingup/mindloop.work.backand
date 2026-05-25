@@ -18,6 +18,30 @@ SECTION_WORKERS: tuple[tuple[str, str], ...] = (
 )
 
 
+SECTION_WORKER_TITLES: dict[str, str] = {
+    "requirements_constraints": "用户需求与硬约束",
+    "progress_plan": "任务计划与执行进度",
+    "code_architecture": "代码结构与架构事实",
+    "observations_evidence": "工具观察与外部事实",
+    "decisions_rationale": "决策与理由",
+    "todos_risks": "待办与风险",
+}
+
+
+def context_compression_worker_id(worker_name: str, worker_role: str, output_section: str | None) -> str:
+    return worker_name or output_section or worker_role
+
+
+def context_compression_worker_title(worker_name: str, worker_role: str, output_section: str | None) -> str:
+    if output_section in SECTION_WORKER_TITLES:
+        return SECTION_WORKER_TITLES[output_section]
+    if worker_role == "final_assembler":
+        return "最终 Markdown 汇编"
+    if worker_role == "final_verifier":
+        return "压缩结果校验"
+    return worker_name
+
+
 @dataclass(frozen=True, slots=True)
 class CompressionRange:
     compressed_start_index: int

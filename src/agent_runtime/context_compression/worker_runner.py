@@ -13,7 +13,11 @@ from agent_runtime.context_compression.event_publisher import (
     ContextCompressionEventPublisher,
 )
 from agent_runtime.context_compression.job_store import InMemoryCompressionJobStore
-from agent_runtime.context_compression.models import CompressionJob
+from agent_runtime.context_compression.models import (
+    CompressionJob,
+    context_compression_worker_id,
+    context_compression_worker_title,
+)
 from agent_runtime.context_compression.summary_tools import ContextSummaryToolExecutor
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
@@ -323,12 +327,12 @@ class ContextCompressionWorkerRunner:
     ) -> None:
         payload = _base_payload(job)
         payload["phase"] = _phase_for_worker_role(worker_role)
-        worker_id = _worker_id(worker_name, worker_role, output_section)
+        worker_id = context_compression_worker_id(worker_name, worker_role, output_section)
         payload["worker"] = {
             "worker_id": worker_id,
             "id": worker_id,
             "name": worker_name,
-            "title": _worker_title(worker_name, worker_role, output_section),
+            "title": context_compression_worker_title(worker_name, worker_role, output_section),
             "role": worker_role,
             "output_section": output_section,
             "input_mode": input_mode,
@@ -364,30 +368,6 @@ def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
 
 def _assistant_text(message: UniMessage) -> str:
     return "\n".join(part.text for part in message.content if isinstance(part, TextPart)).strip()
-
-
-def _worker_id(worker_name: str, worker_role: str, output_section: str | None) -> str:
-    if output_section:
-        return output_section
-    return worker_name or worker_role
-
-
-def _worker_title(worker_name: str, worker_role: str, output_section: str | None) -> str:
-    titles = {
-        "requirements_constraints": "用户需求与硬约束",
-        "progress_plan": "任务计划与执行进度",
-        "code_architecture": "代码结构与架构事实",
-        "observations_evidence": "工具观察与外部事实",
-        "decisions_rationale": "决策与理由",
-        "todos_risks": "待办与风险",
-    }
-    if output_section in titles:
-        return titles[output_section]
-    if worker_role == "final_assembler":
-        return "最终 Markdown 汇编"
-    if worker_role == "final_verifier":
-        return "压缩结果校验"
-    return worker_name
 
 
 def _next_tool_calling_candidate(
