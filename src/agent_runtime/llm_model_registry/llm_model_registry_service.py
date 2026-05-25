@@ -11,7 +11,10 @@ from typing import Any
 
 from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
 from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
-from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
+from agent_runtime.llm_model_registry.llm_model_metadata import (
+    LLM_MODEL_SOURCE_BUILTIN,
+    LlmModelMetadata,
+)
 from agent_runtime.llm_model_registry.llm_model_registry_repository import (
     LlmModelRegistryRepository,
 )
@@ -180,9 +183,24 @@ class LlmModelRegistryService:
         return metadata
 
     def save_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
-        """新增或覆盖保存模型元数据。"""
+        """Save custom model metadata."""
+        existing = self._repository.find_model_metadata_by_id(metadata.model_id)
+        if existing is not None and existing.source == LLM_MODEL_SOURCE_BUILTIN:
+            raise ValueError(f"Builtin LLM model metadata cannot be edited: {metadata.model_id}")
+        if metadata.source == LLM_MODEL_SOURCE_BUILTIN:
+            raise ValueError(f"Builtin LLM model metadata cannot be created through the custom save API: {metadata.model_id}")
         self._repository.save_model_metadata(metadata)
-        logger.info("保存 LLM 模型元数据: %s", metadata.model_id)
+        logger.info("Saved LLM model metadata: %s", metadata.model_id)
+        return metadata
+
+    def ensure_builtin_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
+        if metadata.source != LLM_MODEL_SOURCE_BUILTIN:
+            raise ValueError(f"Builtin LLM model metadata source must be builtin: {metadata.model_id}")
+        existing = self._repository.find_model_metadata_by_id(metadata.model_id)
+        if existing == metadata:
+            return existing
+        self._repository.save_model_metadata(metadata)
+        logger.info("Ensured builtin LLM model metadata: %s", metadata.model_id)
         return metadata
 
     def delete_model_metadata(self, model_id: str) -> None:
@@ -190,6 +208,9 @@ class LlmModelRegistryService:
 
         如果已有服务商模型接入项引用该模型，则拒绝删除，避免服务商定义留下悬空 model_id。
         """
+        existing = self._repository.find_model_metadata_by_id(model_id)
+        if existing is not None and existing.source == LLM_MODEL_SOURCE_BUILTIN:
+            raise ValueError(f"Builtin LLM model metadata cannot be deleted: {model_id}")
         referenced_by = [
             provider.provider_id
             for provider in self._repository.find_all_providers()

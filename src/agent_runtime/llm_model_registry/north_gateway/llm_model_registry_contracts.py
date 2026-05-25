@@ -46,6 +46,7 @@ class LlmModelMetadataSaveRequest:
     max_output_tokens: int
 
     group: str = "default"
+    source: str = "custom"
 
     # 会话压缩触发阈值。
     compression_threshold: int | None = None
@@ -66,6 +67,7 @@ class LlmModelMetadataSaveRequest:
             context_window=self.context_window,
             max_output_tokens=self.max_output_tokens,
             group=self.group,
+            source=self.source,
             compression_threshold=self.compression_threshold,
             supports_tool_calling=self.supports_tool_calling,
             supports_structured_output=self.supports_structured_output,
@@ -80,6 +82,7 @@ class LlmModelMetadataSaveRequest:
             context_window=metadata.context_window,
             max_output_tokens=metadata.max_output_tokens,
             group=metadata.group,
+            source=metadata.source,
             compression_threshold=metadata.compression_threshold,
             supports_tool_calling=metadata.supports_tool_calling,
             supports_structured_output=metadata.supports_structured_output,
@@ -198,6 +201,9 @@ class LlmModelRegistryGateway(Protocol):
         request: LlmModelMetadataSaveRequest,
     ) -> LlmModelMetadata:
         """新增或覆盖保存模型元数据。"""
+        ...
+
+    def ensure_builtin_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
         ...
 
     def delete_model_metadata(self, model_id: str) -> None:

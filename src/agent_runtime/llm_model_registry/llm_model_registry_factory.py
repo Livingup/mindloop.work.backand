@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent_runtime.llm_model_registry.infrastructure.sqlite_llm_model_registry_repository import (
     SqliteLlmModelRegistryRepository,
 )
+from agent_runtime.llm_model_registry.builtin_models import builtin_llm_model_metadata
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     LlmModelRegistryService,
 )
@@ -35,4 +36,6 @@ class LlmModelRegistryFactory:
             ),
         )
         service = LlmModelRegistryService(repository)
+        for metadata in builtin_llm_model_metadata():
+            service.ensure_builtin_model_metadata(metadata)
         return LlmModelRegistryGatewayImpl(service)

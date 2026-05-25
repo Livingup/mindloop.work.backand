@@ -53,6 +53,10 @@ class LlmModelRegistryGatewayImpl:
         """删除模型元数据。仍被服务商引用时抛出 ValueError。"""
         self._service.delete_model_metadata(model_id)
 
+
+    def ensure_builtin_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
+        return self._service.ensure_builtin_model_metadata(metadata)
+
     # ── 服务商定义管理 ──────────────────────────────────────
 
     def list_providers(self) -> list[LlmProviderDefinition]:

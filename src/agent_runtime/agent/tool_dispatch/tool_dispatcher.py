@@ -437,6 +437,11 @@ def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
         "loop_decision": result.loop_decision,
         "output": _preview_value(result.output),
     }
+    ui_kind = result.metadata.get("ui_kind")
+    if ui_kind:
+        preview["ui_kind"] = ui_kind
+    if result.frontend_message is not None:
+        preview["frontend_message"] = _preview_value(result.frontend_message.model_dump(mode="json"))
     if result.error_code:
         preview["error_code"] = result.error_code
     if result.error_message:

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS llm_model_metadata (
     max_output_tokens                   INTEGER NOT NULL,
     group_name                          TEXT NOT NULL,
     compression_threshold               INTEGER,
+    source                              TEXT NOT NULL DEFAULT 'custom',
     supports_tool_calling               INTEGER NOT NULL,
     supports_structured_output          INTEGER NOT NULL,
     supported_input_modalities_json     TEXT NOT NULL
@@ -153,7 +154,7 @@ class SqliteLlmModelRegistryRepository:
             rows = self._connection().execute(
                 """
                 SELECT model_id, context_window, max_output_tokens, group_name,
-                       compression_threshold, supports_tool_calling,
+                       compression_threshold, source, supports_tool_calling,
                        supports_structured_output, supported_input_modalities_json
                 FROM llm_model_metadata
                 ORDER BY model_id ASC
@@ -167,7 +168,7 @@ class SqliteLlmModelRegistryRepository:
             row = self._connection().execute(
                 """
                 SELECT model_id, context_window, max_output_tokens, group_name,
-                       compression_threshold, supports_tool_calling,
+                       compression_threshold, source, supports_tool_calling,
                        supports_structured_output, supported_input_modalities_json
                 FROM llm_model_metadata
                 WHERE model_id = ?
@@ -183,14 +184,15 @@ class SqliteLlmModelRegistryRepository:
                 """
                 INSERT INTO llm_model_metadata (
                     model_id, context_window, max_output_tokens, group_name,
-                    compression_threshold, supports_tool_calling,
+                    compression_threshold, source, supports_tool_calling,
                     supports_structured_output, supported_input_modalities_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(model_id) DO UPDATE SET
                     context_window = excluded.context_window,
                     max_output_tokens = excluded.max_output_tokens,
                     group_name = excluded.group_name,
                     compression_threshold = excluded.compression_threshold,
+                    source = excluded.source,
                     supports_tool_calling = excluded.supports_tool_calling,
                     supports_structured_output = excluded.supports_structured_output,
                     supported_input_modalities_json = excluded.supported_input_modalities_json
@@ -449,6 +451,7 @@ class SqliteLlmModelRegistryRepository:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA foreign_keys=ON")
             conn.executescript(_SCHEMA)
+            _migrate_schema(conn)
             conn.commit()
             self._conn = conn
             self._db_path = db_path
@@ -575,6 +578,7 @@ def _model_metadata_to_row(metadata: LlmModelMetadata) -> tuple[Any, ...]:
         metadata.max_output_tokens,
         metadata.group,
         metadata.compression_threshold,
+        metadata.source,
         _bool_to_int(metadata.supports_tool_calling),
         _bool_to_int(metadata.supports_structured_output),
         _json_dumps(list(metadata.supported_input_modalities)),
@@ -588,10 +592,23 @@ def _row_to_model_metadata(row: tuple[Any, ...]) -> LlmModelMetadata:
         max_output_tokens=int(row[2]),
         group=str(row[3]),
         compression_threshold=int(row[4]) if row[4] is not None else None,
-        supports_tool_calling=bool(row[5]),
-        supports_structured_output=bool(row[6]),
-        supported_input_modalities=tuple(str(item) for item in _json_loads_list(row[7])),
+        source=str(row[5] or "custom"),
+        supports_tool_calling=bool(row[6]),
+        supports_structured_output=bool(row[7]),
+        supported_input_modalities=tuple(str(item) for item in _json_loads_list(row[8])),
     )
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(llm_model_metadata)").fetchall()
+    }
+    if "source" not in columns:
+        conn.execute(
+            "ALTER TABLE llm_model_metadata "
+            "ADD COLUMN source TEXT NOT NULL DEFAULT 'custom'"
+        )
 
 
 def _bool_to_int(value: bool) -> int:

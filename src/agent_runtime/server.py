@@ -66,6 +66,12 @@ def create_app() -> FastAPI:
     from agent_runtime.llm_http_trace.north_gateway.llm_http_trace_rest_adapter import (
         create_llm_http_trace_router,
     )
+    from agent_runtime.image_generation.north_gateway.image_generation_rest_adapter import (
+        create_image_generation_router,
+    )
+    from agent_runtime.image_generation.service import ImageGenerationService
+    from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
+    from agent_runtime.file_resource.shared_service import get_file_resource_service
     from agent_runtime.system_settings.system_settings_factory import (
         SystemSettingsFactory,
     )
@@ -139,6 +145,13 @@ def create_app() -> FastAPI:
         communication_gateway=communication_gateway,
     )
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
+    image_generation_service = ImageGenerationService(
+        settings_repository=ImageGenerationSettingsRepository(
+            lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+        ),
+        llm_registry_gateway=llm_model_registry_gateway,
+        file_resource_service=get_file_resource_service(),
+    )
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     codex_oauth_service.ensure_builtin_provider()
     codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
@@ -387,6 +400,11 @@ def create_app() -> FastAPI:
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
+    )
+    app.include_router(
+        create_image_generation_router(image_generation_service),
+        prefix="/api/image-generation",
+        tags=["图片生成"],
     )
     app.include_router(
         create_codex_oauth_router(codex_oauth_service),

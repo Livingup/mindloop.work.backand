@@ -67,6 +67,7 @@ class LlmModelMetadataResponse(BaseModel):
     context_window: int
     max_output_tokens: int
     group: str = "default"
+    source: str = "custom"
     compression_threshold: int | None = None
     supports_tool_calling: bool = False
     supports_structured_output: bool = False
@@ -418,6 +419,7 @@ def _body_to_model_request(
         context_window=body.context_window,
         max_output_tokens=body.max_output_tokens,
         group=body.group,
+        source="custom",
         compression_threshold=body.compression_threshold,
         supports_tool_calling=body.supports_tool_calling,
         supports_structured_output=body.supports_structured_output,

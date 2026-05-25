@@ -14,6 +14,11 @@ from agent_runtime.llm_model_registry.llm_registry_validation import (
  )
 
 
+LLM_MODEL_SOURCE_BUILTIN = "builtin"
+LLM_MODEL_SOURCE_CUSTOM = "custom"
+SUPPORTED_LLM_MODEL_SOURCES = frozenset({LLM_MODEL_SOURCE_BUILTIN, LLM_MODEL_SOURCE_CUSTOM})
+
+
 @dataclass(frozen=True, slots=True)
 class LlmModelMetadata:
     """LLM 模型型号元数据聚合根。
@@ -33,6 +38,7 @@ class LlmModelMetadata:
     max_output_tokens: int
 
     group: str = "default"
+    source: str = LLM_MODEL_SOURCE_CUSTOM
 
     # 会话压缩触发阈值。为空时表示该模型不声明专属阈值，由调用方使用系统默认策略。
     compression_threshold: int | None = None
@@ -55,6 +61,10 @@ class LlmModelMetadata:
         validate_positive_int(self.max_output_tokens, "max_output_tokens")
         validate_optional_text(self.group, "group")
         object.__setattr__(self, "group", self.group.strip())
+        source = str(self.source).strip().lower()
+        if source not in SUPPORTED_LLM_MODEL_SOURCES:
+            raise ValueError("source must be one of: " + ", ".join(sorted(SUPPORTED_LLM_MODEL_SOURCES)))
+        object.__setattr__(self, "source", source)
         if self.compression_threshold is not None:
             validate_positive_int(self.compression_threshold, "compression_threshold")
             if self.compression_threshold > self.context_window:
@@ -72,6 +82,7 @@ class LlmModelMetadata:
             "context_window": self.context_window,
             "max_output_tokens": self.max_output_tokens,
             "group": self.group,
+            "source": self.source,
             "supports_tool_calling": self.supports_tool_calling,
             "supports_structured_output": self.supports_structured_output,
             "supported_input_modalities": list(self.supported_input_modalities),
@@ -88,6 +99,7 @@ class LlmModelMetadata:
             context_window=int(data.get("context_window", 0)),
             max_output_tokens=int(data.get("max_output_tokens", 0)),
             group=str(data.get("group") or "default"),
+            source=str(data.get("source") or LLM_MODEL_SOURCE_CUSTOM),
             compression_threshold=(
                 int(data["compression_threshold"])
                 if data.get("compression_threshold") is not None else None
