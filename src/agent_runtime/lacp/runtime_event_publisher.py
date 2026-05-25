@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from typing import Any
@@ -11,6 +12,7 @@ from agent_runtime.lacp.models import LacpExecutionObservation
 from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
 
 logger = logging.getLogger(__name__)
+_COMPOSITE_PUBLISHER_TIMEOUT_SECONDS = 5.0
 
 LACP_OBSERVATION_EVENT_TYPES = frozenset({
     "agent.task.started",
@@ -50,14 +52,24 @@ class CompositeRuntimeEventPublisher:
     ) -> None:
         for publisher in self._publishers:
             try:
-                await publisher.publish(
-                    context,
+                await asyncio.wait_for(
+                    publisher.publish(
+                        context,
+                        event_type,
+                        payload,
+                        source=source,
+                        correlation_id=correlation_id,
+                        parent_message_id=parent_message_id,
+                        metadata=metadata,
+                    ),
+                    timeout=_COMPOSITE_PUBLISHER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Runtime event publisher timed out: event_type=%s publisher=%s timeout_seconds=%s",
                     event_type,
-                    payload,
-                    source=source,
-                    correlation_id=correlation_id,
-                    parent_message_id=parent_message_id,
-                    metadata=metadata,
+                    publisher.__class__.__name__,
+                    _COMPOSITE_PUBLISHER_TIMEOUT_SECONDS,
                 )
             except Exception:
                 logger.exception("Runtime event publisher failed: event_type=%s publisher=%s", event_type, publisher.__class__.__name__)

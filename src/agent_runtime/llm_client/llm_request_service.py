@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import re
 import time
@@ -53,6 +54,7 @@ _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
     "llm.tool_call.arguments.delta",
     "llm.tool_call.arguments.completed",
 }
+logger = logging.getLogger(__name__)
 
 
 class LlmRequestService:
@@ -715,22 +717,63 @@ def _build_stream_event_handler(
             )
         for publish_event_type, publish_payload in events_to_publish:
             _notify_request_observer(request_event_observer, publish_event_type, publish_payload)
-            future = asyncio.run_coroutine_threadsafe(
-                publisher.publish(
-                    context,
-                    publish_event_type,
-                    publish_payload,
-                    source="llm_client",
-                    metadata={"conversation_id": conversation_id},
-                ),
-                event_loop,
+            _schedule_runtime_event_publish(
+                publisher=publisher,
+                context=context,
+                event_type=publish_event_type,
+                payload=publish_payload,
+                event_loop=event_loop,
+                conversation_id=conversation_id,
             )
-            try:
-                future.result()
-            except Exception:
-                pass
 
     return handle
+
+
+def _schedule_runtime_event_publish(
+    *,
+    publisher: RuntimeEventPublisher,
+    context: Any,
+    event_type: str,
+    payload: dict[str, Any],
+    event_loop: asyncio.AbstractEventLoop,
+    conversation_id: str,
+) -> None:
+    if event_loop.is_closed():
+        logger.warning("运行时事件发布被跳过，event loop 已关闭: event_type=%s", event_type)
+        return
+    coro = publisher.publish(
+        context,
+        event_type,
+        payload,
+        source="llm_client",
+        metadata={"conversation_id": conversation_id},
+    )
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is event_loop:
+        task = event_loop.create_task(coro)
+
+        def on_done(done_task: asyncio.Task[None]) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("异步运行时事件发布失败: event_type=%s", event_type)
+
+        task.add_done_callback(on_done)
+        return
+    future = asyncio.run_coroutine_threadsafe(coro, event_loop)
+
+    def on_threadsafe_done(done_future: Any) -> None:
+        try:
+            done_future.result()
+        except Exception:
+            logger.exception("跨线程运行时事件发布失败: event_type=%s", event_type)
+
+    future.add_done_callback(on_threadsafe_done)
 
 
 def _apply_render_side_effects(conversation: Any, api_format: str, rendered_messages: Any) -> None:

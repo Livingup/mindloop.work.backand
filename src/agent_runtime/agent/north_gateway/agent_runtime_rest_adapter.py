@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -313,6 +313,7 @@ def create_agent_runtime_router(
     chat_bubble_service: ChatBubbleService | None = None,
     conversation_repository: ConversationRepository | None = None,
     communication_gateway: CommunicationGateway | None = None,
+    runtime_health_snapshot: Callable[[], dict[str, Any]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -608,6 +609,7 @@ def create_agent_runtime_router(
         )
         evidence = {
             "frontend": frontend_snapshot,
+            "backend_control_plane": runtime_health_snapshot() if runtime_health_snapshot is not None else None,
             "backend_instance": _agent_instance_diagnostics(instance) if instance is not None else None,
             "backend_task": _agent_task_diagnostics(task) if task is not None else None,
             "backend_instance_error": instance_error,
@@ -829,6 +831,7 @@ def _analyze_scene_diagnostics(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     matched: list[dict[str, Any]] = []
     frontend = _dict_value(evidence.get("frontend"))
+    control_plane = _dict_value(evidence.get("backend_control_plane"))
     backend_instance = _dict_value(evidence.get("backend_instance"))
     runtime = _dict_value(evidence.get("backend_runtime"))
     communication = _dict_value(evidence.get("communication"))
@@ -843,6 +846,19 @@ def _analyze_scene_diagnostics(
         or _int_or_none(frontend.get("last_seq"))
         or _int_or_none(frontend.get("cursor"))
     )
+    event_loop = _dict_value(control_plane.get("event_loop"))
+    event_loop_status = _optional_text(event_loop.get("status"))
+    blocked_tick_count = _int_or_none(event_loop.get("blocked_tick_count")) or 0
+    max_lag_ms = _int_or_none(event_loop.get("max_lag_ms")) or 0
+
+    if event_loop_status in {"blocked_recently", "slow_recently"} or blocked_tick_count > 0 or max_lag_ms >= 2000:
+        matched.append(_diagnostic_rule("backend_control_plane_lag", "后端控制面 event loop 出现明显调度延迟。"))
+        return _diagnosis(
+            "backend_control_plane_lag",
+            "error" if event_loop_status == "blocked_recently" or blocked_tick_count > 0 else "warning",
+            "后端控制面调度延迟",
+            f"后端 event loop maxLag={max_lag_ms}ms，blockedTicks={blocked_tick_count}，status={event_loop_status or 'unknown'}。",
+        ), matched
 
     if evidence.get("backend_instance_error"):
         matched.append(_diagnostic_rule("backend_instance_missing", "后端没有找到当前 Agent 实例或任务。"))

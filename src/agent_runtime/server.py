@@ -106,6 +106,7 @@ def create_app() -> FastAPI:
     from agent_runtime.codex_oauth.north_gateway.local_callback_server import (
         CodexOAuthLocalCallbackServer,
     )
+    from agent_runtime.runtime_health import EventLoopLagMonitor
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -149,6 +150,9 @@ def create_app() -> FastAPI:
     lacp_settings_repository = LacpFactory.create_settings_repository()
     terminal_gateway = TerminalFactory.create()
     system_settings_gateway = SystemSettingsFactory.create()
+    event_loop_monitor = EventLoopLagMonitor()
+    runtime_loop: asyncio.AbstractEventLoop | None = None
+    detach_tasks: set[asyncio.Task[None]] = set()
 
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
     from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
@@ -170,9 +174,10 @@ def create_app() -> FastAPI:
         except Exception:
             return True
 
-    def _on_scene_session_expired(session) -> None:
+    async def _detach_expired_scene(session) -> None:
         try:
-            agent_runtime_gateway.detach_scene(
+            await asyncio.to_thread(
+                agent_runtime_gateway.detach_scene,
                 session.scene_id,
                 DetachSceneRequest(workspace_path=session.workspace_path),
             )
@@ -182,6 +187,30 @@ def create_app() -> FastAPI:
                 session.scene_id,
             )
 
+    def _schedule_detach_expired_scene(session) -> None:
+        task = asyncio.create_task(
+            _detach_expired_scene(session),
+            name=f"scene-session-expired-detach-{session.scene_id}",
+        )
+        detach_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[None]) -> None:
+            detach_tasks.discard(done_task)
+            with suppress(asyncio.CancelledError):
+                done_task.result()
+
+        task.add_done_callback(_on_done)
+
+    def _on_scene_session_expired(session) -> None:
+        loop = runtime_loop
+        if loop is None or loop.is_closed():
+            logger.warning("Scene 自动关闭已跳过，runtime event loop 不可用: scene_id=%s", session.scene_id)
+            return
+        try:
+            loop.call_soon_threadsafe(_schedule_detach_expired_scene, session)
+        except RuntimeError:
+            logger.exception("Scene 自动关闭调度失败: scene_id=%s", session.scene_id)
+
     scene_session_registry = SceneSessionRegistry(
         on_expired=_on_scene_session_expired,
         can_expire=_can_scene_expire,
@@ -189,6 +218,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        nonlocal runtime_loop
+
         async def auto_connect_mcp_services() -> None:
             logger.info("正在调度已启用 MCP 服务的后台连接…")
             try:
@@ -200,6 +231,8 @@ def create_app() -> FastAPI:
             except (Exception, asyncio.CancelledError) as e:
                 logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
 
+        runtime_loop = asyncio.get_running_loop()
+        event_loop_monitor.start()
         scene_session_registry.start()
         codex_oauth_callback_server.start()
         auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
@@ -207,6 +240,13 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            scene_session_registry.stop()
+            for task in tuple(detach_tasks):
+                task.cancel()
+            for task in tuple(detach_tasks):
+                with suppress(Exception, asyncio.CancelledError):
+                    await task
+            detach_tasks.clear()
             if not auto_connect_task.done():
                 auto_connect_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):
@@ -218,13 +258,14 @@ def create_app() -> FastAPI:
             await lacp_client.shutdown()
             await mcp_gateway.shutdown()
             codex_oauth_callback_server.stop()
-            scene_session_registry.stop()
+            await event_loop_monitor.stop()
+            runtime_loop = None
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
 
     @app.get("/api/health")
-    def health_check() -> dict[str, str]:
-        return {"status": "ok"}
+    def health_check() -> dict[str, object]:
+        return {"status": "ok", "event_loop": event_loop_monitor.snapshot()}
 
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
@@ -267,6 +308,7 @@ def create_app() -> FastAPI:
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
             communication_gateway=communication_gateway,
+            runtime_health_snapshot=event_loop_monitor.snapshot,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],

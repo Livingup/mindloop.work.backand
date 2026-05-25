@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
+from threading import RLock
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
@@ -50,6 +51,7 @@ class CommunicationService:
         self._event_hub = event_hub
 
         self._stream_cache: dict[str, CommunicationStream] = {}
+        self._stream_cache_lock = RLock()
 
     def create_stream(
         self,
@@ -70,19 +72,22 @@ class CommunicationService:
             metadata=dict(metadata or {}),
         )
         created = self._repository.create_stream(stream)
-        self._stream_cache[created.stream_id] = created
+        with self._stream_cache_lock:
+            self._stream_cache[created.stream_id] = created
         return created
 
     def get_stream(self, stream_id: str) -> CommunicationStream:
         """按 stream_id 获取通信流。"""
         _require_non_blank(stream_id, "stream_id")
-        cached = self._stream_cache.get(stream_id)
+        with self._stream_cache_lock:
+            cached = self._stream_cache.get(stream_id)
         if cached is not None:
             return cached
         stream = self._repository.get_stream(stream_id)
         if stream is None:
             raise KeyError(f"通信流不存在: {stream_id}")
-        self._stream_cache[stream_id] = stream
+        with self._stream_cache_lock:
+            self._stream_cache[stream_id] = stream
         return stream
 
     def close_stream(self, stream_id: str) -> CommunicationStream:
@@ -90,7 +95,8 @@ class CommunicationService:
         stream = self.get_stream(stream_id)
         closed = stream.close()
         saved = self._repository.save_stream(closed)
-        self._stream_cache[saved.stream_id] = saved
+        with self._stream_cache_lock:
+            self._stream_cache[saved.stream_id] = saved
         return saved
 
     async def publish_message(
@@ -118,22 +124,19 @@ class CommunicationService:
         )
         _require_non_blank(stream_id, "stream_id")
         _require_non_blank(message_type, "message_type")
-        stream = self.get_stream(stream_id)
-        stream.ensure_active()
-        message = CommunicationMessage(
-            message_id=message_id or _new_id("message"),
-            stream_id=stream.stream_id,
-            seq=0,
-            type=message_type,
-            topic=topic or stream.topic,
+        saved = await asyncio.to_thread(
+            self._append_message_sync,
+            stream_id=stream_id,
+            message_type=message_type,
+            payload=payload,
+            topic=topic,
             source=source,
             actor_id=actor_id,
             correlation_id=correlation_id,
             parent_message_id=parent_message_id,
-            payload=dict(payload or {}),
-            metadata=dict(metadata or {}),
+            metadata=metadata,
+            message_id=message_id,
         )
-        saved = self._repository.append_message(message)
         await self._event_hub.publish(saved)
         duration_seconds = time.perf_counter() - started_at
         if duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
@@ -208,14 +211,15 @@ class CommunicationService:
     ) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
-        self.get_stream(stream_id)
+        await asyncio.to_thread(self.get_stream, stream_id)
         cursor = max(after_seq, 0)
         subscription = self._event_hub.subscribe(stream_id, after_seq=cursor)
         next_live_message = asyncio.create_task(anext(subscription))
         await asyncio.sleep(0)
         try:
             while True:
-                replay_messages = self._repository.list_messages(
+                replay_messages = await asyncio.to_thread(
+                    self._repository.list_messages,
                     stream_id,
                     after_seq=cursor,
                     limit=5000,
@@ -235,7 +239,8 @@ class CommunicationService:
                 if message.seq <= cursor:
                     continue
                 if message.seq > cursor + 1:
-                    gap_messages = self._repository.list_messages(
+                    gap_messages = await asyncio.to_thread(
+                        self._repository.list_messages,
                         stream_id,
                         after_seq=cursor,
                         limit=5000,
@@ -256,3 +261,34 @@ class CommunicationService:
             with suppress(asyncio.CancelledError):
                 await next_live_message
             await subscription.aclose()
+
+    def _append_message_sync(
+        self,
+        *,
+        stream_id: str,
+        message_type: str,
+        payload: dict[str, Any] | None,
+        topic: str | None,
+        source: str | None,
+        actor_id: str | None,
+        correlation_id: str | None,
+        parent_message_id: str | None,
+        metadata: dict[str, Any] | None,
+        message_id: str | None,
+    ) -> CommunicationMessage:
+        stream = self.get_stream(stream_id)
+        stream.ensure_active()
+        message = CommunicationMessage(
+            message_id=message_id or _new_id("message"),
+            stream_id=stream.stream_id,
+            seq=0,
+            type=message_type,
+            topic=topic or stream.topic,
+            source=source,
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            parent_message_id=parent_message_id,
+            payload=dict(payload or {}),
+            metadata=dict(metadata or {}),
+        )
+        return self._repository.append_message(message)
