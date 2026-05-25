@@ -206,6 +206,7 @@ def create_llm_model_registry_router(
     gateway: LlmModelRegistryGateway,
     builtin_provider_ids: set[str] | None = None,
     api_formats: tuple[LlmApiFormat, ...] | None = None,
+    unsupported_input_modality_strategies: tuple[str, ...] | None = None,
 ) -> APIRouter:
     """根据网关实例创建 LLM 注册 REST API 路由。
 
@@ -218,6 +219,11 @@ def create_llm_model_registry_router(
     router = APIRouter()
     readonly_provider_ids = _BUILTIN_PROVIDER_IDS if builtin_provider_ids is None else builtin_provider_ids
     supported_api_formats = SUPPORTED_LLM_API_FORMATS if api_formats is None else api_formats
+    supported_unsupported_input_modality_strategies = (
+        SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES
+        if unsupported_input_modality_strategies is None
+        else frozenset(unsupported_input_modality_strategies)
+    )
 
     @router.get("/metadata", response_model=LlmRegistryMetadataResponse)
     def get_registry_metadata() -> LlmRegistryMetadataResponse:
@@ -225,7 +231,7 @@ def create_llm_model_registry_router(
             api_formats=list(supported_api_formats),
             input_modalities=sorted(SUPPORTED_INPUT_MODALITIES),
             unsupported_input_modality_strategies=sorted(
-                SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES
+                supported_unsupported_input_modality_strategies
             ),
         )
 
@@ -327,6 +333,12 @@ def create_llm_model_registry_router(
         policy_group_id: str,
         body: LlmExecutionPolicyBody,
     ) -> LlmExecutionPolicyResponse:
+        if body.unsupported_input_modality_strategy not in supported_unsupported_input_modality_strategies:
+            raise HTTPException(
+                status_code=400,
+                detail="执行策略包含当前 Registry 不支持的输入模态不兼容处理策略: "
+                + body.unsupported_input_modality_strategy,
+            )
         try:
             policy = gateway.save_execution_policy(
                 _body_to_execution_policy_request(policy_group_id, body)
