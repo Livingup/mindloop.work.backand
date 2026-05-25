@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
@@ -17,6 +18,10 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
     CreateCommunicationStreamRequest,
     PublishCommunicationMessageRequest,
+)
+from agent_runtime.runtime_network_monitor import (
+    new_network_trace_id,
+    runtime_network_monitor,
 )
 
 
@@ -167,6 +172,8 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
         after_seq: int = Query(default=0, ge=0),
     ) -> StreamingResponse:
         """通过 SSE 订阅通信流消息。"""
+        trace_id = request.headers.get("x-network-trace-id") or request.query_params.get("network_trace_id") or new_network_trace_id("sse")
+        started_at = time.perf_counter()
         try:
             gateway.get_stream(stream_id)
         except KeyError:
@@ -174,8 +181,22 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
         effective_after_seq = max(after_seq, _last_event_id_to_seq(request.headers.get("last-event-id")))
 
         async def event_generator() -> AsyncIterator[str]:
+            active_sse = runtime_network_monitor.begin_sse_connection()
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "sse.subscribe.start",
+                "trace_id": trace_id,
+                "stream_id": stream_id,
+                "after_seq": effective_after_seq,
+                "active_sse_connections": active_sse,
+                **runtime_network_monitor.snapshot(),
+            })
             subscription = gateway.subscribe_messages(stream_id, after_seq=effective_after_seq)
             next_message = asyncio.create_task(anext(subscription))
+            sent_count = 0
+            keepalive_count = 0
+            first_event_recorded = False
+            close_reason = "completed"
             try:
                 while True:
                     done, _pending = await asyncio.wait(
@@ -184,18 +205,63 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if await request.is_disconnected():
+                        close_reason = "client_disconnected"
                         return
                     if done:
                         message = next_message.result()
+                        sent_count += 1
+                        if not first_event_recorded:
+                            first_event_recorded = True
+                            runtime_network_monitor.record({
+                                "layer": "backend",
+                                "type": "sse.first_event",
+                                "trace_id": trace_id,
+                                "stream_id": stream_id,
+                                "after_seq": effective_after_seq,
+                                "first_seq": message.seq,
+                                "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                                **runtime_network_monitor.snapshot(),
+                            })
                         yield _format_sse_message(message)
                         next_message = asyncio.create_task(anext(subscription))
                     else:
+                        keepalive_count += 1
                         yield ": keep-alive\n\n"
+            except Exception as exc:
+                close_reason = exc.__class__.__name__
+                runtime_network_monitor.record({
+                    "layer": "backend",
+                    "type": "sse.stream.error",
+                    "trace_id": trace_id,
+                    "stream_id": stream_id,
+                    "after_seq": effective_after_seq,
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                    "sent_count": sent_count,
+                    "keepalive_count": keepalive_count,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                    **runtime_network_monitor.snapshot(),
+                })
+                raise
             finally:
                 next_message.cancel()
                 with suppress(asyncio.CancelledError):
                     await next_message
                 await subscription.aclose()
+                active_after = runtime_network_monitor.end_sse_connection()
+                runtime_network_monitor.record({
+                    "layer": "backend",
+                    "type": "sse.close",
+                    "trace_id": trace_id,
+                    "stream_id": stream_id,
+                    "after_seq": effective_after_seq,
+                    "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                    "sent_count": sent_count,
+                    "keepalive_count": keepalive_count,
+                    "close_reason": close_reason,
+                    "active_sse_connections": active_after,
+                    **runtime_network_monitor.snapshot(),
+                })
 
         return StreamingResponse(
             event_generator(),

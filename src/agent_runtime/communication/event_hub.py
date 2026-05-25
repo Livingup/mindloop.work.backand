@@ -10,6 +10,7 @@ from threading import RLock
 from typing import AsyncIterator
 
 from agent_runtime.communication.communication_message import CommunicationMessage
+from agent_runtime.runtime_network_monitor import runtime_network_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,16 @@ class InMemoryCommunicationEventHub:
         for queue in overflow_queues:
             _signal_subscriber_overflow(queue)
         if overflow_queues:
+            queue_full_total = runtime_network_monitor.event_hub_queue_full(len(overflow_queues))
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "event_hub.queue_full",
+                "stream_id": saved.stream_id,
+                "seq": saved.seq,
+                "overflow_subscribers": len(overflow_queues),
+                "event_hub_queue_full_count": queue_full_total,
+                **runtime_network_monitor.snapshot(),
+            })
             logger.warning(
                 "通信事件订阅队列已满，已断开慢订阅者: stream_id=%s, overflow_subscribers=%s, seq=%s",
                 saved.stream_id,
@@ -119,6 +130,16 @@ class InMemoryCommunicationEventHub:
                 if message.seq > actual_after_seq
             ]
             state.subscribers.add(queue)
+        active_subscribers = runtime_network_monitor.event_hub_subscribed()
+        runtime_network_monitor.record({
+            "layer": "backend",
+            "type": "event_hub.subscribe",
+            "stream_id": stream_id,
+            "after_seq": actual_after_seq,
+            "replay_count": len(replay_messages),
+            "event_hub_subscribers": active_subscribers,
+            **runtime_network_monitor.snapshot(),
+        })
         try:
             for message in replay_messages:
                 yield message
@@ -130,6 +151,14 @@ class InMemoryCommunicationEventHub:
         finally:
             with state.lock:
                 state.subscribers.discard(queue)
+            active_subscribers = runtime_network_monitor.event_hub_unsubscribed()
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "event_hub.unsubscribe",
+                "stream_id": stream_id,
+                "event_hub_subscribers": active_subscribers,
+                **runtime_network_monitor.snapshot(),
+            })
 
     def _state_for(self, stream_id: str) -> _StreamEventState:
         with self._states_lock:

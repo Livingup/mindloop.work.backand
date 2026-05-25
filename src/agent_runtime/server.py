@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -107,6 +108,10 @@ def create_app() -> FastAPI:
         CodexOAuthLocalCallbackServer,
     )
     from agent_runtime.runtime_health import EventLoopLagMonitor
+    from agent_runtime.runtime_network_monitor import (
+        new_network_trace_id,
+        runtime_network_monitor,
+    )
 
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
@@ -233,6 +238,7 @@ def create_app() -> FastAPI:
 
         runtime_loop = asyncio.get_running_loop()
         event_loop_monitor.start()
+        runtime_network_monitor.start()
         scene_session_registry.start()
         codex_oauth_callback_server.start()
         auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
@@ -259,13 +265,72 @@ def create_app() -> FastAPI:
             await mcp_gateway.shutdown()
             codex_oauth_callback_server.stop()
             await event_loop_monitor.stop()
+            runtime_network_monitor.stop()
             runtime_loop = None
 
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
 
+    @app.middleware("http")
+    async def network_monitoring_middleware(request, call_next):
+        if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+        trace_id = request.headers.get("x-network-trace-id") or request.query_params.get("network_trace_id") or new_network_trace_id("http")
+        started_at = time.perf_counter()
+        active_http = runtime_network_monitor.begin_http_request()
+        path = _safe_network_path(str(request.url.path), dict(request.query_params))
+        should_record_start = _is_key_network_path(path)
+        if should_record_start:
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "http.request.start",
+                "trace_id": trace_id,
+                "method": request.method,
+                "path": path,
+                "active_http_requests": active_http,
+                **runtime_network_monitor.snapshot(),
+            })
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            active_after = runtime_network_monitor.end_http_request()
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "http.request.error",
+                "trace_id": trace_id,
+                "method": request.method,
+                "path": path,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                "active_http_requests": active_after,
+                "event_loop": event_loop_monitor.snapshot(),
+                "error_type": exc.__class__.__name__,
+                "error_message": str(exc),
+            })
+            raise
+        active_after = runtime_network_monitor.end_http_request()
+        duration_ms = round((time.perf_counter() - started_at) * 1000)
+        if should_record_start or duration_ms >= 1000 or response.status_code >= 400:
+            runtime_network_monitor.record({
+                "layer": "backend",
+                "type": "http.request.end",
+                "trace_id": trace_id,
+                "method": request.method,
+                "path": path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+                "active_http_requests": active_after,
+                "event_loop": event_loop_monitor.snapshot(),
+                **runtime_network_monitor.snapshot(),
+            })
+        response.headers["x-network-trace-id"] = trace_id
+        return response
+
     @app.get("/api/health")
     def health_check() -> dict[str, object]:
-        return {"status": "ok", "event_loop": event_loop_monitor.snapshot()}
+        return {
+            "status": "ok",
+            "event_loop": event_loop_monitor.snapshot(),
+            "network": runtime_network_monitor.snapshot(),
+        }
 
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
@@ -374,6 +439,25 @@ def create_app() -> FastAPI:
         tags=["Scene Terminal"],
     )
     return app
+
+
+def _safe_network_path(path: str, query_params: dict[str, object]) -> str:
+    allowed_keys = ("after_seq", "limit", "latest", "network_trace_id")
+    safe_params = []
+    for key in allowed_keys:
+        value = query_params.get(key)
+        if value is not None:
+            safe_params.append(f"{key}={value}")
+    return f"{path}?{'&'.join(safe_params)}" if safe_params else path
+
+
+def _is_key_network_path(path: str) -> bool:
+    return (
+        path == "/api/health"
+        or "diagnostics" in path
+        or "attach" in path
+        or "/events" in path
+    )
 
 
 def run_server(
