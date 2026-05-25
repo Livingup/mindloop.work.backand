@@ -516,9 +516,21 @@ class AgentExecutionEngine:
         communication_context = self._build_communication_context(request, task, instance)
         if request.communication_stream_id != communication_context.stream_id:
             request = replace(request, communication_stream_id=communication_context.stream_id)
+        active_in_memory = (
+            instance.instance_id in self._active_instance_ids
+            or instance.instance_id in self._active_execution_handles
+        )
+        if instance.status == AGENT_INSTANCE_STATUS_RUNNING and not active_in_memory:
+            failure_message = "检测到 Agent 实例持久态为 running，但当前进程没有对应执行任务，已恢复为 ready。"
+            logger.warning(
+                "恢复孤儿 Agent 运行态: instance_id=%s, task_id=%s",
+                instance.instance_id,
+                task.task_id,
+            )
+            instance = self._runtime_gateway.interrupt_agent_instance(instance.instance_id, failure_message)
         is_running = (
             instance.status == AGENT_INSTANCE_STATUS_RUNNING
-            or instance.instance_id in self._active_instance_ids
+            or active_in_memory
         )
         if is_running:
             logger.info(
@@ -527,7 +539,7 @@ class AgentExecutionEngine:
                 task.task_id,
                 pending_message.message_id,
                 instance.status,
-                instance.instance_id in self._active_instance_ids,
+                active_in_memory,
             )
             return AgentMessageSubmissionResult(
                 status="queued",
@@ -611,9 +623,16 @@ class AgentExecutionEngine:
                 conversation_id=None,
                 phase="execution_cancelled",
             )
+            self._recover_agent_instance_after_background_exit(
+                instance_id,
+                "Agent 后台执行任务被取消。",
+                error_type="CancelledError",
+            )
+            return
         with suppress(asyncio.CancelledError):
             exc = task.exception()
             if exc is not None:
+                failure_message = str(exc) or exc.__class__.__name__
                 self._set_execution_phase(
                     task_id="",
                     instance_id=instance_id,
@@ -622,12 +641,42 @@ class AgentExecutionEngine:
                     phase="execution_failed",
                     metadata={
                         "error_type": exc.__class__.__name__,
-                        "error_message": str(exc),
+                        "error_message": failure_message,
                     },
                 )
                 logger.error("Agent 后台执行失败。", exc_info=(type(exc), exc, exc.__traceback__))
+                self._recover_agent_instance_after_background_exit(
+                    instance_id,
+                    failure_message,
+                    error_type=exc.__class__.__name__,
+                )
+                if _is_process_control_exception(exc):
+                    raise exc
                 return
             logger.info("Agent 后台执行结束: instance_id=%s", instance_id)
+
+    def _recover_agent_instance_after_background_exit(
+        self,
+        instance_id: str,
+        failure_message: str,
+        *,
+        error_type: str,
+    ) -> None:
+        try:
+            instance = self._runtime_gateway.get_agent_instance(instance_id)
+        except Exception:
+            logger.exception("读取异常结束的 Agent 实例失败: instance_id=%s", instance_id)
+            return
+        if instance.status != AGENT_INSTANCE_STATUS_RUNNING:
+            return
+        try:
+            self._runtime_gateway.interrupt_agent_instance(instance_id, failure_message)
+        except Exception:
+            logger.exception(
+                "恢复异常结束的 Agent 实例状态失败: instance_id=%s, error_type=%s",
+                instance_id,
+                error_type,
+            )
 
     async def _run_agent_instance(
         self,
@@ -673,6 +722,10 @@ class AgentExecutionEngine:
                 phase="load_conversation",
             )
             conversation = await self._load_or_create_conversation(instance, request)
+            await self._repair_unmatched_tool_results(
+                conversation,
+                reason="previous_execution_interrupted",
+            )
             communication_context = communication_context.with_metadata(conversation_id=conversation.id)
             self._touch_execution_progress(instance.instance_id, metadata={"conversation_id": conversation.id})
 
@@ -955,8 +1008,12 @@ class AgentExecutionEngine:
                     continue
 
             raise RuntimeError("Agent 执行循环异常结束。")
-        except Exception as exc:
-            failure_message = str(exc)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
+            failure_message = str(exc) or exc.__class__.__name__
             self._set_execution_phase(
                 task_id=task.task_id,
                 instance_id=instance.instance_id,
@@ -1020,6 +1077,44 @@ class AgentExecutionEngine:
                 communication_stream_id=communication_context.stream_id,
             )
 
+    async def _repair_unmatched_tool_results(
+        self,
+        conversation: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        if not conversation.messages:
+            return False
+        last_message = conversation.messages[-1]
+        if last_message.role != "assistant":
+            return False
+        tool_uses = _extract_tool_uses(last_message)
+        if not tool_uses:
+            return False
+        tool_message = UniMessage(
+            role=ROLE_TOOL,
+            content=[
+                ToolResultPart(
+                    tool_use_ref=_tool_use_ref(tool_use),
+                    is_error=True,
+                    output=(
+                        "Tool execution did not complete because the previous Agent execution was interrupted. "
+                        f"reason={reason}; tool_name={tool_use.name}"
+                    ),
+                )
+                for tool_use in tool_uses
+            ],
+        )
+        conversation.append_message(tool_message)
+        await self._conversation_repository.save(conversation)
+        logger.warning(
+            "修复未匹配的工具结果消息: conversation_id=%s, tool_count=%s, reason=%s",
+            getattr(conversation, "id", None),
+            len(tool_uses),
+            reason,
+        )
+        return True
+
     async def _resume_from_pending_user_messages(
         self,
         *,
@@ -1081,6 +1176,10 @@ class AgentExecutionEngine:
             instance_id=current_instance.instance_id,
         )
         next_conversation = await self._load_or_create_conversation(current_instance, next_request)
+        await self._repair_unmatched_tool_results(
+            next_conversation,
+            reason="previous_execution_interrupted",
+        )
         next_context = next_context.with_metadata(conversation_id=next_conversation.id)
         return current_task, current_instance, next_request, next_conversation, next_context, next_trace_path
 
@@ -1678,11 +1777,22 @@ class AgentExecutionEngine:
                     actor_id=tool_use.name,
                 ),
             )
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
             tool_call_id = _tool_use_ref(tool_use)
+            error_message = str(exc) or exc.__class__.__name__
+            logger.exception(
+                "Agent 工具调用异常，已转换为工具错误结果: tool=%s, error_type=%s, error_message=%s",
+                tool_use.name,
+                exc.__class__.__name__,
+                error_message,
+            )
             tool_result = build_tool_error_result(
                 error_code=exc.__class__.__name__,
-                error_message=str(exc),
+                error_message=error_message,
             )
             return ToolDispatchResult(
                 tool_name=tool_use.name,
@@ -1740,8 +1850,17 @@ class AgentExecutionEngine:
             tasks.append((tool_use, tool_task))
         if tasks:
             try:
-                running_results = await asyncio.gather(*(task for _tool_use, task in tasks))
-                for result in running_results:
+                running_results = await asyncio.gather(
+                    *(task for _tool_use, task in tasks),
+                    return_exceptions=True,
+                )
+                for (tool_use, _task), result in zip(tasks, running_results):
+                    if isinstance(result, BaseException):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if _is_process_control_exception(result):
+                            raise result
+                        result = self._build_exception_tool_dispatch_result(tool_use, result)
                     results_by_ref[result.result_part.tool_use_ref] = result
             finally:
                 if instance_id:
@@ -1759,6 +1878,28 @@ class AgentExecutionEngine:
             int((time.perf_counter() - started_at) * 1000),
         )
         return UniMessage(role=ROLE_TOOL, content=result_parts), tool_results
+
+    def _build_exception_tool_dispatch_result(
+        self,
+        tool_use: ToolUsePart,
+        exc: BaseException,
+    ) -> ToolDispatchResult:
+        tool_call_id = _tool_use_ref(tool_use)
+        error_message = str(exc) or exc.__class__.__name__
+        tool_result = build_tool_error_result(
+            error_code=exc.__class__.__name__,
+            error_message=error_message,
+        )
+        return ToolDispatchResult(
+            tool_name=tool_use.name,
+            source="tool_dispatcher",
+            result_part=ToolResultPart(
+                tool_use_ref=tool_call_id,
+                is_error=True,
+                output=tool_result.error_message or "Tool dispatch failed.",
+            ),
+            tool_result=tool_result,
+        )
 
     async def _build_interrupted_tool_results(
         self,
@@ -2069,6 +2210,10 @@ def _tool_use_ref(tool_use: ToolUsePart) -> str:
 
 def _tool_source(tool_use: ToolUsePart) -> str:
     return "mcp" if tool_use.name.startswith("mcp__") else "local"
+
+
+def _is_process_control_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
 
 def _unsupported_input_modality_strategy(instance: AgentInstance) -> str:

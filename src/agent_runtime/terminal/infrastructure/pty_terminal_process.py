@@ -93,7 +93,9 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 active.timeout_task = asyncio.create_task(self._enforce_timeout(session, request.command_id, request.timeout_ms))
             try:
                 await _write_terminal(session, _command_input_text(request.command_line))
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
                 session.active_command = None
                 if active.timeout_task is not None:
                     active.timeout_task.cancel()
@@ -159,7 +161,9 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             exit_code = await session.process.wait()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
             error_message = None if session.closing else str(exc)
         finally:
             self._discard_session_if_current(session)
@@ -186,7 +190,9 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             exit_code = _windows_exit_status(session.winpty)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
             error_message = None if session.closing else str(exc)
         finally:
             self._discard_session_if_current(session)
@@ -301,7 +307,16 @@ async def _start_windows_terminal(request: TerminalSessionStartRequest, *, on_ex
             dimensions=(max(1, request.rows), max(1, request.cols)),
         )
     except TypeError:
-        winpty = PtyProcess.spawn(argv, cwd=request.cwd, env=_process_env())
+        try:
+            winpty = PtyProcess.spawn(argv, cwd=request.cwd, env=_process_env())
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
+            raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
+    except BaseException as exc:
+        if _is_process_control_exception(exc):
+            raise
+        raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
     return _TerminalSession(
         terminal_id=request.terminal_id,
         shell=request.shell,
@@ -337,6 +352,10 @@ def _read_windows_pty(winpty: Any) -> str:
         return winpty.read(_PTY_READ_CHUNK_SIZE)
     except EOFError:
         return ""
+    except BaseException as exc:
+        if _is_process_control_exception(exc):
+            raise
+        raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
 
 
 async def _write_terminal(session: _TerminalSession, text: str) -> None:
@@ -344,7 +363,12 @@ async def _write_terminal(session: _TerminalSession, text: str) -> None:
         os.write(session.master_fd, text.encode("utf-8", errors="replace"))
         return
     if session.winpty is not None:
-        await asyncio.to_thread(session.winpty.write, text)
+        try:
+            await asyncio.to_thread(session.winpty.write, text)
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
+            raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
         return
     raise KeyError(f"终端运行时不可写: {session.terminal_id}")
 
@@ -372,11 +396,25 @@ async def _close_terminal_session(session: _TerminalSession) -> None:
         try:
             await asyncio.to_thread(session.winpty.close, True)
         except TypeError:
-            await asyncio.to_thread(session.winpty.close)
-        except Exception:
+            try:
+                await asyncio.to_thread(session.winpty.close)
+            except BaseException as exc:
+                if _is_process_control_exception(exc):
+                    raise
+                try:
+                    await asyncio.to_thread(session.winpty.kill)
+                except BaseException as kill_exc:
+                    if _is_process_control_exception(kill_exc):
+                        raise
+                    pass
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
             try:
                 await asyncio.to_thread(session.winpty.kill)
-            except Exception:
+            except BaseException as kill_exc:
+                if _is_process_control_exception(kill_exc):
+                    raise
                 pass
 
 
@@ -386,7 +424,9 @@ def _session_alive(session: _TerminalSession) -> bool:
     if session.winpty is not None:
         try:
             return bool(session.winpty.isalive())
-        except Exception:
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
             return False
     return False
 
@@ -394,7 +434,9 @@ def _session_alive(session: _TerminalSession) -> bool:
 def _windows_exit_status(winpty: Any) -> int | None:
     try:
         return int(winpty.get_exitstatus())
-    except Exception:
+    except BaseException as exc:
+        if _is_process_control_exception(exc):
+            raise
         return None
 
 

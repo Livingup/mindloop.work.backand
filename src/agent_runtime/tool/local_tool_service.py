@@ -133,7 +133,12 @@ class LocalToolService:
             result = tool_def.fn(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
-        except Exception as exc:
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            error_message = str(exc) or exc.__class__.__name__
             logger.exception(
                 "本地工具执行失败: %s, 耗时=%sms",
                 tool_name,
@@ -141,7 +146,7 @@ class LocalToolService:
             )
             return build_tool_error_result(
                 error_code=exc.__class__.__name__,
-                error_message=str(exc),
+                error_message=error_message,
             )
         unified_result = wrap_tool_output(result)
         if unified_result.loop_decision not in tool_def.allowed_loop_decisions:
