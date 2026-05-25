@@ -119,9 +119,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_execution_policy_candidates_provider
 """
 
 
-def llm_model_registry_db_path(registry_dir: str) -> Path:
+def llm_model_registry_db_path(registry_dir: str, db_filename: str = LLM_MODEL_REGISTRY_DB_FILENAME) -> Path:
     """根据 registry_dir 解析 LLM Registry SQLite 文件路径。"""
-    return Path(registry_dir).expanduser() / LLM_MODEL_REGISTRY_DB_FILENAME
+    return Path(registry_dir).expanduser() / db_filename
 
 
 class SqliteLlmModelRegistryRepository:
@@ -132,8 +132,9 @@ class SqliteLlmModelRegistryRepository:
     或外层候选切换顺序被 SQLite 行顺序打乱。
     """
 
-    def __init__(self, registry_dir_accessor: Callable[[], str]) -> None:
+    def __init__(self, registry_dir_accessor: Callable[[], str], db_filename: str = LLM_MODEL_REGISTRY_DB_FILENAME) -> None:
         self._registry_dir_accessor = registry_dir_accessor
+        self._db_filename = db_filename
         self._lock = RLock()
         self._conn: sqlite3.Connection | None = None
         self._db_path: Path | None = None
@@ -441,7 +442,7 @@ class SqliteLlmModelRegistryRepository:
 
     def _connection(self) -> sqlite3.Connection:
         with self._lock:
-            db_path = llm_model_registry_db_path(self._registry_dir_accessor())
+            db_path = llm_model_registry_db_path(self._registry_dir_accessor(), self._db_filename)
             if self._conn is not None and self._db_path == db_path:
                 return self._conn
             if self._conn is not None:

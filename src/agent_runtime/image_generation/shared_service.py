@@ -23,7 +23,7 @@ def get_image_generation_service() -> ImageGenerationService:
                 settings_repository=ImageGenerationSettingsRepository(
                     data_dir_accessor=lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
                 ),
-                llm_registry_gateway=LlmModelRegistryFactory.create(),
+                llm_registry_gateway=LlmModelRegistryFactory.create_image_generation_registry(),
                 file_resource_service=get_file_resource_service(),
             )
         return _image_generation_service

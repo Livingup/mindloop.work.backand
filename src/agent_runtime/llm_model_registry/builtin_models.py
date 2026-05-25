@@ -11,6 +11,10 @@ BUILTIN_IMAGE_GENERATION_MODEL_ID = "gpt-image-2"
 
 
 def builtin_llm_model_metadata() -> tuple[LlmModelMetadata, ...]:
+    return ()
+
+
+def builtin_image_generation_model_metadata() -> tuple[LlmModelMetadata, ...]:
     return (
         LlmModelMetadata(
             model_id=BUILTIN_IMAGE_GENERATION_MODEL_ID,

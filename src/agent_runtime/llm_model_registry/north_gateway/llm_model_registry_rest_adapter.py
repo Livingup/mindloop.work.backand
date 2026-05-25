@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
-from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, SUPPORTED_LLM_API_FORMATS
+from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, LlmApiFormat, SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_execution_policy import (
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
@@ -204,6 +204,8 @@ class LlmRegistryMetadataResponse(BaseModel):
 
 def create_llm_model_registry_router(
     gateway: LlmModelRegistryGateway,
+    builtin_provider_ids: set[str] | None = None,
+    api_formats: tuple[LlmApiFormat, ...] | None = None,
 ) -> APIRouter:
     """根据网关实例创建 LLM 注册 REST API 路由。
 
@@ -214,11 +216,13 @@ def create_llm_model_registry_router(
         FastAPI APIRouter，挂载时建议使用 prefix="/api/llm-registry"。
     """
     router = APIRouter()
+    readonly_provider_ids = _BUILTIN_PROVIDER_IDS if builtin_provider_ids is None else builtin_provider_ids
+    supported_api_formats = SUPPORTED_LLM_API_FORMATS if api_formats is None else api_formats
 
     @router.get("/metadata", response_model=LlmRegistryMetadataResponse)
     def get_registry_metadata() -> LlmRegistryMetadataResponse:
         return LlmRegistryMetadataResponse(
-            api_formats=list(SUPPORTED_LLM_API_FORMATS),
+            api_formats=list(supported_api_formats),
             input_modalities=sorted(SUPPORTED_INPUT_MODALITIES),
             unsupported_input_modality_strategies=sorted(
                 SUPPORTED_UNSUPPORTED_INPUT_MODALITY_STRATEGIES
@@ -262,7 +266,7 @@ def create_llm_model_registry_router(
     @router.get("/providers", response_model=list[LlmProviderResponse])
     def list_providers() -> list[LlmProviderResponse]:
         """列出所有 LLM 服务商定义。"""
-        return [_provider_to_response(item) for item in gateway.list_providers()]
+        return [_provider_to_response(item, readonly_provider_ids) for item in gateway.list_providers()]
 
     @router.get("/providers/{provider_id}", response_model=LlmProviderResponse)
     def get_provider(provider_id: str) -> LlmProviderResponse:
@@ -271,7 +275,7 @@ def create_llm_model_registry_router(
             provider = gateway.get_provider(provider_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"LLM 服务商不存在: {provider_id}")
-        return _provider_to_response(provider)
+        return _provider_to_response(provider, readonly_provider_ids)
 
     @router.put("/providers/{provider_id}", response_model=LlmProviderResponse)
     def save_provider(
@@ -279,16 +283,27 @@ def create_llm_model_registry_router(
         body: LlmProviderBody,
     ) -> LlmProviderResponse:
         """新增或覆盖保存 LLM 服务商定义。"""
+        invalid_api_formats = sorted({
+            item.api_format
+            for item in body.models
+            if item.api_format not in supported_api_formats
+        })
+        if invalid_api_formats:
+            raise HTTPException(
+                status_code=400,
+                detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: "
+                + ", ".join(invalid_api_formats),
+            )
         try:
             provider = gateway.save_provider(_body_to_provider_request(provider_id, body))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return _provider_to_response(provider)
+        return _provider_to_response(provider, readonly_provider_ids)
 
     @router.delete("/providers/{provider_id}", status_code=204)
     def delete_provider(provider_id: str) -> None:
         """删除 LLM 服务商定义。不存在时静默返回 204。"""
-        if _is_builtin_provider_id(provider_id):
+        if _is_builtin_provider_id(provider_id, readonly_provider_ids):
             raise HTTPException(status_code=409, detail=f"内置服务商不能删除: {provider_id}")
         try:
             gateway.delete_provider(provider_id)
@@ -372,14 +387,15 @@ def _metadata_to_response(metadata: LlmModelMetadata) -> LlmModelMetadataRespons
     return LlmModelMetadataResponse(**metadata.to_dict())
 
 
-def _provider_to_response(provider: LlmProviderDefinition) -> LlmProviderResponse:
+def _provider_to_response(provider: LlmProviderDefinition, builtin_provider_ids: set[str] | None = None) -> LlmProviderResponse:
     """将服务商定义领域实体转换为 REST 响应模型。"""
-    return LlmProviderResponse(**provider.to_dict(), **_provider_runtime_metadata(provider))
+    return LlmProviderResponse(**provider.to_dict(), **_provider_runtime_metadata(provider, builtin_provider_ids))
 
 
-def _provider_runtime_metadata(provider: LlmProviderDefinition) -> dict[str, Any]:
+def _provider_runtime_metadata(provider: LlmProviderDefinition, builtin_provider_ids: set[str] | None = None) -> dict[str, Any]:
     auth_type = "oauth" if any(item.api_format == API_FORMAT_CODEX_RESPONSES for item in provider.models) else "api_key"
-    builtin = _is_builtin_provider_id(provider.provider_id)
+    readonly_provider_ids = _BUILTIN_PROVIDER_IDS if builtin_provider_ids is None else builtin_provider_ids
+    builtin = _is_builtin_provider_id(provider.provider_id, readonly_provider_ids)
     return {
         "provider_type": "builtin" if builtin else "custom",
         "auth_type": auth_type,
@@ -388,8 +404,8 @@ def _provider_runtime_metadata(provider: LlmProviderDefinition) -> dict[str, Any
     }
 
 
-def _is_builtin_provider_id(provider_id: str) -> bool:
-    return provider_id in _BUILTIN_PROVIDER_IDS
+def _is_builtin_provider_id(provider_id: str, builtin_provider_ids: set[str] | None = None) -> bool:
+    return provider_id in (_BUILTIN_PROVIDER_IDS if builtin_provider_ids is None else builtin_provider_ids)
 
 
 def _execution_policy_to_response(policy: LlmExecutionPolicy) -> LlmExecutionPolicyResponse:

@@ -5,7 +5,10 @@ from __future__ import annotations
 from agent_runtime.llm_model_registry.infrastructure.sqlite_llm_model_registry_repository import (
     SqliteLlmModelRegistryRepository,
 )
-from agent_runtime.llm_model_registry.builtin_models import builtin_llm_model_metadata
+from agent_runtime.llm_model_registry.builtin_models import (
+    builtin_image_generation_model_metadata,
+    builtin_llm_model_metadata,
+)
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     LlmModelRegistryService,
 )
@@ -37,5 +40,20 @@ class LlmModelRegistryFactory:
         )
         service = LlmModelRegistryService(repository)
         for metadata in builtin_llm_model_metadata():
+            service.ensure_builtin_model_metadata(metadata)
+        return LlmModelRegistryGatewayImpl(service)
+
+    @staticmethod
+    def create_image_generation_registry() -> LlmModelRegistryGatewayImpl:
+        from agent_runtime.config import ConfigRegistry
+
+        repository = SqliteLlmModelRegistryRepository(
+            registry_dir_accessor=(
+                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir
+            ),
+            db_filename="image_generation_llm_registry.sqlite3",
+        )
+        service = LlmModelRegistryService(repository)
+        for metadata in builtin_image_generation_model_metadata():
             service.ensure_builtin_model_metadata(metadata)
         return LlmModelRegistryGatewayImpl(service)
