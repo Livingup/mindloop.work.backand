@@ -20,6 +20,7 @@ from agent_runtime.llm_model_registry.llm_model_registry_service import Resolved
 
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?\}$")
+_SIZE_PATTERN = re.compile(r"^([1-9]\d*)x([1-9]\d*)$")
 _MIME_BY_OUTPUT_FORMAT = {
     "png": "image/png",
     "jpeg": "image/jpeg",
@@ -27,7 +28,10 @@ _MIME_BY_OUTPUT_FORMAT = {
 }
 _DEFAULT_OUTPUT_FORMAT = "png"
 _DEFAULT_SIZE = "1024x1024"
-_DEFAULT_QUALITY = "auto"
+_DEFAULT_QUALITY = "high"
+_STANDARD_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+_MAX_SIZE_EDGE = 3840
+_MAX_SIZE_PIXELS = 3840 * 2160
 
 
 class ImageGenerationConfigurationError(ValueError):
@@ -127,12 +131,17 @@ class ImageGenerationService:
         self,
         request: ImageGenerationRequest,
     ) -> dict[str, Any]:
+        output_format = request.output_format or _DEFAULT_OUTPUT_FORMAT
+        if request.background == "transparent" and output_format not in {"png", "webp"}:
+            raise ValueError("background=transparent requires output_format to be png or webp.")
+        if request.output_compression is not None and output_format not in {"jpeg", "webp"}:
+            raise ValueError("output_compression is only supported for jpeg or webp output.")
         body: dict[str, Any] = {
             "prompt": request.prompt,
             "n": _bounded_count(request.n),
-            "size": request.size or _DEFAULT_SIZE,
-            "quality": request.quality or _DEFAULT_QUALITY,
-            "output_format": request.output_format or _DEFAULT_OUTPUT_FORMAT,
+            "size": _normalize_size(request.size),
+            "quality": _DEFAULT_QUALITY,
+            "output_format": output_format,
         }
         for key, value in {
             "background": request.background,
@@ -191,6 +200,28 @@ def _bounded_count(value: int) -> int:
     if count < 1 or count > 10:
         raise ValueError("n must be between 1 and 10.")
     return count
+
+
+def _normalize_size(value: str | None) -> str:
+    if value is None:
+        return _DEFAULT_SIZE
+    normalized = value.strip().lower()
+    if normalized == "auto" or normalized in _STANDARD_SIZES:
+        return normalized
+    match = _SIZE_PATTERN.match(normalized)
+    if match is None:
+        raise ValueError("size must be auto or a WIDTHxHEIGHT string.")
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width % 16 != 0 or height % 16 != 0:
+        raise ValueError("size width and height must both be divisible by 16.")
+    if width > _MAX_SIZE_EDGE or height > _MAX_SIZE_EDGE:
+        raise ValueError("size width and height must not exceed 3840.")
+    if width * height > _MAX_SIZE_PIXELS:
+        raise ValueError("size must not exceed 3840x2160 pixels.")
+    if width * 3 < height or height * 3 < width:
+        raise ValueError("size aspect ratio must be between 1:3 and 3:1.")
+    return normalized
 
 
 def _mime_type_for_output_format(output_format: str) -> str:

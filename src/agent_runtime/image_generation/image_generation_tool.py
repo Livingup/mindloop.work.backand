@@ -10,19 +10,34 @@ from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolResult, FrontendMessage, ToolRuntimeContext
 
 
+GENERATE_IMAGE_TOOL_DESCRIPTION = """Generate one or more images from a text prompt using the configured gpt-image-2 image generation policy, then store generated images as file resources.
+
+Agent-controlled parameters:
+- prompt: required image description, generated from the user's visual intent.
+- n: optional image count, integer 1-10, defaults to 1.
+- size: optional output size, defaults to 1024x1024. For gpt-image-2, use auto, one of the standard sizes 1024x1024 / 1536x1024 / 1024x1536, or a custom WIDTHxHEIGHT string. For custom sizes, width and height must both be divisible by 16, aspect ratio must be between 1:3 and 3:1, maximum edge is 3840, maximum pixels are 3840x2160, and resolutions above 2560x1440 are experimental.
+- background: optional background mode, one of auto / transparent / opaque. Use transparent only when the user asks for transparent background; transparent output requires png or webp.
+- output_format: optional image format, one of png / jpeg / webp, defaults to png.
+- output_compression: optional compression level, integer 0-100, only for jpeg/webp output; do not set it for png.
+
+Runtime-fixed parameters:
+- quality is always high and is not controlled by the Agent.
+- model/provider/api key/retry/candidate policy come from image generation settings and the selected image generation LLM registry policy.
+- stream and partial_images are not used by this tool; arbitrary request_params, moderation, and user are not accepted."""
+
+
 class GenerateImageRequest(BaseModel):
-    prompt: str = Field(description="Required text prompt describing the image to generate. The Agent must set this per call according to the user's image request.")
-    size: Literal["1024x1024", "1536x1024", "1024x1536"] | None = Field(default=None, description="Optional gpt-image-2 output size controlled by the Agent per call. Allowed values: 1024x1024, 1536x1024, 1024x1536. If omitted, the runtime uses 1024x1024.")
-    quality: Literal["auto", "high", "medium", "low"] | None = Field(default=None, description="Optional gpt-image-2 quality controlled by the Agent per call. Allowed values: auto, high, medium, low. If omitted, the runtime uses auto.")
-    background: Literal["auto", "transparent", "opaque"] | None = Field(default=None, description="Optional gpt-image-2 background mode controlled by the Agent per call. Allowed values: auto, transparent, opaque. Use transparent only when the user wants transparent-background output.")
-    output_format: Literal["png", "jpeg", "webp"] | None = Field(default=None, description="Optional output image format controlled by the Agent per call. Allowed values: png, jpeg, webp. If omitted, the runtime uses png.")
-    output_compression: int | None = Field(default=None, ge=0, le=100, description="Optional compression level controlled by the Agent per call for jpeg/webp output only. Allowed integer range: 0-100. Do not set it for png output.")
-    n: int = Field(default=1, ge=1, le=10, description="Optional number of images controlled by the Agent per call. Allowed integer range: 1-10. If the user does not ask for multiple images, use 1.")
+    prompt: str = Field(description="Image description generated from the user's visual intent.")
+    size: str | None = Field(default=None, description="Requested output size.")
+    background: Literal["auto", "transparent", "opaque"] | None = Field(default=None, description="Requested background mode.")
+    output_format: Literal["png", "jpeg", "webp"] | None = Field(default=None, description="Requested output image format.")
+    output_compression: int | None = Field(default=None, ge=0, le=100, description="Requested jpeg/webp compression level.")
+    n: int = Field(default=1, ge=1, le=10, description="Requested image count.")
 
 
 @tool(
     name="generate_image",
-    description="Generate one or more images from a text prompt using the configured image generation LLM policy, then store the generated images as file resources.",
+    description=GENERATE_IMAGE_TOOL_DESCRIPTION,
     group="image_generation",
     public=True,
     always_enabled=True,
@@ -33,7 +48,6 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         ImageGenerationRequest(
             prompt=request.prompt,
             size=request.size,
-            quality=request.quality,
             background=request.background,
             output_format=request.output_format,
             output_compression=request.output_compression,

@@ -8,7 +8,6 @@ from typing import Any
 class ImageGenerationRequest:
     prompt: str
     size: str | None = None
-    quality: str | None = None
     background: str | None = None
     output_format: str | None = None
     output_compression: int | None = None
