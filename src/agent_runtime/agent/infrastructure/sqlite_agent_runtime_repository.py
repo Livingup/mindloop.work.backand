@@ -16,8 +16,6 @@ from agent_runtime.agent.agent_instance import (
     PendingUserMessageAttachment,
 )
 from agent_runtime.agent.agent_task import (
-    AGENT_TASK_STATUS_FAILED,
-    AGENT_TASK_STATUS_UNFINISHED,
     AgentParentChildRelation,
     AgentTask,
 )
@@ -122,13 +120,11 @@ class SqliteAgentRuntimeRepository:
                 return 0
             now = _datetime_to_text(datetime.now(timezone.utc))
             placeholders = ",".join("?" for _ in affected_task_ids)
-            instance_message = "AgentRuntime restarted; running instance state was reset."
-            task_message = "AgentRuntime restarted; unfinished task state was failed."
+            instance_message = "AgentRuntime restarted; running execution carrier state was recovered."
             instance_result = self._conn.execute(
                 f"""
                 UPDATE agent_instances
                 SET status = ?,
-                    pending_user_messages_json = '[]',
                     updated_at = ?,
                     paused_at = ?,
                     failed_at = ?,
@@ -147,18 +143,13 @@ class SqliteAgentRuntimeRepository:
             task_result = self._conn.execute(
                 f"""
                 UPDATE agent_tasks
-                SET status = ?,
-                    updated_at = ?,
-                    failed_at = ?,
-                    failure_message = ?
-                WHERE status = ? AND task_id IN ({placeholders})
+                SET updated_at = ?,
+                    paused_at = ?
+                WHERE task_id IN ({placeholders})
                 """,
                 (
-                    AGENT_TASK_STATUS_FAILED,
                     now,
                     now,
-                    task_message,
-                    AGENT_TASK_STATUS_UNFINISHED,
                     *affected_task_ids,
                 ),
             )

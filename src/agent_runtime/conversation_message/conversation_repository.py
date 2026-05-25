@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
+    ToolResultPart,
     UniMessage,
 )
 
@@ -65,6 +66,28 @@ class ConversationRepository(Protocol):
         self, conversation_id: str, provider: str, state: Any,
     ) -> None:
         """新增或更新单个 LLM 供应商的会话状态（如缓存路由、缓存断点或思考续接状态）。"""
+        ...
+
+    async def save_pending_tool_result(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+        result_part: ToolResultPart,
+    ) -> None:
+        ...
+
+    async def list_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> list[ToolResultPart]:
+        ...
+
+    async def clear_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> None:
         ...
 
     # ── 层级查询 ─────────────────────────────────────────────────

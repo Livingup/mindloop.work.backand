@@ -10,6 +10,7 @@ from typing import Any
 from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
+    ToolResultPart,
     UniMessage,
 )
 
@@ -24,6 +25,7 @@ class InMemoryConversationRepository:
     def __init__(self) -> None:
         self._store: dict[str, Conversation] = {}
         self._hierarchy: dict[str, dict[str, str]] = {}
+        self._pending_tool_results: dict[tuple[str, int, str], ToolResultPart] = {}
 
     async def create(
         self, conv: Conversation, *, task_id: str, thread_id: str,
@@ -61,6 +63,40 @@ class InMemoryConversationRepository:
     ) -> None:
         conv = await self.get(conversation_id)
         conv.provider_state[provider] = state
+
+    async def save_pending_tool_result(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+        result_part: ToolResultPart,
+    ) -> None:
+        self._pending_tool_results[
+            (conversation_id, assistant_message_index, result_part.tool_use_ref)
+        ] = result_part
+
+    async def list_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> list[ToolResultPart]:
+        return [
+            part
+            for (cid, index, _tool_ref), part in self._pending_tool_results.items()
+            if cid == conversation_id and index == assistant_message_index
+        ]
+
+    async def clear_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> None:
+        keys = [
+            key
+            for key in self._pending_tool_results
+            if key[0] == conversation_id and key[1] == assistant_message_index
+        ]
+        for key in keys:
+            self._pending_tool_results.pop(key, None)
 
     async def list_by_task(self, task_id: str) -> list[str]:
         return [cid for cid, h in self._hierarchy.items() if h["task_id"] == task_id]

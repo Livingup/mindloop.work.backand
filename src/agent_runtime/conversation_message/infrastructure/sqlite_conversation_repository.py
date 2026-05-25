@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +146,14 @@ CREATE TABLE IF NOT EXISTS provider_state (
     provider        TEXT NOT NULL,
     state           TEXT NOT NULL,
     PRIMARY KEY (conversation_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS pending_tool_results (
+    conversation_id          TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    assistant_message_index  INTEGER NOT NULL,
+    tool_use_ref             TEXT NOT NULL,
+    result_part              TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, assistant_message_index, tool_use_ref)
 );
 """
 
@@ -298,6 +308,54 @@ class SqliteConversationRepository:
         )
         self._conn.commit()
 
+    async def save_pending_tool_result(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+        result_part: ToolResultPart,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_tool_results "
+            "(conversation_id, assistant_message_index, tool_use_ref, result_part) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                conversation_id,
+                assistant_message_index,
+                result_part.tool_use_ref,
+                json.dumps(_part_to_dict(result_part), ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
+
+    async def list_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> list[ToolResultPart]:
+        rows = self._conn.execute(
+            "SELECT result_part FROM pending_tool_results "
+            "WHERE conversation_id = ? AND assistant_message_index = ?",
+            (conversation_id, assistant_message_index),
+        ).fetchall()
+        results: list[ToolResultPart] = []
+        for row in rows:
+            part = _dict_to_part(json.loads(row[0]))
+            if isinstance(part, ToolResultPart):
+                results.append(part)
+        return results
+
+    async def clear_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> None:
+        self._conn.execute(
+            "DELETE FROM pending_tool_results "
+            "WHERE conversation_id = ? AND assistant_message_index = ?",
+            (conversation_id, assistant_message_index),
+        )
+        self._conn.commit()
+
     # ── 层级查询 ─────────────────────────────────────────────────
 
     async def list_by_task(self, task_id: str) -> list[str]:
@@ -358,9 +416,13 @@ class SqliteConversationRepository:
         """全量覆写指定会话的 JSONL 消息文件。"""
         path = self._msg_path(task_id, conversation_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             for msg in messages:
                 f.write(_message_to_json_line(msg) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
 
     def _upsert_state(self, cid: str, state: ConversationState) -> None:
         self._conn.execute(

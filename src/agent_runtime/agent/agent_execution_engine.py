@@ -932,6 +932,8 @@ class AgentExecutionEngine:
                         agent_definition,
                         tool_uses,
                         communication_context,
+                        conversation_id=conversation.id,
+                        assistant_message_index=len(conversation.messages) - 1,
                         interrupt_state=interrupt_state,
                     ),
                     stage="tool_batch",
@@ -956,6 +958,7 @@ class AgentExecutionEngine:
                 )
                 conversation.append_message(tool_result_message)
                 await self._conversation_repository.save(conversation)
+                await self._clear_pending_tool_results(conversation.id, len(conversation.messages) - 2)
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
                 logger.info(
@@ -1085,28 +1088,45 @@ class AgentExecutionEngine:
     ) -> bool:
         if not conversation.messages:
             return False
-        last_message = conversation.messages[-1]
+        assistant_message_index = len(conversation.messages) - 1
+        last_message = conversation.messages[assistant_message_index]
         if last_message.role != "assistant":
             return False
         tool_uses = _extract_tool_uses(last_message)
         if not tool_uses:
             return False
-        tool_message = UniMessage(
-            role=ROLE_TOOL,
-            content=[
+        pending_tool_results = await self._list_pending_tool_results(
+            conversation.id,
+            assistant_message_index,
+        )
+        pending_tool_results_by_ref = {
+            result.tool_use_ref: result
+            for result in pending_tool_results
+        }
+        result_parts: list[ToolResultPart] = []
+        for tool_use in tool_uses:
+            tool_use_ref = _tool_use_ref(tool_use)
+            pending_result = pending_tool_results_by_ref.get(tool_use_ref)
+            if pending_result is not None:
+                result_parts.append(pending_result)
+                continue
+            result_parts.append(
                 ToolResultPart(
-                    tool_use_ref=_tool_use_ref(tool_use),
+                    tool_use_ref=tool_use_ref,
                     is_error=True,
                     output=(
                         "Tool execution did not complete because the previous Agent execution was interrupted. "
                         f"reason={reason}; tool_name={tool_use.name}"
                     ),
                 )
-                for tool_use in tool_uses
-            ],
+            )
+        tool_message = UniMessage(
+            role=ROLE_TOOL,
+            content=result_parts,
         )
         conversation.append_message(tool_message)
         await self._conversation_repository.save(conversation)
+        await self._clear_pending_tool_results(conversation.id, assistant_message_index)
         logger.warning(
             "修复未匹配的工具结果消息: conversation_id=%s, tool_count=%s, reason=%s",
             getattr(conversation, "id", None),
@@ -1114,6 +1134,49 @@ class AgentExecutionEngine:
             reason,
         )
         return True
+
+    async def _persist_pending_tool_result(
+        self,
+        conversation_id: str | None,
+        assistant_message_index: int | None,
+        result_part: ToolResultPart,
+    ) -> None:
+        if conversation_id is None or assistant_message_index is None:
+            return
+        try:
+            await self._conversation_repository.save_pending_tool_result(
+                conversation_id,
+                assistant_message_index,
+                result_part,
+            )
+        except AttributeError:
+            return
+
+    async def _list_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> list[ToolResultPart]:
+        try:
+            return await self._conversation_repository.list_pending_tool_results(
+                conversation_id,
+                assistant_message_index,
+            )
+        except AttributeError:
+            return []
+
+    async def _clear_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> None:
+        try:
+            await self._conversation_repository.clear_pending_tool_results(
+                conversation_id,
+                assistant_message_index,
+            )
+        except AttributeError:
+            return
 
     async def _resume_from_pending_user_messages(
         self,
@@ -1811,6 +1874,8 @@ class AgentExecutionEngine:
         tool_uses: list[ToolUsePart],
         communication_context: RuntimeCommunicationContext,
         *,
+        conversation_id: str | None = None,
+        assistant_message_index: int | None = None,
         interrupt_state: _AgentExecutionInterruptState,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
@@ -1827,11 +1892,17 @@ class AgentExecutionEngine:
         running_tools: list[dict[str, Any]] = []
         for tool_use in tool_uses:
             if interrupt_state.requested:
-                results_by_ref[_tool_use_ref(tool_use)] = await self._build_cancelled_tool_dispatch_result(
+                cancelled_result = await self._build_cancelled_tool_dispatch_result(
                     tool_use,
                     communication_context,
                     interrupt_state=interrupt_state,
                     phase="not_started",
+                )
+                results_by_ref[_tool_use_ref(tool_use)] = cancelled_result
+                await self._persist_pending_tool_result(
+                    conversation_id,
+                    assistant_message_index,
+                    cancelled_result.result_part,
                 )
                 continue
             running_tools.append({
@@ -1850,19 +1921,44 @@ class AgentExecutionEngine:
             tasks.append((tool_use, tool_task))
         if tasks:
             try:
-                running_results = await asyncio.gather(
-                    *(task for _tool_use, task in tasks),
-                    return_exceptions=True,
-                )
-                for (tool_use, _task), result in zip(tasks, running_results):
-                    if isinstance(result, BaseException):
-                        if isinstance(result, asyncio.CancelledError):
-                            raise result
-                        if _is_process_control_exception(result):
-                            raise result
-                        result = self._build_exception_tool_dispatch_result(tool_use, result)
-                    results_by_ref[result.result_part.tool_use_ref] = result
+                task_by_asyncio_task = {
+                    task: tool_use
+                    for tool_use, task in tasks
+                }
+                pending_tasks = set(task_by_asyncio_task)
+                while pending_tasks:
+                    done_tasks, pending_tasks = await asyncio.wait(
+                        pending_tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done_tasks:
+                        tool_use = task_by_asyncio_task[task]
+                        try:
+                            result = task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException as exc:
+                            if _is_process_control_exception(exc):
+                                raise
+                            result = self._build_exception_tool_dispatch_result(tool_use, exc)
+                        results_by_ref[result.result_part.tool_use_ref] = result
+                        await self._persist_pending_tool_result(
+                            conversation_id,
+                            assistant_message_index,
+                            result.result_part,
+                        )
+                        if instance_id:
+                            tool_use_ref = _tool_use_ref(tool_use)
+                            running_tools = [
+                                item
+                                for item in running_tools
+                                if item.get("tool_call_id") != tool_use_ref
+                            ]
+                            self._set_execution_running_tools(instance_id, running_tools)
             finally:
+                for _tool_use, task in tasks:
+                    if not task.done():
+                        task.cancel()
                 if instance_id:
                     self._set_execution_running_tools(instance_id, [])
         results = [results_by_ref[_tool_use_ref(tool_use)] for tool_use in tool_uses]
