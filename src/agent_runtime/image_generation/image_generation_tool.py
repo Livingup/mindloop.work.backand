@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -11,16 +11,13 @@ from agent_runtime.tool.tool_execution_models import BaseToolResult, FrontendMes
 
 
 class GenerateImageRequest(BaseModel):
-    prompt: str = Field(description="Text prompt describing the image to generate.")
-    size: str | None = Field(default=None, description="Image size, for example 1024x1024, 1536x1024, 1024x1536, or custom WIDTHxHEIGHT supported by the selected model.")
-    quality: str | None = Field(default=None, description="Image quality, for example auto, high, medium, or low.")
-    background: str | None = Field(default=None, description="Background mode: auto, transparent, or opaque.")
-    output_format: str | None = Field(default=None, description="Output image format: png, jpeg, or webp.")
-    output_compression: int | None = Field(default=None, description="Compression level 0-100 for webp/jpeg outputs.")
-    moderation: str | None = Field(default=None, description="Moderation level: auto or low.")
-    n: int = Field(default=1, description="Number of images to generate, from 1 to 10.")
-    user: str | None = Field(default=None, description="Optional end-user identifier for provider abuse monitoring.")
-    request_params: dict[str, Any] = Field(default_factory=dict, description="Advanced provider-specific request parameters. model, stream, and partial_images are ignored.")
+    prompt: str = Field(description="Required text prompt describing the image to generate. The Agent must set this per call according to the user's image request.")
+    size: Literal["1024x1024", "1536x1024", "1024x1536"] | None = Field(default=None, description="Optional gpt-image-2 output size controlled by the Agent per call. Allowed values: 1024x1024, 1536x1024, 1024x1536. If omitted, the runtime uses 1024x1024.")
+    quality: Literal["auto", "high", "medium", "low"] | None = Field(default=None, description="Optional gpt-image-2 quality controlled by the Agent per call. Allowed values: auto, high, medium, low. If omitted, the runtime uses auto.")
+    background: Literal["auto", "transparent", "opaque"] | None = Field(default=None, description="Optional gpt-image-2 background mode controlled by the Agent per call. Allowed values: auto, transparent, opaque. Use transparent only when the user wants transparent-background output.")
+    output_format: Literal["png", "jpeg", "webp"] | None = Field(default=None, description="Optional output image format controlled by the Agent per call. Allowed values: png, jpeg, webp. If omitted, the runtime uses png.")
+    output_compression: int | None = Field(default=None, ge=0, le=100, description="Optional compression level controlled by the Agent per call for jpeg/webp output only. Allowed integer range: 0-100. Do not set it for png output.")
+    n: int = Field(default=1, ge=1, le=10, description="Optional number of images controlled by the Agent per call. Allowed integer range: 1-10. If the user does not ask for multiple images, use 1.")
 
 
 @tool(
@@ -40,10 +37,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
             background=request.background,
             output_format=request.output_format,
             output_compression=request.output_compression,
-            moderation=request.moderation,
             n=request.n,
-            user=request.user,
-            request_params=dict(request.request_params),
         )
     )
     resources = [

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -12,10 +12,7 @@ class ImageGenerationRequest:
     background: str | None = None
     output_format: str | None = None
     output_compression: int | None = None
-    moderation: str | None = None
     n: int = 1
-    user: str | None = None
-    request_params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -55,7 +55,6 @@ class ImageGenerationService:
         self,
         *,
         llm_policy_group_id: str | None,
-        default_request_params: dict[str, Any] | None = None,
     ):
         normalized_policy_id = llm_policy_group_id.strip() if isinstance(llm_policy_group_id, str) else None
         if normalized_policy_id == "":
@@ -64,7 +63,6 @@ class ImageGenerationService:
             self._require_usable_policy(normalized_policy_id)
         return self._settings_repository.save_settings(
             llm_policy_group_id=normalized_policy_id,
-            default_request_params=default_request_params or {},
         )
 
     def validate_policy(self, policy_group_id: str) -> None:
@@ -77,7 +75,7 @@ class ImageGenerationService:
         if not settings.llm_policy_group_id:
             raise ImageGenerationConfigurationError("Image generation LLM policy is not configured.")
         policy = self._llm_registry_gateway.resolve_execution_policy(settings.llm_policy_group_id)
-        request_body = self._build_request_body(request, settings.default_request_params)
+        request_body = self._build_request_body(request)
         last_error: Exception | None = None
         attempt_count = 0
         for candidate_index, candidate in enumerate(policy.candidates):
@@ -128,26 +126,20 @@ class ImageGenerationService:
     def _build_request_body(
         self,
         request: ImageGenerationRequest,
-        default_request_params: dict[str, Any],
     ) -> dict[str, Any]:
-        body = dict(default_request_params)
-        body.update(request.request_params)
-        body["prompt"] = request.prompt
-        body["n"] = _bounded_count(request.n)
-        body["size"] = request.size or body.get("size") or _DEFAULT_SIZE
-        body["quality"] = request.quality or body.get("quality") or _DEFAULT_QUALITY
-        body["output_format"] = request.output_format or body.get("output_format") or _DEFAULT_OUTPUT_FORMAT
+        body: dict[str, Any] = {
+            "prompt": request.prompt,
+            "n": _bounded_count(request.n),
+            "size": request.size or _DEFAULT_SIZE,
+            "quality": request.quality or _DEFAULT_QUALITY,
+            "output_format": request.output_format or _DEFAULT_OUTPUT_FORMAT,
+        }
         for key, value in {
             "background": request.background,
             "output_compression": request.output_compression,
-            "moderation": request.moderation,
-            "user": request.user,
         }.items():
             if value is not None:
                 body[key] = value
-        body.pop("model", None)
-        body.pop("stream", None)
-        body.pop("partial_images", None)
         return body
 
     def _ingest_images(self, response: dict[str, Any], *, output_format: str) -> list[GeneratedImageResource]:
