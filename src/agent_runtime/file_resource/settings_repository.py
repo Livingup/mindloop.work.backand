@@ -29,7 +29,7 @@ DEFAULT_OBJECT_STORAGE_REGION = "cn-hongkong"
 DEFAULT_OBJECT_STORAGE_BUCKET_NAME = "agent-runtime-resources"
 DEFAULT_OBJECT_STORAGE_PUBLIC_BASE_URL = "https://agent-runtime-resources.oss-cn-hongkong.aliyuncs.com/agent-runtime/file-resource"
 DEFAULT_OBJECT_STORAGE_OBJECT_KEY_PREFIX = "agent-runtime/file-resource"
-DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,7 +87,7 @@ class ObjectStorageSettingsRepository:
                 updated_at=None,
             )
         return ObjectStorageRuntimeSettings(
-            gateway_provider=str(row[0] or DEFAULT_OBJECT_STORAGE_GATEWAY_PROVIDER),
+            gateway_provider=_normalize_gateway_provider(row[0]),
             object_storage_endpoint=str(row[1] or DEFAULT_OBJECT_STORAGE_ENDPOINT),
             object_storage_region=str(row[2] or DEFAULT_OBJECT_STORAGE_REGION),
             object_storage_bucket_name=str(row[3] or DEFAULT_OBJECT_STORAGE_BUCKET_NAME),
@@ -95,7 +95,7 @@ class ObjectStorageSettingsRepository:
             object_storage_object_key_prefix=str(row[5] or DEFAULT_OBJECT_STORAGE_OBJECT_KEY_PREFIX),
             object_storage_access_key_id=_nullable_text(row[6]),
             object_storage_access_key_secret=_nullable_text(row[7]),
-            connect_timeout_seconds=int(row[8] or DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS),
+            connect_timeout_seconds=max(int(row[8] or DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS), DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS),
             updated_at=str(row[9]) if row[9] is not None else None,
         )
 
@@ -133,7 +133,7 @@ class ObjectStorageSettingsRepository:
                 "connect_timeout_seconds = excluded.connect_timeout_seconds, "
                 "updated_at = excluded.updated_at",
                 (
-                    gateway_provider.strip() or DEFAULT_OBJECT_STORAGE_GATEWAY_PROVIDER,
+                    _normalize_gateway_provider(gateway_provider),
                     object_storage_endpoint.strip() or DEFAULT_OBJECT_STORAGE_ENDPOINT,
                     object_storage_region.strip() or DEFAULT_OBJECT_STORAGE_REGION,
                     object_storage_bucket_name.strip() or DEFAULT_OBJECT_STORAGE_BUCKET_NAME,
@@ -141,7 +141,7 @@ class ObjectStorageSettingsRepository:
                     (object_storage_object_key_prefix.strip() or DEFAULT_OBJECT_STORAGE_OBJECT_KEY_PREFIX).strip("/"),
                     _normalize_nullable_text(object_storage_access_key_id),
                     _normalize_nullable_text(object_storage_access_key_secret),
-                    int(connect_timeout_seconds) if int(connect_timeout_seconds) > 0 else DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS,
+                    max(int(connect_timeout_seconds), DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS),
                     now,
                 ),
             )
@@ -174,6 +174,13 @@ def _normalize_nullable_text(value: str | None) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _normalize_gateway_provider(value: object) -> str:
+    provider = str(value or "").strip()
+    if provider == DEFAULT_OBJECT_STORAGE_GATEWAY_PROVIDER:
+        return provider
+    return DEFAULT_OBJECT_STORAGE_GATEWAY_PROVIDER
 
 
 def _utc_now_text() -> str:

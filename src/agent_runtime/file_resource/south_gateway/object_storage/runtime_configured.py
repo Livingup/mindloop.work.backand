@@ -11,9 +11,6 @@ from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
     UploadedObjectStorageResource,
 )
-from agent_runtime.file_resource.south_gateway.object_storage.in_memory import (
-    InMemoryObjectStorageGateway,
-)
 
 
 class ObjectStorageConfigurationError(RuntimeError):
@@ -44,9 +41,6 @@ class RuntimeConfiguredObjectStorageGateway(ObjectStorageGateway):
     def _create_gateway(self, *, require_credentials: bool) -> ObjectStorageGateway:
         settings = self._settings_repository.get_settings()
         provider = settings.gateway_provider.strip()
-        if provider == "memory":
-            base_url = settings.object_storage_public_base_url.strip() or "memory://file-resource"
-            return InMemoryObjectStorageGateway(base_url)
         if provider == "aliyun_oss":
             self._assert_aliyun_settings(settings, require_credentials=require_credentials)
             return AliyunOssObjectStorageGateway(

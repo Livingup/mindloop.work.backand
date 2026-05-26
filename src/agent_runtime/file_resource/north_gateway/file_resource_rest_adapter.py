@@ -10,7 +10,10 @@ from pydantic import BaseModel, Field
 from agent_runtime.config import ConfigRegistry
 from agent_runtime.file_resource.models import ImageResourceMetadata, PdfResourceMetadata
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
-from agent_runtime.file_resource.settings_repository import ObjectStorageSettingsRepository
+from agent_runtime.file_resource.settings_repository import (
+    DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS,
+    ObjectStorageSettingsRepository,
+)
 from agent_runtime.file_resource.shared_service import get_file_resource_service
 from agent_runtime.file_resource.south_gateway.object_storage.runtime_configured import (
     ObjectStorageConfigurationError,
@@ -70,7 +73,7 @@ class ObjectStorageSettingsUpdateBody(BaseModel):
     object_storage_object_key_prefix: str = ""
     object_storage_access_key_id: str | None = None
     object_storage_access_key_secret: str | None = None
-    connect_timeout_seconds: int = 10
+    connect_timeout_seconds: int = DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS
 
 
 def create_file_resource_router() -> APIRouter:
@@ -130,7 +133,7 @@ def create_file_resource_router() -> APIRouter:
     def update_object_storage_settings(
         body: ObjectStorageSettingsUpdateBody,
     ) -> ObjectStorageSettingsResponse:
-        if body.gateway_provider != "aliyun_oss" and body.gateway_provider != "memory":
+        if body.gateway_provider != "aliyun_oss":
             raise HTTPException(status_code=400, detail=f"不支持的对象存储服务商: {body.gateway_provider}")
         if body.connect_timeout_seconds <= 0:
             raise HTTPException(status_code=400, detail="对象存储连接超时时间必须大于 0。")
@@ -199,8 +202,8 @@ def _object_storage_settings_response(
         object_storage_bucket_name=settings.object_storage_bucket_name,
         object_storage_public_base_url=settings.object_storage_public_base_url,
         object_storage_object_key_prefix=settings.object_storage_object_key_prefix,
-        object_storage_access_key_id=settings.object_storage_access_key_id,
-        object_storage_access_key_secret=settings.object_storage_access_key_secret,
+        object_storage_access_key_id=None,
+        object_storage_access_key_secret=None,
         object_storage_access_key_id_configured=bool((settings.object_storage_access_key_id or "").strip()),
         object_storage_access_key_secret_configured=bool((settings.object_storage_access_key_secret or "").strip()),
         connect_timeout_seconds=settings.connect_timeout_seconds,

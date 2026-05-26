@@ -5,10 +5,17 @@
 """
 from __future__ import annotations
 
+from contextlib import suppress
+from math import ceil
+
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
     UploadedObjectStorageResource,
 )
+
+_MULTIPART_UPLOAD_THRESHOLD_BYTES = 16 * 1024 * 1024
+_MULTIPART_UPLOAD_PART_SIZE_BYTES = 8 * 1024 * 1024
+_MIN_OSS_SOCKET_TIMEOUT_SECONDS = 120
 
 
 class AliyunOssObjectStorageGateway(ObjectStorageGateway):
@@ -46,7 +53,7 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         self._object_storage_object_key_prefix = object_storage_object_key_prefix.strip("/")
 
         # OSS 连接超时时间，单位秒。用于控制南向网关建立连接时的等待上限。
-        self._connect_timeout_seconds = connect_timeout_seconds
+        self._connect_timeout_seconds = max(connect_timeout_seconds, _MIN_OSS_SOCKET_TIMEOUT_SECONDS)
 
         # OSS Bucket 客户端实例。通过 oss2 SDK 初始化，用于执行实际的对象上传和删除操作。
         self._oss_bucket = self._create_oss_bucket(
@@ -68,11 +75,18 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         """
 
         object_key = self._build_object_key(resource_id)
-        self._oss_bucket.put_object(
-            object_key,
-            resource_content,
-            headers={"Content-Type": resource_mime_type},
-        )
+        if len(resource_content) >= _MULTIPART_UPLOAD_THRESHOLD_BYTES:
+            self._multipart_upload_object(
+                object_key=object_key,
+                resource_content=resource_content,
+                resource_mime_type=resource_mime_type,
+            )
+        else:
+            self._oss_bucket.put_object(
+                object_key,
+                resource_content,
+                headers={"Content-Type": resource_mime_type},
+            )
         return UploadedObjectStorageResource(
             resource_id=resource_id,
             object_storage_url=self._build_public_url(resource_id),
@@ -106,6 +120,49 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         """
 
         return f"{self._object_storage_public_base_url}/{resource_id}"
+
+    def _multipart_upload_object(
+        self,
+        *,
+        object_key: str,
+        resource_content: bytes,
+        resource_mime_type: str,
+    ) -> None:
+        try:
+            import oss2
+        except ImportError as import_error:
+            raise RuntimeError(
+                "统一文件资源服务启用 aliyun_oss 对象存储网关时缺少 oss2 依赖，请先安装 aliyun-oss2。"
+            ) from import_error
+
+        upload_id = self._oss_bucket.init_multipart_upload(
+            object_key,
+            headers={"Content-Type": resource_mime_type},
+        ).upload_id
+        parts = []
+        try:
+            part_count = ceil(len(resource_content) / _MULTIPART_UPLOAD_PART_SIZE_BYTES)
+            for part_index in range(part_count):
+                part_number = part_index + 1
+                start = part_index * _MULTIPART_UPLOAD_PART_SIZE_BYTES
+                end = min(start + _MULTIPART_UPLOAD_PART_SIZE_BYTES, len(resource_content))
+                result = self._oss_bucket.upload_part(
+                    object_key,
+                    upload_id,
+                    part_number,
+                    resource_content[start:end],
+                )
+                parts.append(oss2.models.PartInfo(part_number, result.etag))
+            self._oss_bucket.complete_multipart_upload(
+                object_key,
+                upload_id,
+                parts,
+                headers={"Content-Type": resource_mime_type},
+            )
+        except Exception:
+            with suppress(Exception):
+                self._oss_bucket.abort_multipart_upload(object_key, upload_id)
+            raise
 
     def _create_oss_bucket(
         self,
