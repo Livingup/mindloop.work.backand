@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 ToolExecutionStatus = Literal["success", "failed", "skipped"]
 LoopDecision = Literal["continue", "pause", "complete", "fail"]
-TextFormat = Literal["plain_text", "markdown", "json"]
+TextFormat = Literal["plain_text", "markdown", "json", "html"]
 ToolCategory = Literal["business", "lifecycle", "system"]
 
 
@@ -18,7 +18,7 @@ class FrontendMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(description="需要展示给用户的文本内容。")
-    text_format: TextFormat = Field(default="markdown", description="文本内容的格式声明；可选值仅限 plain_text、markdown、json。")
+    text_format: TextFormat = Field(default="markdown", description="文本内容的格式声明；可选值仅限 plain_text、markdown、json、html。")
     channel: str | None = Field(default=None, description="目标前端通道，例如 web、cli。")
     metadata: dict[str, Any] = Field(default_factory=dict, description="前端渲染或业务追踪所需的附加元数据。")
 

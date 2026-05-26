@@ -2408,12 +2408,12 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
     supported_formats = _format_render_option_values(
         render_options.get("supported_text_formats")
         or render_options.get("text_formats")
-        or ("markdown", "plain_text", "json")
+        or ("html",)
     )
     preferred_format = str(
         render_options.get("preferred_text_format")
         or render_options.get("text_format")
-        or "markdown"
+        or "html"
     )
     return (
         "## Runtime lifecycle tool policy\n"
@@ -2443,7 +2443,7 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
         f"- Current frontend channel: `{channel}`.\n"
         f"- Supported text formats: `{supported_formats}`.\n"
         f"- Preferred text format: `{preferred_format}`.\n"
-        "- Set `text_format` explicitly and do not return HTML.\n"
+        "- Set `message_user.text_format` explicitly to `html`; `message_user.message` must be an HTML fragment following the tool schema, not Markdown.\n"
         "- `message_user` with `request_response`: `options` must be objects with `id`, `label`, "
         "and optional `description`."
     )

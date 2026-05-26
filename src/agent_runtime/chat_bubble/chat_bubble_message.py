@@ -37,6 +37,7 @@ CHAT_BUBBLE_TEXT_FORMATS: Final[frozenset[str]] = frozenset({
     "plain_text",
     "markdown",
     "json",
+    "html",
     "diff",
 })
 
@@ -126,7 +127,7 @@ class ChatBubbleMessage:
     # 气泡正文文本。
     text: str
 
-    # 文本格式：plain_text / markdown / json / diff。
+    # 文本格式：plain_text / markdown / json / html / diff。
     text_format: ChatBubbleTextFormat = "markdown"
 
     # 前端展示渠道，当前 Web Chat 默认 web。

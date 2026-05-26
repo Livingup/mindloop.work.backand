@@ -18,13 +18,13 @@ from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
     FrontendMessage,
     LoopControl,
-    TextFormat,
 )
 
 
 # ── 公共模型 ─────────────────────────────────────────────────────────
 
 MessageAction = Literal["notify", "request_response"]
+MessageUserTextFormat = Literal["html"]
 
 
 class MessageOption(BaseModel):
@@ -58,14 +58,23 @@ class MessageUserRequest(BaseToolRequest):
     )
     message: str = Field(
         description=(
-            "发送给用户的文本正文。"
+            "发送给用户的 HTML fragment 正文。"
             "notify 时交代要同步的进度/发现/状态；"
             "request_response 时清晰说明你需要用户做什么（提问、请求审核、请求确认、求助等）。"
+            "内容必须符合 text_format=html 的 HTML fragment 技术规范，不要写 Markdown。"
         ),
     )
-    text_format: TextFormat = Field(
-        default="markdown",
-        description="message 的文本格式；可选值仅限 plain_text、markdown、json。plain_text 表示纯文本，markdown 表示带标题/列表/代码块的推荐默认值，json 表示结构化 JSON 且需要前端渲染为表格/卡片时使用。",
+    text_format: MessageUserTextFormat = Field(
+        default="html",
+        description=(
+            "message 的文本格式；唯一允许值是 html。"
+            "当 text_format=html 时，message 必须是可直接插入页面正文区域的 HTML fragment："
+            "不要输出完整文档结构（禁止 <!doctype>、<html>、<head>、<body>），不要输出 Markdown 语法。"
+            "使用语义化 HTML 标签表达结构，例如 article、header、section、footer、h1、h2、h3、p、ul、ol、li、dl、dt、dd、blockquote、pre、code、table、thead、tbody、tr、th、td、strong、em、a、small、sup、br、hr。"
+            "不要输出展示绑定或脚本相关内容：禁止 class、style、id、data-*、on* 事件属性，禁止 script、style、iframe、object、embed、svg、canvas、form、input、button。"
+            "链接使用 <a href=\"https://...\">文本</a>，外部 URL 不要裸写；代码块使用 <pre><code>...</code></pre>；列表使用 ul/ol/li；表格使用 table 语义标签。"
+            "插入来自用户、工具、网页或外部系统的动态文本时，必须进行 HTML 字符转义：& 转为 &amp;，< 转为 &lt;，> 转为 &gt;，\" 转为 &quot;，避免把外部文本当作 HTML 执行。"
+        ),
     )
     options: list[MessageOption] = Field(
         default_factory=list,
@@ -90,7 +99,7 @@ class MessageUserRequest(BaseToolRequest):
     description=(
         "向用户发送消息。这是 Agent 与用户沟通的【唯一】渠道——所有面向用户的展示性输出都必须走此工具，不要用普通 assistant 文本输出给用户。\n"
         "\n"
-        "【做什么】将 message 文本以指定格式发送到前端展示。通过 action 选择行为模式：\n"
+        "【做什么】将 message 作为 HTML fragment 发送到前端展示。通过 action 选择行为模式：\n"
         "  • notify：发完即继续，Agent 不阻塞（单向告知）\n"
         "  • request_response：发完后阻塞等用户回复（双向沟通）\n"
         "\n"
@@ -99,6 +108,12 @@ class MessageUserRequest(BaseToolRequest):
         "• 需要用户提供决策、选择、确认、审核才能继续（用 request_response）\n"
         "• 任务完成需要用户验收（用 request_response）\n"
         "• 遇到无法判断的场景需要向用户求助（用 request_response）\n"
+        "\n"
+        "【HTML 输出协议】\n"
+        "• text_format 必须填 html，message 必须是 HTML fragment，不是 Markdown，也不是完整 HTML 文档。\n"
+        "• 只使用语义化内容标签表达结构，不要写 class/style/id/data-* 或任何 on* 事件属性。\n"
+        "• 禁止 script/style/iframe/object/embed/svg/canvas/form/input/button 等可执行或交互标签。\n"
+        "• 外部文本必须 HTML 转义；链接使用 a 标签，代码使用 pre/code，列表使用 ul/ol/li，表格使用 table 语义标签。\n"
         "\n"
         "【不要用于】\n"
         "• Agent 内部推理/规划/反思（这些是思考过程，用户不需要看）\n"
