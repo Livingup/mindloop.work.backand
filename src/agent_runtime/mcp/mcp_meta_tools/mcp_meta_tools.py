@@ -17,12 +17,14 @@ from pydantic import Field
 from agent_runtime.tool.tool_execution_models import (
     BaseToolRequest,
     BaseToolResult,
+    LoopControl,
     build_tool_error_result,
 )
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
     McpClientGateway,
 )
+from agent_runtime.mcp.mcp_client.tool_result_normalizer import normalize_mcp_tool_content_for_llm
 
 # 模块级 gateway 引用，由 configure() 注入
 _gateway: McpClientGateway | None = None
@@ -253,11 +255,21 @@ async def mcp_call_tool(request: McpCallToolRequest) -> str | BaseToolResult:
         result = await gw.call_tool(request.service_id, request.tool_name, args_dict)
     except (Exception, asyncio.CancelledError) as e:
         return _tool_error(f"MCP 工具执行失败: {e}")
-    data: dict[str, Any] = {
-        "content": result.content,
-        "content_blocks": list(result.content_blocks),
-        "is_error": result.is_error,
-    }
-    if result.structured_content:
-        data["structured_content"] = result.structured_content
-    return json.dumps(data, ensure_ascii=False)
+    output = normalize_mcp_tool_content_for_llm(result.content_blocks, fallback_text=result.content)
+    if result.is_error:
+        return build_tool_error_result(
+            error_code="McpToolError",
+            error_message=result.content,
+            output=output,
+        )
+    return BaseToolResult(
+        success=True,
+        execution_status="success",
+        output=output,
+        loop_control=LoopControl(decision="continue"),
+        metadata={
+            "mcp_service_id": request.service_id,
+            "mcp_tool_name": request.tool_name,
+            "structured_content": result.structured_content,
+        },
+    )
