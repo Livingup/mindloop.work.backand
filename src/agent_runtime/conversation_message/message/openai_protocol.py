@@ -47,6 +47,13 @@ from agent_runtime.conversation_message.south_gateway.resource_resolver.contract
 )
 
 
+_OPENAI_REPLAYABLE_OUTPUT_ITEM_TYPES = frozenset({
+    "reasoning",
+    "message",
+    "function_call",
+})
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIRenderResult:
     """OpenAI 渲染结果。
@@ -140,7 +147,7 @@ class OpenAIAdapter:
             source_provider=PROVIDER_OPENAI,
             provider_extras={
                 PROVIDER_OPENAI: {
-                    "raw": raw_response.get("output"),  # 完整 output 数组
+                    "raw": _filter_replayable_output_items(raw_response.get("output")),
                 },
             },
         )
@@ -323,7 +330,9 @@ def _build_openai_assistant(
     if msg.source_provider == PROVIDER_OPENAI:
         extras = (msg.provider_extras or {}).get(PROVIDER_OPENAI)
         if extras and extras.get("raw") is not None:
-            return list(clone_raw_value(extras["raw"]))
+            raw_items = _filter_replayable_output_items(extras["raw"])
+            if raw_items:
+                return raw_items
 
     include_thinking_text = should_include_cross_protocol_thinking_text(options)
     input_items: list[Any] = []
@@ -362,3 +371,14 @@ def _build_openai_assistant(
         "role": "assistant",
         "content": [{"type": "output_text", "text": "(empty)"}],
     }]
+
+
+def _filter_replayable_output_items(raw_output: Any) -> list[Any]:
+    if not isinstance(raw_output, list):
+        return []
+    return [
+        clone_raw_value(item)
+        for item in raw_output
+        if isinstance(item, dict)
+        and item.get("type") in _OPENAI_REPLAYABLE_OUTPUT_ITEM_TYPES
+    ]
