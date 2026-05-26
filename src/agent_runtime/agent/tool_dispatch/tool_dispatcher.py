@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, McpToolBinding
@@ -194,8 +194,6 @@ class AgentToolDispatcher:
                     "error_message": str(exc),
                     "duration_ms": int((time.perf_counter() - started_at) * 1000),
                     "result_preview": {
-                        "success": False,
-                        "execution_status": "failed",
                         "error_type": exc.__class__.__name__,
                         "error_message": str(exc),
                     },
@@ -229,6 +227,7 @@ class AgentToolDispatcher:
                 "error_message": result.tool_result.error_message,
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "result_preview": _preview_tool_result(result.tool_result),
+                "ui_preview": _preview_tool_ui(result.tool_result),
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -444,13 +443,16 @@ def _stable_json_text(value: Any) -> str:
         return str(value)
 
 
-def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
-    preview: dict[str, Any] = {
-        "success": result.success,
-        "execution_status": result.execution_status,
-        "loop_decision": result.loop_decision,
-        "output": _preview_value(result.output),
-    }
+def _preview_tool_result(result: BaseToolResult) -> Any:
+    if result.output is not None:
+        return _preview_value(result.output)
+    if result.error_message:
+        return {"error_message": result.error_message}
+    return {}
+
+
+def _preview_tool_ui(result: BaseToolResult) -> dict[str, Any] | None:
+    preview: dict[str, Any] = {}
     ui_kind = result.metadata.get("ui_kind")
     if ui_kind:
         preview["ui_kind"] = ui_kind
@@ -458,11 +460,7 @@ def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
         preview["output"] = _preview_value(result.metadata["preview_output"])
     if result.frontend_message is not None:
         preview["frontend_message"] = _preview_value(result.frontend_message.model_dump(mode="json"))
-    if result.error_code:
-        preview["error_code"] = result.error_code
-    if result.error_message:
-        preview["error_message"] = result.error_message
-    return preview
+    return preview or None
 
 
 def _preview_value(value: Any, *, depth: int = 0) -> Any:
@@ -488,6 +486,8 @@ def _preview_value(value: Any, *, depth: int = 0) -> Any:
         if len(value) > TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS:
             preview_items.append(f"<truncated {len(value) - TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS} more items>")
         return preview_items
+    if is_dataclass(value) and not isinstance(value, type):
+        return _preview_value(asdict(value), depth=depth + 1)
     if isinstance(value, BaseToolResult):
         return _preview_value(value.to_serializable_dict(), depth=depth + 1)
     if hasattr(value, "model_dump"):

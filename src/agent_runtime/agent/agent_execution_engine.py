@@ -2047,7 +2047,9 @@ class AgentExecutionEngine:
                 "cancelled_by": "user",
                 "phase": phase,
                 "reason": interrupt_state.reason,
-                "result_preview": tool_result.to_serializable_dict(),
+                "result_preview": {
+                    "error_message": tool_result.error_message or "Tool execution cancelled.",
+                },
             },
             source="agent_execution_engine",
             correlation_id=tool_call_id,
