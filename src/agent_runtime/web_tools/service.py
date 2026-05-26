@@ -477,27 +477,43 @@ def _render_html_document(
     results = data.get("results") if isinstance(data.get("results"), list) else []
     citations = data.get("citations") if isinstance(data.get("citations"), list) else []
     items = data.get("items") if isinstance(data.get("items"), list) else []
+    reference_sources = _collect_reference_sources(results, citations)
+    reference_markers = _render_reference_markers(reference_sources)
 
     sections = [
-        '<article class="web-tool-result" data-operation="' + html.escape(operation, quote=True) + '">',
+        "<article>",
         "<header>",
         f"<h1>{html.escape(title)}</h1>",
         "<dl>",
+        "<div>",
         f"<dt>{html.escape(target_label)}</dt>",
         "<dd>" + _render_target_list(targets) + "</dd>",
+        "</div>",
         "</dl>",
         "</header>",
     ]
     if summary:
-        sections.extend(["<section>", "<h2>Summary</h2>", f"<p>{html.escape(summary)}</p>", "</section>"])
+        sections.extend(
+            [
+                "<section>",
+                "<h2>Summary</h2>",
+                f"<p>{html.escape(summary)}{reference_markers}</p>",
+                "</section>",
+            ]
+        )
     if key_points:
-        sections.extend(["<section>", "<h2>Key Points</h2>", _render_text_list(key_points), "</section>"])
+        sections.extend(
+            [
+                "<section>",
+                "<h2>Key Points</h2>",
+                _render_text_list(key_points, reference_sources),
+                "</section>",
+            ]
+        )
     if items:
         sections.extend(["<section>", "<h2>Batch Items</h2>", _render_batch_items(items), "</section>"])
-    if results:
-        sections.extend(["<section>", "<h2>Sources</h2>", _render_sources(results), "</section>"])
-    if citations:
-        sections.extend(["<section>", "<h2>Citations</h2>", _render_citations(citations), "</section>"])
+    if reference_sources:
+        sections.extend(["<footer>", "<h2>Sources</h2>", _render_sources(reference_sources), "</footer>"])
     sections.append("</article>")
     return "\n".join(sections)
 
@@ -521,8 +537,9 @@ def _render_target_list(targets: tuple[str, ...]) -> str:
     return "<ol>" + "".join(f"<li>{html.escape(target)}</li>" for target in targets) + "</ol>"
 
 
-def _render_text_list(values: list[Any]) -> str:
-    return "<ol>" + "".join(f"<li>{html.escape(str(value))}</li>" for value in values if str(value).strip()) + "</ol>"
+def _render_text_list(values: list[Any], reference_sources: list[dict[str, str]] | None = None) -> str:
+    reference_markers = _render_reference_markers(reference_sources or [])
+    return "<ol>" + "".join(f"<li>{html.escape(str(value))}{reference_markers}</li>" for value in values if str(value).strip()) + "</ol>"
 
 
 def _render_batch_items(items: list[Any]) -> str:
@@ -540,36 +557,94 @@ def _render_batch_items(items: list[Any]) -> str:
     return "<ol>" + "".join(rendered) + "</ol>"
 
 
-def _render_sources(results: list[Any]) -> str:
-    rendered: list[str] = []
-    for item in results:
+def _collect_reference_sources(results: list[Any], citations: list[Any]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    seen: dict[str, dict[str, str]] = {}
+
+    def add(item: Any) -> None:
         if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or item.get("url") or "Untitled source")
-        url = str(item.get("url") or "")
-        snippet = str(item.get("snippet") or "")
-        source = str(item.get("source") or "")
-        published_at = str(item.get("published_at") or "")
-        link = f'<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>' if url else html.escape(title)
+            return
+        url = _clean_string(item.get("url"))
+        title = _clean_string(item.get("title")) or _clean_string(item.get("source")) or url or "Untitled source"
+        snippet = _clean_string(item.get("snippet"))
+        source = _clean_string(item.get("source"))
+        published_at = _clean_string(item.get("published_at"))
+        key = url or f"{title}|{snippet}|{source}"
+        if not key:
+            return
+        existing = seen.get(key)
+        if existing is not None:
+            if not existing.get("title") and title:
+                existing["title"] = title
+            if not existing.get("snippet") and snippet:
+                existing["snippet"] = snippet
+            if not existing.get("source") and source:
+                existing["source"] = source
+            if not existing.get("published_at") and published_at:
+                existing["published_at"] = published_at
+            return
+        source_ref = {
+            "index": str(len(sources) + 1),
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "source": source,
+            "published_at": published_at,
+        }
+        sources.append(source_ref)
+        seen[key] = source_ref
+
+    for item in results:
+        add(item)
+    for item in citations:
+        add(item)
+    return sources
+
+
+def _clean_string(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _render_reference_markers(reference_sources: list[dict[str, str]], *, limit: int = 6) -> str:
+    if not reference_sources:
+        return ""
+    rendered: list[str] = []
+    for source in reference_sources[:limit]:
+        index = html.escape(source["index"])
+        title = html.escape(source.get("title") or f"Source {index}", quote=True)
+        url = source.get("url") or ""
+        label = f"[{index}]"
+        if url:
+            rendered.append(f'<a href="{html.escape(url, quote=True)}" title="{title}" target="_blank" rel="noreferrer">{label}</a>')
+        else:
+            rendered.append(f"<span title=\"{title}\">{label}</span>")
+    if len(reference_sources) > limit:
+        rendered.append(f"<span>+{len(reference_sources) - limit}</span>")
+    return '<sup aria-label="Sources">' + "".join(rendered) + "</sup>"
+
+
+def _render_sources(reference_sources: list[dict[str, str]]) -> str:
+    rendered: list[str] = []
+    for source_ref in reference_sources:
+        index = source_ref["index"]
+        title = source_ref.get("title") or source_ref.get("url") or "Untitled source"
+        url = source_ref.get("url") or ""
+        snippet = source_ref.get("snippet") or ""
+        source = source_ref.get("source") or ""
+        published_at = source_ref.get("published_at") or ""
+        link = (
+            f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noreferrer">{html.escape(title)}</a>'
+            if url
+            else html.escape(title)
+        )
         meta = " · ".join(part for part in (source, published_at) if part)
         rendered.append(
             "<li>"
-            f"<h3>{link}</h3>"
+            f"<h3>{html.escape(index)}. {link}</h3>"
             + (f"<p>{html.escape(snippet)}</p>" if snippet else "")
             + (f"<p><small>{html.escape(meta)}</small></p>" if meta else "")
             + "</li>"
         )
-    return "<ol>" + "".join(rendered) + "</ol>"
-
-
-def _render_citations(citations: list[Any]) -> str:
-    rendered: list[str] = []
-    for citation in citations:
-        if not isinstance(citation, dict):
-            continue
-        url = str(citation.get("url") or "")
-        if not url:
-            continue
-        title = str(citation.get("title") or url)
-        rendered.append(f'<li><a href="{html.escape(url, quote=True)}">{html.escape(title)}</a></li>')
     return "<ol>" + "".join(rendered) + "</ol>"
