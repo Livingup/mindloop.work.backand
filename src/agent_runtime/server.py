@@ -70,11 +70,17 @@ def create_app() -> FastAPI:
     from agent_runtime.llm_http_trace.north_gateway.llm_http_trace_rest_adapter import (
         create_llm_http_trace_router,
     )
+    from agent_runtime.llm_client import LlmClientFactory
     from agent_runtime.image_generation.north_gateway.image_generation_rest_adapter import (
         create_image_generation_router,
     )
     from agent_runtime.image_generation.service import ImageGenerationService
     from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
+    from agent_runtime.web_tools.north_gateway.web_tools_rest_adapter import (
+        create_web_tools_router,
+    )
+    from agent_runtime.web_tools.service import WebToolsService
+    from agent_runtime.web_tools.settings_repository import WebToolsSettingsRepository
     from agent_runtime.file_resource.shared_service import get_file_resource_service
     from agent_runtime.system_settings.system_settings_factory import (
         SystemSettingsFactory,
@@ -156,6 +162,13 @@ def create_app() -> FastAPI:
         ),
         llm_registry_gateway=image_generation_registry_gateway,
         file_resource_service=get_file_resource_service(),
+    )
+    web_tools_service = WebToolsService(
+        settings_repository=WebToolsSettingsRepository(
+            lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+        ),
+        llm_registry_gateway=llm_model_registry_gateway,
+        llm_request_service=LlmClientFactory.create(),
     )
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     codex_oauth_service.ensure_builtin_provider()
@@ -423,6 +436,11 @@ def create_app() -> FastAPI:
         create_image_generation_router(image_generation_service),
         prefix="/api/image-generation",
         tags=["图片生成"],
+    )
+    app.include_router(
+        create_web_tools_router(web_tools_service),
+        prefix="/api/web-tools",
+        tags=["网络工具"],
     )
     app.include_router(
         create_codex_oauth_router(codex_oauth_service),

@@ -53,6 +53,7 @@ class LocalToolFactory:
         import agent_runtime.frontend_debug.frontend_debug_tool  # noqa: F401
         import agent_runtime.image_generation.image_generation_tool  # noqa: F401
         import agent_runtime.terminal.terminal_tool  # noqa: F401
+        import agent_runtime.web_tools.web_tools  # noqa: F401
 
         repository = get_global_repository()
         if schema_cache is None:
