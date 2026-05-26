@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import html
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +27,11 @@ from agent_runtime.web_tools.models import (
     WebToolsRuntimeSettings,
 )
 from agent_runtime.web_tools.settings_repository import WebToolsSettingsRepository
+
+
+WEB_TOOL_BATCH_CONCURRENCY = 3
+WEB_SEARCH_MAX_BATCH_QUERIES = 10
+READ_URL_CONTEXT_MAX_BATCH_URLS = 10
 
 
 class WebToolsConfigurationError(RuntimeError):
@@ -70,32 +77,91 @@ class WebToolsService:
         return self._adapter_registry.supported_api_formats()
 
     async def web_search(self, request: WebSearchRequest) -> WebToolResult:
-        query = request.query.strip()
-        if not query:
-            raise ValueError("query must not be empty.")
-        normalized = WebSearchRequest(
-            query=query,
-            max_results=max(1, min(50, int(request.max_results))),
-            allowed_domains=_normalize_domains(request.allowed_domains),
-            blocked_domains=_normalize_domains(request.blocked_domains),
-            recency=request.recency.strip() if isinstance(request.recency, str) and request.recency.strip() else None,
+        queries = _normalize_text_batch(
+            request.query,
+            request.additional_queries,
+            max_items=WEB_SEARCH_MAX_BATCH_QUERIES,
         )
-        return await self._execute("web_search", normalized)
+        if not queries:
+            raise ValueError("query must not be empty.")
+        max_results = max(1, min(50, int(request.max_results)))
+        allowed_domains = _normalize_domains(request.allowed_domains)
+        blocked_domains = _normalize_domains(request.blocked_domains)
+        recency = request.recency.strip() if isinstance(request.recency, str) and request.recency.strip() else None
+        requests = tuple(
+            WebSearchRequest(
+                query=query,
+                max_results=max_results,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+                recency=recency,
+            )
+            for query in queries
+        )
+        if len(requests) == 1:
+            return await self._execute_single("web_search", requests[0])
+        return await self._execute_batch(
+            "web_search",
+            WebSearchRequest(
+                query=requests[0].query,
+                additional_queries=tuple(item.query for item in requests[1:]),
+                max_results=max_results,
+                allowed_domains=allowed_domains,
+                blocked_domains=blocked_domains,
+                recency=recency,
+            ),
+            requests,
+        )
 
     async def read_url_context(self, request: ReadUrlContextRequest) -> WebToolResult:
-        url = request.url.strip()
-        if not url:
-            raise ValueError("url must not be empty.")
-        if not url.lower().startswith(("http://", "https://")):
-            raise ValueError("url must start with http:// or https://.")
-        normalized = ReadUrlContextRequest(
-            url=url,
-            question=request.question.strip() if isinstance(request.question, str) and request.question.strip() else None,
-            max_summary_tokens=request.max_summary_tokens,
+        urls = _normalize_text_batch(
+            request.url,
+            request.additional_urls,
+            max_items=READ_URL_CONTEXT_MAX_BATCH_URLS,
         )
-        return await self._execute("read_url_context", normalized)
+        if not urls:
+            raise ValueError("url must not be empty.")
+        for url in urls:
+            if not url.lower().startswith(("http://", "https://")):
+                raise ValueError("url must start with http:// or https://.")
+        question = request.question.strip() if isinstance(request.question, str) and request.question.strip() else None
+        requests = tuple(
+            ReadUrlContextRequest(
+                url=url,
+                question=question,
+                max_summary_tokens=request.max_summary_tokens,
+            )
+            for url in urls
+        )
+        if len(requests) == 1:
+            return await self._execute_single("read_url_context", requests[0])
+        return await self._execute_batch(
+            "read_url_context",
+            ReadUrlContextRequest(
+                url=requests[0].url,
+                additional_urls=tuple(item.url for item in requests[1:]),
+                question=question,
+                max_summary_tokens=request.max_summary_tokens,
+            ),
+            requests,
+        )
 
-    async def _execute(
+    async def _execute_batch(
+        self,
+        operation: WebToolOperation,
+        batch_request: WebSearchRequest | ReadUrlContextRequest,
+        requests: tuple[WebSearchRequest | ReadUrlContextRequest, ...],
+    ) -> WebToolResult:
+        semaphore = asyncio.Semaphore(WEB_TOOL_BATCH_CONCURRENCY)
+
+        async def run_one(item: WebSearchRequest | ReadUrlContextRequest) -> WebToolResult:
+            async with semaphore:
+                return await self._execute_single(operation, item)
+
+        outputs = await asyncio.gather(*(run_one(item) for item in requests), return_exceptions=True)
+        return _merge_batch_results(operation, batch_request, requests, outputs)
+
+    async def _execute_single(
         self,
         operation: WebToolOperation,
         request: WebSearchRequest | ReadUrlContextRequest,
@@ -128,9 +194,10 @@ class WebToolsService:
                         ),
                     )
                 )
-                content = _assistant_text(response.assistant_message.content)
-                data = _parse_result_data(content)
+                raw_content = _assistant_text(response.assistant_message.content)
+                data = _parse_result_data(raw_content)
                 _enrich_sources(data, response.raw_response)
+                content = _render_html_document(operation, request, data)
                 return WebToolResult(
                     operation=operation,
                     content=content,
@@ -271,3 +338,238 @@ def _normalize_domains(values: tuple[str, ...]) -> tuple[str, ...]:
         seen.add(text)
         normalized.append(text)
     return tuple(normalized)
+
+
+def _normalize_text_batch(primary: str, additional: tuple[str, ...], *, max_items: int) -> tuple[str, ...]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in (primary, *additional):
+        text = str(value).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+        if len(items) >= max_items:
+            break
+    return tuple(items)
+
+
+def _merge_batch_results(
+    operation: WebToolOperation,
+    batch_request: WebSearchRequest | ReadUrlContextRequest,
+    requests: tuple[WebSearchRequest | ReadUrlContextRequest, ...],
+    outputs: list[WebToolResult | BaseException],
+) -> WebToolResult:
+    items: list[dict[str, Any]] = []
+    merged_results: list[Any] = []
+    merged_key_points: list[str] = []
+    merged_citations: list[dict[str, Any]] = []
+    citation_urls: set[str] = set()
+    first_success: WebToolResult | None = None
+    success_count = 0
+
+    for request, output in zip(requests, outputs, strict=True):
+        target = _request_target(operation, request)
+        if isinstance(output, WebToolResult):
+            success_count += 1
+            if first_success is None:
+                first_success = output
+            item = {
+                "target": target,
+                "success": True,
+                "summary": output.data.get("summary"),
+                "results": output.data.get("results") if isinstance(output.data.get("results"), list) else [],
+                "key_points": output.data.get("key_points") if isinstance(output.data.get("key_points"), list) else [],
+                "citations": output.data.get("citations") if isinstance(output.data.get("citations"), list) else [],
+                "provider": _result_provider(output),
+            }
+            items.append(item)
+            if isinstance(item["results"], list):
+                merged_results.extend(item["results"])
+            if isinstance(item["key_points"], list):
+                merged_key_points.extend(str(value) for value in item["key_points"] if str(value).strip())
+            if isinstance(item["citations"], list):
+                for citation in item["citations"]:
+                    if not isinstance(citation, dict):
+                        continue
+                    url = citation.get("url")
+                    if not isinstance(url, str) or not url or url in citation_urls:
+                        continue
+                    citation_urls.add(url)
+                    merged_citations.append(citation)
+        else:
+            items.append(
+                {
+                    "target": target,
+                    "success": False,
+                    "error_type": output.__class__.__name__,
+                    "error_message": str(output),
+                }
+            )
+
+    if first_success is None:
+        first_error = next((item.get("error_message") for item in items if item.get("error_message")), "all batch items failed")
+        raise RuntimeError(f"Web tool {operation} batch failed: {first_error}")
+
+    data = {
+        "summary": f"{operation} completed {success_count}/{len(requests)} batch items.",
+        "results": merged_results,
+        "key_points": merged_key_points,
+        "citations": merged_citations,
+        "items": items,
+        "batch": {
+            "operation": operation,
+            "requested_count": len(requests),
+            "success_count": success_count,
+            "failure_count": len(requests) - success_count,
+            "targets": [_request_target(operation, request) for request in requests],
+        },
+    }
+    return WebToolResult(
+        operation=operation,
+        content=_render_html_document(operation, batch_request, data),
+        data=data,
+        provider_id=first_success.provider_id,
+        binding_id=first_success.binding_id,
+        model_id=first_success.model_id,
+        model_alias=first_success.model_alias,
+        api_format=first_success.api_format,
+        candidate_index=first_success.candidate_index,
+        attempt_count=sum(output.attempt_count for output in outputs if isinstance(output, WebToolResult)),
+        api_key_index=first_success.api_key_index,
+    )
+
+
+def _result_provider(result: WebToolResult) -> dict[str, Any]:
+    return {
+        "provider_id": result.provider_id,
+        "binding_id": result.binding_id,
+        "model_id": result.model_id,
+        "model_alias": result.model_alias,
+        "api_format": result.api_format,
+        "candidate_index": result.candidate_index,
+        "attempt_count": result.attempt_count,
+        "api_key_index": result.api_key_index,
+    }
+
+
+def _request_target(operation: WebToolOperation, request: WebSearchRequest | ReadUrlContextRequest) -> str:
+    if operation == "web_search" and isinstance(request, WebSearchRequest):
+        return request.query
+    if operation == "read_url_context" and isinstance(request, ReadUrlContextRequest):
+        return request.url
+    return ""
+
+
+def _render_html_document(
+    operation: WebToolOperation,
+    request: WebSearchRequest | ReadUrlContextRequest,
+    data: dict[str, Any],
+) -> str:
+    title = "Web Search Result" if operation == "web_search" else "URL Context Result"
+    target_label = "Query" if operation == "web_search" else "URL"
+    targets = _document_targets(operation, request, data)
+    summary = str(data.get("summary") or "").strip()
+    key_points = data.get("key_points") if isinstance(data.get("key_points"), list) else []
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    citations = data.get("citations") if isinstance(data.get("citations"), list) else []
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+
+    sections = [
+        '<article class="web-tool-result" data-operation="' + html.escape(operation, quote=True) + '">',
+        "<header>",
+        f"<h1>{html.escape(title)}</h1>",
+        "<dl>",
+        f"<dt>{html.escape(target_label)}</dt>",
+        "<dd>" + _render_target_list(targets) + "</dd>",
+        "</dl>",
+        "</header>",
+    ]
+    if summary:
+        sections.extend(["<section>", "<h2>Summary</h2>", f"<p>{html.escape(summary)}</p>", "</section>"])
+    if key_points:
+        sections.extend(["<section>", "<h2>Key Points</h2>", _render_text_list(key_points), "</section>"])
+    if items:
+        sections.extend(["<section>", "<h2>Batch Items</h2>", _render_batch_items(items), "</section>"])
+    if results:
+        sections.extend(["<section>", "<h2>Sources</h2>", _render_sources(results), "</section>"])
+    if citations:
+        sections.extend(["<section>", "<h2>Citations</h2>", _render_citations(citations), "</section>"])
+    sections.append("</article>")
+    return "\n".join(sections)
+
+
+def _document_targets(operation: WebToolOperation, request: WebSearchRequest | ReadUrlContextRequest, data: dict[str, Any]) -> tuple[str, ...]:
+    batch = data.get("batch") if isinstance(data.get("batch"), dict) else None
+    if batch and isinstance(batch.get("targets"), list):
+        return tuple(str(item) for item in batch["targets"] if str(item).strip())
+    if operation == "web_search" and isinstance(request, WebSearchRequest):
+        return _normalize_text_batch(request.query, request.additional_queries, max_items=WEB_SEARCH_MAX_BATCH_QUERIES)
+    if operation == "read_url_context" and isinstance(request, ReadUrlContextRequest):
+        return _normalize_text_batch(request.url, request.additional_urls, max_items=READ_URL_CONTEXT_MAX_BATCH_URLS)
+    return tuple()
+
+
+def _render_target_list(targets: tuple[str, ...]) -> str:
+    if not targets:
+        return ""
+    if len(targets) == 1:
+        return html.escape(targets[0])
+    return "<ol>" + "".join(f"<li>{html.escape(target)}</li>" for target in targets) + "</ol>"
+
+
+def _render_text_list(values: list[Any]) -> str:
+    return "<ol>" + "".join(f"<li>{html.escape(str(value))}</li>" for value in values if str(value).strip()) + "</ol>"
+
+
+def _render_batch_items(items: list[Any]) -> str:
+    rendered: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        target = html.escape(str(item.get("target") or ""))
+        if item.get("success") is True:
+            summary = html.escape(str(item.get("summary") or ""))
+            rendered.append(f"<li><h3>{target}</h3><p>{summary}</p></li>")
+        else:
+            error = html.escape(str(item.get("error_message") or "Failed."))
+            rendered.append(f"<li><h3>{target}</h3><p>Failed: {error}</p></li>")
+    return "<ol>" + "".join(rendered) + "</ol>"
+
+
+def _render_sources(results: list[Any]) -> str:
+    rendered: list[str] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("url") or "Untitled source")
+        url = str(item.get("url") or "")
+        snippet = str(item.get("snippet") or "")
+        source = str(item.get("source") or "")
+        published_at = str(item.get("published_at") or "")
+        link = f'<a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>' if url else html.escape(title)
+        meta = " · ".join(part for part in (source, published_at) if part)
+        rendered.append(
+            "<li>"
+            f"<h3>{link}</h3>"
+            + (f"<p>{html.escape(snippet)}</p>" if snippet else "")
+            + (f"<p><small>{html.escape(meta)}</small></p>" if meta else "")
+            + "</li>"
+        )
+    return "<ol>" + "".join(rendered) + "</ol>"
+
+
+def _render_citations(citations: list[Any]) -> str:
+    rendered: list[str] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        url = str(citation.get("url") or "")
+        if not url:
+            continue
+        title = str(citation.get("title") or url)
+        rendered.append(f'<li><a href="{html.escape(url, quote=True)}">{html.escape(title)}</a></li>')
+    return "<ol>" + "".join(rendered) + "</ol>"

@@ -464,14 +464,14 @@ def _preview_tool_ui(result: BaseToolResult) -> dict[str, Any] | None:
 
 
 def _preview_value(value: Any, *, depth: int = 0) -> Any:
-    if depth >= TOOL_RESULT_PREVIEW_MAX_DEPTH:
-        return "<truncated: max depth reached>"
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
         if len(value) <= TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH:
             return value
         return f"{value[:TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH]}...<truncated {len(value) - TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH} chars>"
+    if depth >= TOOL_RESULT_PREVIEW_MAX_DEPTH:
+        return "<truncated: max depth reached>"
     if isinstance(value, dict):
         items = list(value.items())
         preview = {

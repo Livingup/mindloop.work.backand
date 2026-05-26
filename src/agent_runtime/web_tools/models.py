@@ -58,6 +58,7 @@ class WebToolsRuntimeSettings:
 @dataclass(frozen=True, slots=True)
 class WebSearchRequest:
     query: str
+    additional_queries: tuple[str, ...] = field(default_factory=tuple)
     max_results: int = 8
     allowed_domains: tuple[str, ...] = field(default_factory=tuple)
     blocked_domains: tuple[str, ...] = field(default_factory=tuple)
@@ -67,6 +68,7 @@ class WebSearchRequest:
 @dataclass(frozen=True, slots=True)
 class ReadUrlContextRequest:
     url: str
+    additional_urls: tuple[str, ...] = field(default_factory=tuple)
     question: str | None = None
     max_summary_tokens: int | None = None
 
