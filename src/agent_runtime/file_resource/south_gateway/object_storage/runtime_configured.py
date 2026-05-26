@@ -9,6 +9,8 @@ from agent_runtime.file_resource.south_gateway.object_storage.aliyun_oss import 
 )
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
+    ObjectStorageCancelChecker,
+    ObjectStorageProgressCallback,
     UploadedObjectStorageResource,
 )
 
@@ -26,12 +28,17 @@ class RuntimeConfiguredObjectStorageGateway(ObjectStorageGateway):
         resource_id: str,
         resource_content: bytes,
         resource_mime_type: str,
+        *,
+        progress_callback: ObjectStorageProgressCallback | None = None,
+        cancel_checker: ObjectStorageCancelChecker | None = None,
     ) -> UploadedObjectStorageResource:
         gateway = self._create_gateway(require_credentials=True)
         return gateway.upload_resource_content(
             resource_id=resource_id,
             resource_content=resource_content,
             resource_mime_type=resource_mime_type,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
         )
 
     def delete_resource_content(self, resource_id: str) -> None:

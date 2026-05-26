@@ -15,6 +15,7 @@ import hashlib
 import logging
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from agent_runtime.file_resource.local_storage import LocalResourceStorage
 from agent_runtime.file_resource.metadata_parser import FileResourceMetadataParser
@@ -33,9 +34,17 @@ from agent_runtime.file_resource.north_gateway.resource_create_contracts import 
 
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
+    ObjectStorageUploadCancelledError,
 )
 
 logger = logging.getLogger(__name__)
+
+FileResourceProgressCallback = Callable[[str, str, int, int | None, int | None], None]
+FileResourceCancelChecker = Callable[[], bool]
+
+
+class FileResourceCancelledError(RuntimeError):
+    pass
 
 
 class FileResourceService:
@@ -98,6 +107,9 @@ class FileResourceService:
     def create_resources_from_base64_contents(
         self,
         create_requests: list[Base64CreateRequest],
+        *,
+        progress_callback: FileResourceProgressCallback | None = None,
+        cancel_checker: FileResourceCancelChecker | None = None,
     ) -> list[FileResourceCreateResult]:
         """从 Base64 内容批量创建统一文件资源。
 
@@ -107,10 +119,17 @@ class FileResourceService:
         """
 
         self._assert_valid_batch_size(len(create_requests))
-        return [
-            self._create_from_base64(req)
-            for req in create_requests
-        ]
+        results: list[FileResourceCreateResult] = []
+        for req in create_requests:
+            self._ensure_not_cancelled(cancel_checker)
+            results.append(
+                self._create_from_base64(
+                    req,
+                    progress_callback=progress_callback,
+                    cancel_checker=cancel_checker,
+                )
+            )
+        return results
 
     # ── 北向能力：资源访问 ─────────────────────────────────────
 
@@ -160,6 +179,9 @@ class FileResourceService:
     def _create_from_base64(
         self,
         request: Base64CreateRequest,
+        *,
+        progress_callback: FileResourceProgressCallback | None = None,
+        cancel_checker: FileResourceCancelChecker | None = None,
     ) -> FileResourceCreateResult:
         """处理单个 Base64 资源接入请求。
 
@@ -168,19 +190,30 @@ class FileResourceService:
         Base64 解码失败时抛出 ValueError 并携带原始错误信息。
         """
 
+        self._ensure_not_cancelled(cancel_checker)
+        self._emit_progress(progress_callback, "decoding", "正在解码文件内容。", 5)
         try:
             content = base64.b64decode(request.resource_base64_content)
         except Exception as e:
             raise ValueError(
                 f"Base64 内容解码失败: {e}"
             ) from e
-        archive = self._ingest_content(content, request.resource_mime_type)
+        self._ensure_not_cancelled(cancel_checker)
+        archive = self._ingest_content(
+            content,
+            request.resource_mime_type,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+        )
         return self._to_create_result(archive)
 
     def _ingest_content(
         self,
         content: bytes,
         mime_type: str,
+        *,
+        progress_callback: FileResourceProgressCallback | None = None,
+        cancel_checker: FileResourceCancelChecker | None = None,
     ) -> FileResourceArchive:
         """接入资源内容并执行统一建档。
 
@@ -196,33 +229,54 @@ class FileResourceService:
         如果 OSS 上传失败，会尝试回滚已写入的本地文件。
         """
 
+        self._ensure_not_cancelled(cancel_checker)
         validated_mime = self._metadata_parser.assert_supported_mime_type(mime_type)
         content_hash = hashlib.sha256(content).hexdigest()
 
         # 去重
         existing = self._archive_repository.get_archive_by_content_hash(content_hash)
         if existing is not None:
+            self._emit_progress(progress_callback, "completed", "资源已存在，复用已有档案。", 100)
             return existing
 
+        self._ensure_not_cancelled(cancel_checker)
+        self._emit_progress(progress_callback, "processing", "正在解析文件元数据。", 12)
         category = self._metadata_parser.determine_resource_category(validated_mime)
         metadata = self._metadata_parser.parse_metadata(content, validated_mime)
 
         # 本地落盘
+        self._ensure_not_cancelled(cancel_checker)
+        self._emit_progress(progress_callback, "local_storing", "正在写入本地缓存。", 18)
         local_result = self._local_storage.store_resource_content(
             resource_category=category,
             resource_content_hash=content_hash,
             resource_mime_type=validated_mime,
             resource_content=content,
         )
+        self._ensure_not_cancelled(cancel_checker)
+        self._emit_progress(progress_callback, "local_stored", "本地缓存写入完成。", 25)
 
         # OSS 上传（失败时回滚本地文件）
         resource_id = str(uuid.uuid4())
         try:
+            self._emit_progress(progress_callback, "oss_uploading", "正在上传到 OSS。", 30, 0, len(content))
             oss_result = self._object_storage_gateway.upload_resource_content(
                 resource_id=resource_id,
                 resource_content=content,
                 resource_mime_type=validated_mime,
+                progress_callback=lambda uploaded, total: self._emit_progress(
+                    progress_callback,
+                    "oss_uploading",
+                    f"正在上传到 OSS: {uploaded}/{total} bytes。",
+                    30 + int((uploaded / total) * 60) if total > 0 else 30,
+                    uploaded,
+                    total,
+                ),
+                cancel_checker=cancel_checker,
             )
+        except ObjectStorageUploadCancelledError as exc:
+            self._local_storage.delete_resource_content(local_result.local_storage_path)
+            raise FileResourceCancelledError("文件上传已取消。") from exc
         except Exception:
             logger.warning(
                 "OSS 上传失败，回滚本地文件: %s",
@@ -233,6 +287,13 @@ class FileResourceService:
             raise
 
         # 建档
+        try:
+            self._ensure_not_cancelled(cancel_checker)
+        except FileResourceCancelledError:
+            self._local_storage.delete_resource_content(local_result.local_storage_path)
+            self._object_storage_gateway.delete_resource_content(resource_id)
+            raise
+        self._emit_progress(progress_callback, "archiving", "正在创建资源档案。", 95)
         archive = FileResourceArchive.create_new(
             resource_id=resource_id,
             resource_content_hash=content_hash,
@@ -244,6 +305,7 @@ class FileResourceService:
             resource_metadata=metadata,
         )
         self._archive_repository.save_archive(archive)
+        self._emit_progress(progress_callback, "completed", "资源建档完成。", 100)
         return archive
 
     # ── 内部：资源访问 ─────────────────────────────────────────
@@ -332,3 +394,19 @@ class FileResourceService:
             raise ValueError(
                 f"统一文件资源服务批量请求超过上限: {count} > {self._batch_limit}"
             )
+
+    def _ensure_not_cancelled(self, cancel_checker: FileResourceCancelChecker | None) -> None:
+        if cancel_checker is not None and cancel_checker():
+            raise FileResourceCancelledError("文件上传已取消。")
+
+    def _emit_progress(
+        self,
+        progress_callback: FileResourceProgressCallback | None,
+        phase: str,
+        message: str,
+        progress_percent: int,
+        uploaded_bytes: int | None = None,
+        total_bytes: int | None = None,
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(phase, message, progress_percent, uploaded_bytes, total_bytes)

@@ -10,6 +10,9 @@ from math import ceil
 
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
+    ObjectStorageCancelChecker,
+    ObjectStorageProgressCallback,
+    ObjectStorageUploadCancelledError,
     UploadedObjectStorageResource,
 )
 
@@ -66,6 +69,9 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         resource_id: str,
         resource_content: bytes,
         resource_mime_type: str,
+        *,
+        progress_callback: ObjectStorageProgressCallback | None = None,
+        cancel_checker: ObjectStorageCancelChecker | None = None,
     ) -> UploadedObjectStorageResource:
         """上传统一文件资源内容到阿里云国际 OSS。
 
@@ -75,18 +81,25 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         """
 
         object_key = self._build_object_key(resource_id)
+        self._ensure_not_cancelled(cancel_checker)
         if len(resource_content) >= _MULTIPART_UPLOAD_THRESHOLD_BYTES:
             self._multipart_upload_object(
                 object_key=object_key,
                 resource_content=resource_content,
                 resource_mime_type=resource_mime_type,
+                progress_callback=progress_callback,
+                cancel_checker=cancel_checker,
             )
         else:
+            self._ensure_not_cancelled(cancel_checker)
             self._oss_bucket.put_object(
                 object_key,
                 resource_content,
                 headers={"Content-Type": resource_mime_type},
             )
+            self._ensure_not_cancelled(cancel_checker)
+            if progress_callback is not None:
+                progress_callback(len(resource_content), len(resource_content))
         return UploadedObjectStorageResource(
             resource_id=resource_id,
             object_storage_url=self._build_public_url(resource_id),
@@ -127,6 +140,8 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         object_key: str,
         resource_content: bytes,
         resource_mime_type: str,
+        progress_callback: ObjectStorageProgressCallback | None,
+        cancel_checker: ObjectStorageCancelChecker | None,
     ) -> None:
         try:
             import oss2
@@ -143,6 +158,7 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
         try:
             part_count = ceil(len(resource_content) / _MULTIPART_UPLOAD_PART_SIZE_BYTES)
             for part_index in range(part_count):
+                self._ensure_not_cancelled(cancel_checker)
                 part_number = part_index + 1
                 start = part_index * _MULTIPART_UPLOAD_PART_SIZE_BYTES
                 end = min(start + _MULTIPART_UPLOAD_PART_SIZE_BYTES, len(resource_content))
@@ -152,17 +168,26 @@ class AliyunOssObjectStorageGateway(ObjectStorageGateway):
                     part_number,
                     resource_content[start:end],
                 )
+                self._ensure_not_cancelled(cancel_checker)
                 parts.append(oss2.models.PartInfo(part_number, result.etag))
+                if progress_callback is not None:
+                    progress_callback(end, len(resource_content))
+            self._ensure_not_cancelled(cancel_checker)
             self._oss_bucket.complete_multipart_upload(
                 object_key,
                 upload_id,
                 parts,
                 headers={"Content-Type": resource_mime_type},
             )
+            self._ensure_not_cancelled(cancel_checker)
         except Exception:
             with suppress(Exception):
                 self._oss_bucket.abort_multipart_upload(object_key, upload_id)
             raise
+
+    def _ensure_not_cancelled(self, cancel_checker: ObjectStorageCancelChecker | None) -> None:
+        if cancel_checker is not None and cancel_checker():
+            raise ObjectStorageUploadCancelledError("对象存储上传已取消。")
 
     def _create_oss_bucket(
         self,

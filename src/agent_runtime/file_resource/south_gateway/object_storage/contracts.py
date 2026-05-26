@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +25,14 @@ class UploadedObjectStorageResource:
     object_storage_url: str
 
 
+ObjectStorageProgressCallback = Callable[[int, int], None]
+ObjectStorageCancelChecker = Callable[[], bool]
+
+
+class ObjectStorageUploadCancelledError(RuntimeError):
+    pass
+
+
 class ObjectStorageGateway(Protocol):
     """对象存储南向网关接口。
 
@@ -36,6 +44,9 @@ class ObjectStorageGateway(Protocol):
         resource_id: str,
         resource_content: bytes,
         resource_mime_type: str,
+        *,
+        progress_callback: ObjectStorageProgressCallback | None = None,
+        cancel_checker: ObjectStorageCancelChecker | None = None,
     ) -> UploadedObjectStorageResource:
         """上传资源内容到外部对象存储服务。"""
 

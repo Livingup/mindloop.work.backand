@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_runtime.config import ConfigRegistry
@@ -14,10 +17,11 @@ from agent_runtime.file_resource.settings_repository import (
     DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS,
     ObjectStorageSettingsRepository,
 )
-from agent_runtime.file_resource.shared_service import get_file_resource_service
+from agent_runtime.file_resource.shared_service import get_file_resource_service, get_file_resource_upload_task_service
 from agent_runtime.file_resource.south_gateway.object_storage.runtime_configured import (
     ObjectStorageConfigurationError,
 )
+from agent_runtime.file_resource.upload_task_service import FileResourceUploadTaskEvent, TERMINAL_UPLOAD_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +50,18 @@ class FileResourceResponse(BaseModel):
 
 class CreateFileResourcesResponse(BaseModel):
     resources: list[FileResourceResponse]
+
+
+class FileResourceUploadTaskResponse(BaseModel):
+    task_id: str
+    status: str
+    phase: str
+    message: str
+    progress_percent: int
+    resources: list[dict[str, Any]] | None = None
+    error_message: str | None = None
+    latest_seq: int
+    events_url: str
 
 
 class ObjectStorageSettingsResponse(BaseModel):
@@ -124,6 +140,77 @@ def create_file_resource_router() -> APIRouter:
             responses.append(_resource_response(resource, name=body.resources[index].name))
         return CreateFileResourcesResponse(resources=responses)
 
+    @router.post("/upload-tasks", response_model=FileResourceUploadTaskResponse)
+    def create_upload_task(body: CreateFileResourcesBody) -> FileResourceUploadTaskResponse:
+        if not body.resources:
+            raise HTTPException(status_code=400, detail="resources 不能为空。")
+        task_service = get_file_resource_upload_task_service()
+        task = task_service.create_task(
+            resources=[
+                Base64CreateRequest(
+                    resource_base64_content=item.base64_content,
+                    resource_mime_type=item.mime_type,
+                )
+                for item in body.resources
+            ],
+            names=[item.name for item in body.resources],
+        )
+        return _upload_task_response(task_service.snapshot(task))
+
+    @router.get("/upload-tasks/{task_id}", response_model=FileResourceUploadTaskResponse)
+    def get_upload_task(task_id: str) -> FileResourceUploadTaskResponse:
+        task_service = get_file_resource_upload_task_service()
+        task = task_service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"上传任务不存在: {task_id}")
+        return _upload_task_response(task_service.snapshot(task))
+
+    @router.post("/upload-tasks/{task_id}/cancel", response_model=FileResourceUploadTaskResponse)
+    def cancel_upload_task(task_id: str) -> FileResourceUploadTaskResponse:
+        task_service = get_file_resource_upload_task_service()
+        task = task_service.cancel_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"上传任务不存在: {task_id}")
+        return _upload_task_response(task_service.snapshot(task))
+
+    @router.get("/upload-tasks/{task_id}/events")
+    async def stream_upload_task_events(
+        task_id: str,
+        request: Request,
+        after_seq: int = Query(default=0, ge=0),
+    ) -> StreamingResponse:
+        task_service = get_file_resource_upload_task_service()
+        task = task_service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"上传任务不存在: {task_id}")
+
+        async def event_generator():
+            cursor = max(after_seq, 0)
+            while True:
+                for event in task_service.list_events_after(task, cursor):
+                    cursor = event.seq
+                    yield _format_upload_task_sse(event)
+                snapshot = task_service.snapshot(task)
+                if snapshot["status"] in TERMINAL_UPLOAD_STATUSES:
+                    return
+                if await request.is_disconnected():
+                    return
+                has_event = await asyncio.to_thread(task_service.wait_for_event, task, cursor, 15)
+                if await request.is_disconnected():
+                    return
+                if not has_event:
+                    yield ": keep-alive\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @router.get("/object-storage-settings", response_model=ObjectStorageSettingsResponse)
     def get_object_storage_settings() -> ObjectStorageSettingsResponse:
         repository = _object_storage_settings_repository()
@@ -189,6 +276,26 @@ def _object_storage_settings_repository() -> ObjectStorageSettingsRepository:
     return ObjectStorageSettingsRepository(
         data_dir_accessor=lambda: ConfigRegistry.instance().file_resource_service.local_resource_storage_root_path,
     )
+
+
+def _upload_task_response(snapshot: dict[str, Any]) -> FileResourceUploadTaskResponse:
+    task_id = snapshot["task_id"]
+    return FileResourceUploadTaskResponse(
+        task_id=task_id,
+        status=snapshot["status"],
+        phase=snapshot["phase"],
+        message=snapshot["message"],
+        progress_percent=snapshot["progress_percent"],
+        resources=snapshot.get("resources"),
+        error_message=snapshot.get("error_message"),
+        latest_seq=snapshot["latest_seq"],
+        events_url=f"/api/file-resources/upload-tasks/{task_id}/events",
+    )
+
+
+def _format_upload_task_sse(event: FileResourceUploadTaskEvent) -> str:
+    payload = json.dumps(event.to_dict(), ensure_ascii=False, separators=(",", ":"))
+    return f"id: {event.seq}\nevent: file_resource_upload_task\ndata: {payload}\n\n"
 
 
 def _object_storage_settings_response(

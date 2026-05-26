@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
+    ObjectStorageUploadCancelledError,
     UploadedObjectStorageResource,
 )
 
@@ -34,14 +35,21 @@ class InMemoryObjectStorageGateway(ObjectStorageGateway):
         resource_id: str,
         resource_content: bytes,
         resource_mime_type: str,
+        *,
+        progress_callback=None,
+        cancel_checker=None,
     ) -> UploadedObjectStorageResource:
         """上传资源内容到内存对象存储网关。"""
 
+        if cancel_checker is not None and cancel_checker():
+            raise ObjectStorageUploadCancelledError("对象存储上传已取消。")
         self._stored_content_by_id[resource_id] = StoredObjectContent(
             resource_id=resource_id,
             resource_mime_type=resource_mime_type,
             resource_content=resource_content,
         )
+        if progress_callback is not None:
+            progress_callback(len(resource_content), len(resource_content))
         return UploadedObjectStorageResource(
             resource_id=resource_id,
             object_storage_url=f"{self._object_storage_public_base_url}/{resource_id}",
