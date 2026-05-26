@@ -95,6 +95,7 @@ def _tool_success_result(result: WebToolResult, ctx: ToolRuntimeContext) -> Base
         metadata={
             "ui_kind": "web_tools",
             "operation": result.operation,
+            "html_content": result.content,
             "preview_output": result.data,
             "provider_id": result.provider_id,
             "binding_id": result.binding_id,

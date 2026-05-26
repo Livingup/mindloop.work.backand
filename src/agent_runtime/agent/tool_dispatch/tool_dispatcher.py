@@ -458,6 +458,8 @@ def _preview_tool_ui(result: BaseToolResult) -> dict[str, Any] | None:
         preview["ui_kind"] = ui_kind
     if "preview_output" in result.metadata:
         preview["output"] = _preview_value(result.metadata["preview_output"])
+    if isinstance(result.metadata.get("html_content"), str):
+        preview["html_content"] = result.metadata["html_content"]
     if result.frontend_message is not None:
         preview["frontend_message"] = _preview_value(result.frontend_message.model_dump(mode="json"))
     return preview or None
