@@ -29,6 +29,7 @@ class FileResourceAccessResult:
     # 资源 MIME 类型。
     resource_mime_type: str
 
+    resource_size_in_bytes: int
     # 资源对象存储访问地址。
     object_storage_url: str
 

@@ -329,6 +329,7 @@ class FileResourceService:
             local_storage_path=archive.local_storage_path,
             resource_base64_content=b64_content,
             resource_mime_type=archive.resource_mime_type,
+            resource_size_in_bytes=archive.resource_size_in_bytes,
             object_storage_url=archive.object_storage_url,
             resource_metadata=archive.resource_metadata,
         )

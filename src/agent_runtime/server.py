@@ -403,6 +403,7 @@ def create_app() -> FastAPI:
             session_registry=scene_session_registry,
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
+            file_resource_service=get_file_resource_service(),
             communication_gateway=communication_gateway,
             runtime_health_snapshot=event_loop_monitor.snapshot,
         ),
