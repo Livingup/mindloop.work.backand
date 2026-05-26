@@ -73,11 +73,15 @@ def _inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
             target = defs.get(name, {})
             merged = {**target, **{k: v for k, v in value.items() if k != "$ref"}}
             return resolve(merged)
-        return {
+        resolved_value = {
             key: resolve(item)
             for key, item in value.items()
             if key not in {"$defs"}
         }
+        if "const" in resolved_value:
+            const_value = resolved_value.pop("const")
+            resolved_value.setdefault("enum", [const_value])
+        return resolved_value
 
     resolved = resolve(schema)
     if not isinstance(resolved, dict):
