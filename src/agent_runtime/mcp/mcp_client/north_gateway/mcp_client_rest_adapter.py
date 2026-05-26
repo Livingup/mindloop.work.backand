@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
     McpClientGateway,
@@ -130,6 +130,7 @@ class McpToolResultResponse(BaseModel):
     """工具执行结果。"""
 
     content: str
+    content_blocks: list[dict[str, Any]] = Field(default_factory=list)
     structured_content: dict | None = None
     is_error: bool = False
 
@@ -412,6 +413,7 @@ def create_mcp_router(gateway: McpClientGateway) -> APIRouter:
             raise HTTPException(status_code=502, detail=str(e))
         data: dict[str, Any] = {
             "content": result.content,
+            "content_blocks": list(result.content_blocks),
             "is_error": result.is_error,
         }
         if result.structured_content:

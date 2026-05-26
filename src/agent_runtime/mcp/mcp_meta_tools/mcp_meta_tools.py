@@ -255,6 +255,7 @@ async def mcp_call_tool(request: McpCallToolRequest) -> str | BaseToolResult:
         return _tool_error(f"MCP 工具执行失败: {e}")
     data: dict[str, Any] = {
         "content": result.content,
+        "content_blocks": list(result.content_blocks),
         "is_error": result.is_error,
     }
     if result.structured_content:

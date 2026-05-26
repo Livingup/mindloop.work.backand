@@ -42,6 +42,14 @@ _MCP_RECONNECT_BASE_DELAY_SECONDS = 2.0
 _MCP_RECONNECT_MAX_DELAY_SECONDS = 60.0
 
 
+def _dump_mcp_content_block(content: Any) -> dict[str, Any]:
+    if hasattr(content, "model_dump"):
+        return content.model_dump(mode="json", by_alias=True)
+    if isinstance(content, dict):
+        return content
+    return {"type": "text", "text": str(content)}
+
+
 class _ManagedConnection:
     """一个受管理的 MCP 服务连接。
 
@@ -264,12 +272,15 @@ class McpSessionManager:
 
         # 拼接所有 TextContent
         text_parts: list[str] = []
+        content_blocks: list[dict[str, Any]] = []
         for content in result.content:
+            content_blocks.append(_dump_mcp_content_block(content))
             if isinstance(content, types.TextContent):
                 text_parts.append(content.text)
 
         return McpToolResult(
             content="\n".join(text_parts),
+            content_blocks=tuple(content_blocks),
             structured_content=result.structuredContent,
             is_error=result.isError,
         )

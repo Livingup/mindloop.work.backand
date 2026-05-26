@@ -235,6 +235,7 @@ class McpClientGatewayImpl:
         result = await self._service.call_tool(service_id, tool_name, arguments)
         return McpToolResultDTO(
             content=result.content,
+            content_blocks=result.content_blocks,
             structured_content=result.structured_content,
             is_error=result.is_error,
         )

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 MCP_CONNECTION_STATUS_CONNECTED = "connected"
 MCP_CONNECTION_STATUS_CONNECTING = "connecting"
@@ -115,6 +116,8 @@ class McpToolResult:
 
     content: str = ""
     """工具返回的文本内容（多个 TextContent 拼接）。"""
+
+    content_blocks: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     structured_content: dict | None = None
     """工具返回的结构化内容。"""

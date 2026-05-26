@@ -58,7 +58,7 @@ def _part_to_dict(part: UniPart) -> dict[str, Any]:
             "kind": "tool_result",
             "tool_use_ref": part.tool_use_ref,
             "is_error": part.is_error,
-            "output": part.output,
+            "output": _tool_result_output_to_json(part.output),
         }
     raise TypeError(f"Unknown part type: {type(part)}")
 
@@ -84,9 +84,21 @@ def _dict_to_part(d: dict[str, Any]) -> UniPart:
         return ToolResultPart(
             tool_use_ref=d["tool_use_ref"],
             is_error=bool(d.get("is_error", False)),
-            output=d["output"],
+            output=_tool_result_output_from_json(d["output"]),
         )
     raise ValueError(f"Unknown part kind: {kind}")
+
+
+def _tool_result_output_to_json(output: Any) -> Any:
+    if isinstance(output, list) and all(isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output):
+        return [_part_to_dict(item) for item in output]
+    return output
+
+
+def _tool_result_output_from_json(output: Any) -> Any:
+    if isinstance(output, list) and all(isinstance(item, dict) and "kind" in item for item in output):
+        return [_dict_to_part(item) for item in output]
+    return output
 
 
 def _message_to_json_line(msg: UniMessage) -> str:

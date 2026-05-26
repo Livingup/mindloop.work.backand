@@ -140,6 +140,7 @@ class McpToolResultDTO:
     """工具执行结果 DTO。"""
 
     content: str
+    content_blocks: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     structured_content: dict | None = None
     is_error: bool = False
 

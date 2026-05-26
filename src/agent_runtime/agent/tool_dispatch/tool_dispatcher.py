@@ -14,7 +14,9 @@ from agent_runtime.communication.runtime_event_publisher import (
     RuntimeCommunicationContext,
     RuntimeEventPublisher,
 )
-from agent_runtime.conversation_message.message.models import ToolResultPart, ToolUsePart
+from agent_runtime.conversation_message.message.models import ImagePart, PdfPart, TextPart, ToolResultPart, ToolUsePart
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
+from agent_runtime.file_resource.shared_service import get_file_resource_service
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
@@ -41,6 +43,11 @@ TOOL_RESULT_PREVIEW_MAX_STRING_LENGTH = 4000
 TOOL_RESULT_PREVIEW_MAX_LIST_ITEMS = 20
 TOOL_RESULT_PREVIEW_MAX_DICT_ITEMS = 40
 TOOL_RESULT_PREVIEW_MAX_DEPTH = 4
+_MCP_TEXT_BLOCK = "text"
+_MCP_IMAGE_BLOCK = "image"
+_MCP_AUDIO_BLOCK = "audio"
+_MCP_RESOURCE_LINK_BLOCK = "resource_link"
+_MCP_EMBEDDED_RESOURCE_BLOCK = "resource"
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +272,7 @@ class AgentToolDispatcher:
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
                 is_error=not result.success,
-                output=_extract_llm_visible_output(result),
+                output=_extract_llm_visible_content(result),
             ),
             tool_result=result,
         )
@@ -282,12 +289,12 @@ class AgentToolDispatcher:
         _ensure_mcp_tool_allowed(agent_definition.mcp_tools, service_id, tool_name)
         params = _ensure_dict_arguments(tool_use.input)
         result = await self._mcp_client_gateway.call_tool(service_id, tool_name, params)
-        output: Any = result.structured_content if result.structured_content is not None else result.content
+        output = _normalize_mcp_tool_content_for_llm(result.content_blocks, fallback_text=result.content)
         if result.is_error:
             tool_result = build_tool_error_result(
                 error_code="McpToolError",
                 error_message=result.content,
-                output={"content": result.content, "structured_content": result.structured_content},
+                output=output,
             )
         else:
             tool_result = BaseToolResult(
@@ -302,7 +309,7 @@ class AgentToolDispatcher:
             result_part=ToolResultPart(
                 tool_use_ref=_tool_use_ref(tool_use),
                 is_error=not tool_result.success,
-                output=_extract_llm_visible_output(tool_result),
+                output=_extract_llm_visible_content(tool_result),
             ),
             tool_result=tool_result,
         )
@@ -414,7 +421,7 @@ def _tool_use_ref(tool_use: ToolUsePart) -> str:
     return tool_use.tool_use_id or tool_use.name
 
 
-def _extract_llm_visible_output(result: BaseToolResult) -> Any:
+def _extract_llm_visible_content(result: BaseToolResult) -> Any:
     """从 BaseToolResult 中提取 LLM 可见的业务输出。
 
     Runtime 内部控制字段（loop_control / frontend_message / metadata 等）不暴露给 LLM。
@@ -422,12 +429,148 @@ def _extract_llm_visible_output(result: BaseToolResult) -> Any:
     """
     if result.success:
         return result.output
-    error_text = result.error_message or "Tool execution failed."
+    error_text = f"工具执行失败：{result.error_message or 'Tool execution failed.'}"
     if result.output is None:
-        return error_text
+        return [TextPart(text=error_text)]
     if isinstance(result.output, str):
-        return f"{error_text}\n\nPartial output: {result.output}"
-    return {"error_message": error_text, "partial_output": result.output}
+        return [TextPart(text=f"{error_text}\n\n{result.output}")]
+    if _is_unipart_list(result.output):
+        return [TextPart(text=error_text), *result.output]
+    return [TextPart(text=f"{error_text}\n\n{_stable_json_text(result.output)}")]
+
+
+def _normalize_mcp_tool_content_for_llm(
+    content_blocks: tuple[dict[str, Any], ...],
+    *,
+    fallback_text: str,
+) -> list[TextPart | ImagePart | PdfPart]:
+    parts: list[TextPart | ImagePart | PdfPart] = []
+    for block in content_blocks:
+        block_type = block.get("type")
+        if block_type == _MCP_TEXT_BLOCK:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(TextPart(text=text))
+            continue
+        if block_type == _MCP_IMAGE_BLOCK:
+            part = _mcp_image_block_to_part(block)
+            parts.append(part if part is not None else TextPart(text=_describe_unsupported_mcp_block(block)))
+            continue
+        if block_type == _MCP_AUDIO_BLOCK:
+            parts.append(TextPart(text=_describe_unsupported_mcp_block(block)))
+            continue
+        if block_type == _MCP_RESOURCE_LINK_BLOCK:
+            parts.append(TextPart(text=_describe_mcp_resource_link(block)))
+            continue
+        if block_type == _MCP_EMBEDDED_RESOURCE_BLOCK:
+            parts.extend(_mcp_embedded_resource_to_parts(block))
+            continue
+        parts.append(TextPart(text=_describe_unsupported_mcp_block(block)))
+    if parts:
+        return parts
+    return [TextPart(text=fallback_text or "MCP 工具执行完成，但没有返回可见内容。")]
+
+
+def _mcp_image_block_to_part(block: dict[str, Any]) -> ImagePart | None:
+    data = block.get("data")
+    mime_type = block.get("mimeType") or block.get("mime_type")
+    if not isinstance(data, str) or not data:
+        return None
+    if not isinstance(mime_type, str) or not mime_type.startswith("image/"):
+        return None
+    resource_id = _create_file_resource_from_base64(data, mime_type)
+    return ImagePart(resource_id=resource_id) if resource_id else None
+
+
+def _mcp_embedded_resource_to_parts(block: dict[str, Any]) -> list[TextPart | ImagePart | PdfPart]:
+    resource = block.get("resource")
+    if not isinstance(resource, dict):
+        return [TextPart(text=_describe_unsupported_mcp_block(block))]
+    uri = str(resource.get("uri") or "")
+    mime_type = resource.get("mimeType") or resource.get("mime_type")
+    if not isinstance(mime_type, str):
+        mime_type = None
+    text = resource.get("text")
+    if isinstance(text, str):
+        label = _resource_label(uri=uri, mime_type=mime_type)
+        return [TextPart(text=f"{label}\n{text}" if label else text)]
+    blob = resource.get("blob")
+    if isinstance(blob, str) and mime_type:
+        if mime_type.startswith("image/"):
+            resource_id = _create_file_resource_from_base64(blob, mime_type)
+            return [ImagePart(resource_id=resource_id)] if resource_id else [TextPart(text=_describe_unsupported_mcp_block(block))]
+        if mime_type == "application/pdf":
+            resource_id = _create_file_resource_from_base64(blob, mime_type)
+            return [PdfPart(resource_id=resource_id)] if resource_id else [TextPart(text=_describe_unsupported_mcp_block(block))]
+    return [TextPart(text=_describe_mcp_embedded_resource_reference(resource))]
+
+
+def _create_file_resource_from_base64(data: str, mime_type: str) -> str | None:
+    try:
+        created = get_file_resource_service().create_resources_from_base64_contents([
+            Base64CreateRequest(resource_base64_content=data, resource_mime_type=mime_type)
+        ])
+    except Exception:
+        logger.exception("MCP 工具返回资源写入统一文件资源服务失败，已降级为文本。")
+        return None
+    if not created:
+        return None
+    return created[0].resource_id
+
+
+def _describe_mcp_resource_link(block: dict[str, Any]) -> str:
+    name = block.get("name")
+    uri = block.get("uri")
+    mime_type = block.get("mimeType") or block.get("mime_type")
+    lines = ["[resource_link] 当前 LLM 协议不支持原生资源链接，已降级为文本引用。"]
+    if name:
+        lines.append(f"name: {name}")
+    if uri:
+        lines.append(f"uri: {uri}")
+    if mime_type:
+        lines.append(f"mime_type: {mime_type}")
+    return "\n".join(lines)
+
+
+def _describe_mcp_embedded_resource_reference(resource: dict[str, Any]) -> str:
+    uri = resource.get("uri")
+    mime_type = resource.get("mimeType") or resource.get("mime_type")
+    lines = ["[unsupported_file] MCP 工具返回了一个文件资源，但当前运行时无法将该文件模态转换为 LLM 可直接读取的 content，已降级为文本引用。"]
+    if uri:
+        lines.append(f"uri: {uri}")
+    if mime_type:
+        lines.append(f"mime_type: {mime_type}")
+    return "\n".join(lines)
+
+
+def _describe_unsupported_mcp_block(block: dict[str, Any]) -> str:
+    block_type = block.get("type") or "unknown"
+    mime_type = block.get("mimeType") or block.get("mime_type")
+    lines = [f"[unsupported_content] MCP 工具返回了不支持的内容类型 {block_type}，已降级为文本。"]
+    if mime_type:
+        lines.append(f"mime_type: {mime_type}")
+    lines.append(f"raw: {_stable_json_text(block)}")
+    return "\n".join(lines)
+
+
+def _resource_label(*, uri: str, mime_type: str | None) -> str:
+    fields = []
+    if uri:
+        fields.append(f"uri: {uri}")
+    if mime_type:
+        fields.append(f"mime_type: {mime_type}")
+    return "\n".join(fields)
+
+
+def _is_unipart_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, (TextPart, ImagePart, PdfPart)) for item in value)
+
+
+def _stable_json_text(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        return str(value)
 
 
 def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
@@ -440,6 +583,8 @@ def _preview_tool_result(result: BaseToolResult) -> dict[str, Any]:
     ui_kind = result.metadata.get("ui_kind")
     if ui_kind:
         preview["ui_kind"] = ui_kind
+    if "preview_output" in result.metadata:
+        preview["output"] = _preview_value(result.metadata["preview_output"])
     if result.frontend_message is not None:
         preview["frontend_message"] = _preview_value(result.frontend_message.model_dump(mode="json"))
     if result.error_code:

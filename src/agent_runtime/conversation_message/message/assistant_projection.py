@@ -120,7 +120,7 @@ def serialize_tool_output(value: Any) -> str:
     """把工具执行结果稳定序列化为协议 tool/function result content。"""
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
 def message_has_tool_results(msg: UniMessage) -> bool:

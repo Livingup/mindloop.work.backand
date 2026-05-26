@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from agent_runtime.conversation_message.message.models import ImagePart, TextPart
 from agent_runtime.image_generation.models import ImageGenerationRequest
 from agent_runtime.image_generation.shared_service import get_image_generation_service
 from agent_runtime.tool import tool
@@ -76,10 +77,14 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         "api_key_index": result.api_key_index,
         "attempt_count": result.attempt_count,
     }
+    llm_visible_output = [
+        TextPart(text=f"已生成 {len(resources)} 张图片。"),
+        *[ImagePart(resource_id=image.resource_id) for image in result.images],
+    ]
     return BaseToolResult(
         success=True,
         execution_status="success",
-        output=output,
+        output=llm_visible_output,
         frontend_message=FrontendMessage(
             text=f"已生成 {len(resources)} 张图片。",
             text_format="markdown",
@@ -87,6 +92,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         ),
         metadata={
             "ui_kind": "image_generation",
+            "preview_output": output,
             "request_id": ctx.request_id,
             "task_id": ctx.task_id,
             "agent_instance_id": ctx.agent_instance_id,

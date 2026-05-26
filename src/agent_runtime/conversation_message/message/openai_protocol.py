@@ -270,11 +270,14 @@ async def _build_openai_tool_result_output(
         isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
     ):
         items: list[dict[str, Any]] = []
-        if is_error:
-            items.append({"type": "input_text", "text": "[ERROR] Tool execution failed."})
+        error_text_prefixed = False
         for item in output:
             if isinstance(item, TextPart):
-                items.append({"type": "input_text", "text": item.text})
+                text = item.text
+                if is_error and not error_text_prefixed:
+                    text = f"[ERROR] {text}"
+                    error_text_prefixed = True
+                items.append({"type": "input_text", "text": text})
             elif isinstance(item, ImagePart):
                 resource = await resolve_resource_access(resolver, item.resource_id)
                 image_url = resource.object_storage_url
@@ -295,6 +298,8 @@ async def _build_openai_tool_result_output(
                         "type": "input_file",
                         "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
                     })
+        if is_error and not error_text_prefixed:
+            items.insert(0, {"type": "input_text", "text": "[ERROR] 工具执行失败。"})
         return items
     text = serialize_tool_output(output)
     if is_error:

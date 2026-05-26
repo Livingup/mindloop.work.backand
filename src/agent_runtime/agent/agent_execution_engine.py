@@ -1114,10 +1114,14 @@ class AgentExecutionEngine:
                 ToolResultPart(
                     tool_use_ref=tool_use_ref,
                     is_error=True,
-                    output=(
-                        "Tool execution did not complete because the previous Agent execution was interrupted. "
-                        f"reason={reason}; tool_name={tool_use.name}"
-                    ),
+                    output=[
+                        TextPart(
+                            text=(
+                                "工具执行失败：Tool execution did not complete because the previous Agent execution was interrupted. "
+                                f"reason={reason}; tool_name={tool_use.name}"
+                            )
+                        )
+                    ],
                 )
             )
         tool_message = UniMessage(
@@ -1863,7 +1867,7 @@ class AgentExecutionEngine:
                 result_part=ToolResultPart(
                     tool_use_ref=tool_call_id,
                     is_error=True,
-                    output=tool_result.error_message or "Tool dispatch failed.",
+                    output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}")],
                 ),
                 tool_result=tool_result,
             )
@@ -1992,7 +1996,7 @@ class AgentExecutionEngine:
             result_part=ToolResultPart(
                 tool_use_ref=tool_call_id,
                 is_error=True,
-                output=tool_result.error_message or "Tool dispatch failed.",
+                output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}")],
             ),
             tool_result=tool_result,
         )
@@ -2054,7 +2058,7 @@ class AgentExecutionEngine:
             result_part=ToolResultPart(
                 tool_use_ref=tool_call_id,
                 is_error=True,
-                output=tool_result.error_message or "Tool execution cancelled.",
+                output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool execution cancelled.'}")],
             ),
             tool_result=tool_result,
         )
