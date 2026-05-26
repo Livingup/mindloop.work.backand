@@ -12,6 +12,11 @@ class ImageGenerationRequest:
     output_format: str | None = None
     output_compression: int | None = None
     n: int = 1
+    image_urls: tuple[str, ...] = ()
+    image_paths: tuple[str, ...] = ()
+    mask_url: str | None = None
+    mask_path: str | None = None
+    input_fidelity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

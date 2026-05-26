@@ -35,6 +35,22 @@ class OpenAIImagesGenerationClient:
             headers.setdefault("Authorization", f"Bearer {api_key}")
         return await _post_json(url, headers, request_body)
 
+    async def edit(
+        self,
+        *,
+        resolved_model: ResolvedLlmProviderModel,
+        api_key: str | None,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        request_body = dict(body)
+        request_body["model"] = resolved_model.model_alias
+        request_body["stream"] = False
+        url = _join_url(resolved_model.api_base_url, "images/edits")
+        headers = _json_headers(resolved_model.custom_headers)
+        if api_key:
+            headers.setdefault("Authorization", f"Bearer {api_key}")
+        return await _post_json(url, headers, request_body)
+
 
 async def _post_json(url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import mimetypes
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
@@ -80,6 +83,7 @@ class ImageGenerationService:
             raise ImageGenerationConfigurationError("Image generation LLM policy is not configured.")
         policy = self._llm_registry_gateway.resolve_execution_policy(settings.llm_policy_group_id)
         request_body = self._build_request_body(request)
+        use_edit_endpoint = "images" in request_body
         last_error: Exception | None = None
         attempt_count = 0
         for candidate_index, candidate in enumerate(policy.candidates):
@@ -97,11 +101,18 @@ class ImageGenerationService:
                 for retry_index in range(max_retries + 1):
                     attempt_count += 1
                     try:
-                        response = await self._images_client.generate(
-                            resolved_model=resolved,
-                            api_key=api_key,
-                            body=request_body,
-                        )
+                        if use_edit_endpoint:
+                            response = await self._images_client.edit(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                body=request_body,
+                            )
+                        else:
+                            response = await self._images_client.generate(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                body=request_body,
+                            )
                         images = self._ingest_images(response, output_format=str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT))
                         if not images:
                             raise RuntimeError("OpenAI Images API returned no image data.")
@@ -115,7 +126,7 @@ class ImageGenerationService:
                             candidate_index=candidate_index,
                             api_key_index=api_key_index,
                             attempt_count=attempt_count,
-                            request_params=dict(request_body),
+                            request_params=_sanitize_request_params(request_body),
                         )
                     except Exception as exc:
                         last_error = exc
@@ -143,9 +154,20 @@ class ImageGenerationService:
             "quality": _DEFAULT_QUALITY,
             "output_format": output_format,
         }
+        images = _image_references_from_request(request.image_urls, request.image_paths)
+        if images:
+            body["images"] = images
+        mask = _mask_reference_from_request(request.mask_url, request.mask_path)
+        if mask is not None:
+            if not images:
+                raise ValueError("mask_url or mask_path requires at least one input image.")
+            body["mask"] = mask
+        if request.input_fidelity is not None and not images:
+            raise ValueError("input_fidelity requires at least one input image.")
         for key, value in {
             "background": request.background,
             "output_compression": request.output_compression,
+            "input_fidelity": request.input_fidelity,
         }.items():
             if value is not None:
                 body[key] = value
@@ -243,6 +265,62 @@ def _resolve_api_key(key: str) -> str:
     if default is not None:
         return default
     raise ValueError(f"LLM API Key environment variable is not set: {env_key}")
+
+
+def _image_references_from_request(image_urls: tuple[str, ...], image_paths: tuple[str, ...]) -> list[dict[str, str]]:
+    references = [{"image_url": _normalize_image_url(url)} for url in image_urls if url.strip()]
+    references.extend({"image_url": _image_path_to_data_url(path)} for path in image_paths if path.strip())
+    if len(references) > 16:
+        raise ValueError("image edit supports at most 16 input images.")
+    return references
+
+
+def _mask_reference_from_request(mask_url: str | None, mask_path: str | None) -> dict[str, str] | None:
+    normalized_url = mask_url.strip() if isinstance(mask_url, str) else ""
+    normalized_path = mask_path.strip() if isinstance(mask_path, str) else ""
+    if normalized_url and normalized_path:
+        raise ValueError("mask_url and mask_path cannot both be provided.")
+    if normalized_url:
+        return {"image_url": _normalize_image_url(normalized_url)}
+    if normalized_path:
+        return {"image_url": _image_path_to_data_url(normalized_path)}
+    return None
+
+
+def _normalize_image_url(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("http://") or normalized.startswith("https://") or normalized.startswith("data:image/"):
+        return normalized
+    raise ValueError("image URLs must be http(s) URLs or data:image/... URLs.")
+
+
+def _image_path_to_data_url(path: str) -> str:
+    file_path = Path(path).expanduser()
+    if not file_path.is_file():
+        raise ValueError(f"image path does not exist or is not a file: {path}")
+    mime_type, _encoding = mimetypes.guess_type(str(file_path))
+    if not mime_type or not mime_type.startswith("image/"):
+        raise ValueError(f"image path must point to an image file: {path}")
+    encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _sanitize_request_params(value: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(value)
+    if isinstance(sanitized.get("images"), list):
+        sanitized["images"] = [_sanitize_image_reference(item) for item in sanitized["images"]]
+    if isinstance(sanitized.get("mask"), dict):
+        sanitized["mask"] = _sanitize_image_reference(sanitized["mask"])
+    return sanitized
+
+
+def _sanitize_image_reference(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    image_url = value.get("image_url")
+    if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
+        return dict(value)
+    return {"image_url": f"{image_url.split(',', 1)[0]},<base64 omitted>"}
 
 
 async def _sleep_before_retry(initial_delay: float, max_delay: float, retry_index: int) -> None:

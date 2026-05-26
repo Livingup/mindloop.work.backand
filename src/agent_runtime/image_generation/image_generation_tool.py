@@ -4,17 +4,20 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from agent_runtime.conversation_message.message.models import ImagePart
+from agent_runtime.conversation_message.message.models import ImagePart, TextPart
 from agent_runtime.image_generation.models import ImageGenerationRequest
 from agent_runtime.image_generation.shared_service import get_image_generation_service
 from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolResult, ToolRuntimeContext
 
 
-GENERATE_IMAGE_TOOL_DESCRIPTION = """Generate one or more images from a text prompt using the configured gpt-image-2 image generation policy, then store generated images as file resources.
+GENERATE_IMAGE_TOOL_DESCRIPTION = """Generate, edit, or extend one or more images using the configured gpt-image-2 image generation policy, then store generated images as file resources.
 
 Agent-controlled parameters:
 - prompt: required image description, generated from the user's visual intent.
+- image_urls/image_paths: optional source images for reference-image generation, image editing, or image extension. Use image URLs or local image file paths that are visible to the runtime. When provided, the tool calls the image edit endpoint.
+- mask_url/mask_path: optional mask image URL/path for localized editing. A mask requires at least one source image.
+- input_fidelity: optional edit fidelity, high or low, only when source images are provided.
 - n: optional image count, integer 1-10, defaults to 1.
 - size: optional output size, defaults to 1024x1024. For gpt-image-2, use auto, one of the standard sizes 1024x1024 / 1536x1024 / 1024x1536, or a custom WIDTHxHEIGHT string. For custom sizes, width and height must both be divisible by 16, aspect ratio must be between 1:3 and 3:1, maximum edge is 3840, maximum pixels are 3840x2160, and resolutions above 2560x1440 are experimental.
 - background: optional background mode, one of auto / transparent / opaque. Use transparent only when the user asks for transparent background; transparent output requires png or webp.
@@ -29,6 +32,11 @@ Runtime-fixed parameters:
 
 class GenerateImageRequest(BaseModel):
     prompt: str = Field(description="Image description generated from the user's visual intent.")
+    image_urls: list[str] = Field(default_factory=list, description="Optional input/reference/edit image URLs. Use http(s) URLs or data:image/... URLs.")
+    image_paths: list[str] = Field(default_factory=list, description="Optional input/reference/edit local image file paths visible to the runtime.")
+    mask_url: str | None = Field(default=None, description="Optional mask image URL for localized editing. Requires at least one input image.")
+    mask_path: str | None = Field(default=None, description="Optional mask local image file path for localized editing. Requires at least one input image.")
+    input_fidelity: Literal["high", "low"] | None = Field(default=None, description="Optional fidelity to input images for editing.")
     size: str | None = Field(default=None, description="Requested output size.")
     background: Literal["auto", "transparent", "opaque"] | None = Field(default=None, description="Requested background mode.")
     output_format: Literal["png", "jpeg", "webp"] | None = Field(default=None, description="Requested output image format.")
@@ -53,6 +61,11 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
             output_format=request.output_format,
             output_compression=request.output_compression,
             n=request.n,
+            image_urls=tuple(request.image_urls),
+            image_paths=tuple(request.image_paths),
+            mask_url=request.mask_url,
+            mask_path=request.mask_path,
+            input_fidelity=request.input_fidelity,
         )
     )
     resources = [
@@ -77,10 +90,13 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         "api_key_index": result.api_key_index,
         "attempt_count": result.attempt_count,
     }
+    revised_prompts = [image.revised_prompt for image in result.images if image.revised_prompt]
+    output_parts = [TextPart(text=prompt) for prompt in revised_prompts]
+    output_parts.extend(ImagePart(resource_id=image.resource_id) for image in result.images)
     return BaseToolResult(
         success=True,
         execution_status="success",
-        output=[ImagePart(resource_id=image.resource_id) for image in result.images],
+        output=output_parts,
         metadata={
             "ui_kind": "image_generation",
             "preview_output": output,
