@@ -61,6 +61,7 @@ class ToolExecBody(BaseModel):
     request_id: str | None = None
     task_id: str | None = None
     agent_instance_id: str | None = None
+    conversation_id: str | None = None
     trace_id: str | None = None
     communication_stream_id: str | None = None
 
@@ -173,6 +174,7 @@ def create_local_tool_router(gateway: LocalToolGateway) -> APIRouter:
                     request_id=body.request_id,
                     task_id=body.task_id,
                     agent_instance_id=body.agent_instance_id,
+                    conversation_id=body.conversation_id,
                     trace_id=body.trace_id,
                     communication_stream_id=body.communication_stream_id,
                 ),

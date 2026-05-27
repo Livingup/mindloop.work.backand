@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -285,6 +286,10 @@ class ImageGenerationService:
         request: ImageGenerationRequest,
         request_body: dict[str, Any],
     ) -> dict[str, Any]:
+        resolved_model = _with_gpt_image_agent_relay_session_header(
+            resolved_model,
+            request.relay_session_id,
+        )
         input_items = _build_gpt_image_agent_initial_input(request, request_body)
         request_params = _merge_gpt_image_agent_request_params(resolved_model)
         output_format = str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT)
@@ -422,6 +427,29 @@ def _sanitize_image_reference(value: Any) -> Any:
 
 def _is_gpt_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
     return resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID and resolved.api_format == API_FORMAT_OPENAI_RESPONSES
+
+
+def _with_gpt_image_agent_relay_session_header(
+    resolved_model: ResolvedLlmProviderModel,
+    relay_session_id: str | None,
+) -> ResolvedLlmProviderModel:
+    headers = dict(resolved_model.custom_headers)
+    if any(key.lower() == "x-relay-session-id" for key in headers):
+        return resolved_model
+    session_id = _normalize_relay_session_id(relay_session_id) or _fallback_gpt_image_agent_relay_session_id(resolved_model)
+    headers["x-relay-session-id"] = session_id
+    return replace(resolved_model, custom_headers=headers)
+
+
+def _normalize_relay_session_id(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _fallback_gpt_image_agent_relay_session_id(resolved_model: ResolvedLlmProviderModel) -> str:
+    return f"image-generation:{resolved_model.provider_id}:{resolved_model.binding_id}"
 
 
 async def _post_openai_responses_json(

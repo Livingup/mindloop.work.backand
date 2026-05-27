@@ -68,6 +68,7 @@ class ToolRuntimeContext(BaseModel):
     request_id: str | None = Field(default=None, description="本次工具调用的请求标识。")
     task_id: str | None = Field(default=None, description="所属 Agent 任务标识。")
     agent_instance_id: str | None = Field(default=None, description="所属 Agent 运行时实例标识。")
+    conversation_id: str | None = Field(default=None, description="所属 Conversation 标识。")
     trace_id: str | None = Field(default=None, description="执行链路追踪标识。")
     communication_stream_id: str | None = Field(default=None, description="所属通信流标识。")
 

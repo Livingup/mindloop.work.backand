@@ -71,6 +71,7 @@ class LocalToolGatewayImpl:
             request_id=request.request_id,
             task_id=request.task_id,
             agent_instance_id=request.agent_instance_id,
+            conversation_id=request.conversation_id,
             trace_id=request.trace_id,
             communication_stream_id=request.communication_stream_id,
         )

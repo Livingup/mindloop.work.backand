@@ -94,6 +94,7 @@ class GptImageAgentGenerationTests(unittest.TestCase):
         async def fake_post_openai_responses_json(*, resolved_model, api_key, body):
             calls.append(body)
             self.assertEqual(resolved_model.model_id, "gpt-5.5")
+            self.assertEqual(resolved_model.custom_headers.get("x-relay-session-id"), "conversation-image-1")
             self.assertEqual(api_key, "test-key")
             if len(calls) == 1:
                 return {
@@ -127,6 +128,7 @@ class GptImageAgentGenerationTests(unittest.TestCase):
                     prompt="画一张霓虹赛博朋克猫海报",
                     size="1024x1024",
                     output_format="png",
+                    relay_session_id="conversation-image-1",
                 )
             )
 
@@ -157,3 +159,37 @@ class GptImageAgentGenerationTests(unittest.TestCase):
         self.assertEqual(second_call["tool_choice"], {"type": "image_generation"})
         self.assertEqual(second_call["input"][-1]["role"], "user")
         self.assertIn("不要询问用户", second_call["input"][-1]["content"][0]["text"])
+
+    def test_gpt_image_agent_uses_stable_fallback_relay_session_id_without_context(self) -> None:
+        seen_headers = []
+
+        async def fake_post_openai_responses_json(*, resolved_model, api_key, body):
+            seen_headers.append(dict(resolved_model.custom_headers))
+            return {
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": "base64-image-result",
+                    }
+                ]
+            }
+
+        async def run_case():
+            service = ImageGenerationService(
+                settings_repository=_SettingsRepository(),
+                llm_registry_gateway=_RegistryGateway(_resolved_gpt_image_agent()),
+                file_resource_service=_FileResourceService(),
+            )
+            return await service.generate_image(
+                ImageGenerationRequest(
+                    prompt="画一张猫",
+                    output_format="png",
+                )
+            )
+
+        with patch("agent_runtime.image_generation.service._post_openai_responses_json", fake_post_openai_responses_json):
+            result = asyncio.run(run_case())
+
+        self.assertEqual(result.model_id, "gpt-5.5")
+        self.assertEqual(seen_headers[0].get("x-relay-session-id"), "image-generation:openai:gpt-55")

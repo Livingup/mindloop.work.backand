@@ -17,6 +17,7 @@ class ImageGenerationRequest:
     mask_url: str | None = None
     mask_path: str | None = None
     input_fidelity: str | None = None
+    relay_session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
