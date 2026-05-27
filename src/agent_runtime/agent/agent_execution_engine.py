@@ -2434,6 +2434,7 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
         f"- Supported text formats: `{supported_formats}`.\n"
         f"- Preferred text format: `{preferred_format}`.\n"
         "- Set `message_user.text_format` explicitly to `html`; `message_user.message` must be an HTML fragment following the tool schema, not Markdown.\n"
+        "- For readable HTML, follow `message_user` schema guidance: prefer tables for comparison/range/status/plan/result information, and keep paragraph/list hierarchy to at most three levels (plain heading/paragraph, bullet main items, dash details) without forcing all three levels.\n"
         "- `message_user` with `request_response`: `options` must be objects with `id`, `label`, "
         "and optional `description`."
     )

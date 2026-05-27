@@ -62,6 +62,8 @@ class MessageUserRequest(BaseToolRequest):
             "notify 时交代要同步的进度/发现/状态；"
             "request_response 时清晰说明你需要用户做什么（提问、请求审核、请求确认、求助等）。"
             "内容必须符合 text_format=html 的 HTML fragment 技术规范，不要写 Markdown。"
+            "结构化内容优先使用表格表达对比、范围、状态、计划或结果；"
+            "段落列表建议按“无符号标题/段落 → 圆点主项 → 短横线细节”表达，最多不超过三级，不必强行凑满三级。"
         ),
     )
     text_format: MessageUserTextFormat = Field(
@@ -73,6 +75,7 @@ class MessageUserRequest(BaseToolRequest):
             "使用语义化 HTML 标签表达结构，例如 article、header、section、footer、h1、h2、h3、p、ul、ol、li、dl、dt、dd、blockquote、pre、code、table、thead、tbody、tr、th、td、strong、em、a、small、sup、br、hr。"
             "不要输出展示绑定或脚本相关内容：禁止 class、style、id、data-*、on* 事件属性，禁止 script、style、iframe、object、embed、svg、canvas、form、input、button。"
             "链接使用 <a href=\"https://...\">文本</a>，外部 URL 不要裸写；代码块使用 <pre><code>...</code></pre>；列表使用 ul/ol/li；表格使用 table 语义标签。"
+            "为提升可读性，多维信息优先使用 table；段落列表最多三层：第 1 层用无符号标题/段落，第 2 层用圆点主项，第 3 层用短横线细节；少于三层时保持简单，不要强行嵌套。"
             "插入来自用户、工具、网页或外部系统的动态文本时，必须进行 HTML 字符转义：& 转为 &amp;，< 转为 &lt;，> 转为 &gt;，\" 转为 &quot;，避免把外部文本当作 HTML 执行。"
         ),
     )
@@ -114,6 +117,7 @@ class MessageUserRequest(BaseToolRequest):
         "• 只使用语义化内容标签表达结构，不要写 class/style/id/data-* 或任何 on* 事件属性。\n"
         "• 禁止 script/style/iframe/object/embed/svg/canvas/form/input/button 等可执行或交互标签。\n"
         "• 外部文本必须 HTML 转义；链接使用 a 标签，代码使用 pre/code，列表使用 ul/ol/li，表格使用 table 语义标签。\n"
+        "• 为了让前端展示更美观整洁，有对比、范围、状态、计划或结果类信息时尽量用 table；段落列表采用最多三级的视觉层级：无符号标题/段落 → 圆点主项 → 短横线细节，少于三级即可表达清楚时不要强行凑满。\n"
         "\n"
         "【不要用于】\n"
         "• Agent 内部推理/规划/反思（这些是思考过程，用户不需要看）\n"

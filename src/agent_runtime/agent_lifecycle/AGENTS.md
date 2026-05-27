@@ -24,8 +24,8 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `action` | Literal | `notify` / `request_response` |
-| `message` | str | 需要展示给用户的文本内容 |
-| `text_format` | `plain_text` / `markdown` / `json` | 文本格式声明，前端按该字段渲染 |
+| `message` | str | 需要展示给用户的 HTML fragment 内容 |
+| `text_format` | `html` | 文本格式声明，前端按 HTML fragment 渲染 |
 | `options` | list[`MessageOption`] | `request_response` 使用的结构化选项数组，每项含 `id` / `label` / `description` |
 | `channel` | str \| None | 目标前端通道，例如 web、cli，一般留空默认沿用会话流 |
 | `metadata` | dict | 附加元数据 |
@@ -94,8 +94,9 @@ Runtime 只消费 `BaseToolResult.loop_control.decision` 控制循环，不根�
 4. 任务成功完成后用 `message_user(action=request_response)` 汇报成果并等待用户验收，得到明确肯定后再 `end_task`。未经用户确认不要直接 `end_task`。
 5. 不可恢复失败用 `fail_task` 报告（不是 `end_task`）。推荐先 `message_user(action=notify)` 告知失败原因和已尝试的方案，再 `fail_task`。常规工具异常框架会自动包装，不需要主动 `fail_task`。
 6. 不要在同一 assistant turn 中混用生命周期工具和业务工具，除非用户明确要求。
-7. 必须显式设置 `text_format`，不要返回 HTML。
-8. `request_response.options` 必须是包含 `id`、`label`、可选 `description` 的对象数组。
+7. 必须显式设置 `text_format=html`，`message` 必须是 HTML fragment，不要返回 Markdown 或普通 assistant 文本。
+8. HTML 输出应遵循 `message_user` 工具 schema：对比、范围、状态、计划或结果类信息优先用表格；段落列表最多三级，采用“无符号标题/段落 → 圆点主项 → 短横线细节”的视觉层级，少于三级即可表达清楚时不要强行凑满。
+9. `request_response.options` 必须是包含 `id`、`label`、可选 `description` 的对象数组。
 
 如果 LLM 连续返回普通文本而没有工具调用，Runtime 会把它视为 plain text fallback；连续达到 `_PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD` 后暂停实例和任务，避免无限循环。
 
