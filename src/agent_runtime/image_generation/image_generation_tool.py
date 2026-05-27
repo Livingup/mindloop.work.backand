@@ -90,8 +90,13 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         "api_key_index": result.api_key_index,
         "attempt_count": result.attempt_count,
     }
-    revised_prompts = [image.revised_prompt for image in result.images if image.revised_prompt]
-    output_parts = [TextPart(text=prompt) for prompt in revised_prompts]
+    text_outputs = [f"Image generation prompt: {request.prompt}"]
+    seen_revised_prompts: set[str] = set()
+    for image in result.images:
+        if image.revised_prompt and image.revised_prompt not in seen_revised_prompts:
+            text_outputs.append(f"Revised prompt: {image.revised_prompt}")
+            seen_revised_prompts.add(image.revised_prompt)
+    output_parts = [TextPart(text=text) for text in text_outputs]
     output_parts.extend(ImagePart(resource_id=image.resource_id) for image in result.images)
     return BaseToolResult(
         success=True,
