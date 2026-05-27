@@ -44,8 +44,24 @@ class LlmModelRegistryFactory:
         return LlmModelRegistryGatewayImpl(service)
 
     @staticmethod
-    def create_image_generation_registry() -> LlmModelRegistryGatewayImpl:
+    def create_image_generation_registry():
         from agent_runtime.config import ConfigRegistry
+        from agent_runtime.image_generation.llm_registry_gateway import (
+            GPT_IMAGE_AGENT_MODEL_ID,
+            ImageGenerationLlmRegistryGateway,
+        )
+        from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
+
+        llm_registry_gateway = LlmModelRegistryFactory.create()
+
+        def external_provider_model_resolver(provider_id: str, binding_id: str):
+            try:
+                resolved = llm_registry_gateway.resolve_provider_model(provider_id, binding_id)
+            except Exception:
+                return None
+            if resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID and resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
+                return resolved
+            return None
 
         repository = SqliteLlmModelRegistryRepository(
             registry_dir_accessor=(
@@ -53,7 +69,13 @@ class LlmModelRegistryFactory:
             ),
             db_filename="image_generation_llm_registry.sqlite3",
         )
-        service = LlmModelRegistryService(repository)
+        service = LlmModelRegistryService(
+            repository,
+            external_provider_model_resolver=external_provider_model_resolver,
+        )
         for metadata in builtin_image_generation_model_metadata():
             service.ensure_builtin_model_metadata(metadata)
-        return LlmModelRegistryGatewayImpl(service)
+        return ImageGenerationLlmRegistryGateway(
+            image_registry_gateway=LlmModelRegistryGatewayImpl(service),
+            llm_registry_gateway=llm_registry_gateway,
+        )

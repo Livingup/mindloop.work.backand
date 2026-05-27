@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
 from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
@@ -152,6 +152,9 @@ class ResolvedLlmExecutionPolicy:
         }
 
 
+ExternalProviderModelResolver = Callable[[str, str], ResolvedLlmProviderModel | None]
+
+
 class LlmModelRegistryService:
     """LLM 服务商与模型注册领域服务。
 
@@ -164,10 +167,16 @@ class LlmModelRegistryService:
     - 解析服务商模型接入项时应用 base URL、API Keys、headers 等覆盖规则。
     """
 
-    def __init__(self, repository: LlmModelRegistryRepository) -> None:
+    def __init__(
+        self,
+        repository: LlmModelRegistryRepository,
+        *,
+        external_provider_model_resolver: ExternalProviderModelResolver | None = None,
+    ) -> None:
         # LLM 注册仓储。该仓储负责用户自定义模型元数据、服务商定义和执行策略组的持久化与查询，
         # 是后续 Agent 执行引擎选择 LLM 服务商、模型、策略和协议参数的数据基础。
         self._repository = repository
+        self._external_provider_model_resolver = external_provider_model_resolver
 
     # ── 模型元数据管理 ──────────────────────────────────────
 
@@ -392,14 +401,16 @@ class LlmModelRegistryService:
         for candidate in policy.candidates:
             provider = self._repository.find_provider_by_id(candidate.provider_id)
             if provider is None:
-                missing_candidates.append(
-                    f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
-                )
+                if not self._has_external_provider_model(candidate.provider_id, candidate.model_binding_id):
+                    missing_candidates.append(
+                        f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
+                    )
                 continue
             if not any(binding.id == candidate.model_binding_id for binding in provider.models):
-                missing_candidates.append(
-                    f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
-                )
+                if not self._has_external_provider_model(candidate.provider_id, candidate.model_binding_id):
+                    missing_candidates.append(
+                        f"{candidate.id}: {candidate.provider_id}/{candidate.model_binding_id}"
+                    )
         if missing_candidates:
             raise ValueError(
                 "LLM 执行策略组候选项引用了不存在的服务商模型接入项: "
@@ -407,6 +418,14 @@ class LlmModelRegistryService:
             )
         if policy.enabled and not policy.enabled_candidates():
             raise ValueError("启用状态的 LLM 执行策略组至少需要一个启用候选项。")
+
+    def _has_external_provider_model(self, provider_id: str, binding_id: str) -> bool:
+        if self._external_provider_model_resolver is None:
+            return False
+        try:
+            return self._external_provider_model_resolver(provider_id, binding_id) is not None
+        except Exception:
+            return False
 
     def _ensure_provider_bindings_not_referenced(
         self,

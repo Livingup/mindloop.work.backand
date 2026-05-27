@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
+import json
+import logging
 import mimetypes
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +19,16 @@ from agent_runtime.image_generation.models import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
+from agent_runtime.image_generation.llm_registry_gateway import GPT_IMAGE_AGENT_MODEL_ID
 from agent_runtime.image_generation.openai_images_client import OpenAIImagesGenerationClient
 from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
-from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS
+from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES
+from agent_runtime.llm_client.llm_protocol_clients import (
+    _aggregate_openai_responses_sse,
+    _join_url,
+    _json_headers,
+    _post_json,
+)
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 
@@ -35,6 +46,15 @@ _DEFAULT_QUALITY = "high"
 _STANDARD_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
 _MAX_SIZE_EDGE = 3840
 _MAX_SIZE_PIXELS = 3840 * 2160
+_GPT_IMAGE_AGENT_MAX_ROUNDS = 5
+_GPT_IMAGE_AGENT_SYSTEM_PROMPT = (
+    "你是 generate_image 工具内部的临时生图 Agent。"
+    "尽最大可能根据用户的需求描述来直接生成图片，不要询问用户。"
+    "你只能使用当前请求中提供的内置图片生成工具完成任务。"
+    "如果用户需求信息不完整，请自行做合理视觉补全并直接生成图片。"
+)
+
+logger = logging.getLogger(__name__)
 
 
 class ImageGenerationConfigurationError(ValueError):
@@ -100,8 +120,16 @@ class ImageGenerationService:
                     continue
                 for retry_index in range(max_retries + 1):
                     attempt_count += 1
+                    attempt_started_at = time.perf_counter()
                     try:
-                        if use_edit_endpoint:
+                        if _is_gpt_image_agent_model(resolved):
+                            response = await self._run_gpt_image_agent(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                request=request,
+                                request_body=request_body,
+                            )
+                        elif use_edit_endpoint:
                             response = await self._images_client.edit(
                                 resolved_model=resolved,
                                 api_key=api_key,
@@ -116,6 +144,17 @@ class ImageGenerationService:
                         images = self._ingest_images(response, output_format=str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT))
                         if not images:
                             raise RuntimeError("OpenAI Images API returned no image data.")
+                        logger.info(
+                            "Image generation attempt succeeded: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s attempt_count=%s elapsed_ms=%s",
+                            settings.llm_policy_group_id,
+                            candidate_index,
+                            resolved.provider_id,
+                            resolved.binding_id,
+                            api_key_index,
+                            retry_index,
+                            attempt_count,
+                            int((time.perf_counter() - attempt_started_at) * 1000),
+                        )
                         return ImageGenerationResult(
                             images=tuple(images),
                             provider_id=resolved.provider_id,
@@ -130,6 +169,20 @@ class ImageGenerationService:
                         )
                     except Exception as exc:
                         last_error = exc
+                        logger.warning(
+                            "Image generation attempt failed: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s max_retries=%s attempt_count=%s elapsed_ms=%s error=%s: %s",
+                            settings.llm_policy_group_id,
+                            candidate_index,
+                            resolved.provider_id,
+                            resolved.binding_id,
+                            api_key_index,
+                            retry_index,
+                            max_retries,
+                            attempt_count,
+                            int((time.perf_counter() - attempt_started_at) * 1000),
+                            exc.__class__.__name__,
+                            exc,
+                        )
                         if retry_index < max_retries:
                             await _sleep_before_retry(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index)
                             continue
@@ -211,10 +264,54 @@ class ImageGenerationService:
             self._assert_supported_model(candidate.resolved_model)
 
     def _assert_supported_model(self, resolved: ResolvedLlmProviderModel) -> None:
-        if resolved.api_format != API_FORMAT_OPENAI_IMAGES_GENERATIONS:
+        if resolved.api_format == API_FORMAT_OPENAI_IMAGES_GENERATIONS:
+            return
+        if _is_gpt_image_agent_model(resolved):
+            return
+        if resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
             raise ImageGenerationConfigurationError(
-                f"Image generation only supports api_format={API_FORMAT_OPENAI_IMAGES_GENERATIONS}: {resolved.provider_id}/{resolved.binding_id}"
+                f"Image generation only supports model_id={GPT_IMAGE_AGENT_MODEL_ID} for api_format={API_FORMAT_OPENAI_RESPONSES}: {resolved.provider_id}/{resolved.binding_id}"
             )
+        else:
+            raise ImageGenerationConfigurationError(
+                f"Image generation only supports api_format={API_FORMAT_OPENAI_IMAGES_GENERATIONS} or {API_FORMAT_OPENAI_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}: {resolved.provider_id}/{resolved.binding_id}"
+            )
+
+    async def _run_gpt_image_agent(
+        self,
+        *,
+        resolved_model: ResolvedLlmProviderModel,
+        api_key: str | None,
+        request: ImageGenerationRequest,
+        request_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        input_items = _build_gpt_image_agent_initial_input(request, request_body)
+        request_params = _merge_gpt_image_agent_request_params(resolved_model)
+        output_format = str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT)
+        for round_index in range(_GPT_IMAGE_AGENT_MAX_ROUNDS):
+            body: dict[str, Any] = {
+                **request_params,
+                "model": resolved_model.model_alias,
+                "input": input_items,
+                "instructions": _GPT_IMAGE_AGENT_SYSTEM_PROMPT,
+                "tools": [{"type": "image_generation"}],
+                "tool_choice": {"type": "image_generation"},
+                "store": False,
+                "stream": True,
+            }
+            if resolved_model.max_output_tokens:
+                body.setdefault("max_output_tokens", resolved_model.max_output_tokens)
+            raw_response = await _post_openai_responses_json(
+                resolved_model=resolved_model,
+                api_key=api_key,
+                body=body,
+            )
+            data = _extract_gpt_image_agent_image_data(raw_response, output_format=output_format)
+            if data:
+                return {"data": data}
+            input_items.extend(_replayable_gpt_image_agent_output_items(raw_response))
+            input_items.append(_build_gpt_image_agent_continue_input(round_index))
+        raise RuntimeError(f"gpt-5.5 image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
 
 
 def _bounded_count(value: int) -> int:
@@ -321,6 +418,161 @@ def _sanitize_image_reference(value: Any) -> Any:
     if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
         return dict(value)
     return {"image_url": f"{image_url.split(',', 1)[0]},<base64 omitted>"}
+
+
+def _is_gpt_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
+    return resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID and resolved.api_format == API_FORMAT_OPENAI_RESPONSES
+
+
+async def _post_openai_responses_json(
+    *,
+    resolved_model: ResolvedLlmProviderModel,
+    api_key: str | None,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    url = _join_url(resolved_model.api_base_url, "responses")
+    headers = _json_headers(resolved_model.custom_headers)
+    if api_key:
+        headers.setdefault("Authorization", f"Bearer {api_key}")
+    response = await _post_json(
+        url,
+        headers,
+        body,
+        sse_aggregator=_aggregate_openai_responses_sse,
+    )
+    if not isinstance(response, dict):
+        raise RuntimeError("OpenAI Responses image agent response must be a JSON object.")
+    return response
+
+
+def _merge_gpt_image_agent_request_params(resolved_model: ResolvedLlmProviderModel) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    _merge_json_field(merged, resolved_model.custom_request_params, "custom_request_params")
+    _merge_json_field(merged, resolved_model.thinking, "thinking")
+    return merged
+
+
+def _merge_json_field(target: dict[str, Any], value: str | None, field_name: str) -> None:
+    if value is None or not value.strip():
+        return
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object.")
+    target.update(parsed)
+
+
+def _build_gpt_image_agent_initial_input(request: ImageGenerationRequest, request_body: dict[str, Any]) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": _build_gpt_image_agent_prompt(request, request_body),
+        }
+    ]
+    for image in request_body.get("images") or []:
+        if isinstance(image, dict) and isinstance(image.get("image_url"), str):
+            content.append({"type": "input_image", "image_url": image["image_url"]})
+    mask = request_body.get("mask")
+    if isinstance(mask, dict) and isinstance(mask.get("image_url"), str):
+        content.append({"type": "input_image", "image_url": mask["image_url"]})
+    return [{"type": "message", "role": "user", "content": content}]
+
+
+def _build_gpt_image_agent_prompt(request: ImageGenerationRequest, request_body: dict[str, Any]) -> str:
+    lines = [
+        "请根据以下 generate_image 工具参数直接生成图片，不要询问用户。",
+        f"用户生图需求: {request.prompt}",
+        f"输出数量: {request_body.get('n')}",
+        f"输出尺寸: {request_body.get('size')}",
+        f"输出格式: {request_body.get('output_format')}",
+        f"背景模式: {request_body.get('background', 'auto')}",
+        f"质量: {request_body.get('quality')}",
+    ]
+    if request_body.get("output_compression") is not None:
+        lines.append(f"输出压缩: {request_body.get('output_compression')}")
+    if request_body.get("input_fidelity") is not None:
+        lines.append(f"输入参考/编辑保真度: {request_body.get('input_fidelity')}")
+    if request_body.get("images"):
+        lines.append("已附加输入/参考/编辑图片，请结合这些图片完成生成或编辑。")
+    if request_body.get("mask"):
+        lines.append("已附加局部编辑 mask 图片，请按 mask 限定区域完成编辑。")
+    return "\n".join(lines)
+
+
+def _build_gpt_image_agent_continue_input(round_index: int) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    f"第 {round_index + 1} 轮没有返回图片结果。"
+                    "请不要询问用户，不要只返回说明文字，立刻调用内置图片生成工具并返回图片。"
+                ),
+            }
+        ],
+    }
+
+
+def _extract_gpt_image_agent_image_data(raw_response: dict[str, Any], *, output_format: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in _iter_dicts_deep(raw_response.get("output")):
+        item_type = item.get("type")
+        if item_type not in {"image_generation_call", "image_generation"}:
+            continue
+        result = item.get("result") or item.get("image") or item.get("b64_json")
+        if isinstance(result, str) and result.strip():
+            b64_json, mime_type = _normalize_generated_image_result(result, output_format)
+            items.append({"b64_json": b64_json, "revised_prompt": _text_or_none(item.get("revised_prompt")) or _text_or_none(item.get("prompt"))})
+            continue
+        if isinstance(result, dict):
+            b64_json = result.get("b64_json") or result.get("base64") or result.get("data")
+            if isinstance(b64_json, str) and b64_json.strip():
+                normalized, _mime_type = _normalize_generated_image_result(b64_json, output_format)
+                items.append({"b64_json": normalized, "revised_prompt": _text_or_none(result.get("revised_prompt")) or _text_or_none(result.get("prompt"))})
+    return items
+
+
+def _normalize_generated_image_result(value: str, output_format: str) -> tuple[str, str]:
+    stripped = value.strip()
+    if stripped.startswith("data:image/"):
+        header, _separator, data = stripped.partition(",")
+        mime_type = header.removeprefix("data:").split(";", 1)[0] or _mime_type_for_output_format(output_format)
+        return data, mime_type
+    return stripped, _mime_type_for_output_format(output_format)
+
+
+def _replayable_gpt_image_agent_output_items(raw_response: dict[str, Any]) -> list[dict[str, Any]]:
+    output = raw_response.get("output")
+    if not isinstance(output, list):
+        return []
+    replayable: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"reasoning", "message", "function_call"}:
+            replayable.append(copy.deepcopy(item))
+    return replayable
+
+
+def _iter_dicts_deep(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_dicts_deep(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_dicts_deep(child)
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 async def _sleep_before_retry(initial_delay: float, max_delay: float, retry_index: int) -> None:

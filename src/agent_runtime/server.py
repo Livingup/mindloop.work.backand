@@ -63,7 +63,7 @@ def create_app() -> FastAPI:
     from agent_runtime.llm_model_registry.llm_execution_policy import (
         UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
     )
-    from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS
+    from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES
     from agent_runtime.llm_http_trace.llm_http_trace_factory import (
         LlmHttpTraceFactory,
     )
@@ -424,7 +424,7 @@ def create_app() -> FastAPI:
         create_llm_model_registry_router(
             image_generation_registry_gateway,
             builtin_provider_ids=set(),
-            api_formats=(API_FORMAT_OPENAI_IMAGES_GENERATIONS,),
+            api_formats=(API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES),
             unsupported_input_modality_strategies=(
                 UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
             ),
