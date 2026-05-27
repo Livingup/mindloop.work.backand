@@ -60,12 +60,12 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
     """
     router = APIRouter()
 
-    @router.get("/", response_model=list[SnippetSummaryResponse])
-    def list_snippets() -> list[SnippetSummaryResponse]:
+    @router.get("/", response_model=list[SnippetResponse])
+    def list_snippets() -> list[SnippetResponse]:
         """列出所有提示词片段摘要。"""
         snippets = gateway.list_snippets()
         return [
-            SnippetSummaryResponse(name=s.name, category=s.category)
+            SnippetResponse(name=s.name, text=s.text, category=s.category)
             for s in snippets
         ]
 
