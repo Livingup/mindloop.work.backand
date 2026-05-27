@@ -79,10 +79,11 @@ class LocalToolGatewayImpl:
             request.params,
             runtime_context=runtime_context,
         )
-        payload = result.model_dump(mode="python")
+        payload = result.model_dump(mode="python", exclude={"output"})
         payload.pop("tool_name", None)
         return ToolExecuteResult(
             tool_name=request.tool_name,
+            output=result.output,
             **payload,
         )
 
