@@ -167,8 +167,6 @@ class AgentInstance:
 
     llm_policy_group_id: str | None = None
 
-    llm_policy_snapshot_json: dict[str, Any] = field(default_factory=dict)
-
     # 当前实例执行载体状态。ready 可接收输入，running 表示执行循环正在进行。
     status: AgentInstanceStatus = AGENT_INSTANCE_STATUS_READY
 
@@ -208,8 +206,6 @@ class AgentInstance:
         _require_non_blank(self.llm_model_binding_id, "llm_model_binding_id")
         if self.llm_policy_group_id is not None:
             _require_non_blank(self.llm_policy_group_id, "llm_policy_group_id")
-        if not isinstance(self.llm_policy_snapshot_json, dict):
-            raise ValueError("llm_policy_snapshot_json 必须是对象。")
         _require_non_blank(self.trace_id, "trace_id")
         if self.conversation_id is not None:
             _require_non_blank(self.conversation_id, "conversation_id")
@@ -324,7 +320,6 @@ class AgentInstance:
         self,
         *,
         llm_policy_group_id: str,
-        llm_policy_snapshot_json: dict[str, Any],
         llm_provider_id: str,
         llm_model_binding_id: str,
         at: datetime | None = None,
@@ -332,12 +327,9 @@ class AgentInstance:
         _require_non_blank(llm_policy_group_id, "llm_policy_group_id")
         _require_non_blank(llm_provider_id, "llm_provider_id")
         _require_non_blank(llm_model_binding_id, "llm_model_binding_id")
-        if not isinstance(llm_policy_snapshot_json, dict):
-            raise ValueError("llm_policy_snapshot_json 必须是对象。")
         return replace(
             self,
             llm_policy_group_id=llm_policy_group_id,
-            llm_policy_snapshot_json=dict(llm_policy_snapshot_json),
             llm_provider_id=llm_provider_id,
             llm_model_binding_id=llm_model_binding_id,
             updated_at=at or _utc_now(),

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 from dataclasses import dataclass
@@ -30,9 +30,6 @@ from agent_runtime.agent_definition.north_gateway.agent_definition_contracts imp
     AgentDefinitionNorthGateway,
 )
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
-from agent_runtime.llm_model_registry.llm_model_registry_service import (
-    ResolvedLlmExecutionPolicy,
-)
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelRegistryGateway,
 )
@@ -108,7 +105,7 @@ class AgentInstanceResponse(BaseModel):
     current_working_directory: str
     agent_definition_id: str
     llm_policy_group_id: str | None = None
-    llm_policy_snapshot_json: dict[str, Any] = Field(default_factory=dict)
+
     llm_provider_id: str
     llm_model_binding_id: str
     conversation_id: str | None
@@ -372,7 +369,6 @@ def create_agent_runtime_router(
                     llm_provider_id=llm_selection.llm_provider_id,
                     llm_model_binding_id=llm_selection.llm_model_binding_id,
                     llm_policy_group_id=llm_selection.llm_policy_group_id,
-                    llm_policy_snapshot_json=llm_selection.llm_policy_snapshot_json,
                     task_id=body.task_id,
                     root_instance_id=body.root_instance_id,
                     conversation_id=body.conversation_id,
@@ -444,7 +440,6 @@ def create_agent_runtime_router(
             updated = gateway.switch_agent_instance_llm_policy(
                 instance_id,
                 llm_policy_group_id=llm_selection.llm_policy_group_id or body.llm_policy_group_id,
-                llm_policy_snapshot_json=llm_selection.llm_policy_snapshot_json,
                 llm_provider_id=llm_selection.llm_provider_id,
                 llm_model_binding_id=llm_selection.llm_model_binding_id,
             )
@@ -580,9 +575,6 @@ def create_agent_runtime_router(
             fallback_llm_provider_id=fallback.llm_provider_id if fallback else None,
             fallback_llm_model_binding_id=fallback.llm_model_binding_id if fallback else None,
             fallback_llm_policy_group_id=fallback.llm_policy_group_id if fallback else None,
-            fallback_llm_policy_snapshot_json=(
-                fallback.llm_policy_snapshot_json if fallback else None
-            ),
         )
         try:
             response = gateway.attach_scene(scene_id, request)
@@ -1022,12 +1014,6 @@ class _LlmRuntimeSelection:
     llm_provider_id: str
     llm_model_binding_id: str
     llm_policy_group_id: str | None = None
-    llm_policy_snapshot_json: dict[str, Any] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.llm_policy_snapshot_json is None:
-            object.__setattr__(self, "llm_policy_snapshot_json", {})
-
 
 def _resolve_llm_runtime_selection(
     body: CreateRootAgentInstanceBody,
@@ -1150,32 +1136,7 @@ def _resolve_llm_policy_group(
         llm_provider_id=first.provider_id,
         llm_model_binding_id=first.model_binding_id,
         llm_policy_group_id=resolved.policy_group_id,
-        llm_policy_snapshot_json=_policy_snapshot_without_secrets(resolved),
     )
-
-
-def _policy_snapshot_without_secrets(
-    resolved: ResolvedLlmExecutionPolicy,
-) -> dict[str, Any]:
-    return {
-        "policy_group_id": resolved.policy_group_id,
-        "name": resolved.name,
-        "description": resolved.description,
-        "unsupported_input_modality_strategy": resolved.unsupported_input_modality_strategy,
-        "candidates": [
-            {
-                "candidate_id": candidate.candidate_id,
-                "provider_id": candidate.provider_id,
-                "model_binding_id": candidate.model_binding_id,
-                "model_id": candidate.resolved_model.model_id,
-                "model_alias": candidate.resolved_model.model_alias,
-                "api_format": candidate.resolved_model.api_format,
-                "sdk_platform": candidate.resolved_model.sdk_platform,
-                "context_window": candidate.resolved_model.context_window,
-            }
-            for candidate in resolved.candidates
-        ],
-    }
 
 
 def _task_response(task: AgentTask) -> AgentRuntimeTaskResponse:
@@ -1318,7 +1279,7 @@ async def _instance_response(
         current_working_directory=instance.current_working_directory,
         agent_definition_id=instance.agent_definition_id,
         llm_policy_group_id=instance.llm_policy_group_id,
-        llm_policy_snapshot_json=instance.llm_policy_snapshot_json,
+
         llm_provider_id=instance.llm_provider_id,
         llm_model_binding_id=instance.llm_model_binding_id,
         conversation_id=instance.conversation_id,
@@ -1405,59 +1366,36 @@ def _fallback_context_usage(
     instance: AgentInstance,
     llm_registry_gateway: LlmModelRegistryGateway | None,
 ) -> dict[str, Any] | None:
-    candidate = _first_policy_candidate(instance)
-    if llm_registry_gateway is not None and candidate is not None:
-        provider_id = candidate.get("provider_id")
-        model_binding_id = candidate.get("model_binding_id")
-        if provider_id and model_binding_id:
-            try:
-                resolved = llm_registry_gateway.resolve_provider_model(
-                    str(provider_id),
-                    str(model_binding_id),
-                )
-                return _context_usage_from_model(
-                    provider_id=resolved.provider_id,
-                    binding_id=resolved.binding_id,
-                    model_id=resolved.model_id,
-                    model_alias=resolved.model_alias,
-                    context_window_max=resolved.context_window,
-                )
-            except (KeyError, ValueError):
-                pass
-    if candidate is not None:
-        context_window = _int_or_none(candidate.get("context_window"))
-        if context_window is not None:
-            return _context_usage_from_model(
-                provider_id=_optional_text(candidate.get("provider_id")),
-                binding_id=_optional_text(candidate.get("model_binding_id")),
-                model_id=_optional_text(candidate.get("model_id")),
-                model_alias=_optional_text(candidate.get("model_alias")),
-                context_window_max=context_window,
-            )
-    if llm_registry_gateway is not None:
+    if llm_registry_gateway is None:
+        return None
+    if instance.llm_policy_group_id:
         try:
-            resolved = llm_registry_gateway.resolve_provider_model(
-                instance.llm_provider_id,
-                instance.llm_model_binding_id,
-            )
-            return _context_usage_from_model(
-                provider_id=resolved.provider_id,
-                binding_id=resolved.binding_id,
-                model_id=resolved.model_id,
-                model_alias=resolved.model_alias,
-                context_window_max=resolved.context_window,
-            )
+            policy = llm_registry_gateway.resolve_execution_policy(instance.llm_policy_group_id)
+            first = policy.candidates[0] if policy.candidates else None
+            if first is not None:
+                return _context_usage_from_model(
+                    provider_id=first.resolved_model.provider_id,
+                    binding_id=first.resolved_model.binding_id,
+                    model_id=first.resolved_model.model_id,
+                    model_alias=first.resolved_model.model_alias,
+                    context_window_max=first.resolved_model.context_window,
+                )
         except (KeyError, ValueError):
             return None
-    return None
-
-
-def _first_policy_candidate(instance: AgentInstance) -> dict[str, Any] | None:
-    candidates = instance.llm_policy_snapshot_json.get("candidates")
-    if not isinstance(candidates, list) or not candidates:
+    try:
+        resolved = llm_registry_gateway.resolve_provider_model(
+            instance.llm_provider_id,
+            instance.llm_model_binding_id,
+        )
+        return _context_usage_from_model(
+            provider_id=resolved.provider_id,
+            binding_id=resolved.binding_id,
+            model_id=resolved.model_id,
+            model_alias=resolved.model_alias,
+            context_window_max=resolved.context_window,
+        )
+    except (KeyError, ValueError):
         return None
-    first = candidates[0]
-    return first if isinstance(first, dict) else None
 
 
 def _context_usage_from_model(

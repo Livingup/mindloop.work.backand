@@ -252,6 +252,19 @@ class LlmModelRegistryService:
                 "LLM 服务商引用了不存在的模型元数据: "
                 + ", ".join(missing_model_ids)
             )
+        existing = self._repository.find_provider_by_id(provider.provider_id)
+        if existing is not None:
+            removed_binding_ids = {
+                binding.id
+                for binding in existing.models
+            } - {
+                binding.id
+                for binding in provider.models
+            }
+            self._ensure_provider_bindings_not_referenced(
+                provider.provider_id,
+                removed_binding_ids,
+            )
         self._repository.save_provider(provider)
         logger.info("保存 LLM 服务商定义: %s", provider.provider_id)
         return provider
@@ -394,3 +407,27 @@ class LlmModelRegistryService:
             )
         if policy.enabled and not policy.enabled_candidates():
             raise ValueError("启用状态的 LLM 执行策略组至少需要一个启用候选项。")
+
+    def _ensure_provider_bindings_not_referenced(
+        self,
+        provider_id: str,
+        binding_ids: set[str],
+    ) -> None:
+        if not binding_ids:
+            return
+        referenced_by: list[str] = []
+        for policy in self._repository.find_all_execution_policies():
+            for candidate in policy.candidates:
+                if (
+                    candidate.provider_id == provider_id
+                    and candidate.model_binding_id in binding_ids
+                ):
+                    referenced_by.append(
+                        f"{policy.policy_group_id}/{candidate.id}: "
+                        f"{provider_id}/{candidate.model_binding_id}"
+                    )
+        if referenced_by:
+            raise ValueError(
+                "LLM 服务商模型接入项正被执行策略组引用，不能删除: "
+                + ", ".join(referenced_by)
+            )

@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Agent 运行时任务与实例管理领域服务。"""
 from __future__ import annotations
 
@@ -67,7 +67,6 @@ class AgentRuntimeService:
         llm_provider_id: str,
         llm_model_binding_id: str,
         llm_policy_group_id: str | None = None,
-        llm_policy_snapshot_json: dict[str, Any] | None = None,
         task_id: str | None = None,
         root_instance_id: str | None = None,
         conversation_id: str | None = None,
@@ -99,7 +98,6 @@ class AgentRuntimeService:
                 conversation_id=conversation_id,
                 trace_id=actual_trace_id,
                 llm_policy_group_id=llm_policy_group_id,
-                llm_policy_snapshot_json=llm_policy_snapshot_json or {},
             )
             task = AgentTask(
                 task_id=actual_task_id,
@@ -127,7 +125,6 @@ class AgentRuntimeService:
         llm_provider_id: str,
         llm_model_binding_id: str,
         llm_policy_group_id: str | None = None,
-        llm_policy_snapshot_json: dict[str, Any] | None = None,
         child_instance_id: str | None = None,
         conversation_id: str | None = None,
         trace_id: str | None = None,
@@ -166,7 +163,6 @@ class AgentRuntimeService:
                 conversation_id=conversation_id,
                 trace_id=actual_trace_id,
                 llm_policy_group_id=llm_policy_group_id,
-                llm_policy_snapshot_json=llm_policy_snapshot_json or {},
             )
             updated_task = task.add_child_relation(
                 child_instance_id=actual_child_instance_id,
@@ -545,7 +541,6 @@ class AgentRuntimeService:
         instance_id: str,
         *,
         llm_policy_group_id: str,
-        llm_policy_snapshot_json: dict[str, Any],
         llm_provider_id: str,
         llm_model_binding_id: str,
     ) -> AgentInstance:
@@ -553,7 +548,6 @@ class AgentRuntimeService:
             instance = self._get_required_instance(instance_id)
             updated = instance.switch_llm_policy(
                 llm_policy_group_id=llm_policy_group_id,
-                llm_policy_snapshot_json=llm_policy_snapshot_json,
                 llm_provider_id=llm_provider_id,
                 llm_model_binding_id=llm_model_binding_id,
             )

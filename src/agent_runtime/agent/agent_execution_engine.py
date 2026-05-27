@@ -766,7 +766,7 @@ class AgentExecutionEngine:
                 )
                 self._touch_execution_progress(instance.instance_id, metadata={"drained_user_message_count": drained_count})
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
-                resolved_candidates = self._resolve_instance_llm_candidates(instance)
+                resolved_candidates, unsupported_modality_strategy = self._resolve_instance_llm_policy(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
                 try:
                     self._set_execution_phase(
@@ -788,6 +788,7 @@ class AgentExecutionEngine:
                             agent_definition=agent_definition,
                             instance=instance,
                             resolved_candidates=resolved_candidates,
+                            unsupported_modality_strategy=unsupported_modality_strategy,
                             render_options=request.render_options,
                             request_overrides=request.request_overrides,
                             communication_context=communication_context,
@@ -1412,33 +1413,26 @@ class AgentExecutionEngine:
             raise ValueError(f"Agent 定义已禁用，不能执行: {agent_definition_id}")
         return definition
 
-    def _resolve_instance_llm_candidates(
+    def _resolve_instance_llm_policy(
         self,
         instance: AgentInstance,
-    ) -> tuple[ResolvedLlmProviderModel, ...]:
-        candidates = instance.llm_policy_snapshot_json.get("candidates")
-        if isinstance(candidates, list) and candidates:
-            resolved: list[ResolvedLlmProviderModel] = []
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    continue
-                provider_id = candidate.get("provider_id")
-                model_binding_id = candidate.get("model_binding_id")
-                if not provider_id or not model_binding_id:
-                    continue
-                resolved.append(
-                    self._llm_registry_gateway.resolve_provider_model(
-                        str(provider_id),
-                        str(model_binding_id),
-                    )
-                )
-            if resolved:
-                return tuple(resolved)
+    ) -> tuple[tuple[ResolvedLlmProviderModel, ...], str]:
+        if instance.llm_policy_group_id:
+            policy = self._llm_registry_gateway.resolve_execution_policy(instance.llm_policy_group_id)
+            candidates = tuple(candidate.resolved_model for candidate in policy.candidates)
+            if not candidates:
+                raise ValueError(f"LLM 执行策略组没有可用候选项: {instance.llm_policy_group_id}")
+            return candidates, _normalize_unsupported_input_modality_strategy(
+                policy.unsupported_input_modality_strategy
+            )
         return (
-            self._llm_registry_gateway.resolve_provider_model(
-                instance.llm_provider_id,
-                instance.llm_model_binding_id,
+            (
+                self._llm_registry_gateway.resolve_provider_model(
+                    instance.llm_provider_id,
+                    instance.llm_model_binding_id,
+                ),
             ),
+            UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE,
         )
 
     async def _send_prompt_with_policy_failover(
@@ -1450,6 +1444,7 @@ class AgentExecutionEngine:
         agent_definition: AgentDefinition,
         instance: AgentInstance,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
+        unsupported_modality_strategy: str,
         render_options: dict[str, Any],
         request_overrides: dict[str, Any],
         communication_context: RuntimeCommunicationContext,
@@ -1457,7 +1452,6 @@ class AgentExecutionEngine:
     ) -> _PromptWithConversationResult:
         last_error: Exception | None = None
         skipped_for_modalities = False
-        unsupported_modality_strategy = _unsupported_input_modality_strategy(instance)
         llm_call_id = f"llm-call-{uuid.uuid4().hex}"
         for candidate_index, resolved_model in enumerate(resolved_candidates):
             missing_modalities = _missing_input_modalities(conversation, resolved_model)
@@ -2318,13 +2312,9 @@ def _is_process_control_exception(exc: BaseException) -> bool:
     return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
 
 
-def _unsupported_input_modality_strategy(instance: AgentInstance) -> str:
-    strategy = instance.llm_policy_snapshot_json.get("unsupported_input_modality_strategy")
-    if not strategy:
-        return UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
-    strategy_text = str(strategy)
-    if strategy_text == UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE:
-        return strategy_text
+def _normalize_unsupported_input_modality_strategy(strategy: str | None) -> str:
+    if strategy == UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE:
+        return strategy
     return UNSUPPORTED_INPUT_MODALITY_STRATEGY_DEGRADE
 
 

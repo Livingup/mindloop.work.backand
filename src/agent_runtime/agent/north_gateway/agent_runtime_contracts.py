@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Agent 运行时任务与实例管理北向网关契约。
 
 该模块定义程序内部动态运行态管理能力。后续 Agent 执行引擎应通过该契约
@@ -41,7 +41,6 @@ class CreateTaskWithRootAgentInstanceRequest:
 
     llm_policy_group_id: str | None = None
 
-    llm_policy_snapshot_json: dict[str, Any] | None = None
 
     # 可选任务 ID。不传时由领域服务生成。
     task_id: str | None = None
@@ -87,8 +86,6 @@ class AttachSceneRequest:
     # Fallback：策略组 ID。仅 mode=created 时使用。
     fallback_llm_policy_group_id: str | None = None
 
-    # Fallback：策略组解析快照（不含密钥）。仅 mode=created 时使用。
-    fallback_llm_policy_snapshot_json: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +166,6 @@ class CreateChildAgentInstanceRequest:
 
     llm_policy_group_id: str | None = None
 
-    llm_policy_snapshot_json: dict[str, Any] | None = None
 
     # 可选子实例 ID。不传时由领域服务生成。
     child_instance_id: str | None = None
@@ -379,7 +375,6 @@ class AgentRuntimeGateway(Protocol):
         instance_id: str,
         *,
         llm_policy_group_id: str,
-        llm_policy_snapshot_json: dict[str, Any],
         llm_provider_id: str,
         llm_model_binding_id: str,
     ) -> AgentInstance:
