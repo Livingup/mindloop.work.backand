@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from agent_runtime.conversation_message.message.models import ImagePart, PdfPart, TextPart
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
 
@@ -21,7 +22,7 @@ def normalize_mcp_tool_content_for_llm(
     content_blocks: tuple[dict[str, Any], ...],
     *,
     fallback_text: str,
-) -> list[TextPart | ImagePart | PdfPart]:
+) -> list[dict[str, Any]]:
     parts: list[TextPart | ImagePart | PdfPart] = []
     for block in content_blocks:
         block_type = block.get("type")
@@ -45,8 +46,8 @@ def normalize_mcp_tool_content_for_llm(
             continue
         parts.append(TextPart(text=_describe_unsupported_mcp_block(block)))
     if parts:
-        return parts
-    return [TextPart(text=fallback_text or "MCP 工具执行完成，但没有返回可见内容。")]
+        return normalize_tool_result_output(parts)
+    return normalize_tool_result_output(fallback_text or "MCP 工具执行完成，但没有返回可见内容。")
 
 
 def _mcp_image_block_to_part(block: dict[str, Any]) -> ImagePart | None:

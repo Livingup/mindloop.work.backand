@@ -55,6 +55,7 @@ from agent_runtime.conversation_message.message.models import (
     UniPart,
     ROLE_TOOL,
 )
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.context_compression.compression_service import ContextCompressionService
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
@@ -1115,14 +1116,10 @@ class AgentExecutionEngine:
                 ToolResultPart(
                     tool_use_ref=tool_use_ref,
                     is_error=True,
-                    output=[
-                        TextPart(
-                            text=(
-                                "工具执行失败：Tool execution did not complete because the previous Agent execution was interrupted. "
-                                f"reason={reason}; tool_name={tool_use.name}"
-                            )
-                        )
-                    ],
+                    output=normalize_tool_result_output(
+                        "工具执行失败：Tool execution did not complete because the previous Agent execution was interrupted. "
+                        f"reason={reason}; tool_name={tool_use.name}"
+                    ),
                 )
             )
         tool_message = UniMessage(
@@ -1861,7 +1858,7 @@ class AgentExecutionEngine:
                 result_part=ToolResultPart(
                     tool_use_ref=tool_call_id,
                     is_error=True,
-                    output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}")],
+                    output=normalize_tool_result_output(f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}"),
                 ),
                 tool_result=tool_result,
             )
@@ -1990,7 +1987,7 @@ class AgentExecutionEngine:
             result_part=ToolResultPart(
                 tool_use_ref=tool_call_id,
                 is_error=True,
-                output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}")],
+                output=normalize_tool_result_output(f"工具执行失败：{tool_result.error_message or 'Tool dispatch failed.'}"),
             ),
             tool_result=tool_result,
         )
@@ -2054,7 +2051,7 @@ class AgentExecutionEngine:
             result_part=ToolResultPart(
                 tool_use_ref=tool_call_id,
                 is_error=True,
-                output=[TextPart(text=f"工具执行失败：{tool_result.error_message or 'Tool execution cancelled.'}")],
+                output=normalize_tool_result_output(f"工具执行失败：{tool_result.error_message or 'Tool execution cancelled.'}"),
             ),
             tool_result=tool_result,
         )

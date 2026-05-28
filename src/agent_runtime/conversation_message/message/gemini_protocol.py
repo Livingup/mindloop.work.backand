@@ -42,6 +42,7 @@ from agent_runtime.conversation_message.message.models import (
     UniMessage,
     UniPart,
 )
+from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_gemini_response_parts
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -281,42 +282,12 @@ async def _build_gemini_function_response(
     Gemini 约定 response 中使用 "output" key 表达输出，"error" key 表达错误。
     多模态资源优先 fileData (公网 URL)，无则降级到 inlineData (base64)。
     """
+    text_content, media_parts = await tool_result_output_to_gemini_response_parts(output, resolver)
     response: dict[str, Any] = {}
-    media_parts: list[dict[str, Any]] = []
-
-    if isinstance(output, list) and all(
-        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
-    ):
-        text_pieces: list[str] = []
-        for item in output:
-            if isinstance(item, TextPart):
-                text_pieces.append(item.text)
-            elif isinstance(item, ImagePart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                media_parts.append(_build_gemini_media_part(
-                    resource, item.resource_id, default_mime=resource.mime_type,
-                ))
-            elif isinstance(item, PdfPart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                media_parts.append(_build_gemini_media_part(
-                    resource, item.resource_id, default_mime="application/pdf",
-                ))
-        text_content = "\n".join(text_pieces) if text_pieces else None
-        if is_error:
-            response["error"] = text_content or "Tool execution failed."
-        elif text_content is not None:
-            response["output"] = text_content
-    elif isinstance(output, dict):
-        if is_error:
-            response["error"] = output
-        else:
-            response = dict(output)
+    if is_error:
+        response["error"] = text_content or "Tool execution failed."
     else:
-        text = serialize_tool_output(output)
-        if is_error:
-            response["error"] = text
-        else:
-            response["output"] = text
+        response["output"] = text_content
 
     function_response: dict[str, Any] = {
         "name": tool_name_for_result(tool_use_ref, tool_name_by_ref),

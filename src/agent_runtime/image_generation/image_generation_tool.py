@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from agent_runtime.conversation_message.message.models import ImagePart, TextPart
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.image_generation.models import ImageGenerationRequest
 from agent_runtime.image_generation.shared_service import get_image_generation_service
 from agent_runtime.tool import tool
@@ -102,7 +103,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
     return BaseToolResult(
         success=True,
         execution_status="success",
-        output=output_parts,
+        output=normalize_tool_result_output(output_parts),
         metadata={
             "ui_kind": "image_generation",
             "preview_output": output,

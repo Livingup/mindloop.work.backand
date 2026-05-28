@@ -51,6 +51,7 @@ from agent_runtime.context_compression.transcript_snapshot import build_transcri
 from agent_runtime.context_compression.worker_runner import ContextCompressionWorkerRunner
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import Conversation
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
@@ -77,6 +78,7 @@ class ContextCompressionService:
         conversation_repository: ConversationRepository,
         runtime_gateway: AgentRuntimeGateway,
         llm_registry_gateway: LlmModelRegistryGateway,
+        resource_resolver: ResourceResolver,
         archive_repository: ContextCompressionArchiveRepository,
         event_publisher: RuntimeEventPublisher,
         config_accessor: Callable[[], ContextCompressionConfig],
@@ -86,6 +88,7 @@ class ContextCompressionService:
         self._conversation_repository = conversation_repository
         self._runtime_gateway = runtime_gateway
         self._llm_registry_gateway = llm_registry_gateway
+        self._resource_resolver = resource_resolver
         self._archive_repository = archive_repository
         self._config_accessor = config_accessor
         self._settings_repository = settings_repository
@@ -175,7 +178,7 @@ class ContextCompressionService:
             job.range = range_plan
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_RANGE_PLANNED, _base_payload(job, status="running", phase="range_planned"))
-            input_text = build_transcript_snapshot(source_conversation, job, range_plan)
+            input_text = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
             await self._run_section_workers(
                 job=job,
                 input_text=input_text,

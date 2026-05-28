@@ -11,7 +11,6 @@ from agent_runtime.conversation_message.message.assistant_projection import (
     clone_raw_value,
     iter_assistant_semantic_segments,
     serialize_tool_arguments,
-    serialize_tool_output,
     should_include_cross_protocol_thinking_text,
 )
 from agent_runtime.conversation_message.message.models import (
@@ -25,6 +24,10 @@ from agent_runtime.conversation_message.message.models import (
     ToolUsePart,
     UniMessage,
     UniPart,
+)
+from agent_runtime.conversation_message.message.tool_result_output import (
+    prefix_tool_result_error_output,
+    tool_result_output_to_text,
 )
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
@@ -172,13 +175,12 @@ async def _build_openai_chat_tool_messages(
     for part in msg.content:
         if part.kind != "tool_result":
             continue
-        text_content = await _build_openai_chat_tool_result_text(part.output, resolver)
-        if part.is_error:
-            text_content = f"[ERROR] {text_content}"
+        output = prefix_tool_result_error_output(part.output) if part.is_error else part.output
+        text_content = await _build_openai_chat_tool_result_text(output, resolver)
         messages.append({
             "role": "tool",
             "tool_call_id": part.tool_use_ref,
-            "content": text_content,
+            "content": text_content or "(empty)",
         })
     return messages
 
@@ -191,26 +193,7 @@ async def _build_openai_chat_tool_result_text(
 
     多模态资源降级为 [<type> file: <路径或URL>] 文本引用。
     """
-    if isinstance(output, list) and all(
-        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
-    ):
-        text_pieces: list[str] = []
-        for item in output:
-            if isinstance(item, TextPart):
-                text_pieces.append(item.text)
-            elif isinstance(item, ImagePart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                text_pieces.append(_resource_path_text("image", resource))
-            elif isinstance(item, PdfPart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                text_pieces.append(_resource_path_text("pdf", resource))
-        return "\n".join(text_pieces)
-    return serialize_tool_output(output)
-
-
-def _resource_path_text(resource_type: str, resource: Any) -> str:
-    path = resource.local_storage_path or resource.object_storage_url or resource.resource_id
-    return f"[{resource_type} file: {path}]"
+    return await tool_result_output_to_text(output, resolver)
 
 
 def _build_openai_chat_assistant(

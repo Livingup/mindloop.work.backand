@@ -26,7 +26,6 @@ from agent_runtime.conversation_message.message.assistant_projection import (
     clone_raw_value,
     iter_assistant_semantic_segments,
     serialize_tool_arguments,
-    serialize_tool_output,
     should_include_cross_protocol_thinking_text,
 )
 from agent_runtime.conversation_message.message.models import (
@@ -40,6 +39,10 @@ from agent_runtime.conversation_message.message.models import (
     ToolUsePart,
     UniMessage,
     UniPart,
+)
+from agent_runtime.conversation_message.message.tool_result_output import (
+    prefix_tool_result_error_output,
+    tool_result_output_to_text,
 )
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
@@ -184,7 +187,9 @@ async def _build_zhipu_user(
         elif part.kind == "image":
             resource = await resolve_resource_access(resolver, part.resource_id)
             if INPUT_MODALITY_IMAGE not in supported_modalities:
-                text_parts.append(_resource_path_text("image", resource))
+                resource_text = _resource_path_text("image", resource)
+                if resource_text:
+                    text_parts.append(resource_text)
                 continue
             has_non_text_part = True
             image_url = resource.object_storage_url
@@ -195,7 +200,9 @@ async def _build_zhipu_user(
         elif part.kind == "pdf":
             resource = await resolve_resource_access(resolver, part.resource_id)
             if INPUT_MODALITY_PDF not in supported_modalities:
-                text_parts.append(_resource_path_text("pdf", resource))
+                resource_text = _resource_path_text("pdf", resource)
+                if resource_text:
+                    text_parts.append(resource_text)
                 continue
             has_non_text_part = True
             file_url = resource.object_storage_url
@@ -223,19 +230,22 @@ async def _build_zhipu_tool_messages(
     resource_texts: list[str] = []
     for part in msg.content:
         if part.kind == "tool_result":
-            text_content = await _build_zhipu_tool_result_text(part.output, resolver)
-            if part.is_error:
-                text_content = f"[ERROR] {text_content}"
+            output = prefix_tool_result_error_output(part.output) if part.is_error else part.output
+            text_content = await _build_zhipu_tool_result_text(output, resolver)
             tool_results.append({
                 "tool_call_id": part.tool_use_ref,
-                "content": text_content,
+                "content": text_content or "(empty)",
             })
         elif part.kind == "image":
             resource = await resolve_resource_access(resolver, part.resource_id)
-            resource_texts.append(_resource_path_text("image", resource))
+            resource_text = _resource_path_text("image", resource)
+            if resource_text:
+                resource_texts.append(resource_text)
         elif part.kind == "pdf":
             resource = await resolve_resource_access(resolver, part.resource_id)
-            resource_texts.append(_resource_path_text("pdf", resource))
+            resource_text = _resource_path_text("pdf", resource)
+            if resource_text:
+                resource_texts.append(resource_text)
 
     messages: list[dict[str, Any]] = []
     for result in tool_results:
@@ -264,21 +274,7 @@ async def _build_zhipu_tool_result_text(
 
     多模态资源降级为 [<type> file: <路径或URL>] 文本引用。
     """
-    if isinstance(output, list) and all(
-        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
-    ):
-        text_pieces: list[str] = []
-        for item in output:
-            if isinstance(item, TextPart):
-                text_pieces.append(item.text)
-            elif isinstance(item, ImagePart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                text_pieces.append(_resource_path_text("image", resource))
-            elif isinstance(item, PdfPart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                text_pieces.append(_resource_path_text("pdf", resource))
-        return "\n".join(text_pieces)
-    return serialize_tool_output(output)
+    return await tool_result_output_to_text(output, resolver)
 
 
 def _build_zhipu_assistant(
@@ -343,9 +339,11 @@ def _supported_input_modalities(options: dict[str, Any] | None) -> set[str]:
     return {str(item) for item in modalities}
 
 
-def _resource_path_text(resource_type: str, resource: Any) -> str:
-    path = resource.local_storage_path or resource.object_storage_url or resource.resource_id
-    return f"[{resource_type} file: {path}]"
+def _resource_path_text(resource_type: str, resource: Any) -> str | None:
+    path = resource.object_storage_url or resource.local_storage_path
+    if not path:
+        return None
+    return f"[{resource_type} file] {path}"
 
 
 def _require_base64(base64_content: str | None, resource_id: str) -> str:

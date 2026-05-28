@@ -122,8 +122,9 @@ class AgentExecutionFactory:
         local_tool_gateway = LocalToolFactory.create()
         mcp_gateway = mcp_client_gateway or McpClientFactory.create()
         runtime_gateway = AgentRuntimeFactory.create()
+        resource_resolver = _LazyFileResourceResolver()
         llm_request_service = LlmClientFactory.create(
-            _LazyFileResourceResolver(),
+            resource_resolver,
             event_publisher=event_publisher,
         )
 
@@ -149,6 +150,7 @@ class AgentExecutionFactory:
             conversation_repository=conversation_repository,
             runtime_gateway=runtime_gateway,
             llm_registry_gateway=llm_registry_gateway,
+            resource_resolver=resource_resolver,
             archive_repository=ContextCompressionArchiveRepository(
                 config.context_compression.archive_data_dir,
             ),

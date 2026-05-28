@@ -26,7 +26,6 @@ from agent_runtime.conversation_message.message.assistant_projection import (
     clone_raw_value,
     iter_assistant_semantic_segments,
     serialize_tool_arguments,
-    serialize_tool_output,
     should_include_cross_protocol_thinking_text,
 )
 from agent_runtime.conversation_message.message.models import (
@@ -40,6 +39,10 @@ from agent_runtime.conversation_message.message.models import (
     ToolUsePart,
     UniMessage,
     UniPart,
+)
+from agent_runtime.conversation_message.message.tool_result_output import (
+    prefix_tool_result_error_output,
+    tool_result_output_to_openai_responses_output,
 )
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
@@ -271,47 +274,10 @@ async def _build_openai_tool_result_output(
     """构造 OpenAI Responses function_call_output 的 output 字段。
 
     OpenAI Responses 没有原生 is_error 字段，错误以文本标记编码进 output 内容。
-    多模态资源优先使用 object_storage_url，无则降级到 base64 data URI。
+    多模态资源走 Responses 原生 input_image / input_file 内容项。
     """
-    if isinstance(output, list) and all(
-        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
-    ):
-        items: list[dict[str, Any]] = []
-        error_text_prefixed = False
-        for item in output:
-            if isinstance(item, TextPart):
-                text = item.text
-                if is_error and not error_text_prefixed:
-                    text = f"[ERROR] {text}"
-                    error_text_prefixed = True
-                items.append({"type": "input_text", "text": text})
-            elif isinstance(item, ImagePart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                image_url = resource.object_storage_url
-                if not image_url:
-                    data = _require_base64(resource.base64_content, item.resource_id)
-                    image_url = f"data:{resource.mime_type};base64,{data}"
-                items.append({"type": "input_image", "image_url": image_url})
-            elif isinstance(item, PdfPart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                if resource.object_storage_url:
-                    items.append({
-                        "type": "input_file",
-                        "file_url": resource.object_storage_url,
-                    })
-                else:
-                    data = _require_base64(resource.base64_content, item.resource_id)
-                    items.append({
-                        "type": "input_file",
-                        "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
-                    })
-        if is_error and not error_text_prefixed:
-            items.insert(0, {"type": "input_text", "text": "[ERROR] 工具执行失败。"})
-        return items
-    text = serialize_tool_output(output)
-    if is_error:
-        return f"[ERROR] {text}"
-    return text
+    normalized_output = prefix_tool_result_error_output(output) if is_error else output
+    return await tool_result_output_to_openai_responses_output(normalized_output, resolver)
 
 
 def _build_openai_assistant(

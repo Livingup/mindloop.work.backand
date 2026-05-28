@@ -33,6 +33,7 @@ from agent_runtime.conversation_message.message.models import (
     UniMessage,
     UniPart,
 )
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_output_for_json
 
 
 # ── 序列化辅助函数 ──────────────────────────────────────────────
@@ -90,15 +91,11 @@ def _dict_to_part(d: dict[str, Any]) -> UniPart:
 
 
 def _tool_result_output_to_json(output: Any) -> Any:
-    if isinstance(output, list) and all(isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output):
-        return [_part_to_dict(item) for item in output]
-    return output
+    return normalize_tool_output_for_json(output)
 
 
 def _tool_result_output_from_json(output: Any) -> Any:
-    if isinstance(output, list) and all(isinstance(item, dict) and "kind" in item for item in output):
-        return [_dict_to_part(item) for item in output]
-    return output
+    return normalize_tool_output_for_json(output)
 
 
 def _message_to_json_line(msg: UniMessage) -> str:

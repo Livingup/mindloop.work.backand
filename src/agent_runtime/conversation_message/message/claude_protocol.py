@@ -28,7 +28,6 @@ from agent_runtime.conversation_message.message.assistant_projection import (
     AssistantToolUseSegment,
     clone_raw_value,
     iter_assistant_semantic_segments,
-    serialize_tool_output,
     should_include_cross_protocol_thinking_text,
 )
 from agent_runtime.conversation_message.message.models import (
@@ -43,6 +42,7 @@ from agent_runtime.conversation_message.message.models import (
     UniMessage,
     UniPart,
 )
+from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_claude_content
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -309,41 +309,7 @@ async def _build_claude_tool_result_content(
       多模态资源优先使用 object_storage_url，无则降级到 base64
     - dict/其他: 序列化为 JSON 字符串
     """
-    if isinstance(output, str):
-        return output
-    if isinstance(output, list) and all(
-        isinstance(item, (TextPart, ImagePart, PdfPart)) for item in output
-    ):
-        blocks: list[dict[str, Any]] = []
-        for item in output:
-            if isinstance(item, TextPart):
-                blocks.append({"type": "text", "text": item.text})
-            elif isinstance(item, ImagePart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                if resource.object_storage_url:
-                    source = {"type": "url", "url": resource.object_storage_url}
-                else:
-                    data = _require_base64(resource.base64_content, item.resource_id)
-                    source = {
-                        "type": "base64",
-                        "media_type": resource.mime_type,
-                        "data": data,
-                    }
-                blocks.append({"type": "image", "source": source})
-            elif isinstance(item, PdfPart):
-                resource = await resolve_resource_access(resolver, item.resource_id)
-                if resource.object_storage_url:
-                    source = {"type": "url", "url": resource.object_storage_url}
-                else:
-                    data = _require_base64(resource.base64_content, item.resource_id)
-                    source = {
-                        "type": "base64",
-                        "media_type": resource.mime_type or "application/pdf",
-                        "data": data,
-                    }
-                blocks.append({"type": "document", "source": source})
-        return blocks
-    return serialize_tool_output(output)
+    return await tool_result_output_to_claude_content(output, resolver)
 
 
 def _build_claude_assistant(

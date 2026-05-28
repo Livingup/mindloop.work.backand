@@ -5,6 +5,7 @@ from typing import Any
 
 from agent_runtime.context_compression.job_store import InMemoryCompressionJobStore
 from agent_runtime.conversation_message.message.models import ToolResultPart, ToolUsePart
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
@@ -50,12 +51,12 @@ class ContextSummaryToolExecutor:
             if allowed_tool_names is not None and tool_use.name not in allowed_tool_names:
                 raise PermissionError(f"当前 Worker 不允许调用上下文压缩工具: {tool_use.name}")
             result = self._execute(job_id=job_id, worker_name=worker_name, expected_section=expected_section, tool_use=tool_use)
-            return ToolResultPart(tool_use_ref=tool_use.tool_use_id or tool_use.name, is_error=False, output=result)
+            return ToolResultPart(tool_use_ref=tool_use.tool_use_id or tool_use.name, is_error=False, output=normalize_tool_result_output(result))
         except Exception as exc:
             return ToolResultPart(
                 tool_use_ref=tool_use.tool_use_id or tool_use.name,
                 is_error=True,
-                output={"error_type": exc.__class__.__name__, "error_message": str(exc)},
+                output=normalize_tool_result_output({"error_type": exc.__class__.__name__, "error_message": str(exc)}),
             )
 
     def _execute(self, *, job_id: str, worker_name: str, expected_section: str | None, tool_use: ToolUsePart) -> dict[str, Any]:

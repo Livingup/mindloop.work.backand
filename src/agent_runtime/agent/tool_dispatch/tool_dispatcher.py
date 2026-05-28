@@ -15,6 +15,7 @@ from agent_runtime.communication.runtime_event_publisher import (
     RuntimeEventPublisher,
 )
 from agent_runtime.conversation_message.message.models import ImagePart, PdfPart, TextPart, ToolResultPart, ToolUsePart
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
@@ -422,15 +423,15 @@ def _extract_llm_visible_content(result: BaseToolResult) -> Any:
     成功时返回业务输出 result.output；失败时返回错误信息文本（必要时附带 partial output）。
     """
     if result.success:
-        return result.output
+        return normalize_tool_result_output(result.output)
     error_text = f"工具执行失败：{result.error_message or 'Tool execution failed.'}"
     if result.output is None:
-        return [TextPart(text=error_text)]
+        return normalize_tool_result_output(error_text)
     if isinstance(result.output, str):
-        return [TextPart(text=f"{error_text}\n\n{result.output}")]
+        return normalize_tool_result_output(f"{error_text}\n\n{result.output}")
     if _is_unipart_list(result.output):
-        return [TextPart(text=error_text), *result.output]
-    return [TextPart(text=f"{error_text}\n\n{_stable_json_text(result.output)}")]
+        return normalize_tool_result_output([TextPart(text=error_text), *result.output])
+    return normalize_tool_result_output(f"{error_text}\n\n{_stable_json_text(result.output)}")
 
 
 def _is_unipart_list(value: Any) -> bool:

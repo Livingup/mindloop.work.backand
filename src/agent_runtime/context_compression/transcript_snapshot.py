@@ -5,9 +5,11 @@ from typing import Any
 
 from agent_runtime.context_compression.models import CompressionJob, CompressionRange
 from agent_runtime.conversation_message.message.models import Conversation, ImagePart, PdfPart, TextPart, ThinkingPart, ToolResultPart, ToolUsePart
+from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_text
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
 
 
-def build_transcript_snapshot(conversation: Conversation, job: CompressionJob, range_plan: CompressionRange) -> str:
+async def build_transcript_snapshot(conversation: Conversation, job: CompressionJob, range_plan: CompressionRange, resolver: ResourceResolver) -> str:
     lines: list[str] = [
         "# Conversation Transcript Snapshot",
         "",
@@ -32,7 +34,7 @@ def build_transcript_snapshot(conversation: Conversation, job: CompressionJob, r
             lines.append(f"- source_vendor: {message.source_vendor}")
         lines.append("- content:")
         for part in message.content:
-            lines.extend(_part_lines(part))
+            lines.extend(await _part_lines(part, resolver))
         lines.append("")
     lines.extend([
         "## Runtime Compression Instruction",
@@ -41,7 +43,7 @@ def build_transcript_snapshot(conversation: Conversation, job: CompressionJob, r
     return "\n".join(lines)
 
 
-def _part_lines(part: Any) -> list[str]:
+async def _part_lines(part: Any, resolver: ResourceResolver) -> list[str]:
     if isinstance(part, TextPart):
         return ["  - kind: text", "    text: |", *_indent_block(part.text)]
     if isinstance(part, ThinkingPart):
@@ -55,24 +57,27 @@ def _part_lines(part: Any) -> list[str]:
             *_indent_block(json.dumps(part.input, ensure_ascii=False, indent=2)),
         ]
     if isinstance(part, ToolResultPart):
+        output_text = await tool_result_output_to_text(part.output, resolver)
         return [
             "  - kind: tool_result",
             f"    tool_use_ref: {part.tool_use_ref}",
             f"    is_error: {part.is_error}",
-            "    output_json: |",
-            *_indent_block(json.dumps(part.output, ensure_ascii=False, indent=2)),
+            "    output_text: |",
+            *_indent_block(output_text),
         ]
     if isinstance(part, ImagePart):
+        locator_text = await tool_result_output_to_text([{"kind": "image", "resource_id": part.resource_id}], resolver)
         return [
             "  - kind: image",
-            f"    runtime_internal_resource_id: {part.resource_id}",
-            "    access_method: controlled file resource API or original locator if preserved in nearby text/tool output",
+            "    resource_locator: |",
+            *_indent_block(locator_text),
         ]
     if isinstance(part, PdfPart):
+        locator_text = await tool_result_output_to_text([{"kind": "pdf", "resource_id": part.resource_id}], resolver)
         return [
             "  - kind: pdf",
-            f"    runtime_internal_resource_id: {part.resource_id}",
-            "    access_method: controlled file resource API or original locator if preserved in nearby text/tool output",
+            "    resource_locator: |",
+            *_indent_block(locator_text),
         ]
     return ["  - kind: unknown", f"    value: {part!r}"]
 
