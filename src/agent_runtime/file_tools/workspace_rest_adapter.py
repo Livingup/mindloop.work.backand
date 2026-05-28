@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Literal
 
@@ -24,6 +25,19 @@ class WorkspaceTreeResponse(BaseModel):
     name: str
     path: str
     children: list[WorkspaceTreeNodeResponse] = Field(default_factory=list)
+
+
+class WorkspaceGitStatusRequest(BaseModel):
+    workspace_path: str = Field(description="要检查 Git 状态的工作区根目录路径。")
+
+
+class WorkspaceGitStatusResponse(BaseModel):
+    workspace_path: str
+    is_git_repository_root: bool = Field(description="该目录本身是否为 Git 仓库根目录。")
+    branch: str | None = Field(default=None, description="当前检出的 Git 分支；detached HEAD 或不可读取时为空。")
+    dirty: bool = Field(default=False, description="工作区是否存在未提交变更。")
+    display_text: str | None = Field(default=None, description="状态栏可直接展示的分支文本，例如 main*。")
+    reason: str | None = Field(default=None, description="不可展示分支时的机器可读原因。")
 
 
 _EXCLUDED_NAMES = {
@@ -62,7 +76,93 @@ def create_workspace_router() -> APIRouter:
             ),
         )
 
+    @router.post("/git-status", response_model=WorkspaceGitStatusResponse)
+    def get_workspace_git_status(body: WorkspaceGitStatusRequest) -> WorkspaceGitStatusResponse:
+        root = Path(body.workspace_path).expanduser().resolve()
+        if not root.exists():
+            raise HTTPException(status_code=404, detail=f"工作目录不存在: {root}")
+        if not root.is_dir():
+            raise HTTPException(status_code=400, detail=f"工作目录不是文件夹: {root}")
+        return _read_git_status(root)
+
     return router
+
+
+_GIT_COMMAND_TIMEOUT_SECONDS = 3.0
+
+
+def _read_git_status(root: Path) -> WorkspaceGitStatusResponse:
+    """读取工作区 Git 状态；只有目录本身是 Git 仓库根目录时才返回可展示文本。"""
+    if not (root / ".git").exists():
+        return _git_status_response(root, is_git_repository_root=False, reason="missing_git_metadata")
+
+    top_level_ok, top_level = _run_git(root, "rev-parse", "--show-toplevel")
+    if not top_level_ok or not top_level:
+        return _git_status_response(root, is_git_repository_root=False, reason="git_root_unavailable")
+
+    top_level_path = Path(top_level).expanduser().resolve()
+    if not _is_same_path(root, top_level_path):
+        return _git_status_response(root, is_git_repository_root=False, reason="not_git_repository_root")
+
+    branch_ok, branch_output = _run_git(root, "branch", "--show-current")
+    branch = branch_output if branch_ok and branch_output else None
+    dirty_ok, dirty_output = _run_git(root, "status", "--porcelain")
+    dirty = bool(dirty_output) if dirty_ok else False
+    display_text = f"{branch}{'*' if dirty else ''}" if branch else None
+    return _git_status_response(
+        root,
+        is_git_repository_root=True,
+        branch=branch,
+        dirty=dirty,
+        display_text=display_text,
+        reason=None if display_text else "branch_unavailable",
+    )
+
+
+def _git_status_response(
+    root: Path,
+    *,
+    is_git_repository_root: bool,
+    branch: str | None = None,
+    dirty: bool = False,
+    display_text: str | None = None,
+    reason: str | None = None,
+) -> WorkspaceGitStatusResponse:
+    return WorkspaceGitStatusResponse(
+        workspace_path=str(root),
+        is_git_repository_root=is_git_repository_root,
+        branch=branch,
+        dirty=dirty,
+        display_text=display_text,
+        reason=reason,
+    )
+
+
+def _run_git(root: Path, *args: str) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            text=True,
+            timeout=_GIT_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+    return completed.returncode == 0, completed.stdout.strip()
+
+
+def _is_same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return _normalise_path_for_compare(left) == _normalise_path_for_compare(right)
+
+
+def _normalise_path_for_compare(path: Path) -> str:
+    return str(path).replace("\\", "/").rstrip("/").casefold()
 
 
 def _read_children(
