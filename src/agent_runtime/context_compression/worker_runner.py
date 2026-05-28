@@ -91,20 +91,6 @@ class ContextCompressionWorkerRunner:
                     next_resolved_model is not None
                     and isinstance(exc, LlmProviderModelServiceUnavailable)
                 )
-                if can_failover:
-                    await self._publish_worker_activity(
-                        communication_context,
-                        job,
-                        worker_name=worker_name,
-                        worker_role=worker_role,
-                        output_section=output_section,
-                        input_mode=input_mode,
-                        resolved_model=next_resolved_model,
-                        kind=_failover_activity_kind(resolved_model, next_resolved_model),
-                        text=_failover_activity_text(resolved_model, next_resolved_model),
-                        details=None,
-                        duration_ms=0,
-                    )
                 if not can_failover:
                     raise
         if last_error is not None:
@@ -256,21 +242,22 @@ class ContextCompressionWorkerRunner:
         except LlmRequestCancelled:
             raise
         except Exception as exc:
-            await self._publish_worker_event(
-                communication_context,
-                CONTEXT_COMPRESSION_WORKER_FAILED,
-                job,
-                worker_name=worker_name,
-                worker_role=worker_role,
-                output_section=output_section,
-                input_mode=input_mode,
-                resolved_model=resolved_model,
-                round_index=0,
-                max_rounds=max_rounds,
-                duration_ms=int((time.perf_counter() - started_at) * 1000),
-                error_type=exc.__class__.__name__,
-                error_message=str(exc),
-            )
+            if not (next_resolved_model is not None and isinstance(exc, LlmProviderModelServiceUnavailable)):
+                await self._publish_worker_event(
+                    communication_context,
+                    CONTEXT_COMPRESSION_WORKER_FAILED,
+                    job,
+                    worker_name=worker_name,
+                    worker_role=worker_role,
+                    output_section=output_section,
+                    input_mode=input_mode,
+                    resolved_model=resolved_model,
+                    round_index=0,
+                    max_rounds=max_rounds,
+                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    error_type=exc.__class__.__name__,
+                    error_message=str(exc),
+                )
             raise
 
     async def _publish_worker_activity(
@@ -400,36 +387,8 @@ def _activity_from_llm_event(event_type: str, payload: dict[str, Any]) -> tuple[
 
 def _failed_activity(payload: dict[str, Any]) -> tuple[str, str]:
     if payload.get("will_retry") is True:
-        next_key = payload.get("next_api_key_index")
-        key = payload.get("api_key_index")
-        next_provider = str(payload.get("next_provider_id") or "")
-        provider = str(payload.get("provider_id") or "")
-        next_model = str(payload.get("next_model_alias") or payload.get("next_model_id") or "")
-        model = str(payload.get("model_alias") or payload.get("model_id") or "")
-        if next_provider and provider and next_provider != provider:
-            return "provider_switching", "请求失败，正在切换服务商"
-        if next_model and model and next_model != model:
-            return "model_switching", "请求失败，正在切换模型"
-        if next_key is not None and next_key != key:
-            return "api_key_switching", "请求失败，正在切换 key"
-        return "llm_failed_recovering", "请求失败，正在重试"
+        return "llm_retrying", f"请求失败，正在重试（{_retry_target_label(payload)}）"
     return "llm_failed", _short_error_text(payload)
-
-
-def _failover_activity_kind(current: ResolvedLlmProviderModel, next_model: ResolvedLlmProviderModel) -> str:
-    if current.provider_id != next_model.provider_id:
-        return "provider_switching"
-    if current.model_id != next_model.model_id or current.binding_id != next_model.binding_id:
-        return "model_switching"
-    return "llm_failed_recovering"
-
-
-def _failover_activity_text(current: ResolvedLlmProviderModel, next_model: ResolvedLlmProviderModel) -> str:
-    if current.provider_id != next_model.provider_id:
-        return "请求失败，正在切换服务商"
-    if current.model_id != next_model.model_id or current.binding_id != next_model.binding_id:
-        return "请求失败，正在切换模型"
-    return "请求失败，正在恢复"
 
 
 def _activity_details(details: dict[str, Any] | None) -> dict[str, Any]:
@@ -466,6 +425,25 @@ def _key_label(payload: dict[str, Any]) -> str:
     if isinstance(index, int):
         return f"key-{index + 1}"
     return "key"
+
+
+def _retry_target_label(payload: dict[str, Any]) -> str:
+    provider = str(payload.get("next_provider_id") or payload.get("provider_id") or "服务商")
+    model = str(
+        payload.get("next_model_alias")
+        or payload.get("next_model_id")
+        or payload.get("model_alias")
+        or payload.get("model_id")
+        or "模型"
+    )
+    key_index = payload.get("next_api_key_index")
+    if not isinstance(key_index, int):
+        key_index = payload.get("api_key_index")
+    if isinstance(key_index, int):
+        key = f"key-{key_index + 1}"
+    else:
+        key = str(payload.get("api_key_label") or "key")
+    return f"{provider} / {model} / {key}"
 
 
 def _short_error_text(payload: dict[str, Any]) -> str:
