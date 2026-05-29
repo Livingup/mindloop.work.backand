@@ -5,7 +5,6 @@ import codecs
 import locale
 import os
 import signal
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any
@@ -298,31 +297,108 @@ async def _start_windows_terminal(request: TerminalSessionStartRequest, *, on_ex
         from winpty import PtyProcess
     except ImportError as exc:
         raise RuntimeError("Windows ConPTY 终端需要安装 pywinpty 依赖。") from exc
-    argv = subprocess.list2cmdline(_interactive_shell_argv(request.shell))
-    try:
-        winpty = PtyProcess.spawn(
-            argv,
-            cwd=request.cwd,
-            env=_process_env(),
-            dimensions=(max(1, request.rows), max(1, request.cols)),
-        )
-    except TypeError:
-        try:
-            winpty = PtyProcess.spawn(argv, cwd=request.cwd, env=_process_env())
-        except BaseException as exc:
-            if _is_process_control_exception(exc):
-                raise
-            raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
-    except BaseException as exc:
-        if _is_process_control_exception(exc):
-            raise
-        raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
+    argv = _interactive_shell_argv(request.shell)
+    winpty = await _spawn_windows_pty_with_recovery(
+        PtyProcess,
+        shell=request.shell,
+        cwd=request.cwd,
+        argv=argv,
+        env=_process_env(),
+        dimensions=(max(1, request.rows), max(1, request.cols)),
+    )
     return _TerminalSession(
         terminal_id=request.terminal_id,
         shell=request.shell,
         on_exit=on_exit,
         runtime_token=request.runtime_token,
         winpty=winpty,
+    )
+
+
+async def _spawn_windows_pty_with_recovery(
+    pty_process: Any,
+    *,
+    shell: str,
+    cwd: str,
+    argv: list[str],
+    env: dict[str, str],
+    dimensions: tuple[int, int],
+) -> Any:
+    retried = False
+    while True:
+        try:
+            return _spawn_windows_pty(pty_process, argv=argv, cwd=cwd, env=env, dimensions=dimensions)
+        except BaseException as exc:
+            if _is_process_control_exception(exc):
+                raise
+            if not retried and _is_transient_windows_pty_start_error(exc):
+                retried = True
+                await asyncio.sleep(0.05)
+                continue
+            raise _windows_pty_start_error(exc, shell=shell, cwd=cwd, argv=argv, retried=retried) from exc
+
+
+def _spawn_windows_pty(
+    pty_process: Any,
+    *,
+    argv: list[str],
+    cwd: str,
+    env: dict[str, str],
+    dimensions: tuple[int, int],
+) -> Any:
+    try:
+        return pty_process.spawn(list(argv), cwd=cwd, env=env, dimensions=dimensions)
+    except TypeError as exc:
+        if not _is_pywinpty_dimensions_unsupported(exc):
+            raise
+        return pty_process.spawn(list(argv), cwd=cwd, env=env)
+
+
+def _is_pywinpty_dimensions_unsupported(exc: TypeError) -> bool:
+    text = str(exc).lower()
+    return "dimensions" in text and (
+        "unexpected keyword" in text
+        or "got an unexpected" in text
+        or "invalid keyword" in text
+    )
+
+
+def _is_transient_windows_pty_start_error(exc: BaseException) -> bool:
+    text = f"{exc.__class__.__module__}.{exc.__class__.__name__}: {exc}".lower()
+    has_native_panic = (
+        "called `result::unwrap()`" in text
+        or "pyo3_runtime.panicexception" in text
+        or "panicexception" in text
+    )
+    has_success_hresult = (
+        "hresult(0x00000000)" in text
+        or "operation completed successfully" in text
+        or "操作成功完成" in text
+    )
+    return has_native_panic and has_success_hresult
+
+
+def _windows_pty_start_error(
+    exc: BaseException,
+    *,
+    shell: str,
+    cwd: str,
+    argv: list[str],
+    retried: bool,
+) -> RuntimeError:
+    detail = str(exc) or exc.__class__.__name__
+    retry_note = "；已对可疑 native transient 错误重试 1 次" if retried else ""
+    native_hint = ""
+    if _is_transient_windows_pty_start_error(exc):
+        native_hint = (
+            "；检测到底层 pywinpty/winpty-rs/ConPTY 返回 Result::unwrap/HRESULT(0) 异常，"
+            "这通常不是 cwd 不存在或 shell 无法解析，而是 Windows PTY native 层失败或状态竞争"
+        )
+    return RuntimeError(
+        f"Windows PTY 终端启动失败{retry_note}: "
+        f"shell={shell!r}, cwd={cwd!r}, argv={argv!r}, "
+        f"error_type={exc.__class__.__module__}.{exc.__class__.__name__}, "
+        f"error={detail}{native_hint}"
     )
 
 
