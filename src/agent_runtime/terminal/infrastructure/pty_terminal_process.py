@@ -440,6 +440,10 @@ def _windows_exit_status(winpty: Any) -> int | None:
         return None
 
 
+def _is_process_control_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
+
+
 def _normalize_terminal_input(text: str) -> str:
     return text.replace("\r\n", "\r").replace("\n", "\r")
 
