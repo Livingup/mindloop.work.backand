@@ -36,6 +36,7 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
 from agent_runtime.chat_bubble.chat_bubble_message import (
     CHAT_BUBBLE_STATUS_COMPLETED,
     ChatBubbleInteractionOption,
+    ChatBubbleInteractionState,
     ChatBubbleMessage,
     ChatBubbleRole,
     ChatBubbleStatus,
@@ -139,6 +140,7 @@ class ChatBubbleMessageResponse(BaseModel):
     backend_message_id: str | None = None
     pending_message_id: str | None = None
     interaction_options: list[ChatBubbleInteractionOptionModel] = Field(default_factory=list)
+    interaction_state: str
     selected_option_id: str | None = None
     sort_order: int
     created_at: str
@@ -166,6 +168,7 @@ class CreateChatBubbleMessageBody(BaseModel):
     backend_message_id: str | None = None
     pending_message_id: str | None = None
     interaction_options: list[ChatBubbleInteractionOptionModel] = Field(default_factory=list)
+    interaction_state: ChatBubbleInteractionState = "none"
     selected_option_id: str | None = None
     sort_order: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -179,6 +182,7 @@ class PatchChatBubbleMessageBody(BaseModel):
     backend_message_id: str | None = None
     pending_message_id: str | None = None
     interaction_options: list[ChatBubbleInteractionOptionModel] | None = None
+    interaction_state: ChatBubbleInteractionState | None = None
     selected_option_id: str | None = None
     metadata: dict[str, Any] | None = None
 
@@ -748,6 +752,7 @@ def create_agent_runtime_router(
                 backend_message_id=body.backend_message_id,
                 pending_message_id=body.pending_message_id,
                 interaction_options=_interaction_options_tuple(body.interaction_options),
+                interaction_state=body.interaction_state,
                 selected_option_id=body.selected_option_id,
                 sort_order=body.sort_order,
                 metadata=body.metadata,
@@ -783,6 +788,7 @@ def create_agent_runtime_router(
                     if body.interaction_options is not None
                     else None
                 ),
+                interaction_state=body.interaction_state,
                 selected_option_id=body.selected_option_id,
                 metadata=body.metadata,
             )
@@ -1509,6 +1515,7 @@ def _chat_bubble_response(message: ChatBubbleMessage) -> ChatBubbleMessageRespon
             ChatBubbleInteractionOptionModel(**option.to_json())
             for option in message.interaction_options
         ],
+        interaction_state=message.interaction_state,
         selected_option_id=message.selected_option_id,
         sort_order=message.sort_order,
         created_at=_datetime_text(message.created_at),

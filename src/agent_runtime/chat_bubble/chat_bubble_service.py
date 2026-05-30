@@ -7,8 +7,12 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.chat_bubble.chat_bubble_message import (
+    CHAT_BUBBLE_INTERACTION_STATE_ANSWERED,
+    CHAT_BUBBLE_INTERACTION_STATE_NONE,
+    CHAT_BUBBLE_INTERACTION_STATE_PENDING,
     CHAT_BUBBLE_STATUS_COMPLETED,
     ChatBubbleInteractionOption,
+    ChatBubbleInteractionState,
     ChatBubbleMessage,
     ChatBubbleRole,
     ChatBubbleStatus,
@@ -62,6 +66,7 @@ class ChatBubbleService:
         backend_message_id: str | None = None,
         pending_message_id: str | None = None,
         interaction_options: tuple[ChatBubbleInteractionOption, ...] = (),
+        interaction_state: ChatBubbleInteractionState = CHAT_BUBBLE_INTERACTION_STATE_NONE,
         selected_option_id: str | None = None,
         sort_order: int | None = None,
         metadata: dict[str, Any] | None = None,
@@ -72,7 +77,8 @@ class ChatBubbleService:
         - scene_id 是历史气泡列表的主归属，必须与 REST 路径保持一致；
         - bubble_id 可由前端传入以支持幂等写入，未传则由后端生成；
         - sort_order 未传或小于等于 0 时由仓储按 Scene 分配下一递增序号；
-        - interaction_options 只表达前端恢复按钮状态所需的展示数据。
+        - interaction_options 只表达按钮展示数据，不承担是否等待用户回馈的判断；
+        - interaction_state 是后端声明的权威交互状态，前端不得根据按钮选项自行推断。
         """
         _require_non_blank(scene_id, "scene_id")
         actual_bubble_id = bubble_id or _new_bubble_id()
@@ -86,6 +92,10 @@ class ChatBubbleService:
                 actual_sort_order = current.sort_order
             else:
                 actual_sort_order = self._repository.next_sort_order(scene_id)
+            actual_interaction_state = interaction_state
+            if selected_option_id is not None and actual_interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING:
+                actual_interaction_state = CHAT_BUBBLE_INTERACTION_STATE_ANSWERED
+
             message = ChatBubbleMessage(
                 bubble_id=actual_bubble_id,
                 scene_id=scene_id,
@@ -101,6 +111,7 @@ class ChatBubbleService:
                 backend_message_id=backend_message_id,
                 pending_message_id=pending_message_id,
                 interaction_options=interaction_options,
+                interaction_state=actual_interaction_state,
                 selected_option_id=(
                     selected_option_id
                     if selected_option_id is not None
@@ -144,6 +155,7 @@ class ChatBubbleService:
         backend_message_id: str | None = None,
         pending_message_id: str | None = None,
         interaction_options: tuple[ChatBubbleInteractionOption, ...] | None = None,
+        interaction_state: ChatBubbleInteractionState | None = None,
         selected_option_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ChatBubbleMessage:
@@ -156,6 +168,14 @@ class ChatBubbleService:
                 raise KeyError(f"Chat 气泡不存在: {bubble_id}")
             if current.scene_id != scene_id:
                 raise ValueError("Chat 气泡不属于指定 Scene。")
+            actual_interaction_state = interaction_state
+            if (
+                actual_interaction_state is None
+                and selected_option_id is not None
+                and current.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING
+            ):
+                actual_interaction_state = CHAT_BUBBLE_INTERACTION_STATE_ANSWERED
+
             updated = current.with_patch(
                 status=status,
                 text=text,
@@ -164,6 +184,7 @@ class ChatBubbleService:
                 backend_message_id=backend_message_id,
                 pending_message_id=pending_message_id,
                 interaction_options=interaction_options,
+                interaction_state=actual_interaction_state,
                 selected_option_id=selected_option_id,
                 metadata=metadata,
             )

@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any, Callable
 
 from agent_runtime.chat_bubble.chat_bubble_message import (
+    CHAT_BUBBLE_INTERACTION_STATE_NONE,
     ChatBubbleInteractionOption,
     ChatBubbleMessage,
 )
@@ -30,6 +31,7 @@ CREATE TABLE IF NOT EXISTS chat_bubble_messages (
     backend_message_id       TEXT,
     pending_message_id       TEXT,
     interaction_options_json TEXT NOT NULL DEFAULT '[]',
+    interaction_state        TEXT NOT NULL DEFAULT 'none',
     selected_option_id       TEXT,
     sort_order               INTEGER NOT NULL,
     created_at               TEXT NOT NULL,
@@ -77,8 +79,8 @@ class SqliteChatBubbleRepository:
                     bubble_id, scene_id, agent_instance_id, task_id, conversation_id,
                     role, status, text, text_format, channel, client_message_id,
                     backend_message_id, pending_message_id, interaction_options_json,
-                    selected_option_id, sort_order, created_at, updated_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    interaction_state, selected_option_id, sort_order, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bubble_id) DO UPDATE SET
                     scene_id = excluded.scene_id,
                     agent_instance_id = excluded.agent_instance_id,
@@ -93,6 +95,7 @@ class SqliteChatBubbleRepository:
                     backend_message_id = excluded.backend_message_id,
                     pending_message_id = excluded.pending_message_id,
                     interaction_options_json = excluded.interaction_options_json,
+                    interaction_state = excluded.interaction_state,
                     selected_option_id = excluded.selected_option_id,
                     sort_order = excluded.sort_order,
                     created_at = excluded.created_at,
@@ -112,7 +115,7 @@ class SqliteChatBubbleRepository:
                 SELECT bubble_id, scene_id, agent_instance_id, task_id, conversation_id,
                        role, status, text, text_format, channel, client_message_id,
                        backend_message_id, pending_message_id, interaction_options_json,
-                       selected_option_id, sort_order, created_at, updated_at, metadata_json
+                       interaction_state, selected_option_id, sort_order, created_at, updated_at, metadata_json
                 FROM chat_bubble_messages
                 WHERE bubble_id = ?
                 """,
@@ -144,12 +147,12 @@ class SqliteChatBubbleRepository:
                 SELECT bubble_id, scene_id, agent_instance_id, task_id, conversation_id,
                        role, status, text, text_format, channel, client_message_id,
                        backend_message_id, pending_message_id, interaction_options_json,
-                       selected_option_id, sort_order, created_at, updated_at, metadata_json
+                       interaction_state, selected_option_id, sort_order, created_at, updated_at, metadata_json
                 FROM (
                     SELECT bubble_id, scene_id, agent_instance_id, task_id, conversation_id,
                            role, status, text, text_format, channel, client_message_id,
                            backend_message_id, pending_message_id, interaction_options_json,
-                           selected_option_id, sort_order, created_at, updated_at, metadata_json
+                           interaction_state, selected_option_id, sort_order, created_at, updated_at, metadata_json
                     FROM chat_bubble_messages
                     WHERE {where_clause}
                     ORDER BY sort_order DESC
@@ -194,9 +197,21 @@ class SqliteChatBubbleRepository:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        _ensure_schema_columns(self._conn)
         self._conn.commit()
         self._db_path = db_path
         return self._conn
+
+
+def _ensure_schema_columns(conn: sqlite3.Connection) -> None:
+    """幂等补齐历史 chat_bubble_messages 表缺失的后端权威交互状态列。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(chat_bubble_messages)").fetchall()}
+    if "interaction_state" not in columns:
+        conn.execute(
+            "ALTER TABLE chat_bubble_messages "
+            "ADD COLUMN interaction_state TEXT NOT NULL "
+            f"DEFAULT '{CHAT_BUBBLE_INTERACTION_STATE_NONE}'"
+        )
 
 
 def _message_to_row(message: ChatBubbleMessage) -> tuple[Any, ...]:
@@ -216,6 +231,7 @@ def _message_to_row(message: ChatBubbleMessage) -> tuple[Any, ...]:
         message.backend_message_id,
         message.pending_message_id,
         json.dumps([option.to_json() for option in message.interaction_options], ensure_ascii=False),
+        message.interaction_state,
         message.selected_option_id,
         message.sort_order,
         _datetime_to_text(message.created_at),
@@ -244,11 +260,12 @@ def _row_to_message(row: tuple[Any, ...]) -> ChatBubbleMessage:
             ChatBubbleInteractionOption.from_json(option)
             for option in json.loads(row[13] or "[]")
         ),
-        selected_option_id=row[14],
-        sort_order=int(row[15]),
-        created_at=_text_to_datetime(row[16]),
-        updated_at=_text_to_datetime(row[17]),
-        metadata=json.loads(row[18] or "{}"),
+        interaction_state=row[14],
+        selected_option_id=row[15],
+        sort_order=int(row[16]),
+        created_at=_text_to_datetime(row[17]),
+        updated_at=_text_to_datetime(row[18]),
+        metadata=json.loads(row[19] or "{}"),
     )
 
 

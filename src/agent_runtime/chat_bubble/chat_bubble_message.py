@@ -41,6 +41,17 @@ CHAT_BUBBLE_TEXT_FORMATS: Final[frozenset[str]] = frozenset({
     "diff",
 })
 
+ChatBubbleInteractionState: TypeAlias = str
+
+CHAT_BUBBLE_INTERACTION_STATE_NONE: Final[str] = "none"
+CHAT_BUBBLE_INTERACTION_STATE_PENDING: Final[str] = "pending"
+CHAT_BUBBLE_INTERACTION_STATE_ANSWERED: Final[str] = "answered"
+CHAT_BUBBLE_INTERACTION_STATES: Final[frozenset[str]] = frozenset({
+    CHAT_BUBBLE_INTERACTION_STATE_NONE,
+    CHAT_BUBBLE_INTERACTION_STATE_PENDING,
+    CHAT_BUBBLE_INTERACTION_STATE_ANSWERED,
+})
+
 
 def _utc_now() -> datetime:
     """返回带 UTC 时区的当前时间。"""
@@ -142,8 +153,11 @@ class ChatBubbleMessage:
     # 后端 AgentInstance pending 队列中的消息 ID。
     pending_message_id: str | None = None
 
-    # request_response 类型消息的交互选项。
+    # request_response 类型消息的交互选项；只表达按钮展示数据，不承担是否等待用户回馈的判断。
     interaction_options: tuple[ChatBubbleInteractionOption, ...] = ()
+
+    # 后端明确声明的用户交互状态：none / pending / answered。
+    interaction_state: ChatBubbleInteractionState = CHAT_BUBBLE_INTERACTION_STATE_NONE
 
     # 用户已经选择的选项 ID，用于恢复历史按钮状态。
     selected_option_id: str | None = None
@@ -189,8 +203,14 @@ class ChatBubbleMessage:
         for option in self.interaction_options:
             if not isinstance(option, ChatBubbleInteractionOption):
                 raise ValueError("interaction_options 必须由 ChatBubbleInteractionOption 组成。")
+        if self.interaction_state not in CHAT_BUBBLE_INTERACTION_STATES:
+            raise ValueError(f"未知 Chat 气泡交互状态: {self.interaction_state}")
+        if self.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING and self.role != CHAT_BUBBLE_ROLE_ASSISTANT:
+            raise ValueError("只有 assistant 气泡可以处于 pending 交互状态。")
         if self.selected_option_id is not None:
             _require_non_blank(self.selected_option_id, "selected_option_id")
+            if self.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING:
+                raise ValueError("已选择选项的气泡不能继续处于 pending 交互状态。")
         if self.sort_order < 0:
             raise ValueError("sort_order 不能小于 0。")
         if not isinstance(self.metadata, dict):
@@ -210,6 +230,7 @@ class ChatBubbleMessage:
         backend_message_id: str | None = None,
         pending_message_id: str | None = None,
         interaction_options: tuple[ChatBubbleInteractionOption, ...] | None = None,
+        interaction_state: ChatBubbleInteractionState | None = None,
         selected_option_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         at: datetime | None = None,
@@ -230,6 +251,8 @@ class ChatBubbleMessage:
             values["pending_message_id"] = pending_message_id
         if interaction_options is not None:
             values["interaction_options"] = interaction_options
+        if interaction_state is not None:
+            values["interaction_state"] = interaction_state
         if selected_option_id is not None:
             values["selected_option_id"] = selected_option_id
         if metadata is not None:
