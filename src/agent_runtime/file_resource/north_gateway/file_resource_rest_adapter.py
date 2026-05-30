@@ -42,6 +42,7 @@ class FileResourceResponse(BaseModel):
     mime_type: str
     size_in_bytes: int
     object_storage_url: str
+    local_storage_path: str
     width: int | None = None
     height: int | None = None
     page_count: int | None = None
@@ -328,6 +329,7 @@ def _resource_response(resource, *, name: str | None) -> FileResourceResponse:
         mime_type=resource.resource_mime_type,
         size_in_bytes=resource.resource_size_in_bytes,
         object_storage_url=resource.object_storage_url,
+        local_storage_path=resource.local_storage_path,
         width=metadata_dict.get("width"),
         height=metadata_dict.get("height"),
         page_count=metadata_dict.get("page_count"),

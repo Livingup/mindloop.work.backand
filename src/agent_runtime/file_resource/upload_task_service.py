@@ -247,6 +247,7 @@ def _resource_dict(resource, *, name: str | None) -> dict[str, Any]:
         "mime_type": resource.resource_mime_type,
         "size_in_bytes": len(base64.b64decode(resource.resource_base64_content)),
         "object_storage_url": resource.object_storage_url,
+        "local_storage_path": resource.local_storage_path,
         "width": metadata_dict.get("width"),
         "height": metadata_dict.get("height"),
         "page_count": metadata_dict.get("page_count"),
