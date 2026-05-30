@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from agent_runtime.subprocess_utils import hidden_subprocess_kwargs
 from agent_runtime.tool.tool_decorator import tool
@@ -18,14 +18,31 @@ from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolRe
 
 
 MAX_FILE_READ_LINE_COUNT = 1500
+MAX_FILE_READ_FILES = 5
 MAX_CHARS_PER_LINE = 50000
 
 
-class FileReadRequest(BaseToolRequest):
-    file_path: str = Field(description="要读取的文件绝对路径或当前进程可解析的文件路径。")
+class FileReadRange(BaseModel):
     start_line: int = Field(default=1, ge=1, description="1-based 起始行号；取值必须大于等于 1。")
     line_count: int = Field(default=200, ge=1, le=MAX_FILE_READ_LINE_COUNT, description=f"最多读取的行数；取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。")
+
+
+class FileReadFileRequest(BaseModel):
+    file_path: str = Field(description="要读取的文件绝对路径或当前进程可解析的文件路径。")
+    ranges: list[FileReadRange] = Field(
+        default_factory=lambda: [FileReadRange()],
+        min_length=1,
+        description="要读取的行范围列表；每个范围独立返回结构化 lines 数组。单文件单段读取时传一个文件项和一个范围即可。",
+    )
     encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
+
+
+class FileReadRequest(BaseToolRequest):
+    files: list[FileReadFileRequest] = Field(
+        min_length=1,
+        max_length=MAX_FILE_READ_FILES,
+        description=f"要读取的文件列表；一次最多 {MAX_FILE_READ_FILES} 个文件。读取单个文件时传入只包含一个元素的列表。",
+    )
 
 
 class FileReadLineSliceRequest(BaseToolRequest):
@@ -390,9 +407,9 @@ def _encoding_candidates(encoding: str | None) -> list[str]:
     return candidates
 
 
-def _read_text_window(path: Path, request: FileReadRequest) -> tuple[dict[str, Any], str]:
+def _read_text_window(path: Path, request: FileReadRange, encoding: str | None) -> tuple[dict[str, Any], str]:
     last_error: UnicodeDecodeError | LookupError | None = None
-    for candidate in _encoding_candidates(request.encoding):
+    for candidate in _encoding_candidates(encoding):
         try:
             return _read_text_window_with_encoding(path, request, candidate), candidate
         except (UnicodeDecodeError, LookupError) as exc:
@@ -404,7 +421,7 @@ def _read_text_window(path: Path, request: FileReadRequest) -> tuple[dict[str, A
     raise UnicodeDecodeError("unknown", b"", 0, 1, message)
 
 
-def _read_text_window_with_encoding(path: Path, request: FileReadRequest, encoding: str) -> dict[str, Any]:
+def _read_text_window_with_encoding(path: Path, request: FileReadRange, encoding: str) -> dict[str, Any]:
     selected_lines: list[dict[str, Any]] = []
     line_truncations: list[dict[str, Any]] = []
     has_more_lines = False
@@ -605,54 +622,89 @@ def _collect_text_search_matches(
         return {"seen_count": 0, "matches": [], "has_more": False}, f"decode_error: {last_error}"
     return {"seen_count": 0, "matches": [], "has_more": False}, "decode_error"
 
+def _file_read_failure(output_base: dict[str, Any], error_code: str, error_message: str) -> dict[str, Any]:
+    return {
+        **output_base,
+        "success": False,
+        "error_code": error_code,
+        "error_message": error_message,
+        "segments": [],
+        "warnings": [],
+    }
+
+
+def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[str, Any]]:
+    path = Path(file_request.file_path).expanduser().resolve()
+    output_base = {"file_path": str(path)}
+
+    if not path.exists():
+        return False, _file_read_failure(output_base, "PathNotFound", f"文件不存在: {path}")
+    if not path.is_file():
+        return False, _file_read_failure(output_base, "NotAFile", f"路径不是文件: {path}")
+    if _is_binary_file(path):
+        return False, _file_read_failure(output_base, "BinaryFileNotReadable", f"文件可能是二进制文件，默认不读取: {path}")
+
+    try:
+        segments: list[dict[str, Any]] = []
+        used_encoding: str | None = None
+        for segment_index, range_request in enumerate(file_request.ranges, start=1):
+            segment_output, segment_encoding = _read_text_window(path, range_request, file_request.encoding)
+            segment_output["segment_index"] = segment_index
+            segments.append(segment_output)
+            if used_encoding is None:
+                used_encoding = segment_encoding
+    except UnicodeDecodeError as exc:
+        return False, _file_read_failure(output_base, "DecodeError", str(exc))
+    except OSError as exc:
+        return False, _file_read_failure(output_base, "ReadError", str(exc))
+
+    output: dict[str, Any] = {
+        **output_base,
+        "success": True,
+        "requested_segment_count": len(file_request.ranges),
+        "returned_segment_count": len(segments),
+        "segments": segments,
+        "encoding": used_encoding,
+        "size_bytes": path.stat().st_size,
+        "warnings": [],
+    }
+    if used_encoding is not None:
+        output.update(_detect_text_newline_info(path, used_encoding))
+    return True, output
+
+
 @tool(
     name="file_read",
-    description="按行范围读取指定文本文件内容，返回结构化 lines 数组，行号与文本分离。line_count 取值范围为 1 到 1500；工具内部会固定截断超大单行并返回 line_truncations，可用 file_read_line_slice 继续读取超大行。",
+    description=f"批量读取一个或多个文本文件的指定行范围，返回按文件和范围组织的 lines 数组，行号与文本分离。files 一次最多 {MAX_FILE_READ_FILES} 个；读取单个文件时传一个文件项；每个文件可包含多个 ranges，每段 line_count 取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。返回中如有 line_truncations，可用 file_read_line_slice 续读超长单行。",
     group="file",
     category="system",
 )
 def file_read(request: FileReadRequest) -> BaseToolResult:
-    path = Path(request.file_path).expanduser().resolve()
-    output_base = {"file_path": str(path)}
+    files: list[dict[str, Any]] = []
+    failed_files: list[dict[str, Any]] = []
 
-    if not path.exists():
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="PathNotFound",
-            error_message=f"文件不存在: {path}",
-            output=output_base,
-        )
-    if not path.is_file():
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="NotAFile",
-            error_message=f"路径不是文件: {path}",
-            output=output_base,
-        )
-    if _is_binary_file(path):
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="BinaryFileNotReadable",
-            error_message=f"文件可能是二进制文件，默认不读取: {path}",
-            output=output_base,
-        )
+    for file_index, file_request in enumerate(request.files, start=1):
+        success, file_output = _read_file_request(file_request)
+        file_output["file_index"] = file_index
+        files.append(file_output)
+        if not success:
+            failed_files.append(file_output)
 
-    try:
-        output, used_encoding = _read_text_window(path, request)
-    except UnicodeDecodeError as exc:
+    output = {
+        "requested_file_count": len(request.files),
+        "returned_file_count": len(files),
+        "failed_file_count": len(failed_files),
+        "max_file_count": MAX_FILE_READ_FILES,
+        "files": files,
+    }
+    if failed_files:
         return BaseToolResult(
             success=False,
             execution_status="failed",
-            error_code="DecodeError",
-            error_message=str(exc),
-            output=output_base,
+            error_code="FileReadBatchFailed",
+            error_message=f"{len(failed_files)} 个文件读取失败。",
+            output=output,
         )
-
-    output["encoding"] = used_encoding
-    output.update(_detect_text_newline_info(path, used_encoding))
     return BaseToolResult(output=output)
 
 

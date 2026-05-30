@@ -21,13 +21,26 @@ from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_IDLE,
     TerminalInstance,
 )
-from agent_runtime.terminal.terminal_command import TerminalCommand
+from agent_runtime.terminal.terminal_command import (
+    TERMINAL_COMMAND_STATUS_CANCELLED,
+    TERMINAL_COMMAND_STATUS_COMPLETED,
+    TERMINAL_COMMAND_STATUS_FAILED,
+    TERMINAL_COMMAND_STATUS_TIMEOUT,
+    TerminalCommand,
+)
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 from agent_runtime.terminal.terminal_process import TerminalProcessManager, TerminalProcessStartRequest, TerminalSessionStartRequest
 from agent_runtime.terminal.terminal_repository import TerminalRepository
 from agent_runtime.terminal.terminal_rendering import render_terminal_chunks
 
 ReadMode = Literal["tail", "page", "since", "search"]
+MAX_TERMINAL_READ_WAIT_TIMEOUT_MS = 600_000
+TERMINAL_COMMAND_FINISHED_STATUSES = frozenset({
+    TERMINAL_COMMAND_STATUS_COMPLETED,
+    TERMINAL_COMMAND_STATUS_FAILED,
+    TERMINAL_COMMAND_STATUS_CANCELLED,
+    TERMINAL_COMMAND_STATUS_TIMEOUT,
+})
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +67,10 @@ class ExecuteCommandAccepted:
 class TerminalOutputReadResult:
     terminal_id: str
     command_id: str | None
+    command_status: str | None
+    command_exit_code: int | None
+    command_completed_at: str | None
+    command_finished: bool | None
     status: str
     text: str
     chunks_returned: int
@@ -343,19 +360,27 @@ class TerminalService:
         case_sensitive: bool = False,
     ) -> TerminalOutputReadResult:
         started_at = time.perf_counter()
+        effective_wait_timeout_ms = min(max(wait_timeout_ms, 0), MAX_TERMINAL_READ_WAIT_TIMEOUT_MS)
         logger.info(
-            "读取终端输出开始: terminal_id=%s, command_id=%s, mode=%s, wait_timeout_ms=%s, limit_lines=%s, limit_chars=%s",
+            "读取终端输出开始: terminal_id=%s, command_id=%s, mode=%s, wait_timeout_ms=%s, effective_wait_timeout_ms=%s, limit_lines=%s, limit_chars=%s",
             terminal_id,
             command_id,
             mode,
             wait_timeout_ms,
+            effective_wait_timeout_ms,
             limit_lines,
             limit_chars,
         )
         terminal = self._require_terminal(scope, terminal_id)
+        read_command = self._get_read_command(terminal_id, command_id)
         effective_limit_chars = min(max(limit_chars, 1000), self._max_output_chars_per_read)
-        if wait_timeout_ms > 0:
-            await self._wait_for_output(terminal_id, command_id, after_chunk_index, wait_timeout_ms)
+        if effective_wait_timeout_ms > 0:
+            if read_command is not None:
+                await self._wait_for_command_completion_or_timeout(terminal_id, command_id, effective_wait_timeout_ms)
+            else:
+                await self._wait_for_output(terminal_id, command_id, after_chunk_index, effective_wait_timeout_ms)
+            terminal = self._require_terminal(scope, terminal_id)
+            read_command = self._get_read_command(terminal_id, command_id)
         result: TerminalOutputReadResult
         if mode == "search":
             if not query:
@@ -394,6 +419,7 @@ class TerminalService:
             result = _build_read_result(
                 terminal_id=terminal_id,
                 command_id=command_id,
+                command=read_command,
                 status=terminal.status,
                 chunks=command_chunks,
                 text=tail_text,
@@ -417,6 +443,7 @@ class TerminalService:
         result = _build_read_result(
             terminal_id=terminal_id,
             command_id=command_id,
+            command=read_command,
             status=terminal.status,
             chunks=chunks,
             text=rendered.text,
@@ -804,6 +831,27 @@ class TerminalService:
                 return
             await asyncio.sleep(0.2)
 
+    async def _wait_for_command_completion_or_timeout(
+        self,
+        terminal_id: str,
+        command_id: str,
+        wait_timeout_ms: int,
+    ) -> None:
+        deadline = asyncio.get_running_loop().time() + wait_timeout_ms / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            command = self._get_read_command(terminal_id, command_id)
+            if command is not None and command.status in TERMINAL_COMMAND_FINISHED_STATUSES:
+                return
+            await asyncio.sleep(0.2)
+
+    def _get_read_command(self, terminal_id: str, command_id: str | None) -> TerminalCommand | None:
+        if command_id is None:
+            return None
+        command = self._repo.get_command(command_id)
+        if command is None or command.terminal_id != terminal_id:
+            return None
+        return command
+
     def _lock_for(self, key: str) -> asyncio.Lock:
         lock = self._locks.get(key)
         if lock is None:
@@ -839,6 +887,7 @@ def _build_read_result(
     *,
     terminal_id: str,
     command_id: str | None,
+    command: TerminalCommand | None,
     status: str,
     chunks: list[TerminalOutputChunk],
     text: str,
@@ -852,6 +901,10 @@ def _build_read_result(
     return TerminalOutputReadResult(
         terminal_id=terminal_id,
         command_id=command_id,
+        command_status=command.status if command is not None else None,
+        command_exit_code=command.exit_code if command is not None else None,
+        command_completed_at=command.completed_at.isoformat() if command is not None and command.completed_at is not None else None,
+        command_finished=command.status in TERMINAL_COMMAND_FINISHED_STATUSES if command is not None else None,
         status=status,
         text=actual_text,
         chunks_returned=len(chunks),

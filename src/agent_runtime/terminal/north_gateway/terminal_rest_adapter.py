@@ -80,6 +80,10 @@ class ExecuteTerminalCommandResponse(BaseModel):
 class ReadTerminalOutputResponse(BaseModel):
     terminal_id: str
     command_id: str | None
+    command_status: str | None = None
+    command_exit_code: int | None = None
+    command_completed_at: str | None = None
+    command_finished: bool | None = None
     status: str
     text: str
     chunks_returned: int
@@ -172,7 +176,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
         limit_lines: int = Query(default=200, ge=1, le=2000),
         limit_chars: int = Query(default=12000, ge=1000, le=50000),
         after_chunk_index: int | None = Query(default=None, ge=0),
-        wait_timeout_ms: int = Query(default=0, ge=0, le=3600000),
+        wait_timeout_ms: int = Query(default=0, ge=0, le=600000),
         query: str | None = None,
         case_sensitive: bool = False,
     ) -> ReadTerminalOutputResponse:
@@ -315,6 +319,10 @@ def _read_result_to_response(result: ReadTerminalOutputResult) -> ReadTerminalOu
     return ReadTerminalOutputResponse(
         terminal_id=result.terminal_id,
         command_id=result.command_id,
+        command_status=result.command_status,
+        command_exit_code=result.command_exit_code,
+        command_completed_at=result.command_completed_at,
+        command_finished=result.command_finished,
         status=result.status,
         text=result.text,
         chunks_returned=result.chunks_returned,

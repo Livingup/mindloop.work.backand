@@ -155,6 +155,10 @@ def _read_result_to_dto(result: TerminalOutputReadResult) -> ReadTerminalOutputR
     return ReadTerminalOutputResult(
         terminal_id=result.terminal_id,
         command_id=result.command_id,
+        command_status=result.command_status,
+        command_exit_code=result.command_exit_code,
+        command_completed_at=result.command_completed_at,
+        command_finished=result.command_finished,
         status=result.status,
         text=result.text,
         chunks_returned=result.chunks_returned,

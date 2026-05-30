@@ -14,7 +14,7 @@
 
 ### 只读上下文工具
 
-- `file_read`：按行范围读取文本文件内容。
+- `file_read`：批量按文件与行范围读取文本文件内容。
 - `context_document_discover`：发现项目内标准 `AGENTS.md` 上下文文档。
 - `directory_explore`：递进式探索目录结构。
 - `file_name_search`：按文件名、正则、glob、扩展名定位候选文件或目录。

@@ -105,6 +105,10 @@ class ReadTerminalOutputRequest:
 class ReadTerminalOutputResult:
     terminal_id: str
     command_id: str | None
+    command_status: str | None
+    command_exit_code: int | None
+    command_completed_at: str | None
+    command_finished: bool | None
     status: str
     text: str
     chunks_returned: int
