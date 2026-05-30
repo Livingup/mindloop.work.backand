@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from typing import Any, Callable
 
@@ -19,6 +20,7 @@ from agent_runtime.context_compression.models import (
     context_compression_worker_title,
 )
 from agent_runtime.context_compression.summary_tools import ContextSummaryToolExecutor
+from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -50,7 +52,7 @@ class ContextCompressionWorkerRunner:
         output_section: str | None,
         input_mode: str,
         system_prompt: str,
-        input_text: str,
+        worker_input: ContextCompressionWorkerInput,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
@@ -73,7 +75,7 @@ class ContextCompressionWorkerRunner:
                     output_section=output_section,
                     input_mode=input_mode,
                     system_prompt=system_prompt,
-                    input_text=input_text,
+                    worker_input=worker_input,
                     resolved_model=resolved_model,
                     next_resolved_model=next_resolved_model,
                     max_rounds=max_rounds,
@@ -108,7 +110,7 @@ class ContextCompressionWorkerRunner:
         output_section: str | None,
         input_mode: str,
         system_prompt: str,
-        input_text: str,
+        worker_input: ContextCompressionWorkerInput,
         resolved_model: ResolvedLlmProviderModel,
         next_resolved_model: ResolvedLlmProviderModel | None,
         max_rounds: int,
@@ -165,8 +167,7 @@ class ContextCompressionWorkerRunner:
             max_rounds=max_rounds,
         )
         schedule_activity("preparing", "正在准备输入")
-        conversation = create_conversation()
-        conversation.add_user_message([TextPart(text=input_text)], [TextPartMeta()])
+        conversation = _build_worker_conversation(worker_input)
         completed_without_marker = False
         try:
             for round_index in range(1, max_rounds + 1):
@@ -452,6 +453,14 @@ def _short_error_text(payload: dict[str, Any]) -> str:
     if len(message) > 80:
         return f"{message[:77]}..."
     return message
+
+
+def _build_worker_conversation(worker_input: ContextCompressionWorkerInput) -> Conversation:
+    conversation = create_conversation()
+    for message in worker_input.history_messages:
+        conversation.append_message(copy.deepcopy(message))
+    conversation.add_user_message([TextPart(text=worker_input.user_text)], [TextPartMeta()])
+    return conversation
 
 
 def _worker_finished(job: CompressionJob, worker_role: str, output_section: str | None) -> bool:

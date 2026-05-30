@@ -126,6 +126,7 @@ class ContextCompressionSettingsResponse(BaseModel):
 
 class ContextCompressionSettingsUpdateBody(BaseModel):
     llm_policy_group_id: str | None
+    input_mode: str | None = None
 
 
 class ContextCompressionWorkerPromptDetailResponse(BaseModel):
@@ -194,11 +195,13 @@ def create_context_compression_router(
     async def get_settings() -> ContextCompressionSettingsResponse:
         config = _require_config(config_accessor)
         repo = _require_settings_repository(settings_repository)
-        policy_id = repo.get_llm_policy_group_id()
+        settings = repo.get_settings()
+        policy_id = settings.llm_policy_group_id
+        input_mode = settings.input_mode or config.input_mode
         status, status_message = _evaluate_policy_status(llm_registry_gateway, policy_id)
         return ContextCompressionSettingsResponse(
             enabled=config.enabled,
-            input_mode=config.input_mode,
+            input_mode=input_mode,
             llm_policy_group_id=policy_id,
             llm_policy_group_status=status,
             llm_policy_group_status_message=status_message,
@@ -208,13 +211,25 @@ def create_context_compression_router(
     async def update_settings(
         body: ContextCompressionSettingsUpdateBody,
     ) -> ContextCompressionSettingsResponse:
+        _require_config(config_accessor)
         repo = _require_settings_repository(settings_repository)
+        current_settings = repo.get_settings()
         new_policy_id = body.llm_policy_group_id
         if new_policy_id is not None:
             new_policy_id = new_policy_id.strip() or None
         if new_policy_id is not None:
             _require_valid_execution_policy(llm_registry_gateway, new_policy_id)
-        repo.set_llm_policy_group_id(new_policy_id)
+        new_input_mode = current_settings.input_mode
+        if "input_mode" in body.model_fields_set:
+            new_input_mode = body.input_mode.strip() if isinstance(body.input_mode, str) else None
+            if new_input_mode == "":
+                new_input_mode = None
+            if new_input_mode is not None:
+                _validate_input_mode(new_input_mode)
+        repo.set_settings(
+            llm_policy_group_id=new_policy_id,
+            input_mode=new_input_mode,
+        )
         return await get_settings()
 
     @router.get("/workers", response_model=list[ContextCompressionWorkerResponse])

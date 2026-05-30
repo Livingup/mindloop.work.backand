@@ -55,14 +55,17 @@ async def tool_result_output_to_text(value: Any, resolver: ResourceResolver) -> 
         if kind in (_TOOL_OUTPUT_IMAGE, _TOOL_OUTPUT_PDF):
             resource_id = item.get("resource_id")
             if not isinstance(resource_id, str) or not resource_id:
+                pieces.append(f"[{kind} file] resource_id=<missing>")
                 continue
             resource = await _try_resolve_resource(resolver, resource_id)
             if resource is None:
+                pieces.append(f"[{kind} file] resource_id={resource_id} unresolved")
                 continue
             locator = _resource_locator(resource)
             if not locator:
+                pieces.append(f"[{kind} file] resource_id={resource_id} resolved_without_url_or_path")
                 continue
-            pieces.append(f"[{kind} file] {locator}")
+            pieces.append(f"[{kind} file] resource_id={resource_id} locator={locator}")
     return "\n".join(pieces)
 
 

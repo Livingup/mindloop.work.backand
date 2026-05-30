@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
@@ -32,6 +32,7 @@ from agent_runtime.context_compression.gate import decide_context_compression
 from agent_runtime.context_compression.job_store import InMemoryCompressionJobStore
 from agent_runtime.context_compression.models import (
     CompressionJob,
+    CompressionRange,
     CompressionResult,
     SECTION_WORKERS,
     context_compression_worker_id,
@@ -48,10 +49,13 @@ from agent_runtime.context_compression.summary_tools import (
     REPORT_SECTION_ISSUE,
 )
 from agent_runtime.context_compression.transcript_snapshot import build_transcript_snapshot
+from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.context_compression.worker_runner import ContextCompressionWorkerRunner
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
-from agent_runtime.conversation_message.message.models import Conversation
+from agent_runtime.conversation_message.message.models import Conversation, ImagePart, PdfPart, ToolResultPart, UniMessage
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
+from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
@@ -114,7 +118,9 @@ class ContextCompressionService:
         interrupt_checker: Callable[[], bool] | None = None,
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None,
     ) -> CompressionResult:
-        config = self._config_accessor()
+        static_config = self._config_accessor()
+        runtime_settings = self._settings_repository.get_settings()
+        config = replace(static_config, input_mode=runtime_settings.input_mode or static_config.input_mode)
         decision = decide_context_compression(source_conversation, trigger_model, config)
         if not decision.should_compress:
             return CompressionResult(created=False, reason=decision.reason)
@@ -176,13 +182,20 @@ class ContextCompressionService:
                 await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, _base_payload(job, status="skipped", phase="range_planning", reason="insufficient_compressible_range"))
                 return CompressionResult(created=False, job=job, reason="insufficient_compressible_range")
             job.range = range_plan
+            effective_input_mode, worker_candidates = _select_worker_input_mode_and_candidates(
+                requested_input_mode=config.input_mode,
+                source_conversation=source_conversation,
+                range_plan=range_plan,
+                worker_candidates=worker_candidates,
+            )
+            job.input_mode = effective_input_mode
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_RANGE_PLANNED, _base_payload(job, status="running", phase="range_planned"))
-            input_text = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
+            worker_input = await self._build_worker_input(source_conversation, job, range_plan, effective_input_mode)
             await self._run_section_workers(
                 job=job,
-                input_text=input_text,
-                input_mode=config.input_mode,
+                worker_input=worker_input,
+                input_mode=effective_input_mode,
                 resolved_candidates=worker_candidates,
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
@@ -193,7 +206,7 @@ class ContextCompressionService:
                 raise RuntimeError("上下文压缩 Section Worker 未写入任何结构化条目。")
             await self._assemble_final_markdown(
                 job=job,
-                input_mode=config.input_mode,
+                input_mode=effective_input_mode,
                 resolved_candidates=worker_candidates,
                 max_rounds=config.max_worker_rounds,
                 communication_context=communication_context,
@@ -206,7 +219,7 @@ class ContextCompressionService:
             if config.verifier_enabled:
                 await self._verify_final_markdown(
                     job=job,
-                    input_mode=config.input_mode,
+                    input_mode=effective_input_mode,
                     resolved_candidates=worker_candidates,
                     max_rounds=config.max_worker_rounds,
                     communication_context=communication_context,
@@ -260,7 +273,7 @@ class ContextCompressionService:
         self,
         *,
         job: CompressionJob,
-        input_text: str,
+        worker_input: ContextCompressionWorkerInput,
         input_mode: str,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
@@ -290,7 +303,7 @@ class ContextCompressionService:
                 self._run_one_section_worker(
                     job=job,
                     worker=worker,
-                    input_text=input_text,
+                    worker_input=worker_input,
                     input_mode=input_mode,
                     resolved_candidates=resolved_candidates,
                     max_rounds=max_rounds,
@@ -354,7 +367,7 @@ class ContextCompressionService:
         *,
         job: CompressionJob,
         worker: _SectionWorkerRun,
-        input_text: str,
+        worker_input: ContextCompressionWorkerInput,
         input_mode: str,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
@@ -377,7 +390,7 @@ class ContextCompressionService:
                 output_section=worker.section,
                 input_mode=input_mode,
                 system_prompt=worker.system_prompt,
-                input_text=input_text,
+                worker_input=worker_input,
                 resolved_candidates=resolved_candidates,
                 max_rounds=max_rounds,
                 communication_context=communication_context,
@@ -482,7 +495,7 @@ class ContextCompressionService:
             output_section=None,
             input_mode=input_mode,
             system_prompt=prompt,
-            input_text=input_text,
+            worker_input=ContextCompressionWorkerInput(input_mode=input_mode, user_text=input_text),
             resolved_candidates=resolved_candidates,
             max_rounds=max_rounds,
             communication_context=communication_context,
@@ -516,7 +529,7 @@ class ContextCompressionService:
             output_section=None,
             input_mode=input_mode,
             system_prompt=prompt,
-            input_text=_verifier_input(job),
+            worker_input=ContextCompressionWorkerInput(input_mode=input_mode, user_text=_verifier_input(job)),
             resolved_candidates=resolved_candidates,
             max_rounds=max_rounds,
             communication_context=communication_context,
@@ -525,6 +538,26 @@ class ContextCompressionService:
             request_canceller_observer=request_canceller_observer,
         )
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_COMPLETED, _base_payload(job, status="running", phase="verification_completed"))
+
+    async def _build_worker_input(
+        self,
+        source_conversation: Conversation,
+        job: CompressionJob,
+        range_plan: CompressionRange,
+        input_mode: str,
+    ) -> ContextCompressionWorkerInput:
+        if input_mode == "native_multimodal_history":
+            return ContextCompressionWorkerInput(
+                input_mode=input_mode,
+                user_text=_native_history_instruction(job, range_plan),
+                history_messages=tuple(
+                    source_conversation.messages[
+                        range_plan.compressed_start_index:range_plan.compressed_end_index + 1
+                    ]
+                ),
+            )
+        transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
+        return ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text=transcript)
 
     def _resolve_worker_candidates(self, config: ContextCompressionConfig) -> tuple[ResolvedLlmProviderModel, ...]:
         del config  # 预留参数，未来可能从 config 读取退让策略
@@ -564,6 +597,91 @@ class ContextCompressionService:
         if error_message is not None:
             payload["error_message"] = error_message
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, payload)
+
+
+def _select_worker_input_mode_and_candidates(
+    *,
+    requested_input_mode: str,
+    source_conversation: Conversation,
+    range_plan: CompressionRange,
+    worker_candidates: tuple[ResolvedLlmProviderModel, ...],
+) -> tuple[str, tuple[ResolvedLlmProviderModel, ...]]:
+    if requested_input_mode != "native_multimodal_history":
+        return "transcript_snapshot", worker_candidates
+
+    required_modalities = _required_native_input_modalities(_compressed_range_messages(source_conversation, range_plan))
+    if not required_modalities:
+        return "native_multimodal_history", worker_candidates
+
+    compatible_candidates = tuple(
+        candidate
+        for candidate in worker_candidates
+        if candidate.supports_tool_calling and not _missing_required_input_modalities(required_modalities, candidate)
+    )
+    if not compatible_candidates:
+        return "transcript_snapshot", worker_candidates
+    return "native_multimodal_history", compatible_candidates
+
+
+def _compressed_range_messages(conversation: Conversation, range_plan: CompressionRange) -> tuple[UniMessage, ...]:
+    return tuple(conversation.messages[range_plan.compressed_start_index:range_plan.compressed_end_index + 1])
+
+
+def _required_native_input_modalities(messages: tuple[UniMessage, ...]) -> set[str]:
+    required: set[str] = set()
+    for message in messages:
+        required.update(_message_required_native_modalities(message))
+    return required
+
+
+def _message_required_native_modalities(message: UniMessage) -> set[str]:
+    required: set[str] = set()
+    for part in message.content:
+        required.update(_part_required_native_modalities(part))
+    return required
+
+
+def _part_required_native_modalities(part: Any) -> set[str]:
+    if isinstance(part, ImagePart):
+        return {INPUT_MODALITY_IMAGE}
+    if isinstance(part, PdfPart):
+        return {INPUT_MODALITY_PDF}
+    if isinstance(part, ToolResultPart):
+        required: set[str] = set()
+        for item in normalize_tool_result_output(part.output):
+            kind = item.get("kind")
+            if kind == INPUT_MODALITY_IMAGE:
+                required.add(INPUT_MODALITY_IMAGE)
+            elif kind == INPUT_MODALITY_PDF:
+                required.add(INPUT_MODALITY_PDF)
+        return required
+    return set()
+
+
+def _missing_required_input_modalities(
+    required_modalities: set[str],
+    resolved_model: ResolvedLlmProviderModel,
+) -> list[str]:
+    supported_modalities = set(resolved_model.supported_input_modalities)
+    return sorted(modality for modality in required_modalities if modality not in supported_modalities)
+
+
+def _native_history_instruction(job: CompressionJob, range_plan: CompressionRange) -> str:
+    return "\n".join([
+        "# Context Compression Native-History Analysis Instruction",
+        "",
+        "前面的 user / assistant / tool 消息是即将被压缩归档的原始历史片段。",
+        "这些消息只用于上下文压缩分析，不代表当前用户正在发起新任务，也不要继续执行历史任务。",
+        "请基于这些原始历史消息提取长期可恢复的任务上下文，并只通过 context_summary 工具写入结构化压缩结果。",
+        "",
+        f"job_id: {job.job_id}",
+        f"root_conversation_id: {job.root_conversation_id}",
+        f"source_conversation_id: {job.source_conversation_id}",
+        f"compression_index: {job.compression_index}",
+        f"compressed_message_range: {range_plan.compressed_start_index}..{range_plan.compressed_end_index}",
+        f"retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
+        f"compression_reason: {range_plan.reason}",
+    ])
 
 
 def _assembler_input(job: CompressionJob) -> str:
@@ -618,6 +736,7 @@ def _base_payload(job: CompressionJob, *, status: str, phase: str, reason: str |
         "source_conversation_id": job.source_conversation_id,
         "target_conversation_id": job.target_conversation_id,
         "compression_index": job.compression_index,
+        "input_mode": job.input_mode,
         "phase": phase,
         "status": status,
         "reason": reason or (range_plan.reason if range_plan else None),
