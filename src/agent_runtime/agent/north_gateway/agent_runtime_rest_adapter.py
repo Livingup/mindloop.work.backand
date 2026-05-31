@@ -48,11 +48,10 @@ from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PD
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
 
-MAX_FILES_PER_LLM_REQUEST = 10
-MAX_TOTAL_FILE_BYTES_PER_LLM_REQUEST = 32 * 1024 * 1024
-MAX_SINGLE_FILE_BYTES_PER_LLM_REQUEST = 32 * 1024 * 1024
-MAX_TOTAL_PDF_PAGES_PER_LLM_REQUEST = 100
-MAX_SINGLE_PDF_PAGES_PER_LLM_REQUEST = 100
+MAX_IMAGE_INPUTS_PER_LLM_REQUEST = 1500
+MAX_TOTAL_IMAGE_BYTES_PER_LLM_REQUEST = 512 * 1024 * 1024
+MAX_SINGLE_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
+MAX_TOTAL_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
 
 
 class CreateRootAgentInstanceBody(BaseModel):
@@ -249,11 +248,10 @@ class RemovePendingUserMessageResponse(BaseModel):
 
 
 class FileInputLimitsResponse(BaseModel):
-    max_files_per_request: int
-    max_total_file_bytes_per_request: int
-    max_single_file_bytes: int
-    max_total_pdf_pages_per_request: int
-    max_single_pdf_pages: int
+    max_image_inputs_per_request: int
+    max_total_image_bytes_per_request: int
+    max_single_input_file_bytes: int
+    max_total_input_file_bytes_per_request: int
 
 
 class FileInputStatsResponse(BaseModel):
@@ -262,6 +260,8 @@ class FileInputStatsResponse(BaseModel):
     pdf_file_count: int = 0
     image_file_count: int = 0
     total_pdf_pages: int = 0
+    total_image_bytes: int = 0
+    total_input_file_bytes: int = 0
 
 
 class AgentFileInputStateResponse(BaseModel):
@@ -1159,11 +1159,10 @@ def _task_response(task: AgentTask) -> AgentRuntimeTaskResponse:
 
 def _file_input_limits_response() -> FileInputLimitsResponse:
     return FileInputLimitsResponse(
-        max_files_per_request=MAX_FILES_PER_LLM_REQUEST,
-        max_total_file_bytes_per_request=MAX_TOTAL_FILE_BYTES_PER_LLM_REQUEST,
-        max_single_file_bytes=MAX_SINGLE_FILE_BYTES_PER_LLM_REQUEST,
-        max_total_pdf_pages_per_request=MAX_TOTAL_PDF_PAGES_PER_LLM_REQUEST,
-        max_single_pdf_pages=MAX_SINGLE_PDF_PAGES_PER_LLM_REQUEST,
+        max_image_inputs_per_request=MAX_IMAGE_INPUTS_PER_LLM_REQUEST,
+        max_total_image_bytes_per_request=MAX_TOTAL_IMAGE_BYTES_PER_LLM_REQUEST,
+        max_single_input_file_bytes=MAX_SINGLE_INPUT_FILE_BYTES_PER_LLM_REQUEST,
+        max_total_input_file_bytes_per_request=MAX_TOTAL_INPUT_FILE_BYTES_PER_LLM_REQUEST,
     )
 
 
@@ -1198,6 +1197,8 @@ def _empty_file_input_stats() -> dict[str, int]:
         "pdf_file_count": 0,
         "image_file_count": 0,
         "total_pdf_pages": 0,
+        "total_image_bytes": 0,
+        "total_input_file_bytes": 0,
     }
 
 
@@ -1263,14 +1264,17 @@ def _add_file_input_stats(
     size_in_bytes: int,
     page_count: int,
 ) -> None:
+    safe_size = max(0, size_in_bytes)
     stats["file_count"] += 1
-    stats["total_file_bytes"] += max(0, size_in_bytes)
+    stats["total_file_bytes"] += safe_size
     if kind == INPUT_MODALITY_PDF:
         stats["pdf_file_count"] += 1
         stats["total_pdf_pages"] += max(0, page_count)
+        stats["total_input_file_bytes"] += safe_size
         return
     if kind == INPUT_MODALITY_IMAGE:
         stats["image_file_count"] += 1
+        stats["total_image_bytes"] += safe_size
 
 
 async def _instance_response(
