@@ -87,6 +87,23 @@ def test_openai_normalize_does_not_persist_native_output_items_in_replay_raw():
     assert "very-large-base64-image-result" not in str(raw)
 
 
+def test_openai_prompt_cache_key_uses_explicit_option_and_provider_state():
+    async def run_case():
+        adapter = OpenAIAdapter()
+        conv = Conversation(id="worker-conversation", messages=[])
+
+        rendered = await adapter.render(conv, _Resolver(), {"prompt_cache_key": "source-cache-key"})
+        assert rendered.prompt_cache_key == "source-cache-key"
+
+        adapter.update_state(conv, {"output": []}, {"prompt_cache_key": "source-cache-key"})
+        assert conv.provider_state[PROVIDER_OPENAI]["prompt_cache_key"] == "source-cache-key"
+
+        rendered_from_state = await adapter.render(conv, _Resolver())
+        assert rendered_from_state.prompt_cache_key == "source-cache-key"
+
+    asyncio.run(run_case())
+
+
 def test_openai_render_filters_existing_contaminated_native_output_items():
     async def run_case():
         conv = Conversation(

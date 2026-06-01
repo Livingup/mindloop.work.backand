@@ -12,7 +12,7 @@
 - tool 消息：展开为顶层 function_call_output item
 
 OpenAI Responses 采用 stateless 路径，不依赖 previous_response_id / store=true。
-每次请求都全量展开历史消息，并用 conversation id 作为 prompt_cache_key。
+每次请求都全量展开历史消息，默认用 conversation id 作为 prompt_cache_key；特殊调用方可显式覆盖。
 """
 from __future__ import annotations
 
@@ -192,7 +192,7 @@ class OpenAIAdapter:
         return OpenAIRenderResult(
             input=input_items,
             previous_response_id=None,
-            prompt_cache_key=conv.id,
+            prompt_cache_key=_prompt_cache_key(conv, options),
         )
 
     # ── 预检 ─────────────────────────────────────────────────────
@@ -212,9 +212,23 @@ class OpenAIAdapter:
         provider_state = dict(conv.provider_state.get(PROVIDER_OPENAI) or {})
         provider_state.pop("last_response_id", None)
         provider_state.pop("last_message_index", None)
-        provider_state["prompt_cache_key"] = conv.id
+        provider_state["prompt_cache_key"] = _prompt_cache_key(conv, options)
         provider_state["stateless"] = True
         conv.provider_state[PROVIDER_OPENAI] = provider_state
+
+
+def _prompt_cache_key(conv: Conversation, options: dict[str, Any] | None = None) -> str:
+    opts = options or {}
+    option_cache_key = opts.get("prompt_cache_key")
+    if isinstance(option_cache_key, str) and option_cache_key.strip():
+        return option_cache_key
+
+    provider_state = conv.provider_state.get(PROVIDER_OPENAI)
+    if isinstance(provider_state, dict):
+        state_cache_key = provider_state.get("prompt_cache_key")
+        if isinstance(state_cache_key, str) and state_cache_key.strip():
+            return state_cache_key
+    return conv.id
 
 
 # ── 渲染内部函数 ─────────────────────────────────────────────────

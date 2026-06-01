@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent_runtime.context_compression.compression_service import (
@@ -10,7 +11,10 @@ from agent_runtime.context_compression.compression_service import (
 )
 from agent_runtime.context_compression.models import CompressionJob, CompressionRange
 from agent_runtime.context_compression.settings_repository import ContextCompressionSettingsRepository
+from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
+from agent_runtime.context_compression.worker_runner import _worker_render_options
 from agent_runtime.conversation_message.message.models import (
+    PROVIDER_OPENAI,
     ImagePart,
     PdfPart,
     PdfPartMeta,
@@ -185,8 +189,9 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_history_worker_input_replays_compressed_range_and_adds_instruction(self) -> None:
         conversation = create_conversation()
         conversation.add_user_message([TextPart("old question")], [TextPartMeta()])
-        conversation.append_message(UniMessage(role=ROLE_ASSISTANT, content=[TextPart("old answer")]))
+        conversation.append_message(UniMessage(role=ROLE_ASSISTANT, content=[TextPart("old answer")], source_provider=PROVIDER_OPENAI))
         conversation.add_user_message([TextPart("retained tail")], [TextPartMeta()])
+        conversation.provider_state[PROVIDER_OPENAI] = {"prompt_cache_key": "source-cache-key"}
         job = _job(input_mode="native_multimodal_history")
         range_plan = _range_plan(start=0, end=1)
         service = ContextCompressionService.__new__(ContextCompressionService)
@@ -202,9 +207,29 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker_input.input_mode, "native_multimodal_history")
         self.assertTrue(worker_input.uses_history_messages)
         self.assertEqual(worker_input.history_messages, tuple(conversation.messages[:2]))
+        self.assertEqual(worker_input.openai_responses_prompt_cache_key, "source-cache-key")
         self.assertIn("只用于上下文压缩分析", worker_input.user_text)
         self.assertIn("compressed_message_range: 0..1", worker_input.user_text)
         self.assertNotIn("retained tail", worker_input.user_text)
+
+    def test_worker_render_options_reuses_prompt_cache_key_for_openai_responses_only(self) -> None:
+        worker_input = ContextCompressionWorkerInput(
+            input_mode="native_multimodal_history",
+            user_text="compress",
+            openai_responses_prompt_cache_key="source-cache-key",
+        )
+
+        self.assertEqual(
+            _worker_render_options(_candidate("openai"), worker_input),
+            {"prompt_cache_key": "source-cache-key"},
+        )
+        self.assertEqual(
+            _worker_render_options(
+                replace(_candidate("anthropic"), api_format="anthropic_messages"),
+                worker_input,
+            ),
+            {},
+        )
 
     async def test_transcript_worker_input_preserves_multimodal_resource_locator_text(self) -> None:
         conversation = create_conversation()

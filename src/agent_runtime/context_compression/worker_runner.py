@@ -23,6 +23,7 @@ from agent_runtime.context_compression.summary_tools import ContextSummaryToolEx
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
 from agent_runtime.llm_client.llm_request_service import LlmProviderModelServiceUnavailable, LlmRequestService
@@ -182,6 +183,7 @@ class ContextCompressionWorkerRunner:
                             resolved_model.api_format,
                             allowed_tool_names=allowed_tool_names,
                         ),
+                        render_options=_worker_render_options(resolved_model, worker_input),
                         communication_context=None,
                         next_resolved_model=next_resolved_model,
                         cancellation_checker=interrupt_checker,
@@ -461,6 +463,18 @@ def _build_worker_conversation(worker_input: ContextCompressionWorkerInput) -> C
         conversation.append_message(copy.deepcopy(message))
     conversation.add_user_message([TextPart(text=worker_input.user_text)], [TextPartMeta()])
     return conversation
+
+
+def _worker_render_options(
+    resolved_model: ResolvedLlmProviderModel,
+    worker_input: ContextCompressionWorkerInput,
+) -> dict[str, Any]:
+    if resolved_model.api_format != API_FORMAT_OPENAI_RESPONSES:
+        return {}
+    prompt_cache_key = worker_input.openai_responses_prompt_cache_key
+    if not prompt_cache_key or not prompt_cache_key.strip():
+        return {}
+    return {"prompt_cache_key": prompt_cache_key}
 
 
 def _worker_finished(job: CompressionJob, worker_role: str, output_section: str | None) -> bool:
