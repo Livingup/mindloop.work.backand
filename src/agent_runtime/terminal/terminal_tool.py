@@ -36,7 +36,7 @@ class TerminalReadOutputToolRequest(BaseToolRequest):
     limit_lines: int = Field(default=200, ge=1, le=2000, description="最多读取多少个输出块；取值范围为 1 到 2000；该值不是最终返回文本的行数。")
     limit_chars: int = Field(default=12000, ge=1000, le=50000, description="最多返回多少个字符，避免一次读取过多内容；取值范围为 1000 到 50000。")
     after_chunk_index: int | None = Field(default=None, ge=0, description="since 模式只读取该输出块序号之后的新内容；如提供则取值必须大于等于 0。可结合上次读取结果中的 end_chunk_index 或 next_chunk_index 继续增量观察。")
-    wait_timeout_ms: int = Field(default=0, ge=0, le=600000, description="等待输出或命令完成的最长时间，单位毫秒；取值范围为 0 到 600000（最多 10 分钟）；0 表示立即返回不等待。")
+    wait_timeout_ms: int = Field(default=0, ge=0, le=600000, description="等待 wait_timeout_ms 时间后读取终端输出，单位毫秒；应根据目标命令预估合理完成时间设置，不要默认使用最大值；取值范围为 0 到 600000（最多 10 分钟）；0 表示立即读取不等待。")
     query: str | None = Field(default=None, description="search 模式要搜索的关键词；使用 search 模式时必须提供。")
     case_sensitive: bool = Field(default=False, description="search 模式是否区分大小写；true 表示区分大小写，false 表示不区分大小写。")
 
@@ -114,7 +114,7 @@ async def terminal_execute_command(request: TerminalExecuteCommandToolRequest, c
 
 @tool(
     name="terminal_read_output",
-    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式；默认读取最新输出并限制返回字符数。返回结果包含输出文本、分页位置、是否还有更多内容，以及可用时的 command_status、command_finished、command_exit_code、command_completed_at。wait_timeout_ms 最多 10 分钟：能判断命令完成时等待命令完成或超时；无法判断时等待新输出或超时。是否需要继续等待或写入输入，由你结合命令状态和输出内容判断。",
+    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式；默认读取最新输出并限制返回字符数。返回结果包含输出文本、分页位置、是否还有更多内容，以及可用时的 command_status、command_finished、command_exit_code、command_completed_at。wait_timeout_ms 表示读取前等待的时间（毫秒），需要根据目标命令的预估完成时间合理设置；短命令使用较小等待时间，构建、测试等长命令可使用更长等待时间，不要默认填最大值。是否需要继续等待或写入输入，由你结合命令状态和输出内容判断。",
     group="terminal",
     category="business",
 )
