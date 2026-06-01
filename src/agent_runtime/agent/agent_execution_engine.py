@@ -1698,7 +1698,7 @@ class AgentExecutionEngine:
         mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
         skills_prompt = self._build_skills_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
-        lifecycle_tool_notice = self._build_lifecycle_tool_notice(definition)
+        tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
         return "\n\n".join(
             item
             for item in (
@@ -1707,7 +1707,7 @@ class AgentExecutionEngine:
                 mcp_services_prompt,
                 skills_prompt,
                 lifecycle_prompt,
-                lifecycle_tool_notice,
+                tool_usage_notice,
             )
             if item.strip()
         ) or None
@@ -1803,21 +1803,36 @@ class AgentExecutionEngine:
         )
         return "\n".join(lines)
 
-    def _build_lifecycle_tool_notice(self, definition: AgentDefinition) -> str:
+    def _build_tool_usage_notice(
+        self,
+        definition: AgentDefinition,
+        llm_tools: tuple[LlmToolDefinition, ...],
+    ) -> str:
+        """构造面向本轮 LLM 可见工具的统一工具使用注意事项。"""
+        llm_tool_names = {tool.name for tool in llm_tools}
         tools = self._local_tool_gateway.list_tools(public_only=False, group_by=False)
         lifecycle_tool_names = [
             item.tool_name
             for item in tools
             if item.category == "lifecycle"
+            and item.tool_name in llm_tool_names
             and (item.always_enabled or item.tool_name in definition.tool_ids)
         ]
-        if not lifecycle_tool_names:
-            return ""
-        names = "，".join(lifecycle_tool_names)
-        return (
-            "# 工具调用注意事项\n"
-            f"- 禁止并发调用“{names}”这些工具，这些工具只能单独调用！这些工具只能单独调用！这些工具只能单独调用！"
-        )
+
+        lines = [
+            "# 工具调用注意事项",
+            "- 禁止调用模型内置网络搜索和图片生成工具。",
+        ]
+        if "generate_image" in llm_tool_names:
+            lines.append("- 图片生成请使用generate_image工具。")
+        if {"web_search", "read_url_context"} & llm_tool_names:
+            lines.append("- 网络搜索请使用web_search，read_url_context工具。")
+        if lifecycle_tool_names:
+            names = "，".join(lifecycle_tool_names)
+            lines.append(
+                f"- 禁止并发调用“{names}”这些工具，这些工具只能单独调用！这些工具只能单独调用！这些工具只能单独调用！"
+            )
+        return "\n".join(lines)
 
     async def _execute_single_tool_use(
         self,
