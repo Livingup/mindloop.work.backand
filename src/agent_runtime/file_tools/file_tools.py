@@ -122,39 +122,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _detect_text_newline_info(path: Path, encoding: str) -> dict[str, Any]:
-    """识别文本文件换行风格和结尾换行，用于辅助后续安全编辑。"""
-
-    newline_counts = {"CRLF": 0, "LF": 0, "CR": 0}
-    has_final_newline = False
-    with path.open("r", encoding=encoding, errors="strict", newline="") as file:
-        for raw_line in file:
-            if raw_line.endswith("\r\n"):
-                newline_counts["CRLF"] += 1
-                has_final_newline = True
-            elif raw_line.endswith("\n"):
-                newline_counts["LF"] += 1
-                has_final_newline = True
-            elif raw_line.endswith("\r"):
-                newline_counts["CR"] += 1
-                has_final_newline = True
-            else:
-                has_final_newline = False
-    used_styles = [name for name, count in newline_counts.items() if count > 0]
-    if not used_styles:
-        newline = "NONE"
-    elif len(used_styles) == 1:
-        newline = used_styles[0]
-    else:
-        newline = "MIXED"
-    return {
-        "content_sha256": _sha256_file(path),
-        "newline": newline,
-        "newline_counts": newline_counts,
-        "has_final_newline": has_final_newline,
-    }
-
-
 def _normalize_extensions(extensions: list[str]) -> set[str]:
     return {
         extension.strip().lower().lstrip(".")
@@ -443,11 +410,11 @@ def _read_text_window_with_encoding(path: Path, request: FileReadRange, encoding
             line_item: dict[str, Any] = {
                 "line_number": total_lines,
                 "text": line[:MAX_CHARS_PER_LINE] if truncated_line else line,
-                "truncated": truncated_line,
             }
             if truncated_line:
                 truncation = {
                     "line_number": total_lines,
+                    "truncated": True,
                     "char_start": 1,
                     "char_end": MAX_CHARS_PER_LINE,
                     "line_char_count": line_char_count,
@@ -471,21 +438,19 @@ def _read_text_window_with_encoding(path: Path, request: FileReadRange, encoding
     else:
         truncation_reason = None
 
-    return {
-        "file_path": str(path),
+    segment: dict[str, Any] = {
         "start_line": request.start_line,
         "end_line": end_line,
-        "requested_line_count": request.line_count,
-        "returned_line_count": returned_line_count,
         "total_lines": total_lines,
         "next_start_line": next_start_line,
         "truncated": truncated,
-        "truncation_reason": truncation_reason,
-        "size_bytes": path.stat().st_size,
         "lines": selected_lines,
-        "line_truncations": line_truncations,
-        "warnings": [],
     }
+    if truncation_reason is not None:
+        segment["truncation_reason"] = truncation_reason
+    if line_truncations:
+        segment["line_truncations"] = line_truncations
+    return segment
 
 
 def _read_line_slice(path: Path, request: FileReadLineSliceRequest) -> tuple[dict[str, Any], str]:
@@ -628,8 +593,6 @@ def _file_read_failure(output_base: dict[str, Any], error_code: str, error_messa
         "success": False,
         "error_code": error_code,
         "error_message": error_message,
-        "segments": [],
-        "warnings": [],
     }
 
 
@@ -646,13 +609,9 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
 
     try:
         segments: list[dict[str, Any]] = []
-        used_encoding: str | None = None
-        for segment_index, range_request in enumerate(file_request.ranges, start=1):
-            segment_output, segment_encoding = _read_text_window(path, range_request, file_request.encoding)
-            segment_output["segment_index"] = segment_index
+        for range_request in file_request.ranges:
+            segment_output, _segment_encoding = _read_text_window(path, range_request, file_request.encoding)
             segments.append(segment_output)
-            if used_encoding is None:
-                used_encoding = segment_encoding
     except UnicodeDecodeError as exc:
         return False, _file_read_failure(output_base, "DecodeError", str(exc))
     except OSError as exc:
@@ -660,16 +619,9 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
 
     output: dict[str, Any] = {
         **output_base,
-        "success": True,
-        "requested_segment_count": len(file_request.ranges),
-        "returned_segment_count": len(segments),
+        "content_sha256": _sha256_file(path),
         "segments": segments,
-        "encoding": used_encoding,
-        "size_bytes": path.stat().st_size,
-        "warnings": [],
     }
-    if used_encoding is not None:
-        output.update(_detect_text_newline_info(path, used_encoding))
     return True, output
 
 
@@ -683,20 +635,13 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
     files: list[dict[str, Any]] = []
     failed_files: list[dict[str, Any]] = []
 
-    for file_index, file_request in enumerate(request.files, start=1):
+    for file_request in request.files:
         success, file_output = _read_file_request(file_request)
-        file_output["file_index"] = file_index
         files.append(file_output)
         if not success:
             failed_files.append(file_output)
 
-    output = {
-        "requested_file_count": len(request.files),
-        "returned_file_count": len(files),
-        "failed_file_count": len(failed_files),
-        "max_file_count": MAX_FILE_READ_FILES,
-        "files": files,
-    }
+    output = {"files": files}
     if failed_files:
         return BaseToolResult(
             success=False,
@@ -744,7 +689,7 @@ def file_read_line_slice(request: FileReadLineSliceRequest) -> BaseToolResult:
         )
 
     try:
-        output, used_encoding = _read_line_slice(path, request)
+        output, _used_encoding = _read_line_slice(path, request)
     except UnicodeDecodeError as exc:
         return BaseToolResult(
             success=False,
@@ -754,7 +699,6 @@ def file_read_line_slice(request: FileReadLineSliceRequest) -> BaseToolResult:
             output=output_base,
         )
 
-    output["encoding"] = used_encoding
     return BaseToolResult(output=output)
 
 

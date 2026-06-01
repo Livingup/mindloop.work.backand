@@ -1,9 +1,19 @@
 import asyncio
+import hashlib
 
 from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
 from agent_runtime.conversation_message.message.models import Conversation, ImagePart, ROLE_TOOL, TextPart, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResolvedResource, ResourceMeta
+from agent_runtime.file_tools.file_tools import (
+    FileReadFileRequest,
+    FileReadLineSliceRequest,
+    FileReadRange,
+    FileReadRequest,
+    MAX_CHARS_PER_LINE,
+    file_read,
+    file_read_line_slice,
+)
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
 from agent_runtime.tool.local_tool_service import LocalToolService
 from agent_runtime.tool.north_gateway.local_tool_contracts import ToolExecuteRequest
@@ -133,3 +143,109 @@ def test_local_multimodal_tool_output_renders_to_openai_responses_function_call_
         ]
 
     asyncio.run(run_case())
+
+
+def test_file_read_output_contains_only_llm_visible_fields(tmp_path):
+    target = tmp_path / "sample.py"
+    target.write_text("alpha\nbeta\n", encoding="utf-8")
+
+    result = file_read(
+        FileReadRequest(
+            files=[
+                FileReadFileRequest(
+                    file_path=str(target),
+                    ranges=[FileReadRange(start_line=1, line_count=1)],
+                ),
+            ],
+        ),
+    )
+
+    assert result.success is True
+    assert set(result.output) == {"files"}
+
+    file_output = result.output["files"][0]
+    assert file_output["file_path"] == str(target.resolve())
+    assert file_output["content_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
+    assert set(file_output) == {"file_path", "content_sha256", "segments"}
+
+    segment = file_output["segments"][0]
+    assert segment["start_line"] == 1
+    assert segment["end_line"] == 1
+    assert segment["total_lines"] == 2
+    assert segment["next_start_line"] == 2
+    assert segment["truncated"] is True
+    assert segment["truncation_reason"] == "line_count_limit"
+    assert segment["lines"] == [{"line_number": 1, "text": "alpha"}]
+
+    for unexpected_key in {
+        "requested_file_count",
+        "returned_file_count",
+        "failed_file_count",
+        "max_file_count",
+        "requested_segment_count",
+        "returned_segment_count",
+        "file_index",
+        "segment_index",
+        "encoding",
+        "size_bytes",
+        "newline",
+        "newline_counts",
+        "has_final_newline",
+        "warnings",
+    }:
+        assert unexpected_key not in result.output
+        assert unexpected_key not in file_output
+        assert unexpected_key not in segment
+
+
+def test_file_read_marks_only_truncated_lines_with_continuation_fields(tmp_path):
+    target = tmp_path / "long.txt"
+    target.write_text("x" * (MAX_CHARS_PER_LINE + 2), encoding="utf-8")
+
+    result = file_read(
+        FileReadRequest(
+            files=[
+                FileReadFileRequest(
+                    file_path=str(target),
+                    ranges=[FileReadRange(start_line=1, line_count=1)],
+                ),
+            ],
+        ),
+    )
+
+    segment = result.output["files"][0]["segments"][0]
+    line = segment["lines"][0]
+
+    assert line["truncated"] is True
+    assert line["char_start"] == 1
+    assert line["char_end"] == MAX_CHARS_PER_LINE
+    assert line["next_char_start"] == MAX_CHARS_PER_LINE + 1
+    assert line["continue_with"] == "file_read_line_slice"
+    assert segment["line_truncations"] == [
+        {
+            "line_number": 1,
+            "truncated": True,
+            "char_start": 1,
+            "char_end": MAX_CHARS_PER_LINE,
+            "line_char_count": MAX_CHARS_PER_LINE + 2,
+            "next_char_start": MAX_CHARS_PER_LINE + 1,
+            "continue_with": "file_read_line_slice",
+        },
+    ]
+
+
+def test_file_read_line_slice_output_excludes_encoding_diagnostics(tmp_path):
+    target = tmp_path / "long.txt"
+    target.write_text("abcdef", encoding="utf-8")
+
+    result = file_read_line_slice(
+        FileReadLineSliceRequest(
+            file_path=str(target),
+            line_number=1,
+            char_start=2,
+        ),
+    )
+
+    assert result.success is True
+    assert result.output["text"] == "bcdef"
+    assert "encoding" not in result.output
