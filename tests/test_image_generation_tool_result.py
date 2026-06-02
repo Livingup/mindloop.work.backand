@@ -2,7 +2,6 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from agent_runtime.conversation_message.message.models import ImagePart, TextPart
 from agent_runtime.image_generation.image_generation_tool import GenerateImageRequest, generate_image
 from agent_runtime.image_generation.models import GeneratedImageResource, ImageGenerationResult
 from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
@@ -63,8 +62,8 @@ class ImageGenerationToolResultTests(unittest.TestCase):
         self.assertEqual(
             result.output,
             [
-                TextPart(text="Image generation prompt: Create an enterprise SaaS dashboard"),
-                ImagePart(resource_id="resource-image-1"),
+                {"kind": "text", "text": "Image generation prompt: Create an enterprise SaaS dashboard"},
+                {"kind": "image", "resource_id": "resource-image-1"},
             ],
         )
         self.assertEqual(service.requests[0].relay_session_id, "conversation-1")
@@ -83,8 +82,8 @@ class ImageGenerationToolResultTests(unittest.TestCase):
         self.assertEqual(
             result.output,
             [
-                TextPart(text="Image generation prompt: Create an enterprise SaaS dashboard"),
-                TextPart(text="Revised prompt: A refined prompt"),
-                ImagePart(resource_id="resource-image-1"),
+                {"kind": "text", "text": "Image generation prompt: Create an enterprise SaaS dashboard"},
+                {"kind": "text", "text": "Revised prompt: A refined prompt"},
+                {"kind": "image", "resource_id": "resource-image-1"},
             ],
         )

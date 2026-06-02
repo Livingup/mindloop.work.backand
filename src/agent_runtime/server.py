@@ -8,10 +8,14 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from agent_runtime.config import ConfigRegistry
 
 logger = logging.getLogger("agent_runtime.serve")
+
+# 所有前端离开后，只有连续 30 分钟没有新的任务/执行活动，才允许自动释放 scene。
+SCENE_VACANT_IDLE_EXPIRATION_SECONDS: float = 30 * 60
 
 
 def load_runtime_config(
@@ -123,6 +127,8 @@ def create_app() -> FastAPI:
     from agent_runtime.codex_oauth.north_gateway.local_callback_server import (
         CodexOAuthLocalCallbackServer,
     )
+    from agent_runtime.auth.factory import RuntimeAuthFactory
+    from agent_runtime.auth.north_gateway.auth_rest_adapter import create_runtime_auth_router
     from agent_runtime.runtime_health import EventLoopLagMonitor
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
@@ -173,6 +179,7 @@ def create_app() -> FastAPI:
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     codex_oauth_service.ensure_builtin_provider()
     codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
+    runtime_auth_service = RuntimeAuthFactory.create_service()
     llm_http_trace_service = LlmHttpTraceFactory.create()
     agent_execution_engine = AgentExecutionFactory.create(
         mcp_client_gateway=mcp_gateway,
@@ -193,22 +200,69 @@ def create_app() -> FastAPI:
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
     from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
 
+    def _timestamp_from_datetime(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            return value.timestamp()
+        except Exception:
+            return None
+
+    def _max_activity_timestamp(*values) -> float | None:
+        timestamps = [
+            timestamp
+            for timestamp in (_timestamp_from_datetime(value) for value in values)
+            if timestamp is not None
+        ]
+        return max(timestamps) if timestamps else None
+
     def _can_scene_expire(session) -> bool:
+        """判断空置 scene 是否已满足自动释放门禁。
+
+        自动释放必须同时满足：scene 没有任何前端客户端、空置已持续 30 分钟，且 task/agent
+        在这 30 分钟内没有新的运行态活动。检查异常时保守拒绝过期，避免误停后台任务。
+        """
+        now = time.time()
+        vacant_since_at = getattr(session, "vacant_since_at", None)
+        if vacant_since_at is None:
+            return False
+        if now - vacant_since_at < SCENE_VACANT_IDLE_EXPIRATION_SECONDS:
+            return False
         try:
             tasks = agent_runtime_gateway.list_scene_tasks(session.scene_id)
+            latest_activity_at = vacant_since_at
             for task in tasks:
-                if task.is_terminal:
-                    continue
+                task_activity_at = _max_activity_timestamp(
+                    task.created_at,
+                    task.updated_at,
+                    task.started_at,
+                    task.paused_at,
+                    task.finished_at,
+                    task.failed_at,
+                )
+                if task_activity_at is not None:
+                    latest_activity_at = max(latest_activity_at, task_activity_at)
                 for instance_id in task.agent_instance_ids:
                     try:
                         instance = agent_runtime_gateway.get_agent_instance(instance_id)
-                        if instance.status == AGENT_INSTANCE_STATUS_RUNNING:
-                            return False
                     except KeyError:
                         continue
-            return True
+                    if instance.status == AGENT_INSTANCE_STATUS_RUNNING:
+                        return False
+                    instance_activity_at = _max_activity_timestamp(
+                        instance.created_at,
+                        instance.updated_at,
+                        instance.started_at,
+                        instance.paused_at,
+                        instance.finished_at,
+                        instance.failed_at,
+                    )
+                    if instance_activity_at is not None:
+                        latest_activity_at = max(latest_activity_at, instance_activity_at)
+            return now - latest_activity_at >= SCENE_VACANT_IDLE_EXPIRATION_SECONDS
         except Exception:
-            return True
+            logger.exception("Scene 自动释放条件判断失败，保守跳过本轮: scene_id=%s", session.scene_id)
+            return False
 
     async def _detach_expired_scene(session) -> None:
         try:
@@ -302,6 +356,22 @@ def create_app() -> FastAPI:
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
 
     @app.middleware("http")
+    async def runtime_auth_middleware(request, call_next):
+        path = request.url.path
+        if not path.startswith("/api/") or _is_runtime_auth_exempt_path(path):
+            return await call_next(request)
+        if not runtime_auth_service.has_accounts():
+            return await call_next(request)
+        auth_session = runtime_auth_service.authenticate_token(_runtime_auth_token_from_request(request))
+        if auth_session is None:
+            return JSONResponse(
+                {"detail": "未登录或登录已过期，请重新登录。"},
+                status_code=401,
+            )
+        request.state.runtime_auth_session = auth_session
+        return await call_next(request)
+
+    @app.middleware("http")
     async def network_monitoring_middleware(request, call_next):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
@@ -362,6 +432,12 @@ def create_app() -> FastAPI:
             "event_loop": event_loop_monitor.snapshot(),
             "network": runtime_network_monitor.snapshot(),
         }
+
+    app.include_router(
+        create_runtime_auth_router(runtime_auth_service),
+        prefix="/api/auth",
+        tags=["运行时账号认证"],
+    )
 
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
@@ -513,6 +589,35 @@ def _is_key_network_path(path: str) -> bool:
         or "attach" in path
         or "/events" in path
     )
+
+
+def _is_runtime_auth_exempt_path(path: str) -> bool:
+    return path == "/api/health" or path.startswith("/api/auth/")
+
+
+def _runtime_auth_token_from_request(request) -> str | None:
+    authorization = request.headers.get("authorization")
+    if authorization:
+        prefix = "Bearer "
+        if authorization.startswith(prefix):
+            token = authorization[len(prefix):].strip()
+            if token:
+                return token
+    if _runtime_auth_query_token_allowed(request):
+        query_token = request.query_params.get("access_token")
+        if isinstance(query_token, str) and query_token.strip():
+            return query_token.strip()
+    return None
+
+
+def _runtime_auth_query_token_allowed(request) -> bool:
+    path = getattr(getattr(request, "url", None), "path", "") or ""
+    method = (getattr(request, "method", "") or "").upper()
+    if method == "GET" and path.startswith("/api/communication/streams/") and path.endswith("/events"):
+        return True
+    if method == "POST" and path.startswith("/api/agent-runtime/scenes/") and path.endswith("/detach"):
+        return True
+    return False
 
 
 def run_server(

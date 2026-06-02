@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from agent_runtime.agent.agent_instance import (
@@ -287,6 +287,9 @@ class AttachSceneBody(BaseModel):
     llm_policy_group_id: str | None = None
     llm_provider_id: str | None = None
     llm_model_binding_id: str | None = None
+    client_session_id: str | None = None
+    device_id: str | None = None
+    client_kind: str = "unknown"
 
 
 class AttachSceneResponseModel(BaseModel):
@@ -301,12 +304,15 @@ class AttachSceneResponseModel(BaseModel):
     root_agent_instance: AgentInstanceResponse
     communication_stream_id: str
     event_stream_url: str
+    client_session_id: str | None = None
+    active_client_count: int = 0
 
 
 class DetachSceneBody(BaseModel):
     """detach scene 入参。"""
 
     workspace_path: str
+    client_session_id: str | None = None
 
 
 class DetachSceneResponseModel(BaseModel):
@@ -540,6 +546,7 @@ def create_agent_runtime_router(
     async def attach_scene(
         scene_id: str,
         body: AttachSceneBody,
+        request: Request,
     ) -> AttachSceneResponseModel:
         """前端进入 scene 的统一入口。
 
@@ -574,14 +581,14 @@ def create_agent_runtime_router(
             # 把异常吞掉转为空 fallback；若 gateway 走 mode=created 路径会在 gateway 层抛 ValueError。
             fallback = None
 
-        request = AttachSceneRequest(
+        attach_request = AttachSceneRequest(
             workspace_path=body.workspace_path,
             fallback_llm_provider_id=fallback.llm_provider_id if fallback else None,
             fallback_llm_model_binding_id=fallback.llm_model_binding_id if fallback else None,
             fallback_llm_policy_group_id=fallback.llm_policy_group_id if fallback else None,
         )
         try:
-            response = gateway.attach_scene(scene_id, request)
+            response = gateway.attach_scene(scene_id, attach_request)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except RuntimeError as e:
@@ -589,9 +596,21 @@ def create_agent_runtime_router(
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
 
-        # 注册 scene session（心跳追踪）
+        # 注册 scene client session（心跳追踪）：同一 scene 可被多个前端设备同时 attach。
+        client_session_id = body.client_session_id
+        active_client_count = 0
         if session_registry is not None:
-            session_registry.open_session(scene_id, body.workspace_path)
+            auth_session = getattr(request.state, "runtime_auth_session", None)
+            account = getattr(auth_session, "account", None)
+            client_session_id = session_registry.open_session(
+                scene_id,
+                body.workspace_path,
+                client_session_id=body.client_session_id,
+                device_id=body.device_id,
+                client_kind=body.client_kind,
+                user_id=getattr(account, "account_id", None),
+            )
+            active_client_count = session_registry.active_client_count(scene_id)
 
         return AttachSceneResponseModel(
             mode=response.mode,
@@ -603,10 +622,15 @@ def create_agent_runtime_router(
             ),
             communication_stream_id=response.communication_stream_id,
             event_stream_url=response.event_stream_url,
+            client_session_id=client_session_id,
+            active_client_count=active_client_count,
         )
 
     @router.post("/scenes/{scene_id}/heartbeat", status_code=204)
-    def scene_heartbeat(scene_id: str) -> None:
+    def scene_heartbeat(
+        scene_id: str,
+        client_session_id: str | None = Query(default=None),
+    ) -> None:
         """前端定期发送的 scene 心跳，用于维持 session 活跃状态。
 
         前端应以 stale_timeout / 3 的间隔（默认约 40s）调用本接口。
@@ -614,7 +638,7 @@ def create_agent_runtime_router(
         """
         if session_registry is None:
             return
-        if not session_registry.heartbeat(scene_id):
+        if not session_registry.heartbeat(scene_id, client_session_id=client_session_id):
             raise HTTPException(
                 status_code=404,
                 detail=f"Scene session 不存在，请重新 attach: {scene_id}",
@@ -676,14 +700,27 @@ def create_agent_runtime_router(
         scene_id: str,
         body: DetachSceneBody,
     ) -> DetachSceneResponseModel:
-        """前端主动断开 scene（关闭 tab / beforeunload 时调用）。
+        """前端主动离开 scene，只释放当前客户端连接。
 
-        执行逻辑：移除 session 注册 + 取消 scene 下非终态 task/instances。
+        多端模式下，普通移动端/桌面端关闭不能取消其他前端仍在观察或控制的任务；
+        停止 scene 运行必须调用显式 stop 接口。
         """
-        # 移除 session 注册
         if session_registry is not None:
-            session_registry.close_session(scene_id)
+            session_registry.close_session(scene_id, body.client_session_id)
+        return DetachSceneResponseModel(
+            cancelled_task_count=0,
+            cancelled_instance_count=0,
+        )
 
+    @router.post("/scenes/{scene_id}/stop", status_code=200)
+    def stop_scene(
+        scene_id: str,
+        body: DetachSceneBody,
+    ) -> DetachSceneResponseModel:
+        """显式停止 scene 下未终态任务。
+
+        该接口保留原 detach 的任务取消语义，用于用户明确执行“停止任务/关闭运行”。
+        """
         request = DetachSceneRequest(workspace_path=body.workspace_path)
         response = gateway.detach_scene(scene_id, request)
         return DetachSceneResponseModel(

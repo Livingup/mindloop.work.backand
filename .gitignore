@@ -76,8 +76,10 @@ Desktop.ini
 # 运行时数据（由程序动态生成，不纳入版本管理）
 /runtime-data/
 
-# 测试代码（不纳入版本管理）
-/tests/
+# 测试代码（历史上默认忽略新测试文件；本次场景会话生命周期回归测试需要纳入版本管理）
+/tests/*
+!/tests/test_scene_session_registry.py
+!/tests/test_runtime_auth_token_transport.py
 
 /web-frontend/
 

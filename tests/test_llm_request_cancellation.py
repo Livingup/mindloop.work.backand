@@ -349,7 +349,7 @@ class AgentExecutionFailureBoundaryTests(unittest.TestCase):
             self.assertFalse(parts[0].is_error)
             self.assertFalse(parts[1].is_error)
             self.assertTrue(parts[2].is_error)
-            self.assertIn("interrupted", parts[2].output)
+            self.assertIn("interrupted", parts[2].output[0]["text"])
             self.assertEqual(repository.pending_tool_results, {})
 
         asyncio.run(run_case())
@@ -459,7 +459,7 @@ class AgentExecutionFailureBoundaryTests(unittest.TestCase):
                     pending = await repository.list_pending_tool_results("conversation-1", 1)
                     self.assertEqual(len(pending), 1)
                     self.assertEqual(pending[0].tool_use_ref, "call-1")
-                    self.assertEqual(pending[0].output, {"ok": True})
+                    self.assertEqual(pending[0].output, [{"kind": "text", "text": '{\n  "ok": true\n}'}])
                     await repository.clear_pending_tool_results("conversation-1", 1)
                     self.assertEqual(await repository.list_pending_tool_results("conversation-1", 1), [])
                 finally:
