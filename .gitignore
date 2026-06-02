@@ -80,6 +80,7 @@ Desktop.ini
 /tests/*
 !/tests/test_scene_session_registry.py
 !/tests/test_runtime_auth_token_transport.py
+!/tests/test_system_settings_persistence_inventory.py
 
 /web-frontend/
 

@@ -7,6 +7,7 @@ from typing import Any, Callable
 import yaml
 
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.system_settings.persistence_inventory import build_persistence_inventory
 from agent_runtime.system_settings.system_settings_snapshot import (
     SystemSettingsSnapshot,
 )
@@ -47,6 +48,10 @@ class SystemSettingsService:
             section_names=registry_snapshot.section_names,
             loaded_section_names=registry_snapshot.loaded_section_names,
             watch_enabled=registry_snapshot.watch_enabled,
+            persistence_inventory=build_persistence_inventory(
+                config_path=registry_snapshot.yaml_path,
+                raw_config=masked_config,
+            ),
         )
 
 

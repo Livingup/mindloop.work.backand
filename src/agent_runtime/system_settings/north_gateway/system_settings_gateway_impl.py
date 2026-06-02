@@ -21,4 +21,5 @@ class SystemSettingsGatewayImpl:
             section_names=snapshot.section_names,
             loaded_section_names=snapshot.loaded_section_names,
             watch_enabled=snapshot.watch_enabled,
+            persistence_inventory=snapshot.persistence_inventory,
         )
