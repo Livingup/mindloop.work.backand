@@ -2307,6 +2307,7 @@ def _record_last_context_usage(conversation: Any, llm_response: LlmPromptRespons
         "binding_id": llm_response.binding_id,
         "model_id": llm_response.model_id,
         "model_alias": llm_response.model_alias,
+        "recorded_message_count": len(getattr(conversation, "messages", [])),
     }
 
 

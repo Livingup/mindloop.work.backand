@@ -80,6 +80,11 @@ class CompressionDecision:
     reason: str
     threshold: int | None = None
     used_tokens: int | None = None
+    base_used_tokens: int | None = None
+    estimated_incremental_tokens: int | None = None
+    projected_used_tokens: int | None = None
+    estimated_incremental_message_count: int | None = None
+    recorded_message_count: int | None = None
 
 
 @dataclass(slots=True)
