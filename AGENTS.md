@@ -60,6 +60,10 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；普通 CLI 管理命令默认加载这一份初始化后的运行配置。`spread-ai serve` 是开发/诊断入口，默认同样加载 `~/.spread-ai/agent_runtime.yaml`，但允许通过 `--config-file` 与 `--env-file` 显式指定开发态配置源。正式 Windows 桌面版不通过 `spread-ai serve` 启动，而由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。运行时 REST 服务装配在 `agent_runtime.server` 中，供 `spread-ai serve` 与正式版内部后端入口复用。
 
+#### 用户全局配置云端 PostgreSQL 边界
+
+`cloud_user_config_database` 是程序部署元数据，不是 Settings UI 中可编辑/同步的用户设置；host、port、database、username、sslmode 和连接池元数据写在运行配置中，只有 `SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD` 作为环境变量秘密值。启用 PostgreSQL 后，当前仅允许 prompt snippets、Agent definitions、主 LLM Registry 和图像生成 LLM Registry 直连同一个 PostgreSQL 权威库；这些仓储不得增加本地缓存或另建同步 API。MCP、Skill、LACP、context/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等混合或本机数据不属于该云端迁移范围，除非后续重新做范围设计并获确认。
+
 ### 会话消息模块（conversation_message）
 
 统一历史对话消息管理，建立支持多平台（OpenAI / Claude / Gemini）的统一历史消息列表模型。包括统一消息模型、协议适配器、会话状态管理。不关心 LLM 调用本身，只关注消息的统一表示和协议转换。会话聚合根的持久化支持 InMemory 内存实现和 SQLite + JSONL 混合持久化实现，仓储接口定义在领域层（conversation_repository.py），实现类位于基础设施层（infrastructure/）。会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id。

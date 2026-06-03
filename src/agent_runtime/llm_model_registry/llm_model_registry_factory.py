@@ -20,9 +20,41 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_gateway_i
 class LlmModelRegistryFactory:
     """LLM 服务商与模型注册服务工厂。
 
-    工厂是唯一知道具体 SQLite 仓储实现和 ConfigRegistry 的装配位置。
-    领域层只依赖 Callable 目录访问器和仓储接口，不感知全局配置注册中心。
+    工厂是唯一知道具体仓储实现和 ConfigRegistry 的装配位置。
+    领域层只依赖 Callable 配置访问器和仓储接口，不感知全局配置注册中心。
     """
+
+    @staticmethod
+    def _create_repository(
+        *,
+        db_filename: str | None = None,
+        namespace_prefix: str = "",
+    ):
+        from agent_runtime.config import ConfigRegistry
+
+        if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+            from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+            from agent_runtime.llm_model_registry.infrastructure.postgres_llm_model_registry_repository import (
+                PostgresLlmModelRegistryRepository,
+            )
+
+            store = PostgresUserConfigStore(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
+            return PostgresLlmModelRegistryRepository(
+                lambda: store,
+                namespace_prefix=namespace_prefix,
+            )
+
+        kwargs = {}
+        if db_filename is not None:
+            kwargs["db_filename"] = db_filename
+        return SqliteLlmModelRegistryRepository(
+            registry_dir_accessor=(
+                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir
+            ),
+            **kwargs,
+        )
 
     @staticmethod
     def create() -> LlmModelRegistryGatewayImpl:
@@ -31,13 +63,7 @@ class LlmModelRegistryFactory:
         配置通过访问器从 ConfigRegistry 实时读取，不存储配置副本。
         装配链路：SQLite 仓储 → 领域服务 → 北向网关。
         """
-        from agent_runtime.config import ConfigRegistry
-
-        repository = SqliteLlmModelRegistryRepository(
-            registry_dir_accessor=(
-                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir
-            ),
-        )
+        repository = LlmModelRegistryFactory._create_repository()
         service = LlmModelRegistryService(repository)
         for metadata in builtin_llm_model_metadata():
             service.ensure_builtin_model_metadata(metadata)
@@ -45,7 +71,6 @@ class LlmModelRegistryFactory:
 
     @staticmethod
     def create_image_generation_registry():
-        from agent_runtime.config import ConfigRegistry
         from agent_runtime.image_generation.llm_registry_gateway import (
             GPT_IMAGE_AGENT_MODEL_ID,
             ImageGenerationLlmRegistryGateway,
@@ -63,11 +88,9 @@ class LlmModelRegistryFactory:
                 return resolved
             return None
 
-        repository = SqliteLlmModelRegistryRepository(
-            registry_dir_accessor=(
-                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir
-            ),
+        repository = LlmModelRegistryFactory._create_repository(
             db_filename="image_generation_llm_registry.sqlite3",
+            namespace_prefix="image_generation_",
         )
         service = LlmModelRegistryService(
             repository,

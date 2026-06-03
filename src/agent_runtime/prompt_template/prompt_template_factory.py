@@ -22,8 +22,19 @@ class PromptTemplateFactory:
         """
         from agent_runtime.config import ConfigRegistry
 
-        repo = YamlFileSnippetRepository(
-            snippets_dir_accessor=lambda: ConfigRegistry.instance().prompt_template.snippets_dir,
-        )
+        if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+            from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+            from agent_runtime.prompt_template.infrastructure.postgres_prompt_snippet_repository import (
+                PostgresPromptSnippetRepository,
+            )
+
+            store = PostgresUserConfigStore(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
+            repo = PostgresPromptSnippetRepository(lambda: store)
+        else:
+            repo = YamlFileSnippetRepository(
+                snippets_dir_accessor=lambda: ConfigRegistry.instance().prompt_template.snippets_dir,
+            )
         service = PromptSnippetService(repo)
         return PromptSnippetGateway(service)

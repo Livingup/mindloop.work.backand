@@ -72,6 +72,22 @@ llm_model_registry:
   # legacy YAML 只作为一次性迁移输入，不会在应用启动或仓储初始化时自动导入。
   registry_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-model-registry"
 
+cloud_user_config_database:
+  # 用户全局可复用配置的云端 PostgreSQL 权威库。
+  # 该段是程序部署元数据，不属于 Settings UI 中可同步的用户设置。
+  enabled: true
+  backend: "postgresql"
+  host: "db.mindloop.chat"
+  port: 25432
+  database: "agent_runtime"
+  username: "agent_runtime_client"
+  password: "${SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD}"
+  sslmode: "require"
+  pool:
+    min_size: 1
+    max_size: 5
+    connect_timeout_seconds: 10
+
 codex_oauth:
   data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/codex-oauth"
   client_id: "${CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}"

@@ -27,10 +27,21 @@ class AgentDefinitionFactory:
         """
         from agent_runtime.config import ConfigRegistry
 
-        repository = YamlAgentDefinitionRepository(
-            definitions_dir_accessor=(
-                lambda: ConfigRegistry.instance().agent_definition.definitions_dir
-            ),
-        )
+        if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+            from agent_runtime.agent_definition.infrastructure.postgres_agent_definition_repository import (
+                PostgresAgentDefinitionRepository,
+            )
+            from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+
+            store = PostgresUserConfigStore(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
+            repository = PostgresAgentDefinitionRepository(lambda: store)
+        else:
+            repository = YamlAgentDefinitionRepository(
+                definitions_dir_accessor=(
+                    lambda: ConfigRegistry.instance().agent_definition.definitions_dir
+                ),
+            )
         service = AgentDefinitionService(repository)
         return AgentDefinitionGatewayImpl(service)

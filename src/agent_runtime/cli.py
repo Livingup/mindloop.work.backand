@@ -111,6 +111,55 @@ def init_config(source_path: Path, force: bool) -> None:
     )
 
 
+@config_group.command("migrate-user-global-to-cloud")
+@click.option(
+    "--config-file",
+    "config_file_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="用于执行迁移的 agent_runtime.yaml 配置文件；默认使用 ~/.spread-ai/agent_runtime.yaml。",
+)
+@click.option(
+    "--env-file",
+    "env_file_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="包含 SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD 等敏感部署值的 .env 文件。",
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    help="允许本机数据覆盖云端 PostgreSQL 中已存在的同 ID 数据；默认跳过已存在数据。",
+)
+def migrate_user_global_to_cloud(
+    config_file_path: Path | None,
+    env_file_path: Path | None,
+    overwrite: bool,
+) -> None:
+    """一次性把已批准的本机用户全局配置导入云端 PostgreSQL。"""
+    _load_initialized_runtime_config(
+        env_file_path=env_file_path,
+        config_file_path=config_file_path,
+    )
+    from agent_runtime.cloud_user_config.migration import (
+        migrate_local_user_global_config_to_postgresql,
+    )
+
+    summary = migrate_local_user_global_config_to_postgresql(overwrite=overwrite)
+    status = "error" if summary.failed_total else "ok"
+    _echo_json(
+        {
+            "status": status,
+            "message": "用户全局配置云端迁移完成。" if status == "ok" else "用户全局配置云端迁移存在失败项。",
+            "overwrite": overwrite,
+            "summary": summary.to_dict(),
+        },
+        err=status != "ok",
+    )
+    if summary.failed_total:
+        raise click.exceptions.Exit(1)
+
+
 main.add_command(config_group, name="config")
 
 

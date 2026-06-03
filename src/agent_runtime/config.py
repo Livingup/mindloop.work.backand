@@ -48,6 +48,10 @@ from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.codex_oauth.config import CodexOAuthConfig
+from agent_runtime.cloud_user_config.config import (
+    CloudUserConfigDatabaseConfig,
+    CloudUserConfigDatabasePoolConfig,
+)
 
 
 # ── 宿主运行时服务配置（全局，不属于任何业务域） ──────────────
@@ -145,6 +149,10 @@ class AgentRuntimeConfig:
 
     codex_oauth: CodexOAuthConfig = field(
         default_factory=CodexOAuthConfig,
+    )
+
+    cloud_user_config_database: CloudUserConfigDatabaseConfig = field(
+        default_factory=CloudUserConfigDatabaseConfig,
     )
 
 
@@ -438,6 +446,16 @@ class ConfigRegistry:
             "codex_oauth", _build_codex_oauth_config,
         )
 
+    @property
+    def cloud_user_config_database(self) -> CloudUserConfigDatabaseConfig:
+        if self._config is not None:
+            return self._config.cloud_user_config_database
+        if self._raw_config_data is not None and "cloud_user_config_database" not in self._raw_config_data:
+            return CloudUserConfigDatabaseConfig()
+        return self._get_section_config(
+            "cloud_user_config_database", _build_cloud_user_config_database_config,
+        )
+
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
 
@@ -601,6 +619,29 @@ def _build_llm_model_registry_config(data: dict[str, Any]) -> LlmModelRegistryCo
     """从 YAML 字典构建 LLM 服务商与模型注册模块配置。"""
     return LlmModelRegistryConfig(
         registry_dir=str(data["registry_dir"]),
+    )
+
+
+def _build_cloud_user_config_database_config(data: dict[str, Any]) -> CloudUserConfigDatabaseConfig:
+    pool_data = data.get("pool", {})
+    if not isinstance(pool_data, dict):
+        pool_data = {}
+    return CloudUserConfigDatabaseConfig(
+        enabled=bool(data.get("enabled", False)),
+        backend=str(data.get("backend", "local")),
+        host=str(data.get("host", "db.mindloop.chat")),
+        port=int(data.get("port", 25432)),
+        database=str(data.get("database", "agent_runtime")),
+        username=str(data.get("username", "agent_runtime_client")),
+        password=str(data.get("password", "")),
+        sslmode=str(data.get("sslmode", "require")),
+        pool=CloudUserConfigDatabasePoolConfig(
+            min_size=int(pool_data.get("min_size", 1)),
+            max_size=int(pool_data.get("max_size", 5)),
+            connect_timeout_seconds=int(
+                pool_data.get("connect_timeout_seconds", 10)
+            ),
+        ),
     )
 
 
