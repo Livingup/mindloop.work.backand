@@ -89,6 +89,9 @@ def build_persistence_inventory(
     lacp_data_dir = _config_value(
         raw_config, "lacp", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/lacp"
     )
+    cloud_bootstrap_dir = _config_value(
+        raw_config, "cloud_user_config_database", "bootstrap_data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/cloud-user-config"
+    )
 
     return [
         PersistenceInventoryItem(
@@ -99,14 +102,31 @@ def build_persistence_inventory(
             storage_location=config_path,
             config_sections=["agent_runtime_service", "file_resource_service", "agent_runtime", "scene"],
             persisted_data=[
-                "服务监听地址、端口、环境标识",
-                "各业务模块的数据目录、缓存目录、Trace 目录",
-                "OAuth、LACP、上下文压缩等功能默认运行参数",
+                "服务实例名、环境标识、监听地址和端口等启动元数据",
+                "各运行模块的数据目录、缓存目录、Trace 目录和默认运行参数",
+                "云端共享配置库的默认连接元数据（不含可用启动密码）",
             ],
             server_sync_candidate=False,
             sync_recommendation="local_only",
-            rationale="主配置混合了本机端口、数据根目录、开发/正式环境路径和外部服务默认值，属于机器/部署绑定配置，不应整体跨机器同步。",
-            migration_notes="未来只应抽取其中可复用的用户偏好字段，不能把整份 YAML 当作用户全局配置上传。",
+            rationale="主配置只应承载程序启动和部署元数据；dev/release 是运行环境，不是用户数据隔离边界，不能把整份 YAML 当作跨机器用户设置同步。",
+            migration_notes="云端 PostgreSQL password 等 bootstrap 凭据另存在机器本地用户数据；OSS、LLM、Prompt、Agent 等共享业务设置应进入云端 PostgreSQL 权威库。",
+        ),
+        PersistenceInventoryItem(
+            item_id="cloud_user_config_bootstrap",
+            title="云端共享配置库 bootstrap 凭据",
+            scope=MACHINE_LOCAL_CONFIG,
+            storage_medium="SQLite database",
+            storage_location=_join_location(cloud_bootstrap_dir, "cloud_user_config_bootstrap.db"),
+            config_sections=["cloud_user_config_database"],
+            persisted_data=[
+                "连接云端 PostgreSQL 权威库所需的启用状态、host、port、database、username、password 与 sslmode",
+                "连接池和连接超时启动参数",
+            ],
+            server_sync_candidate=False,
+            sync_recommendation="machine_local_bootstrap_secret",
+            rationale="这些凭据用于首次连接保存共享用户数据的云端 PostgreSQL；把它们存入同一个云库会产生自举悖论，因此属于每台机器本地用户数据。",
+            secret_handling="包含 PostgreSQL password，必须只保存在本机用户数据中，UI 展示时只能掩码或提示重新输入。",
+            migration_notes="同一台机器的 dev/release 默认共享这份本地 bootstrap 数据；完成配置后需要重启 Runtime 才能让启动期装配的共享仓储切换到 PostgreSQL。",
         ),
         PersistenceInventoryItem(
             item_id="llm_model_registry",
@@ -202,8 +222,8 @@ def build_persistence_inventory(
             item_id="object_storage_settings",
             title="对象存储用户设置",
             scope=USER_GLOBAL_REUSABLE_CONFIG,
-            storage_medium="SQLite database",
-            storage_location=_join_location(file_resource_root, "object_storage_settings.db"),
+            storage_medium="PostgreSQL cloud user config item",
+            storage_location="postgresql:cloud_user_config_items/file_resource.object_storage_settings/default",
             config_sections=["file_resource_service"],
             persisted_data=[
                 "对象存储服务商、Endpoint、Region、Bucket、公共访问 URL 和 Key 前缀",
@@ -211,10 +231,10 @@ def build_persistence_inventory(
                 "连接超时时间",
             ],
             server_sync_candidate=True,
-            sync_recommendation="field_level_review",
-            rationale="对象存储连接信息可让多设备复用同一资源后端，但它混合了可共享元数据和高敏凭证，不能无差别同步。",
-            secret_handling="AccessKey ID/Secret 必须加密保存；公共 URL、Bucket 等元数据可单独同步或由产品默认值提供。",
-            migration_notes="当前 UI 只允许用户改密钥，其他字段多为内置默认；后续迁移应区分产品默认、用户覆盖和密钥字段。",
+            sync_recommendation="cloud_authoritative_user_config",
+            rationale="对象存储连接信息是跨机器复用的共享业务设置，云端 PostgreSQL bootstrap 完成后以 cloud_user_config_items 为权威；缺少 OSS 配置只门禁文件上传等依赖能力，不阻塞 Runtime 初始化。",
+            secret_handling="AccessKey ID/Secret 属于用户共享业务密钥，应在云端用户配置库中按敏感字段治理；仓库 env 文件不得承载这些值。",
+            migration_notes="初始化引导可一次性写入 OSS 设置；如果未写入，后续设置页应写入同一 PostgreSQL item，而不是本地 SQLite 形成平行权威。",
         ),
         PersistenceInventoryItem(
             item_id="image_generation_settings",

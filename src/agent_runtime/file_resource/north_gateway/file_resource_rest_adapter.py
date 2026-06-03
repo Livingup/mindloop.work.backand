@@ -16,6 +16,7 @@ from agent_runtime.file_resource.north_gateway.resource_create_contracts import 
 from agent_runtime.file_resource.settings_repository import (
     DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS,
     ObjectStorageSettingsRepository,
+    create_object_storage_settings_repository,
 )
 from agent_runtime.file_resource.shared_service import get_file_resource_service, get_file_resource_upload_task_service
 from agent_runtime.file_resource.south_gateway.object_storage.runtime_configured import (
@@ -274,7 +275,7 @@ def create_file_resource_router() -> APIRouter:
 
 
 def _object_storage_settings_repository() -> ObjectStorageSettingsRepository:
-    return ObjectStorageSettingsRepository(
+    return create_object_storage_settings_repository(
         data_dir_accessor=lambda: ConfigRegistry.instance().file_resource_service.local_resource_storage_root_path,
     )
 

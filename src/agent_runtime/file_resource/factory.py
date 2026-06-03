@@ -13,7 +13,7 @@ from agent_runtime.file_resource.infrastructure import SqliteFileResourceArchive
 from agent_runtime.file_resource.local_storage import LocalResourceStorage
 from agent_runtime.file_resource.metadata_parser import FileResourceMetadataParser
 from agent_runtime.file_resource.models import InMemoryFileResourceArchiveRepository
-from agent_runtime.file_resource.settings_repository import ObjectStorageSettingsRepository
+from agent_runtime.file_resource.settings_repository import create_object_storage_settings_repository
 from agent_runtime.file_resource.service import FileResourceService
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
     ObjectStorageGateway,
@@ -125,7 +125,7 @@ class FileResourceServiceFactory:
     def _create_object_storage_gateway(
         svc_config: FileResourceServiceConfig,
     ) -> ObjectStorageGateway:
-        settings_repository = ObjectStorageSettingsRepository(
+        settings_repository = create_object_storage_settings_repository(
             data_dir_accessor=lambda: svc_config.local_resource_storage_root_path,
         )
         return RuntimeConfiguredObjectStorageGateway(settings_repository)

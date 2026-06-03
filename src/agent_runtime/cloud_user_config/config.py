@@ -20,9 +20,11 @@ class CloudUserConfigDatabasePoolConfig:
 
 @dataclass(frozen=True, slots=True)
 class CloudUserConfigDatabaseConfig:
-    """用户全局可复用配置的云端 PostgreSQL 数据库配置。
+    """用户全局可复用配置的云端 PostgreSQL 数据库连接配置。
 
-    该配置属于程序部署元数据，不属于用户可同步设置；只有 password 使用环境变量占位符。
+    YAML 中只保留默认连接元数据；真正的启动凭据由每台机器本地 bootstrap
+    存储覆盖。只有连接参数和 password 都完整时，云端 PostgreSQL 才会成为
+    prompt、Agent 定义、LLM Registry、OSS 设置等用户共享数据的权威仓储。
     """
 
     enabled: bool = False
@@ -33,18 +35,26 @@ class CloudUserConfigDatabaseConfig:
     username: str = "agent_runtime_client"
     password: str = ""
     sslmode: str = "require"
+    bootstrap_data_dir: str = "~/.spread-ai/cloud-user-config"
     pool: CloudUserConfigDatabasePoolConfig = field(
         default_factory=CloudUserConfigDatabasePoolConfig,
     )
 
     @property
     def is_postgresql_enabled(self) -> bool:
-        return self.enabled and self.backend == "postgresql"
+        return all((
+            self.enabled,
+            self.backend == "postgresql",
+            self.host.strip(),
+            self.port > 0,
+            self.database.strip(),
+            self.username.strip(),
+            self.password.strip(),
+        ))
 
     def require_password(self) -> str:
         if not self.password:
             raise ValueError(
-                "cloud_user_config_database.password 未配置；请设置 "
-                "SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD。"
+                "cloud_user_config_database.password 未配置；请先完成云端用户配置库初始化引导。"
             )
         return self.password

@@ -119,7 +119,7 @@ def create_runtime_auth_router(auth_service: RuntimeAuthService) -> APIRouter:
 def _login_response(
     authenticated_session: AuthenticatedRuntimeSession,
     token: str,
- ) -> RuntimeAuthLoginResponse:
+) -> RuntimeAuthLoginResponse:
     return RuntimeAuthLoginResponse(
         access_token=token,
         account=_account_response(authenticated_session),

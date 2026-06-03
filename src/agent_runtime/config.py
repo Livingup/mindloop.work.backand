@@ -449,12 +449,14 @@ class ConfigRegistry:
     @property
     def cloud_user_config_database(self) -> CloudUserConfigDatabaseConfig:
         if self._config is not None:
-            return self._config.cloud_user_config_database
-        if self._raw_config_data is not None and "cloud_user_config_database" not in self._raw_config_data:
-            return CloudUserConfigDatabaseConfig()
-        return self._get_section_config(
-            "cloud_user_config_database", _build_cloud_user_config_database_config,
-        )
+            base_config = self._config.cloud_user_config_database
+        elif self._raw_config_data is not None and "cloud_user_config_database" not in self._raw_config_data:
+            base_config = CloudUserConfigDatabaseConfig()
+        else:
+            base_config = self._get_section_config(
+                "cloud_user_config_database", _build_cloud_user_config_database_config,
+            )
+        return _apply_cloud_user_config_bootstrap(base_config)
 
     def _get_section_config(self, section_name: str, builder: Any) -> Any:
         """按需解析并构建单个配置段。
@@ -635,6 +637,9 @@ def _build_cloud_user_config_database_config(data: dict[str, Any]) -> CloudUserC
         username=str(data.get("username", "agent_runtime_client")),
         password=str(data.get("password", "")),
         sslmode=str(data.get("sslmode", "require")),
+        bootstrap_data_dir=str(
+            data.get("bootstrap_data_dir", "~/.spread-ai/cloud-user-config")
+        ),
         pool=CloudUserConfigDatabasePoolConfig(
             min_size=int(pool_data.get("min_size", 1)),
             max_size=int(pool_data.get("max_size", 5)),
@@ -643,6 +648,24 @@ def _build_cloud_user_config_database_config(data: dict[str, Any]) -> CloudUserC
             ),
         ),
     )
+
+
+def _apply_cloud_user_config_bootstrap(
+    base_config: CloudUserConfigDatabaseConfig,
+) -> CloudUserConfigDatabaseConfig:
+    """叠加机器本地保存的云端用户配置库连接凭据。"""
+    try:
+        from agent_runtime.cloud_user_config.bootstrap_settings import (
+            CloudUserConfigBootstrapSettingsRepository,
+        )
+
+        repository = CloudUserConfigBootstrapSettingsRepository(
+            lambda: base_config.bootstrap_data_dir,
+        )
+        return repository.get_effective_database_config(base_config)
+    except Exception:
+        logger.exception("读取云端用户配置 bootstrap 凭据失败，继续使用 YAML 默认值。")
+        return base_config
 
 
 def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
@@ -742,15 +765,14 @@ def _build_conv_repo_config(data: dict[str, Any]) -> ConversationRepositoryConfi
 
 
 def _load_dot_env(yaml_config_path: Path, env_file_path: str | None) -> None:
-    """加载 .env 文件中的环境变量。
+    """加载显式指定的 env 文件中的程序启动元数据覆盖。
 
-    优先使用显式指定的路径，否则自动查找 YAML 文件同目录下的 .env。
-    使用 python-dotenv（如已安装），否则用内置简易解析兜底。
-    .env 文件不存在时静默跳过。不覆盖已有的系统环境变量。
+    新配置边界下，YAML 同目录的 `.env` 不再被自动加载，避免 repo/env 文件
+    悄悄承载 OSS、云 DB 密码等用户业务密钥。开发环境如需覆盖 service host/port/env，
+    必须通过 `--env-file config/.env.dev` 显式传入。
     """
+    _ = yaml_config_path
     protected_keys = set(os.environ)
-    common_env_path = yaml_config_path.parent / ".env"
-    _load_single_dot_env(common_env_path, protected_keys=protected_keys, override=False)
     if env_file_path is not None:
         _load_single_dot_env(Path(env_file_path), protected_keys=protected_keys, override=True)
 

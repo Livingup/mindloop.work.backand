@@ -124,7 +124,7 @@ def init_config(source_path: Path, force: bool) -> None:
     "env_file_path",
     default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="包含 SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD 等敏感部署值的 .env 文件。",
+    help="可选的启动元数据 env 文件；云端 PostgreSQL bootstrap 凭据来自机器本地用户数据，不再从 env 文件读取。",
 )
 @click.option(
     "--overwrite",

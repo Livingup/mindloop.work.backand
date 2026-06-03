@@ -7,6 +7,11 @@ from typing import Any
 import yaml
 
 from agent_runtime.cloud_user_config import migration as migration_module
+from agent_runtime.cloud_user_config.bootstrap_settings import CloudUserConfigBootstrapSettingsRepository
+from agent_runtime.cloud_user_config.config import (
+    CloudUserConfigDatabaseConfig,
+    CloudUserConfigDatabasePoolConfig,
+)
 from agent_runtime.config import ConfigRegistry
 from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.llm_model_registry.infrastructure.sqlite_llm_model_registry_repository import (
@@ -55,7 +60,7 @@ class _FakePostgresUserConfigStore:
         return (namespace, item_id) in type(self).items
 
     def ensure_schema(self) -> None:
-        # 触发配置访问，确保测试覆盖 password 环境变量解析路径。
+        # 触发配置访问，确保测试覆盖机器本地 bootstrap 凭据覆盖 YAML 元数据后的密码校验路径。
         self._config_accessor().require_password()
 
 
@@ -70,10 +75,28 @@ def test_migrate_local_user_global_config_to_postgresql_copies_approved_domains(
         "PostgresUserConfigStore",
         _FakePostgresUserConfigStore,
     )
-    monkeypatch.setenv("SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD", "postgres-secret")
-
     data_root = tmp_path / "data"
     _write_runtime_config(tmp_path / "agent_runtime.yaml", data_root)
+    CloudUserConfigBootstrapSettingsRepository(
+        lambda: str(data_root / "cloud-user-config")
+    ).save_config(
+        CloudUserConfigDatabaseConfig(
+            enabled=True,
+            backend="postgresql",
+            host="db.mindloop.chat",
+            port=25432,
+            database="agent_runtime",
+            username="agent_runtime_client",
+            password="postgres-secret",
+            sslmode="require",
+            bootstrap_data_dir=str(data_root / "cloud-user-config"),
+            pool=CloudUserConfigDatabasePoolConfig(
+                min_size=1,
+                max_size=5,
+                connect_timeout_seconds=10,
+            ),
+        )
+    )
     _write_prompt_snippet(data_root)
     _write_agent_definition(data_root)
     _write_llm_registry(data_root, db_filename=None, item_prefix="shared")
@@ -132,7 +155,8 @@ def _write_runtime_config(config_path: Path, data_root: Path) -> None:
                 "  port: 25432",
                 "  database: \"agent_runtime\"",
                 "  username: \"agent_runtime_client\"",
-                "  password: \"${SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD}\"",
+                "  password: \"\"",
+                f"  bootstrap_data_dir: \"{(data_root / 'cloud-user-config').as_posix()}\"",
                 "  sslmode: \"require\"",
                 "  pool:",
                 "    min_size: 1",

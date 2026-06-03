@@ -129,12 +129,18 @@ def create_app() -> FastAPI:
     )
     from agent_runtime.auth.factory import RuntimeAuthFactory
     from agent_runtime.auth.north_gateway.auth_rest_adapter import create_runtime_auth_router
+    from agent_runtime.cloud_user_config.north_gateway.bootstrap_rest_adapter import (
+        create_runtime_bootstrap_router,
+    )
     from agent_runtime.runtime_health import EventLoopLagMonitor
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
         runtime_network_monitor,
     )
 
+    cloud_user_config_database_active_at_start = (
+        ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled
+    )
     prompt_gateway = PromptTemplateFactory.create()
     tool_gateway = LocalToolFactory.create()
     skill_gateway = SkillFactory.create()
@@ -177,7 +183,10 @@ def create_app() -> FastAPI:
         llm_request_service=LlmClientFactory.create(),
     )
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
-    codex_oauth_service.ensure_builtin_provider()
+    if cloud_user_config_database_active_at_start:
+        codex_oauth_service.ensure_builtin_provider()
+    else:
+        logger.info("Runtime 处于 bootstrap 限制模式，跳过内置 Codex Provider 写入以避免本地 LLM Registry 成为共享配置权威。")
     codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
     runtime_auth_service = RuntimeAuthFactory.create_service()
     llm_http_trace_service = LlmHttpTraceFactory.create()
@@ -325,9 +334,14 @@ def create_app() -> FastAPI:
         event_loop_monitor.start()
         runtime_network_monitor.start()
         scene_session_registry.start()
-        codex_oauth_callback_server.start()
-        auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
-        lacp_start_task = asyncio.create_task(lacp_client.start())
+        auto_connect_task: asyncio.Task | None = None
+        lacp_start_task: asyncio.Task | None = None
+        if cloud_user_config_database_active_at_start:
+            codex_oauth_callback_server.start()
+            auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
+            lacp_start_task = asyncio.create_task(lacp_client.start())
+        else:
+            logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接、LACP 启动与 Codex OAuth 回调服务。")
         try:
             yield
         finally:
@@ -338,17 +352,18 @@ def create_app() -> FastAPI:
                 with suppress(Exception, asyncio.CancelledError):
                     await task
             detach_tasks.clear()
-            if not auto_connect_task.done():
+            if auto_connect_task is not None and not auto_connect_task.done():
                 auto_connect_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):
                     await auto_connect_task
-            if not lacp_start_task.done():
+            if lacp_start_task is not None and not lacp_start_task.done():
                 lacp_start_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):
                     await lacp_start_task
             await lacp_client.shutdown()
             await mcp_gateway.shutdown()
-            codex_oauth_callback_server.stop()
+            if cloud_user_config_database_active_at_start:
+                codex_oauth_callback_server.stop()
             await event_loop_monitor.stop()
             runtime_network_monitor.stop()
             runtime_loop = None
@@ -369,6 +384,23 @@ def create_app() -> FastAPI:
                 status_code=401,
             )
         request.state.runtime_auth_session = auth_session
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def runtime_bootstrap_guard_middleware(request, call_next):
+        path = request.url.path
+        if (
+            path.startswith("/api/")
+            and not cloud_user_config_database_active_at_start
+            and not _is_runtime_bootstrap_exempt_path(path)
+        ):
+            return JSONResponse(
+                {
+                    "detail": "Runtime 尚未完成云端用户共享配置库初始化；请先完成 /api/runtime-bootstrap 引导并重启 Runtime。",
+                    "bootstrap_required": True,
+                },
+                status_code=503,
+            )
         return await call_next(request)
 
     @app.middleware("http")
@@ -437,6 +469,13 @@ def create_app() -> FastAPI:
         create_runtime_auth_router(runtime_auth_service),
         prefix="/api/auth",
         tags=["运行时账号认证"],
+    )
+    app.include_router(
+        create_runtime_bootstrap_router(
+            cloud_user_config_database_active_at_start=cloud_user_config_database_active_at_start,
+        ),
+        prefix="/api/runtime-bootstrap",
+        tags=["Runtime 初始化引导"],
     )
 
     app.include_router(
@@ -593,6 +632,15 @@ def _is_key_network_path(path: str) -> bool:
 
 def _is_runtime_auth_exempt_path(path: str) -> bool:
     return path == "/api/health" or path.startswith("/api/auth/")
+
+
+def _is_runtime_bootstrap_exempt_path(path: str) -> bool:
+    return (
+        path == "/api/health"
+        or path.startswith("/api/auth/")
+        or path.startswith("/api/runtime-bootstrap/")
+        or path.startswith("/api/system-settings")
+    )
 
 
 def _runtime_auth_token_from_request(request) -> str | None:

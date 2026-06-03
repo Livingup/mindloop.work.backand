@@ -35,11 +35,11 @@ dev 后端在本仓库独立启动，推荐使用项目内配置目录：
 spread-ai serve --config-file config/agent_runtime.yaml --env-file config/.env.dev
 ```
 
-dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`。`config/.env` 用于公共敏感配置和外部服务配置，`config/.env.dev` 只保存 dev 环境差异；配置加载顺序是先加载 `config/.env`，再加载 `--env-file` 指定文件，系统环境变量优先级最高。
+dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`。`config/.env.dev` 只能保存 dev 启动元数据覆盖，且必须通过 `--env-file config/.env.dev` 显式传入；`config/.env` 与 `config/.env.prod` 不再作为 OSS、云端 PostgreSQL 密码或其他用户业务密钥来源。
 
 正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式后端监听 `127.0.0.1`，端口由 Electron 主进程动态分配并通过命令行参数传入，避免和 dev 后端固定端口冲突。
 
-正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`；正式版 `.env` 位于同一 `runtime-config` 目录。Electron packaged 主进程只负责传入配置文件、env 文件、host 与动态端口，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未在 `.env` 或系统环境显式设置 `SPREAD_AI_DATA_ROOT` 时，dev 与正式版都默认使用同一套 `~/.spread-ai` 用户业务数据；如果确实需要隔离某个部署环境的数据目录，必须在对应 `.env` 文件中显式配置 `SPREAD_AI_DATA_ROOT`。
+正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`。Electron packaged 主进程只负责传入配置文件、host 与动态端口，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未在系统环境显式设置 `SPREAD_AI_DATA_ROOT` 时，dev 与正式版默认使用同一套 `~/.spread-ai` 用户业务数据；dev/prod/release 是运行环境，不是同一台机器上的用户数据隔离边界。
 
 构建正式版后端 sidecar：
 
@@ -58,11 +58,11 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析、`.env` 文件加载、watchdog 文件监听热更新。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；普通 CLI 管理命令默认加载这一份初始化后的运行配置。`spread-ai serve` 是开发/诊断入口，默认同样加载 `~/.spread-ai/agent_runtime.yaml`，但允许通过 `--config-file` 与 `--env-file` 显式指定开发态配置源。正式 Windows 桌面版不通过 `spread-ai serve` 启动，而由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。运行时 REST 服务装配在 `agent_runtime.server` 中，供 `spread-ai serve` 与正式版内部后端入口复用。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析和 watchdog 文件监听热更新；不会自动加载 YAML 同目录 `.env`，只有调用方显式传入的 `--env-file` 会作为启动元数据覆盖来源。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；普通 CLI 管理命令默认加载这一份初始化后的运行配置。`spread-ai serve` 是开发/诊断入口，默认同样加载 `~/.spread-ai/agent_runtime.yaml`，但允许通过 `--config-file` 与 `--env-file` 显式指定开发态配置源。正式 Windows 桌面版不通过 `spread-ai serve` 启动，而由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。运行时 REST 服务装配在 `agent_runtime.server` 中，供 `spread-ai serve` 与正式版内部后端入口复用。
 
 #### 用户全局配置云端 PostgreSQL 边界
 
-`cloud_user_config_database` 是程序部署元数据，不是 Settings UI 中可编辑/同步的用户设置；host、port、database、username、sslmode 和连接池元数据写在运行配置中，只有 `SPREAD_AI_CLOUD_USER_CONFIG_DB_PASSWORD` 作为环境变量秘密值。启用 PostgreSQL 后，当前仅允许 prompt snippets、Agent definitions、主 LLM Registry 和图像生成 LLM Registry 直连同一个 PostgreSQL 权威库；这些仓储不得增加本地缓存或另建同步 API。MCP、Skill、LACP、context/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等混合或本机数据不属于该云端迁移范围，除非后续重新做范围设计并获确认。
+`cloud_user_config_database` 的 YAML 段只保存云端 PostgreSQL 默认连接元数据；真正可用的 PostgreSQL 启动凭据（包括 password，以及必要时同一组 host/port/database/username）属于每台机器本地用户数据，由 runtime bootstrap 本地存储覆盖，不能写入同一个云端 PostgreSQL 库以免形成自举悖论。缺少本机 bootstrap 凭据时，REST 服务只能进入初始化引导有限模式，不得把 prompt snippets、Agent definitions、主 LLM Registry、图像生成 LLM Registry、OSS 设置等跨机器共享配置悄悄落回本地权威。启用 PostgreSQL 后，这些共享数据直连同一个 PostgreSQL 权威库；仓储不得增加本地缓存或另建同步 API。MCP、Skill、LACP、context/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等混合或本机数据不属于该云端迁移范围，除非后续重新做范围设计并获确认。
 
 ### 会话消息模块（conversation_message）
 
