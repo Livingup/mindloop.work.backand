@@ -27,7 +27,7 @@ python -m pip install -e .
 
 ## dev 与正式版启动/打包边界
 
-`spread-ai serve` 只作为开发、调试、CI 和后端诊断入口，不作为正式 Windows 桌面产品的用户启动入口。正式版用户只启动前端仓库打包出来的 `Spread AI.exe`；该 Electron exe 会在 packaged 模式下自动拉起随包携带的后端 sidecar `spread-ai-runtime.exe`，等待 `/api/health` 成功后再打开窗口，并在应用退出时关闭后端进程。
+`spread-ai serve` 只作为开发、调试、CI 和后端诊断入口，不作为正式 Windows 桌面产品的用户启动入口。正式版用户只启动前端仓库打包出来的 `Spread AI.exe`；该 Electron exe 会在 packaged 模式下读取随包复制到用户数据目录的 `agent_runtime.yaml`，用其中 `agent_runtime_service.service_host/service_port` 作为 release 启动元数据权威，自动拉起随包携带的后端 sidecar `spread-ai-runtime.exe`，等待 `/api/health` 成功后再打开窗口，并在应用退出时关闭后端进程。
 
 dev 后端在本仓库独立启动，推荐使用项目内配置目录：
 
@@ -37,9 +37,9 @@ spread-ai serve --config-file config/agent_runtime.yaml --env-file config/.env.d
 
 dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`。`config/.env.dev` 只能保存 dev 启动元数据覆盖，且必须通过 `--env-file config/.env.dev` 显式传入；`config/.env` 与 `config/.env.prod` 不再作为 OSS、云端 PostgreSQL 密码或其他用户业务密钥来源。
 
-正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式后端监听 `127.0.0.1`，端口由 Electron 主进程动态分配并通过命令行参数传入，避免和 dev 后端固定端口冲突。
+正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式 release 后端监听地址和端口由 `agent_runtime.yaml` 的 `agent_runtime_service.service_host/service_port` 决定，Electron packaged 主进程正常只传 `--config-file`，不再用 `--host` / `--port` 覆盖 release 配置；如果 YAML 配置端口被占用，应由 Electron 启动前检查并清晰失败，不得静默切换随机端口。
 
-正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`。Electron packaged 主进程只负责传入配置文件、host 与动态端口，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未在系统环境显式设置 `SPREAD_AI_DATA_ROOT` 时，dev 与正式版默认使用同一套 `~/.spread-ai` 用户业务数据；dev/prod/release 是运行环境，不是同一台机器上的用户数据隔离边界。
+正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`，该 YAML 是 packaged release 程序启动元数据权威，承载服务 host/port、本机数据根和 bootstrap/cloud 默认元数据等信息；它不能写入用户资源密钥、Runtime 本地登录凭据或共享云配置的长期本地权威缓存。正式 release 不扫描外部 `.env`，也不把目标机器 `SPREAD_AI_*` / `VITE_*` 环境变量作为启动或业务配置来源；dev/诊断可通过显式 `--env-file` 或 CLI 参数覆盖。Electron packaged 主进程只负责传入配置文件，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未显式配置时，dev 与正式版默认使用同一套 `~/.spread-ai` 用户业务数据；dev/prod/release 是运行环境，不是同一台机器上的用户数据隔离边界。
 
 构建正式版后端 sidecar：
 

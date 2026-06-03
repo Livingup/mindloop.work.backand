@@ -42,15 +42,15 @@ _ensure_standard_streams()
     "env_file_path",
     default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="正式桌面版内部后端使用的 .env 文件路径。",
+    help="开发/诊断场景显式传入的 env 覆盖文件；正式 release 启动不使用。",
 )
-@click.option("--host", required=True, help="正式桌面版内部后端监听地址。")
-@click.option("--port", required=True, type=int, help="正式桌面版内部后端监听端口。")
+@click.option("--host", default=None, help="开发/诊断场景监听地址覆盖；正式 release 启动不传该参数。")
+@click.option("--port", default=None, type=int, help="开发/诊断场景监听端口覆盖；正式 release 启动不传该参数。")
 def main(
     config_file_path: Path,
     env_file_path: Path | None,
-    host: str,
-    port: int,
+    host: str | None,
+    port: int | None,
 ) -> None:
     run_server(
         config_file_path=config_file_path,
