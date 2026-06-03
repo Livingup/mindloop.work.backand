@@ -631,10 +631,10 @@ def _build_cloud_user_config_database_config(data: dict[str, Any]) -> CloudUserC
     return CloudUserConfigDatabaseConfig(
         enabled=bool(data.get("enabled", False)),
         backend=str(data.get("backend", "local")),
-        host=str(data.get("host", "db.mindloop.chat")),
-        port=int(data.get("port", 25432)),
-        database=str(data.get("database", "agent_runtime")),
-        username=str(data.get("username", "agent_runtime_client")),
+        host=str(data.get("host", "")),
+        port=int(data.get("port", 5432)),
+        database=str(data.get("database", "")),
+        username=str(data.get("username", "")),
         password=str(data.get("password", "")),
         sslmode=str(data.get("sslmode", "require")),
         bootstrap_data_dir=str(

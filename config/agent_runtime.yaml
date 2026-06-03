@@ -74,14 +74,14 @@ llm_model_registry:
 
 cloud_user_config_database:
   # 用户全局可复用配置的云端 PostgreSQL 权威库。
-  # YAML 只保留默认连接元数据；password 等完整启动凭据由每台机器本地 bootstrap 存储覆盖。
+  # PostgreSQL 连接信息必须由用户在初始化引导中提供；YAML 不预置真实 host/database/username。
   # 缺少本机 bootstrap 凭据时，Runtime 进入初始化引导有限模式，不把本地共享配置当作权威来源。
-  enabled: true
-  backend: "postgresql"
-  host: "db.mindloop.chat"
-  port: 25432
-  database: "agent_runtime"
-  username: "agent_runtime_client"
+  enabled: false
+  backend: "local"
+  host: ""
+  port: 5432
+  database: ""
+  username: ""
   password: ""
   sslmode: "require"
   bootstrap_data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/cloud-user-config"

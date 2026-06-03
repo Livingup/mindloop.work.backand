@@ -22,17 +22,19 @@ class CloudUserConfigDatabasePoolConfig:
 class CloudUserConfigDatabaseConfig:
     """用户全局可复用配置的云端 PostgreSQL 数据库连接配置。
 
-    YAML 中只保留默认连接元数据；真正的启动凭据由每台机器本地 bootstrap
-    存储覆盖。只有连接参数和 password 都完整时，云端 PostgreSQL 才会成为
-    prompt、Agent 定义、LLM Registry、OSS 设置等用户共享数据的权威仓储。
+    YAML 中只保留 bootstrap 存储路径、连接池等通用元数据；真正可用的
+    PostgreSQL 连接信息由用户在初始化引导中提供，并由每台机器本地
+    bootstrap 存储覆盖。只有连接参数和 password 都完整时，云端 PostgreSQL
+    才会成为 prompt、Agent 定义、LLM Registry、OSS 设置等用户共享数据的
+    权威仓储。
     """
 
     enabled: bool = False
     backend: str = "local"
-    host: str = "db.mindloop.chat"
-    port: int = 25432
-    database: str = "agent_runtime"
-    username: str = "agent_runtime_client"
+    host: str = ""
+    port: int = 5432
+    database: str = ""
+    username: str = ""
     password: str = ""
     sslmode: str = "require"
     bootstrap_data_dir: str = "~/.spread-ai/cloud-user-config"

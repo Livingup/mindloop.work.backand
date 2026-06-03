@@ -9,6 +9,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from agent_runtime.config import ConfigRegistry
 
@@ -456,6 +457,17 @@ def create_app() -> FastAPI:
             })
         response.headers["x-network-trace-id"] = trace_id
         return response
+
+    # Starlette 后添加的 middleware 会成为更外层包装；CORS 必须包在认证与 bootstrap guard 外侧，
+    # 否则 Electron renderer 的 OPTIONS 预检不带登录 token 时会先被认证中间件拦截为 401。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["x-network-trace-id"],
+        allow_credentials=False,
+    )
 
     @app.get("/api/health")
     def health_check() -> dict[str, object]:

@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 class CloudUserConfigDatabaseBootstrapBody(BaseModel):
     enabled: bool = True
     backend: str = "postgresql"
-    host: str = "db.mindloop.chat"
-    port: int = 25432
-    database: str = "agent_runtime"
-    username: str = "agent_runtime_client"
+    host: str
+    port: int
+    database: str
+    username: str
     password: str
     sslmode: str = "require"
     connect_timeout_seconds: int = 10
@@ -56,26 +56,19 @@ class ObjectStorageBootstrapBody(BaseModel):
 
 
 class RuntimeBootstrapConfigureBody(BaseModel):
-    cloud_user_config_database: CloudUserConfigDatabaseBootstrapBody
+    cloud_user_config_database: CloudUserConfigDatabaseBootstrapBody | None = None
     object_storage_settings: ObjectStorageBootstrapBody | None = None
 
 
 class RuntimeBootstrapCloudDatabaseStatus(BaseModel):
     configured: bool
     active_at_start: bool
-    host: str
-    port: int
-    database: str
-    username: str
-    sslmode: str
-    bootstrap_storage_location: str
     updated_at: str | None = None
     error_message: str | None = None
 
 
 class RuntimeBootstrapObjectStorageStatus(BaseModel):
     configured: bool
-    storage_location: str
     updated_at: str | None = None
     error_message: str | None = None
 
@@ -104,16 +97,19 @@ def create_runtime_bootstrap_router(
     def configure_runtime_bootstrap(
         body: RuntimeBootstrapConfigureBody,
     ) -> RuntimeBootstrapStatusResponse:
-        candidate = _database_config_from_body(body.cloud_user_config_database)
-        if not candidate.is_postgresql_enabled:
-            raise HTTPException(status_code=400, detail="云端用户配置 PostgreSQL 连接参数不完整。")
-        try:
-            PostgresUserConfigStore(lambda: candidate).ensure_schema()
-        except Exception as exc:  # noqa: BLE001 - 需要把连接失败反馈给初始化 UI
-            logger.warning("云端用户配置 PostgreSQL 连接校验失败: %s", exc, exc_info=True)
-            raise HTTPException(status_code=400, detail=f"云端 PostgreSQL 连接失败：{exc}") from exc
+        if body.cloud_user_config_database is not None:
+            candidate = _database_config_from_body(body.cloud_user_config_database)
+            if not candidate.is_postgresql_enabled:
+                raise HTTPException(status_code=400, detail="云端用户配置 PostgreSQL 连接参数不完整。")
+            try:
+                PostgresUserConfigStore(lambda: candidate).ensure_schema()
+            except Exception as exc:  # noqa: BLE001 - 需要把连接失败反馈给初始化 UI
+                logger.warning("云端用户配置 PostgreSQL 连接校验失败: %s", exc, exc_info=True)
+                raise HTTPException(status_code=400, detail=f"云端 PostgreSQL 连接失败：{exc}") from exc
 
-        _cloud_bootstrap_repository().save_config(candidate)
+            _cloud_bootstrap_repository().save_config(candidate)
+        elif not _cloud_database_configured():
+            raise HTTPException(status_code=400, detail="请先完成云端用户配置 PostgreSQL 初始化。")
 
         if body.object_storage_settings is not None:
             _save_object_storage_settings(body.object_storage_settings)
@@ -127,7 +123,7 @@ def _runtime_bootstrap_status(
     cloud_user_config_database_active_at_start: bool,
 ) -> RuntimeBootstrapStatusResponse:
     cloud_config = ConfigRegistry.instance().cloud_user_config_database
-    cloud_configured = cloud_config.is_postgresql_enabled
+    cloud_configured = _cloud_database_configured(cloud_config)
     restart_required = cloud_configured and not cloud_user_config_database_active_at_start
     missing_required_items: list[str] = []
     warnings: list[str] = []
@@ -143,7 +139,7 @@ def _runtime_bootstrap_status(
     ready = cloud_configured and not restart_required
     return RuntimeBootstrapStatusResponse(
         ready=ready,
-        bootstrap_required=not ready,
+        bootstrap_required=not cloud_configured,
         restart_required=restart_required,
         missing_required_items=missing_required_items,
         warnings=warnings,
@@ -162,17 +158,24 @@ def _cloud_database_status(
     repository = _cloud_bootstrap_repository()
     settings = repository.get_settings()
     return RuntimeBootstrapCloudDatabaseStatus(
-        configured=cloud_config.is_postgresql_enabled,
+        configured=_cloud_database_configured(cloud_config),
         active_at_start=active_at_start,
-        host=cloud_config.host,
-        port=cloud_config.port,
-        database=cloud_config.database,
-        username=cloud_config.username,
-        sslmode=cloud_config.sslmode,
-        bootstrap_storage_location=str(repository.db_path()),
         updated_at=settings.updated_at if settings is not None else None,
         error_message=None,
     )
+
+
+def _cloud_database_configured(cloud_config: CloudUserConfigDatabaseConfig | None = None) -> bool:
+    if cloud_config is None:
+        cloud_config = ConfigRegistry.instance().cloud_user_config_database
+    if cloud_config.is_postgresql_enabled:
+        return True
+    try:
+        settings = _cloud_bootstrap_repository().get_settings()
+    except Exception as exc:  # noqa: BLE001 - 状态判断需要降级为未配置
+        logger.warning("读取云端用户配置 bootstrap 状态失败: %s", exc, exc_info=True)
+        return False
+    return bool(settings and settings.configured)
 
 
 def _object_storage_status() -> RuntimeBootstrapObjectStorageStatus:
@@ -183,14 +186,12 @@ def _object_storage_status() -> RuntimeBootstrapObjectStorageStatus:
         settings = repository.get_settings()
         return RuntimeBootstrapObjectStorageStatus(
             configured=settings.configured,
-            storage_location=str(repository.db_path()),
             updated_at=settings.updated_at,
         )
     except Exception as exc:  # noqa: BLE001 - 状态接口需要降级呈现配置错误
         logger.warning("读取对象存储设置状态失败: %s", exc, exc_info=True)
         return RuntimeBootstrapObjectStorageStatus(
             configured=False,
-            storage_location=str(repository.db_path()),
             error_message=str(exc),
         )
 
