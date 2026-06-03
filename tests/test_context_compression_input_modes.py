@@ -6,10 +6,13 @@ from pathlib import Path
 
 from agent_runtime.context_compression.compression_service import (
     ContextCompressionService,
+    _assembler_input,
     _required_native_input_modalities,
     _select_worker_input_mode_and_candidates,
 )
-from agent_runtime.context_compression.models import CompressionJob, CompressionRange
+from agent_runtime.context_compression.conversation_rewriter import rewrite_conversation_with_summary
+from agent_runtime.context_compression.default_prompts import get_default_worker_prompt
+from agent_runtime.context_compression.models import CompressionJob, CompressionRange, SectionItem
 from agent_runtime.context_compression.settings_repository import ContextCompressionSettingsRepository
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.context_compression.worker_runner import _worker_render_options
@@ -380,6 +383,94 @@ class ToolResultTranscriptFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[image file] resource_id=missing-image unresolved", text)
         self.assertIn("[pdf file] resource_id=<missing>", text)
         self.assertIn("[image file] resource_id=image-2 resolved_without_url_or_path", text)
+
+
+class ContextCompressionVisibilityContractTests(unittest.TestCase):
+    def test_assembler_input_uses_business_materials_without_worker_or_job_metadata(self) -> None:
+        job = _job()
+        job.section_items.append(
+            SectionItem(
+                section="requirements_constraints",
+                content="用户要求压缩摘要不要暴露内部 worker 信息。",
+                priority="P0",
+                status="active",
+                source_message_ranges=[[0, 3]],
+                resource_references=[{"absolute_path": "D:/repo/src/app.py", "line_ranges": [[10, 20]]}],
+                worker_name="RequirementConstraintWorker",
+            )
+        )
+        job.section_items.append(
+            SectionItem(
+                section="progress_plan",
+                content="当前任务已定位到汇编输入契约问题。",
+                priority="P1",
+                status="active",
+                source_message_ranges=[[4, 6]],
+                worker_name="ProgressPlanWorker",
+            )
+        )
+
+        assembler_input = _assembler_input(job)
+
+        self.assertIn("用户需求与硬约束", assembler_input)
+        self.assertIn("任务计划与执行进度", assembler_input)
+        self.assertIn("用户要求压缩摘要不要暴露内部 worker 信息。", assembler_input)
+        self.assertIn("可复查资源定位", assembler_input)
+        self.assertNotIn("job-1", assembler_input)
+        self.assertNotIn("root-1", assembler_input)
+        self.assertNotIn("conversation-1", assembler_input)
+        self.assertNotIn("compression_index", assembler_input)
+        self.assertNotIn("worker:", assembler_input)
+        self.assertNotIn("RequirementConstraintWorker", assembler_input)
+        self.assertNotIn("ProgressPlanWorker", assembler_input)
+        self.assertNotIn("source_message_ranges", assembler_input)
+
+    def test_rewritten_summary_visible_markdown_hides_runtime_metadata_but_keeps_provider_extras(self) -> None:
+        source_conversation = create_conversation()
+        source_conversation.add_user_message([TextPart("compressed history")], [TextPartMeta()])
+        source_conversation.add_user_message([TextPart("retained tail")], [TextPartMeta()])
+        job = _job()
+        range_plan = _range_plan()
+
+        target_conversation, summary_message_id = rewrite_conversation_with_summary(
+            source_conversation=source_conversation,
+            job=job,
+            range_plan=range_plan,
+            final_markdown="## Current Objective\n继续定位上下文压缩摘要可见性问题。",
+        )
+
+        summary_message = target_conversation.messages[0]
+        summary_text = summary_message.content[0].text
+        self.assertEqual(summary_message_id, "summary-job-1")
+        self.assertIn("# Runtime Compressed Task Context", summary_text)
+        self.assertIn("## Usage Contract", summary_text)
+        self.assertIn("## Current Objective", summary_text)
+        self.assertNotIn("Runtime Compression Metadata", summary_text)
+        self.assertNotIn("job-1", summary_text)
+        self.assertNotIn("root-1", summary_text)
+        self.assertNotIn("conversation-1", summary_text)
+        self.assertNotIn("compressed_message_range", summary_text)
+        self.assertNotIn("retained_tail_range", summary_text)
+
+        context_compression_extras = summary_message.provider_extras["context_compression"]
+        self.assertEqual(context_compression_extras["job_id"], "job-1")
+        self.assertEqual(context_compression_extras["root_conversation_id"], "root-1")
+        self.assertEqual(context_compression_extras["source_conversation_id"], "conversation-1")
+        self.assertEqual(context_compression_extras["compressed_range"], {"start_index": 0, "end_index": 1})
+        self.assertEqual(context_compression_extras["retained_tail_range"]["start_index"], 2)
+
+    def test_final_assembler_default_prompts_use_business_visible_contract(self) -> None:
+        for input_mode in ["transcript_snapshot", "native_multimodal_history"]:
+            with self.subTest(input_mode=input_mode):
+                prompt = get_default_worker_prompt(input_mode=input_mode, worker_name="FinalAssemblerWorker")
+
+                self.assertIn("业务维度", prompt)
+                self.assertIn("最终 Markdown 的读者是继续执行任务的业务 Agent", prompt)
+                self.assertIn("禁止在最终 Markdown 中输出压缩执行角色名称", prompt)
+                self.assertNotIn("Section Worker", prompt)
+                self.assertNotIn("FinalAssemblerWorker", prompt)
+                self.assertNotIn("Provenance", prompt)
+                self.assertNotIn("Usage Contract", prompt)
 
 
 if __name__ == "__main__":

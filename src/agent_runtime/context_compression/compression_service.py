@@ -35,6 +35,7 @@ from agent_runtime.context_compression.models import (
     CompressionRange,
     CompressionResult,
     SECTION_WORKERS,
+    SECTION_WORKER_TITLES,
     context_compression_worker_id,
     context_compression_worker_title,
 )
@@ -705,27 +706,41 @@ def _native_history_instruction(job: CompressionJob, range_plan: CompressionRang
 
 
 def _assembler_input(job: CompressionJob) -> str:
+    section_order = [section for _worker_name, section in SECTION_WORKERS]
+    grouped_items: dict[str, list[Any]] = {section: [] for section in section_order}
+    for item in job.section_items:
+        grouped_items.setdefault(item.section, []).append(item)
+
+    ordered_sections = [section for section in section_order if grouped_items.get(section)]
+    ordered_sections.extend(section for section in grouped_items if section not in section_order and grouped_items.get(section))
+
     lines = [
-        "# Context Compression Section Items",
+        "# Context Compression Business Materials",
         "",
-        f"job_id: {job.job_id}",
-        f"root_conversation_id: {job.root_conversation_id}",
-        f"source_conversation_id: {job.source_conversation_id}",
-        f"compression_index: {job.compression_index}",
+        "下面是从目标 Agent 的历史会话中按业务维度提取的压缩材料。",
+        "请基于这些业务材料合并、去重、排序并生成下游业务 Agent 可读的历史上下文摘要。",
         "",
     ]
-    for item in job.section_items:
+    for section in ordered_sections:
+        title = SECTION_WORKER_TITLES.get(section, section)
         lines.extend([
-            f"## {item.section}",
-            f"- priority: {item.priority}",
-            f"- status: {item.status}",
-            f"- worker: {item.worker_name or ''}",
-            f"- source_message_ranges: {item.source_message_ranges}",
-            f"- resource_references: {item.resource_references}",
-            item.content,
+            f"## {title}",
+            f"这是从目标 Agent 的会话中提取的{title}信息：",
             "",
         ])
-    return "\n".join(lines)
+        for index, item in enumerate(grouped_items[section], start=1):
+            lines.extend([
+                f"### 条目 {index}",
+                f"- priority: {item.priority}",
+                f"- status: {item.status}",
+            ])
+            if item.resource_references:
+                lines.append(f"- 可复查资源定位: {item.resource_references}")
+            lines.extend([
+                item.content,
+                "",
+            ])
+    return "\n".join(lines).strip()
 
 
 def _verifier_input(job: CompressionJob) -> str:

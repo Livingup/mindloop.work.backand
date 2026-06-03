@@ -40,16 +40,7 @@ def rewrite_conversation_with_summary(
 
 
 def _build_summary_markdown(job: CompressionJob, range_plan: CompressionRange, final_markdown: str) -> str:
-    metadata = "\n".join([
-        "## Runtime Compression Metadata",
-        f"- job_id: {job.job_id}",
-        f"- root_conversation_id: {job.root_conversation_id}",
-        f"- source_conversation_id: {job.source_conversation_id}",
-        f"- compression_index: {job.compression_index}",
-        f"- compressed_message_range: {range_plan.compressed_start_index}..{range_plan.compressed_end_index}",
-        f"- retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
-        f"- retained_tail_anchor: {range_plan.retained_tail_anchor}",
-    ])
+    del job, range_plan  # internal compression metadata stays in provider_extras, not visible Markdown
     usage_contract = "\n".join([
         "# Runtime Compressed Task Context",
         "",
@@ -59,4 +50,4 @@ def _build_summary_markdown(job: CompressionJob, range_plan: CompressionRange, f
         "- If this summary conflicts with later retained raw tail messages, the retained raw tail messages take precedence.",
         "",
     ])
-    return f"{usage_contract}{metadata}\n\n{final_markdown.strip()}\n"
+    return f"{usage_contract}{final_markdown.strip()}\n"

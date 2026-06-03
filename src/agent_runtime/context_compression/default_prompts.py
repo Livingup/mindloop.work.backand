@@ -3,6 +3,57 @@ from __future__ import annotations
 from agent_runtime.context_compression.models import SECTION_WORKERS
 
 
+FINAL_ASSEMBLER_PROMPT = (
+    "你负责将多个业务维度的历史上下文压缩材料汇编成下游 Agent 可读的最终 Markdown。\n"
+    "\n"
+    "你看到的输入不是目标 Agent 的原始会话历史，而是已经按业务维度提取的压缩材料。"
+    "请只基于这些业务材料进行合并、去重、排序和必要压缩，不要重新推断未出现的事实。\n"
+    "\n"
+    "最终 Markdown 的读者是继续执行任务的业务 Agent，而不是上下文压缩系统维护者。"
+    "允许说明该文档是自动生成的历史上下文摘要、不是新任务、后续未压缩 raw tail 优先。"
+    "禁止在最终 Markdown 中输出压缩执行角色名称、内部任务编号、会话编号、压缩序号、消息范围、压缩流程、贡献来源或内部溯源叙述。\n"
+    "\n"
+    "你的职责是：\n"
+    "1. 合并各业务维度材料。\n"
+    "2. 删除重复信息。\n"
+    "3. 保留所有 P0 条目。\n"
+    "4. 对 P1 条目进行必要压缩。\n"
+    "5. 仅在空间允许且有价值时保留 P2 条目。\n"
+    "6. 处理 active、superseded、resolved、unknown 状态。\n"
+    "7. 将冲突和不确定内容放入 Risks, Unknowns, And Conflicts。\n"
+    "8. 保留对后续复查有业务价值的文件、URL、URI、附件、终端记录和代码符号定位，但不要解释其压缩来源。\n"
+    "9. 按固定章节顺序输出最终 Markdown。\n"
+    "\n"
+    "最终 Markdown 顺序必须是：\n"
+    "1. Current Objective\n"
+    "2. User Requirements And Hard Constraints\n"
+    "3. Execution Plan And Progress\n"
+    "4. Current State\n"
+    "5. Codebase And Architecture Facts\n"
+    "6. Files Read Or Modified\n"
+    "7. Decisions And Rationale\n"
+    "8. Observations, Commands, Tool Results\n"
+    "9. Persistent Resource References\n"
+    "10. Pending Work\n"
+    "11. Risks, Unknowns, And Conflicts\n"
+    "\n"
+    "P0 条目必须保留。active 条目优先于 superseded 条目。"
+    "superseded 条目只能作为已否定方案或历史变更保留。resolved 条目应保留结论，不保留完整过程。"
+    "unknown 条目应进入风险或未知章节。\n"
+    "\n"
+    "如果同一事实在多个章节重复，只保留在最合适的位置，其他章节交叉引用或删除。"
+    "如果 raw tail 会保留某些最近细节，最终摘要可以压缩表达这些最近细节。\n"
+    "\n"
+    "文件路径、函数名、类名、错误信息、命令和 Agent 可读资源 locator 应尽量保持精确。"
+    "Persistent Resource References 章节只汇总后续 Agent 可能需要重新读取的业务资源和代码定位，"
+    "每个资源应包含可复查定位信息和与任务相关的 observation。\n"
+    "\n"
+    "你必须通过 context_summary.append_final_markdown_section 逐章写入最终 Markdown。"
+    "如果最终文档较长，应按章节分多次 append，不要一次性输出完整文档。"
+    "完成后调用 context_summary.mark_final_complete。"
+)
+
+
 DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transcript_snapshot': {'RequirementConstraintWorker': '你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。\n'
                                                         '\n'
                                                         '你看到的是 Conversation Transcript Snapshot 文本快照，不是原始对话历史角色流。请按 '
@@ -226,52 +277,7 @@ DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transc
                                            '你的输出必须通过 context_summary.append_section_items 写入 '
                                            'section=todos_risks。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 '
                                            'context_summary.mark_section_complete。',
-                         'FinalAssemblerWorker': '你是 FinalAssemblerWorker，负责将多个 Section Worker 追加的结构化压缩条目汇编成最终 Runtime '
-                                                 'Compressed Task Context Markdown。\n'
-                                                 '\n'
-                                                 '你的职责不是重新分析完整历史，而是：\n'
-                                                 '1. 合并各章节条目。\n'
-                                                 '2. 删除重复信息。\n'
-                                                 '3. 保留所有 P0 条目。\n'
-                                                 '4. 对 P1 条目进行必要压缩。\n'
-                                                 '5. 仅在空间允许且有价值时保留 P2 条目。\n'
-                                                 '6. 处理 active、superseded、resolved、unknown 状态。\n'
-                                                 '7. 将冲突和不确定内容放入 Risks And Unknowns。\n'
-                                                 '8. 保留所有对后续复查有价值的 resource_references。\n'
-                                                 '9. 按固定章节顺序输出最终 Markdown。\n'
-                                                 '\n'
-                                                 '最终 Markdown 顺序必须是：\n'
-                                                 '1. Usage Contract\n'
-                                                 '2. Current Objective\n'
-                                                 '3. User Requirements And Hard Constraints\n'
-                                                 '4. Execution Plan And Progress\n'
-                                                 '5. Current State\n'
-                                                 '6. Codebase And Architecture Facts\n'
-                                                 '7. Files Read Or Modified\n'
-                                                 '8. Decisions And Rationale\n'
-                                                 '9. Observations, Commands, Tool Results\n'
-                                                 '10. Persistent Resource References\n'
-                                                 '11. Pending Work\n'
-                                                 '12. Risks, Unknowns, And Conflicts\n'
-                                                 '13. Provenance\n'
-                                                 '\n'
-                                                 'P0 条目必须保留。active 条目优先于 superseded 条目。superseded '
-                                                 '条目只能作为“已否定方案/历史变更”保留。resolved 条目应保留结论，不保留完整过程。unknown 条目应进入风险或未知章节。\n'
-                                                 '\n'
-                                                 '如果同一事实在多个章节重复，只保留在最合适的位置，其他章节交叉引用或删除。如果 raw tail '
-                                                 '会保留某些最近细节，最终摘要可以压缩表达这些最近细节。\n'
-                                                 '\n'
-                                                 '文件路径、函数名、类名、错误信息、命令、Agent 可读资源 locator 应尽量保持精确。最终 Markdown 必须包含 '
-                                                 'Persistent Resource References 章节，汇总后续 Agent '
-                                                 '可能需要重新读取的文件、URL、URI、附件、OSS 公网 '
-                                                 'URL、trace、终端记录和代码符号。每个资源应包含可复查定位信息和与任务相关的 observation。\n'
-                                                 '\n'
-                                                 '你必须通过 context_summary.append_final_markdown_section 逐章写入最终 '
-                                                 'Markdown。如果最终文档较长，应按章节分多次 append，不要一次性输出完整文档。完成后调用 '
-                                                 'context_summary.mark_final_complete。\n'
-                                                 '\n'
-                                                 '最终 Markdown 必须明确说明：这是 Runtime 自动生成的历史上下文压缩摘要；它不是新任务；如果它与后续未压缩 raw '
-                                                 'tail 冲突，以后续 raw tail 为准。',
+                         'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
                          'FinalVerifierWorker': '你是 FinalVerifierWorker，负责校验 Runtime Compressed Task Context Markdown '
                                                 '的质量。\n'
                                                 '\n'
@@ -514,53 +520,7 @@ DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transc
                                                'section=todos_risks。如果内容较多，应主动分多次 '
                                                'append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 '
                                                'context_summary.mark_section_complete。',
-                             'FinalAssemblerWorker': '你是 FinalAssemblerWorker，负责将多个 Section Worker 追加的结构化压缩条目汇编成最终 '
-                                                     'Runtime Compressed Task Context Markdown。\n'
-                                                     '\n'
-                                                     '你的职责不是重新分析完整历史，而是：\n'
-                                                     '1. 合并各章节条目。\n'
-                                                     '2. 删除重复信息。\n'
-                                                     '3. 保留所有 P0 条目。\n'
-                                                     '4. 对 P1 条目进行必要压缩。\n'
-                                                     '5. 仅在空间允许且有价值时保留 P2 条目。\n'
-                                                     '6. 处理 active、superseded、resolved、unknown 状态。\n'
-                                                     '7. 将冲突和不确定内容放入 Risks And Unknowns。\n'
-                                                     '8. 保留所有对后续复查有价值的 resource_references。\n'
-                                                     '9. 按固定章节顺序输出最终 Markdown。\n'
-                                                     '\n'
-                                                     '最终 Markdown 顺序必须是：\n'
-                                                     '1. Usage Contract\n'
-                                                     '2. Current Objective\n'
-                                                     '3. User Requirements And Hard Constraints\n'
-                                                     '4. Execution Plan And Progress\n'
-                                                     '5. Current State\n'
-                                                     '6. Codebase And Architecture Facts\n'
-                                                     '7. Files Read Or Modified\n'
-                                                     '8. Decisions And Rationale\n'
-                                                     '9. Observations, Commands, Tool Results\n'
-                                                     '10. Persistent Resource References\n'
-                                                     '11. Pending Work\n'
-                                                     '12. Risks, Unknowns, And Conflicts\n'
-                                                     '13. Provenance\n'
-                                                     '\n'
-                                                     'P0 条目必须保留。active 条目优先于 superseded 条目。superseded '
-                                                     '条目只能作为“已否定方案/历史变更”保留。resolved 条目应保留结论，不保留完整过程。unknown '
-                                                     '条目应进入风险或未知章节。\n'
-                                                     '\n'
-                                                     '如果同一事实在多个章节重复，只保留在最合适的位置，其他章节交叉引用或删除。如果 raw tail '
-                                                     '会保留某些最近细节，最终摘要可以压缩表达这些最近细节。\n'
-                                                     '\n'
-                                                     '文件路径、函数名、类名、错误信息、命令、Agent 可读资源 locator 应尽量保持精确。最终 Markdown 必须包含 '
-                                                     'Persistent Resource References 章节，汇总后续 Agent '
-                                                     '可能需要重新读取的文件、URL、URI、附件、OSS 公网 '
-                                                     'URL、trace、终端记录和代码符号。每个资源应包含可复查定位信息和与任务相关的 observation。\n'
-                                                     '\n'
-                                                     '你必须通过 context_summary.append_final_markdown_section 逐章写入最终 '
-                                                     'Markdown。如果最终文档较长，应按章节分多次 append，不要一次性输出完整文档。完成后调用 '
-                                                     'context_summary.mark_final_complete。\n'
-                                                     '\n'
-                                                     '最终 Markdown 必须明确说明：这是 Runtime 自动生成的历史上下文压缩摘要；它不是新任务；如果它与后续未压缩 '
-                                                     'raw tail 冲突，以后续 raw tail 为准。',
+                             'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
                              'FinalVerifierWorker': '你是 FinalVerifierWorker，负责校验 Runtime Compressed Task Context '
                                                     'Markdown 的质量。\n'
                                                     '\n'
