@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 from pathlib import Path
 
 
@@ -182,6 +183,202 @@ class ContextCompressionWorkerPromptRepository:
         _migrate_legacy_input_modes(conn)
         conn.commit()
         return conn
+
+
+class PostgresContextCompressionWorkerPromptRepository:
+    """上下文压缩 Worker prompt 的云端 PostgreSQL 仓储。
+
+    Worker prompt override 属于用户多设备共享级系统配置，运行时只保存到
+    cloud_user_config_items，不提供本机 SQLite fallback。本机 SQLite 仓储仅作为
+    显式迁移旧数据的 legacy source 使用。
+    """
+
+    _NAMESPACE = "context_compression.worker_prompt"
+
+    def __init__(self, store_accessor: Callable[[], Any]) -> None:
+        self._store_accessor = store_accessor
+
+    def upsert_default(
+        self,
+        *,
+        input_mode: str,
+        worker_name: str,
+        default_prompt_text: str,
+    ) -> ContextCompressionWorkerPrompt:
+        current = self.get_prompt(input_mode=input_mode, worker_name=worker_name)
+        now = _utc_now_text()
+        if current is None:
+            prompt = ContextCompressionWorkerPrompt(
+                input_mode=input_mode,
+                worker_name=worker_name,
+                prompt_text=default_prompt_text,
+                default_prompt_text=default_prompt_text,
+                is_custom=False,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+            )
+            self._save_prompt(prompt)
+            return prompt
+        if current.default_prompt_text != default_prompt_text:
+            prompt = ContextCompressionWorkerPrompt(
+                input_mode=input_mode,
+                worker_name=worker_name,
+                prompt_text=current.prompt_text if current.is_custom else default_prompt_text,
+                default_prompt_text=default_prompt_text,
+                is_custom=current.is_custom,
+                revision=current.revision if current.is_custom else current.revision + 1,
+                created_at=current.created_at,
+                updated_at=now,
+            )
+            self._save_prompt(prompt)
+            return prompt
+        return current
+
+    def list_prompts(self) -> list[ContextCompressionWorkerPrompt]:
+        return [
+            _payload_to_prompt(payload)
+            for payload in self._store_accessor().list_payloads(self._NAMESPACE)
+        ]
+
+    def get_prompt(
+        self,
+        *,
+        input_mode: str,
+        worker_name: str,
+    ) -> ContextCompressionWorkerPrompt | None:
+        payload = self._store_accessor().get_payload(
+            self._NAMESPACE,
+            _prompt_item_id(input_mode=input_mode, worker_name=worker_name),
+        )
+        return _payload_to_prompt(payload) if payload is not None else None
+
+    def get_required_prompt(
+        self,
+        *,
+        input_mode: str,
+        worker_name: str,
+    ) -> ContextCompressionWorkerPrompt:
+        prompt = self.get_prompt(input_mode=input_mode, worker_name=worker_name)
+        if prompt is None:
+            raise KeyError(f"上下文压缩 Worker prompt 不存在: {input_mode}/{worker_name}")
+        return prompt
+
+    def update_prompt(
+        self,
+        *,
+        input_mode: str,
+        worker_name: str,
+        prompt_text: str,
+    ) -> ContextCompressionWorkerPrompt:
+        if not prompt_text.strip():
+            raise ValueError("prompt_text 不能为空。")
+        current = self.get_required_prompt(input_mode=input_mode, worker_name=worker_name)
+        prompt = ContextCompressionWorkerPrompt(
+            input_mode=input_mode,
+            worker_name=worker_name,
+            prompt_text=prompt_text,
+            default_prompt_text=current.default_prompt_text,
+            is_custom=True,
+            revision=current.revision + 1,
+            created_at=current.created_at,
+            updated_at=_utc_now_text(),
+        )
+        self._save_prompt(prompt)
+        return prompt
+
+    def reset_prompt(
+        self,
+        *,
+        input_mode: str,
+        worker_name: str,
+    ) -> ContextCompressionWorkerPrompt:
+        current = self.get_required_prompt(input_mode=input_mode, worker_name=worker_name)
+        prompt = ContextCompressionWorkerPrompt(
+            input_mode=input_mode,
+            worker_name=worker_name,
+            prompt_text=current.default_prompt_text,
+            default_prompt_text=current.default_prompt_text,
+            is_custom=False,
+            revision=current.revision + 1,
+            created_at=current.created_at,
+            updated_at=_utc_now_text(),
+        )
+        self._save_prompt(prompt)
+        return prompt
+
+    def save_prompt_snapshot(
+        self,
+        prompt: ContextCompressionWorkerPrompt,
+    ) -> ContextCompressionWorkerPrompt:
+        """保存迁移源中的完整 Worker prompt 快照，保留原始时间与 revision。"""
+        self._save_prompt(prompt)
+        return prompt
+
+    def contains_prompt(self, input_mode: str, worker_name: str) -> bool:
+        return self._store_accessor().contains_payload(
+            self._NAMESPACE,
+            _prompt_item_id(input_mode=input_mode, worker_name=worker_name),
+        )
+
+    def db_path(self) -> str:
+        return "postgresql:cloud_user_config_items/context_compression.worker_prompt"
+
+    def _save_prompt(self, prompt: ContextCompressionWorkerPrompt) -> None:
+        self._store_accessor().save_payload(
+            self._NAMESPACE,
+            _prompt_item_id(input_mode=prompt.input_mode, worker_name=prompt.worker_name),
+            _prompt_payload(prompt),
+        )
+
+
+def create_context_compression_worker_prompt_repository(
+    data_dir_accessor: Callable[[], str],
+):
+    """创建上下文压缩 Worker prompt 共享配置仓储。
+
+    用户多设备共享级 Worker prompt 配置以云端 PostgreSQL 为唯一运行时权威；
+    data_dir_accessor 仅保留为与 legacy SQLite 仓储和迁移代码兼容的形参，
+    运行时不得因云端不可用而回退到本机 SQLite。
+    """
+    del data_dir_accessor
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.config import ConfigRegistry
+
+    store = PostgresUserConfigStore(
+        lambda: ConfigRegistry.instance().cloud_user_config_database,
+    )
+    return PostgresContextCompressionWorkerPromptRepository(lambda: store)
+
+
+def _prompt_item_id(*, input_mode: str, worker_name: str) -> str:
+    return f"{input_mode}:{worker_name}"
+
+
+def _prompt_payload(prompt: ContextCompressionWorkerPrompt) -> dict[str, Any]:
+    return {
+        "input_mode": prompt.input_mode,
+        "worker_name": prompt.worker_name,
+        "prompt_text": prompt.prompt_text,
+        "default_prompt_text": prompt.default_prompt_text,
+        "is_custom": prompt.is_custom,
+        "revision": prompt.revision,
+        "created_at": prompt.created_at,
+        "updated_at": prompt.updated_at,
+    }
+
+
+def _payload_to_prompt(payload: dict[str, Any]) -> ContextCompressionWorkerPrompt:
+    return ContextCompressionWorkerPrompt(
+        input_mode=str(payload["input_mode"]),
+        worker_name=str(payload["worker_name"]),
+        prompt_text=str(payload["prompt_text"]),
+        default_prompt_text=str(payload["default_prompt_text"]),
+        is_custom=bool(payload.get("is_custom", False)),
+        revision=int(payload.get("revision", 1)),
+        created_at=str(payload["created_at"]),
+        updated_at=str(payload["updated_at"]),
+    )
 
 
 def _ensure_revision_column(conn: sqlite3.Connection) -> None:

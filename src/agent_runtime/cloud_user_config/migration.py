@@ -13,6 +13,14 @@ from agent_runtime.agent_definition.infrastructure.yaml_agent_definition_reposit
     YamlAgentDefinitionRepository,
 )
 from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+from agent_runtime.context_compression.prompt_repository import (
+    ContextCompressionWorkerPromptRepository,
+    PostgresContextCompressionWorkerPromptRepository,
+)
+from agent_runtime.context_compression.settings_repository import (
+    ContextCompressionSettingsRepository,
+    PostgresContextCompressionSettingsRepository,
+)
 from agent_runtime.image_generation.settings_repository import (
     ImageGenerationRuntimeSettings,
     ImageGenerationSettingsRepository,
@@ -88,6 +96,8 @@ class CloudUserConfigMigrationSummary:
     image_llm_execution_policies: MigrationDomainStats = field(default_factory=MigrationDomainStats)
     image_generation_settings: MigrationDomainStats = field(default_factory=MigrationDomainStats)
     web_tools_settings: MigrationDomainStats = field(default_factory=MigrationDomainStats)
+    context_compression_settings: MigrationDomainStats = field(default_factory=MigrationDomainStats)
+    context_compression_worker_prompts: MigrationDomainStats = field(default_factory=MigrationDomainStats)
     mcp_streamable_http_services: MigrationDomainStats = field(default_factory=MigrationDomainStats)
     lacp_registry_settings: MigrationDomainStats = field(default_factory=MigrationDomainStats)
     errors: list[str] = field(default_factory=list)
@@ -119,6 +129,8 @@ class CloudUserConfigMigrationSummary:
             "image_llm_execution_policies": self.image_llm_execution_policies.to_dict(),
             "image_generation_settings": self.image_generation_settings.to_dict(),
             "web_tools_settings": self.web_tools_settings.to_dict(),
+            "context_compression_settings": self.context_compression_settings.to_dict(),
+            "context_compression_worker_prompts": self.context_compression_worker_prompts.to_dict(),
             "mcp_streamable_http_services": self.mcp_streamable_http_services.to_dict(),
             "lacp_registry_settings": self.lacp_registry_settings.to_dict(),
             "errors": list(self.errors),
@@ -136,6 +148,8 @@ class CloudUserConfigMigrationSummary:
             self.image_llm_execution_policies,
             self.image_generation_settings,
             self.web_tools_settings,
+            self.context_compression_settings,
+            self.context_compression_worker_prompts,
             self.mcp_streamable_http_services,
             self.lacp_registry_settings,
         )
@@ -148,8 +162,9 @@ def migrate_local_user_global_config_to_postgresql(
     """把本机已批准的用户全局配置一次性导入云端 PostgreSQL。
 
     迁移范围严格限制为 prompt snippets、agent definitions、主/图像生成 LLM Registry、
-    图像生成运行时设置、Web Tools 候选设置、streamable-http MCP 服务定义和 LACP Registry 服务设置。
-    运行态、会话历史、项目数据、stdio MCP 本机路径、LACP instance registrations 等不属于迁移范围。
+    图像生成运行时设置、Web Tools 候选设置、上下文压缩共享偏好与自定义 Worker Prompt、
+    streamable-http MCP 服务定义和 LACP Registry 服务设置。
+    会话历史、项目数据、stdio MCP 本机路径、LACP instance registrations、上下文压缩 job/archive 等不属于迁移范围。
     """
     from agent_runtime.config import ConfigRegistry
 
@@ -193,6 +208,8 @@ def migrate_local_user_global_config_to_postgresql(
     )
     _migrate_image_generation_settings(store, summary, overwrite=overwrite)
     _migrate_web_tools_settings(store, summary, overwrite=overwrite)
+    _migrate_context_compression_settings(store, summary, overwrite=overwrite)
+    _migrate_context_compression_worker_prompts(store, summary, overwrite=overwrite)
     _migrate_mcp_streamable_http_services(store, summary, overwrite=overwrite)
     _migrate_lacp_registry_settings(store, summary, overwrite=overwrite)
 
@@ -359,6 +376,69 @@ def _migrate_web_tools_settings(
         ),
         overwrite=overwrite,
     )
+
+
+def _migrate_context_compression_settings(
+    store: PostgresUserConfigStore,
+    summary: CloudUserConfigMigrationSummary,
+    *,
+    overwrite: bool,
+) -> None:
+    from agent_runtime.config import ConfigRegistry
+
+    source = ContextCompressionSettingsRepository(
+        lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+    )
+    target = PostgresContextCompressionSettingsRepository(lambda: store)
+    _migrate_singleton(
+        domain="context_compression.settings",
+        stats=summary.context_compression_settings,
+        errors=summary.errors,
+        item=lambda: source.get_settings(),
+        item_id="default",
+        should_import=lambda item: (
+            item.updated_at is not None
+            or item.llm_policy_group_id is not None
+            or item.input_mode is not None
+        ),
+        exists=target.contains_settings,
+        save=target.save_settings_snapshot,
+        overwrite=overwrite,
+    )
+
+
+def _migrate_context_compression_worker_prompts(
+    store: PostgresUserConfigStore,
+    summary: CloudUserConfigMigrationSummary,
+    *,
+    overwrite: bool,
+) -> None:
+    from agent_runtime.config import ConfigRegistry
+
+    source = ContextCompressionWorkerPromptRepository(
+        lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+    )
+    target = PostgresContextCompressionWorkerPromptRepository(lambda: store)
+    _migrate_collection(
+        domain="context_compression.worker_prompts",
+        stats=summary.context_compression_worker_prompts,
+        errors=summary.errors,
+        items=lambda: [prompt for prompt in source.list_prompts() if prompt.is_custom],
+        item_id=lambda item: f"{item.input_mode}:{item.worker_name}",
+        exists=lambda item_id: _context_compression_prompt_exists(target, item_id),
+        save=target.save_prompt_snapshot,
+        overwrite=overwrite,
+    )
+
+
+def _context_compression_prompt_exists(
+    target: PostgresContextCompressionWorkerPromptRepository,
+    item_id: str,
+) -> bool:
+    input_mode, separator, worker_name = item_id.partition(":")
+    if not separator:
+        return False
+    return target.contains_prompt(input_mode, worker_name)
 
 
 def _migrate_mcp_streamable_http_services(

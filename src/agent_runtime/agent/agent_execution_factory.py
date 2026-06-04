@@ -11,7 +11,8 @@ from agent_runtime.communication.communication_factory import CommunicationFacto
 from agent_runtime.communication.runtime_event_publisher import CommunicationRuntimeEventPublisher
 from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.compression_service import ContextCompressionService
-from agent_runtime.context_compression.settings_repository import ContextCompressionSettingsRepository
+from agent_runtime.context_compression.prompt_repository import create_context_compression_worker_prompt_repository
+from agent_runtime.context_compression.settings_repository import create_context_compression_settings_repository
 from agent_runtime.conversation_message.infrastructure import SqliteConversationRepository
 
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
@@ -142,7 +143,10 @@ class AgentExecutionFactory:
             agent_definition_gateway=agent_definition_gateway,
         )
         llm_registry_gateway = LlmModelRegistryFactory.create()
-        context_compression_settings_repository = ContextCompressionSettingsRepository(
+        context_compression_settings_repository = create_context_compression_settings_repository(
+            lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+        )
+        context_compression_prompt_repository = create_context_compression_worker_prompt_repository(
             lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
         )
         context_compression_service = ContextCompressionService(
@@ -157,6 +161,7 @@ class AgentExecutionFactory:
             event_publisher=event_publisher,
             config_accessor=lambda: ConfigRegistry.instance().context_compression,
             settings_repository=context_compression_settings_repository,
+            prompt_repository=context_compression_prompt_repository,
         )
         engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,

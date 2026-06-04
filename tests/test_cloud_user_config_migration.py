@@ -19,6 +19,14 @@ from agent_runtime.cloud_user_config.config import (
     CloudUserConfigDatabasePoolConfig,
 )
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.context_compression.prompt_repository import (
+    ContextCompressionWorkerPromptRepository,
+    create_context_compression_worker_prompt_repository,
+)
+from agent_runtime.context_compression.settings_repository import (
+    ContextCompressionSettingsRepository,
+    create_context_compression_settings_repository,
+)
 from agent_runtime.image_generation.settings_repository import (
     ImageGenerationSettingsRepository,
     create_image_generation_settings_repository,
@@ -136,6 +144,8 @@ def test_migrate_local_user_global_config_to_postgresql_copies_approved_domains(
     )
     _write_image_generation_settings(data_root)
     _write_web_tools_settings(data_root)
+    _write_context_compression_settings(data_root)
+    _write_context_compression_worker_prompts(data_root)
     _write_mcp_services(data_root)
     _write_lacp_settings(data_root)
 
@@ -147,11 +157,11 @@ def test_migrate_local_user_global_config_to_postgresql_copies_approved_domains(
         ConfigRegistry.reset()
 
     assert summary.failed_total == 0
-    assert summary.imported_total == 12
+    assert summary.imported_total == 14
     assert summary.skipped_total == 0
     assert second_summary.failed_total == 0
     assert second_summary.imported_total == 0
-    assert second_summary.skipped_total == 12
+    assert second_summary.skipped_total == 14
 
     store = _FakePostgresUserConfigStore.last_instance
     assert store is not None
@@ -176,6 +186,23 @@ def test_migrate_local_user_global_config_to_postgresql_copies_approved_domains(
     web_tools_payload = items[("web_tools.runtime_settings", "default")]
     assert web_tools_payload["candidates"][0]["provider_id"] == "shared-provider"
     assert web_tools_payload["candidates"][0]["model_binding_id"] == "shared-binding"
+
+    context_settings_payload = items[("context_compression.runtime_settings", "default")]
+    assert context_settings_payload["llm_policy_group_id"] == "context-policy"
+    assert context_settings_payload["input_mode"] == "native_multimodal_history"
+    assert context_settings_payload["updated_at"] is not None
+
+    custom_prompt_payload = items[(
+        "context_compression.worker_prompt",
+        "native_multimodal_history:ProgressPlanWorker",
+    )]
+    assert custom_prompt_payload["prompt_text"] == "Custom progress prompt"
+    assert custom_prompt_payload["default_prompt_text"] == "Default progress prompt"
+    assert custom_prompt_payload["is_custom"] is True
+    assert (
+        "context_compression.worker_prompt",
+        "transcript_snapshot:RequirementConstraintWorker",
+    ) not in items
 
     mcp_payload = items[("mcp.streamable_http_service_definition", "remote-search")]
     assert mcp_payload["transport"]["type"] == "streamable-http"
@@ -332,6 +359,40 @@ def test_cloud_enabled_shared_domain_repositories_use_postgresql_authority(
         assert lacp_settings.api_key == "lacp-secret"
         assert not (data_root / "lacp" / "lacp_settings.db").exists()
 
+        context_settings_repository = create_context_compression_settings_repository(
+            lambda: str(data_root / "context-compression"),
+        )
+        context_settings = context_settings_repository.set_settings(
+            llm_policy_group_id="cloud-context-policy",
+            input_mode="transcript_snapshot",
+        )
+        assert str(context_settings_repository.db_path()).startswith("postgresql:")
+        assert context_settings_repository.get_settings().llm_policy_group_id == "cloud-context-policy"
+        assert context_settings.input_mode == "transcript_snapshot"
+
+        context_prompt_repository = create_context_compression_worker_prompt_repository(
+            lambda: str(data_root / "context-compression"),
+        )
+        prompt = context_prompt_repository.upsert_default(
+            input_mode="transcript_snapshot",
+            worker_name="RequirementConstraintWorker",
+            default_prompt_text="Default cloud prompt",
+        )
+        prompt = context_prompt_repository.update_prompt(
+            input_mode=prompt.input_mode,
+            worker_name=prompt.worker_name,
+            prompt_text="Custom cloud prompt",
+        )
+        assert str(context_prompt_repository.db_path()).startswith("postgresql:")
+        assert context_prompt_repository.get_required_prompt(
+            input_mode="transcript_snapshot",
+            worker_name="RequirementConstraintWorker",
+        ).prompt_text == "Custom cloud prompt"
+        assert prompt.is_custom is True
+        assert not (
+            data_root / "context-compression" / "context_compression_worker_prompts.db"
+        ).exists()
+
         local_mcp_repository = YamlMcpServiceRepository(lambda: str(data_root / "mcp-servers"))
         shared_store = _FakePostgresUserConfigStore(
             lambda: ConfigRegistry.instance().cloud_user_config_database,
@@ -390,6 +451,8 @@ def _write_runtime_config(config_path: Path, data_root: Path) -> None:
                 f"  config_dir: \"{(data_root / 'mcp-servers').as_posix()}\"",
                 "lacp:",
                 f"  data_dir: \"{(data_root / 'lacp').as_posix()}\"",
+                "context_compression:",
+                f"  archive_data_dir: \"{(data_root / 'context-compression').as_posix()}\"",
                 "cloud_user_config_database:",
                 "  enabled: true",
                 "  backend: \"postgresql\"",
@@ -527,6 +590,37 @@ def _write_web_tools_settings(data_root: Path) -> None:
                 model_binding_id="shared-binding",
             ),
         )
+    )
+
+
+def _write_context_compression_settings(data_root: Path) -> None:
+    repository = ContextCompressionSettingsRepository(
+        lambda: str(data_root / "context-compression"),
+    )
+    repository.set_settings(
+        llm_policy_group_id="context-policy",
+        input_mode="native_multimodal_history",
+    )
+
+
+def _write_context_compression_worker_prompts(data_root: Path) -> None:
+    repository = ContextCompressionWorkerPromptRepository(
+        lambda: str(data_root / "context-compression"),
+    )
+    repository.upsert_default(
+        input_mode="transcript_snapshot",
+        worker_name="RequirementConstraintWorker",
+        default_prompt_text="Default requirement prompt",
+    )
+    repository.upsert_default(
+        input_mode="native_multimodal_history",
+        worker_name="ProgressPlanWorker",
+        default_prompt_text="Default progress prompt",
+    )
+    repository.update_prompt(
+        input_mode="native_multimodal_history",
+        worker_name="ProgressPlanWorker",
+        prompt_text="Custom progress prompt",
     )
 
 

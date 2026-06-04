@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 from pathlib import Path
 
 
@@ -113,6 +114,120 @@ class ContextCompressionSettingsRepository:
         _ensure_settings_schema(conn)
         conn.commit()
         return conn
+
+
+class PostgresContextCompressionSettingsRepository:
+    """上下文压缩用户共享运行态设置的云端 PostgreSQL 仓储。
+
+    上下文压缩 LLM 策略组绑定与输入模式属于用户多设备共享级系统配置，
+    运行时只写入 cloud_user_config_items，不提供本机 SQLite fallback。
+    本机 SQLite 仓储仅作为显式迁移旧数据的 legacy source 使用。
+    """
+
+    _NAMESPACE = "context_compression.runtime_settings"
+    _ITEM_ID = "default"
+
+    def __init__(self, store_accessor: Callable[[], Any]) -> None:
+        self._store_accessor = store_accessor
+
+    def get_settings(self) -> ContextCompressionRuntimeSettings:
+        payload = self._store_accessor().get_payload(self._NAMESPACE, self._ITEM_ID)
+        if payload is None:
+            return ContextCompressionRuntimeSettings(
+                llm_policy_group_id=None,
+                input_mode=None,
+                updated_at=None,
+            )
+        return _settings_from_payload(payload)
+
+    def get_llm_policy_group_id(self) -> str | None:
+        return self.get_settings().llm_policy_group_id
+
+    def get_input_mode(self) -> str | None:
+        return self.get_settings().input_mode
+
+    def set_settings(
+        self,
+        *,
+        llm_policy_group_id: str | None,
+        input_mode: str | None,
+    ) -> ContextCompressionRuntimeSettings:
+        settings = ContextCompressionRuntimeSettings(
+            llm_policy_group_id=_normalize_optional_text(llm_policy_group_id),
+            input_mode=_normalize_input_mode(input_mode),
+            updated_at=_utc_now_text(),
+        )
+        self._store_accessor().save_payload(
+            self._NAMESPACE,
+            self._ITEM_ID,
+            _settings_payload(settings),
+        )
+        return settings
+
+    def set_llm_policy_group_id(self, value: str | None) -> ContextCompressionRuntimeSettings:
+        current = self.get_settings()
+        return self.set_settings(
+            llm_policy_group_id=value,
+            input_mode=current.input_mode,
+        )
+
+    def save_settings_snapshot(
+        self,
+        settings: ContextCompressionRuntimeSettings,
+    ) -> ContextCompressionRuntimeSettings:
+        """保存迁移源中的完整设置快照，保留 legacy updated_at。"""
+        normalized_settings = ContextCompressionRuntimeSettings(
+            llm_policy_group_id=_normalize_optional_text(settings.llm_policy_group_id),
+            input_mode=_normalize_input_mode(settings.input_mode),
+            updated_at=settings.updated_at or _utc_now_text(),
+        )
+        self._store_accessor().save_payload(
+            self._NAMESPACE,
+            self._ITEM_ID,
+            _settings_payload(normalized_settings),
+        )
+        return normalized_settings
+
+    def contains_settings(self) -> bool:
+        return self._store_accessor().contains_payload(self._NAMESPACE, self._ITEM_ID)
+
+    def db_path(self) -> str:
+        return "postgresql:cloud_user_config_items/context_compression.runtime_settings/default"
+
+
+def create_context_compression_settings_repository(
+    data_dir_accessor: Callable[[], str],
+):
+    """创建上下文压缩共享运行态设置仓储。
+
+    用户多设备共享级系统配置以云端 PostgreSQL 为唯一运行时权威；
+    data_dir_accessor 仅保留为与 legacy SQLite 仓储和迁移代码兼容的形参，
+    运行时不得因云端不可用而回退到本机 SQLite。
+    """
+    del data_dir_accessor
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.config import ConfigRegistry
+
+    store = PostgresUserConfigStore(
+        lambda: ConfigRegistry.instance().cloud_user_config_database,
+    )
+    return PostgresContextCompressionSettingsRepository(lambda: store)
+
+
+def _settings_from_payload(payload: dict[str, Any]) -> ContextCompressionRuntimeSettings:
+    return ContextCompressionRuntimeSettings(
+        llm_policy_group_id=_normalize_optional_text(payload.get("llm_policy_group_id")),
+        input_mode=_normalize_input_mode(payload.get("input_mode") if payload.get("input_mode") is not None else None),
+        updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
+    )
+
+
+def _settings_payload(settings: ContextCompressionRuntimeSettings) -> dict[str, Any]:
+    return {
+        "llm_policy_group_id": settings.llm_policy_group_id,
+        "input_mode": settings.input_mode,
+        "updated_at": settings.updated_at,
+    }
 
 
 def _ensure_settings_schema(conn: sqlite3.Connection) -> None:

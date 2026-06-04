@@ -114,10 +114,10 @@ def create_app() -> FastAPI:
         create_context_compression_router,
     )
     from agent_runtime.context_compression.prompt_repository import (
-        ContextCompressionWorkerPromptRepository,
+        create_context_compression_worker_prompt_repository,
     )
     from agent_runtime.context_compression.settings_repository import (
-        ContextCompressionSettingsRepository,
+        create_context_compression_settings_repository,
     )
     from agent_runtime.lacp.lacp_factory import LacpFactory
     from agent_runtime.lacp.north_gateway.lacp_rest_adapter import create_lacp_router
@@ -156,10 +156,10 @@ def create_app() -> FastAPI:
     conversation_repository = SqliteConversationRepository(
         ConfigRegistry.instance().conversation_repository.data_dir,
     )
-    context_compression_prompt_repository = ContextCompressionWorkerPromptRepository(
+    context_compression_prompt_repository = create_context_compression_worker_prompt_repository(
         lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
     )
-    context_compression_settings_repository = ContextCompressionSettingsRepository(
+    context_compression_settings_repository = create_context_compression_settings_repository(
         lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
     )
     scene_gateway = SceneFactory.create()
