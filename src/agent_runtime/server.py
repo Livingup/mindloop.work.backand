@@ -134,6 +134,10 @@ def create_app() -> FastAPI:
         create_runtime_bootstrap_router,
     )
     from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.logs_management.service import LogsManagementService
+    from agent_runtime.logs_management.north_gateway.logs_management_rest_adapter import (
+        create_logs_management_router,
+    )
     from agent_runtime.runtime_health import EventLoopLagMonitor
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
@@ -203,6 +207,7 @@ def create_app() -> FastAPI:
     lacp_client = LacpFactory.create_client()
     lacp_settings_repository = LacpFactory.create_settings_repository()
     terminal_gateway = TerminalFactory.create()
+    logs_management_service = LogsManagementService()
     system_settings_gateway = SystemSettingsFactory.create()
     event_loop_monitor = EventLoopLagMonitor()
     runtime_loop: asyncio.AbstractEventLoop | None = None
@@ -587,6 +592,11 @@ def create_app() -> FastAPI:
         create_llm_http_trace_router(llm_http_trace_service),
         prefix="/api/llm-http-traces",
         tags=["LLM HTTP 请求日志"],
+    )
+    app.include_router(
+        create_logs_management_router(logs_management_service),
+        prefix="/api/logs",
+        tags=["日志工作区"],
     )
     app.include_router(
         create_system_settings_router(system_settings_gateway),
