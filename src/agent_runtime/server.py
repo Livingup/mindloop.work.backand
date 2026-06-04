@@ -133,6 +133,9 @@ def create_app() -> FastAPI:
     from agent_runtime.cloud_user_config.north_gateway.bootstrap_rest_adapter import (
         create_runtime_bootstrap_router,
     )
+    from agent_runtime.cloud_user_config.north_gateway.config_center_rest_adapter import (
+        create_config_center_router,
+    )
     from agent_runtime.runtime_health import EventLoopLagMonitor
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
@@ -488,6 +491,11 @@ def create_app() -> FastAPI:
         ),
         prefix="/api/runtime-bootstrap",
         tags=["Runtime 初始化引导"],
+    )
+    app.include_router(
+        create_config_center_router(),
+        prefix="/api/config-center",
+        tags=["用户共享配置中心"],
     )
 
     app.include_router(
