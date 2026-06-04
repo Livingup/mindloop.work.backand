@@ -133,9 +133,7 @@ def create_app() -> FastAPI:
     from agent_runtime.cloud_user_config.north_gateway.bootstrap_rest_adapter import (
         create_runtime_bootstrap_router,
     )
-    from agent_runtime.cloud_user_config.north_gateway.config_center_rest_adapter import (
-        create_config_center_router,
-    )
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
     from agent_runtime.runtime_health import EventLoopLagMonitor
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
@@ -340,7 +338,11 @@ def create_app() -> FastAPI:
         scene_session_registry.start()
         auto_connect_task: asyncio.Task | None = None
         lacp_start_task: asyncio.Task | None = None
+        config_cache_poll_task: asyncio.Task | None = None
         if cloud_user_config_database_active_at_start:
+            config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
             codex_oauth_callback_server.start()
             auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
             lacp_start_task = asyncio.create_task(lacp_client.start())
@@ -364,6 +366,10 @@ def create_app() -> FastAPI:
                 lacp_start_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):
                     await lacp_start_task
+            if config_cache_poll_task is not None and not config_cache_poll_task.done():
+                config_cache_poll_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await config_cache_poll_task
             await lacp_client.shutdown()
             await mcp_gateway.shutdown()
             if cloud_user_config_database_active_at_start:
@@ -492,12 +498,6 @@ def create_app() -> FastAPI:
         prefix="/api/runtime-bootstrap",
         tags=["Runtime 初始化引导"],
     )
-    app.include_router(
-        create_config_center_router(),
-        prefix="/api/config-center",
-        tags=["用户共享配置中心"],
-    )
-
     app.include_router(
         create_prompt_snippet_router(prompt_gateway),
         prefix="/api/prompt-snippets",
