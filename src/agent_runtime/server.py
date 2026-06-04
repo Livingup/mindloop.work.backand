@@ -683,6 +683,10 @@ def _runtime_auth_query_token_allowed(request) -> bool:
     method = (getattr(request, "method", "") or "").upper()
     if method == "GET" and path.startswith("/api/communication/streams/") and path.endswith("/events"):
         return True
+    if method == "GET" and path.startswith("/api/file-resources/upload-tasks/") and path.endswith("/events"):
+        return True
+    if method == "GET" and path.startswith("/api/file-resources/") and path.endswith("/content"):
+        return True
     if method == "POST" and path.startswith("/api/agent-runtime/scenes/") and path.endswith("/detach"):
         return True
     return False

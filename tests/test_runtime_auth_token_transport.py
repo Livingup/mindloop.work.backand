@@ -43,6 +43,26 @@ def test_query_token_is_accepted_for_sse_eventsource_transport() -> None:
     assert _runtime_auth_token_from_request(request) == "query-token"
 
 
+def test_query_token_is_accepted_for_file_resource_upload_task_sse_transport() -> None:
+    request = _Request(
+        path="/api/file-resources/upload-tasks/file-upload-a/events",
+        method="GET",
+        access_token="query-token",
+    )
+
+    assert _runtime_auth_token_from_request(request) == "query-token"
+
+
+def test_query_token_is_accepted_for_file_resource_content_transport() -> None:
+    request = _Request(
+        path="/api/file-resources/resource-a/content",
+        method="GET",
+        access_token="query-token",
+    )
+
+    assert _runtime_auth_token_from_request(request) == "query-token"
+
+
 def test_query_token_is_accepted_for_beacon_detach_transport() -> None:
     request = _Request(
         path="/api/agent-runtime/scenes/scene-a/detach",
@@ -67,6 +87,26 @@ def test_query_token_is_rejected_for_scene_stop_request() -> None:
     request = _Request(
         path="/api/agent-runtime/scenes/scene-a/stop",
         method="POST",
+        access_token="query-token",
+    )
+
+    assert _runtime_auth_token_from_request(request) is None
+
+
+def test_query_token_is_rejected_for_file_resource_metadata_request() -> None:
+    request = _Request(
+        path="/api/file-resources/resource-a",
+        method="GET",
+        access_token="query-token",
+    )
+
+    assert _runtime_auth_token_from_request(request) is None
+
+
+def test_query_token_is_rejected_for_object_storage_settings_request() -> None:
+    request = _Request(
+        path="/api/file-resources/object-storage-settings",
+        method="GET",
         access_token="query-token",
     )
 

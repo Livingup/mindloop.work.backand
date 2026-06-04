@@ -116,7 +116,7 @@ Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通�
 
 ### Runtime 本地认证与 Scene Presence 生命周期
 
-Phase-1 访问模型是单 Runtime 主机的多端接入：后端 runtime-local auth 是权限边界，普通 `/api/*` REST 只接受 Bearer `Authorization` header；仅 EventSource `/api/communication/streams/*/events` 和 sendBeacon detach `/api/agent-runtime/scenes/*/detach` 可使用 `access_token` query token。`SceneSessionRegistry` 只记录多端 presence，不拥有任务生命周期；attach、heartbeat、detach、stop 必须保持分离。关闭窗口、unload、workspace switch 和 `/detach` 只关闭当前 `client_session_id`，不得取消 task/instance；显式停止必须走 `/stop` 或 per-Agent interrupt/stop。Scene 自动释放只允许在零客户端且连续 30 分钟没有新的 task/instance 活动、且没有 running instance 时执行，判定异常必须保守跳过。
+Phase-1 访问模型是单 Runtime 主机的多端接入：后端 runtime-local auth 是权限边界，普通 `/api/*` REST 只接受 Bearer `Authorization` header；仅浏览器原生无法设置 Authorization header 且已明确收敛的通道可使用 `access_token` query token：EventSource `/api/communication/streams/*/events`、文件上传进度 EventSource `/api/file-resources/upload-tasks/*/events`、文件内容 GET `/api/file-resources/*/content`，以及 sendBeacon detach `/api/agent-runtime/scenes/*/detach`。不得把 query token 扩展到普通 REST、配置读写、文件资源元数据、上传任务快照或其他写入接口。`SceneSessionRegistry` 只记录多端 presence，不拥有任务生命周期；attach、heartbeat、detach、stop 必须保持分离。关闭窗口、unload、workspace switch 和 `/detach` 只关闭当前 `client_session_id`，不得取消 task/instance；显式停止必须走 `/stop` 或 per-Agent interrupt/stop。Scene 自动释放只允许在零客户端且连续 30 分钟没有新的 task/instance 活动、且没有 running instance 时执行，判定异常必须保守跳过。
 
 ### 通用 LLM 请求客户端（llm_client）
 
