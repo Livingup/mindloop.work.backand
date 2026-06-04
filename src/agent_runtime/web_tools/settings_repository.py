@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS web_tools_settings (
 
 
 class WebToolsSettingsRepository:
+    """Web Tools 运行时设置的本地 SQLite 仓储。"""
+
     def __init__(self, data_dir_accessor: Callable[[], str]) -> None:
         self._data_dir_accessor = data_dir_accessor
 
@@ -71,6 +73,78 @@ class WebToolsSettingsRepository:
         conn.execute(_SCHEMA)
         conn.commit()
         return conn
+
+
+class PostgresWebToolsSettingsRepository:
+    """Web Tools 用户共享设置的云端 PostgreSQL 仓储。
+
+    启用云端用户配置时，候选策略组顺序只保存到云端 JSONB item；
+    本地 SQLite 不再作为读写 fallback。
+    """
+
+    _NAMESPACE = "web_tools.runtime_settings"
+    _ITEM_ID = "default"
+
+    def __init__(self, store_accessor: Callable[[], Any]) -> None:
+        self._store_accessor = store_accessor
+
+    def get_settings(self) -> WebToolsRuntimeSettings:
+        payload = self._store_accessor().get_payload(self._NAMESPACE, self._ITEM_ID)
+        if payload is None:
+            return WebToolsRuntimeSettings()
+        raw_candidates = payload.get("candidates", [])
+        if not isinstance(raw_candidates, list):
+            raise ValueError("web tools candidates must be a JSON array.")
+        return WebToolsRuntimeSettings(
+            candidates=tuple(
+                WebToolPolicyCandidate.from_dict(item)
+                for item in raw_candidates
+                if isinstance(item, dict)
+            ),
+            updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
+        )
+
+    def save_settings(
+        self,
+        *,
+        candidates: tuple[WebToolPolicyCandidate, ...],
+    ) -> WebToolsRuntimeSettings:
+        settings = WebToolsRuntimeSettings(
+            candidates=candidates,
+            updated_at=_utc_now_text(),
+        )
+        self._store_accessor().save_payload(
+            self._NAMESPACE,
+            self._ITEM_ID,
+            {
+                "candidates": [item.to_dict() for item in settings.candidates],
+                "updated_at": settings.updated_at,
+            },
+        )
+        return settings
+
+    def contains_settings(self) -> bool:
+        return self._store_accessor().contains_payload(self._NAMESPACE, self._ITEM_ID)
+
+    def db_path(self) -> str:
+        return "postgresql:cloud_user_config_items/web_tools.runtime_settings/default"
+
+
+def create_web_tools_settings_repository(data_dir_accessor: Callable[[], str]):
+    """按当前配置模式创建 Web Tools 设置仓储。
+
+    PostgreSQL 云端用户配置启用时只装配云端仓储；未启用时只装配本地 SQLite 仓储。
+    禁止云端失败后静默回退本地，避免形成双权威。
+    """
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.config import ConfigRegistry
+
+    if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+        store = PostgresUserConfigStore(
+            lambda: ConfigRegistry.instance().cloud_user_config_database,
+        )
+        return PostgresWebToolsSettingsRepository(lambda: store)
+    return WebToolsSettingsRepository(data_dir_accessor)
 
 
 def _load_candidates(raw: str) -> tuple[WebToolPolicyCandidate, ...]:

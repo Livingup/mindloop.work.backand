@@ -35,9 +35,26 @@ class McpClientFactory:
         """
         from agent_runtime.config import ConfigRegistry
 
-        repository = YamlMcpServiceRepository(
+        local_repository = YamlMcpServiceRepository(
             config_dir_accessor=lambda: ConfigRegistry.instance().mcp_client.config_dir,
         )
+        if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+            from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+            from agent_runtime.mcp.mcp_client.infrastructure.postgres_mcp_service_repository import (
+                PostgresStreamableHttpMcpServiceRepository,
+                TransportRoutingMcpServiceRepository,
+            )
+
+            store = PostgresUserConfigStore(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
+            repository = TransportRoutingMcpServiceRepository(
+                local_repository=local_repository,
+                shared_repository=PostgresStreamableHttpMcpServiceRepository(lambda: store),
+            )
+        else:
+            repository = local_repository
+
         session_manager = McpSessionManager()
         service = McpClientService(repository, session_manager)
         gateway = McpClientGatewayImpl(service, session_manager)

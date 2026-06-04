@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 _SCHEMA = """
@@ -27,6 +28,8 @@ class LacpRuntimeSettings:
 
 
 class LacpSettingsRepository:
+    """LACP Registry 服务设置的本地 SQLite 仓储。"""
+
     def __init__(self, data_dir_accessor: Callable[[], str]) -> None:
         self._data_dir_accessor = data_dir_accessor
 
@@ -92,6 +95,91 @@ class LacpSettingsRepository:
         conn.execute(_SCHEMA)
         conn.commit()
         return conn
+
+
+class PostgresLacpSettingsRepository:
+    """LACP Registry 服务设置的云端 PostgreSQL 仓储。
+
+    只保存用户共享的 registry 服务配置；LACP 实例 registrations.json 仍由
+    LacpRegistrationRegistry 本机保存，不进入云端用户共享配置。
+    """
+
+    _NAMESPACE = "lacp.registry_service_settings"
+    _ITEM_ID = "default"
+
+    def __init__(self, store_accessor: Callable[[], Any]) -> None:
+        self._store_accessor = store_accessor
+
+    def get_settings(self) -> LacpRuntimeSettings:
+        payload = self._store_accessor().get_payload(self._NAMESPACE, self._ITEM_ID)
+        if payload is None:
+            return LacpRuntimeSettings(
+                enabled=False,
+                registry_url="",
+                api_key=None,
+                updated_at=None,
+            )
+        return LacpRuntimeSettings(
+            enabled=bool(payload.get("enabled", False)),
+            registry_url=str(payload.get("registry_url") or ""),
+            api_key=_nullable_text(payload.get("api_key")),
+            updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
+        )
+
+    def save_settings(
+        self,
+        *,
+        enabled: bool,
+        registry_url: str,
+        api_key: str | None,
+    ) -> LacpRuntimeSettings:
+        settings = LacpRuntimeSettings(
+            enabled=enabled,
+            registry_url=registry_url.strip(),
+            api_key=_nullable_text(api_key),
+            updated_at=_utc_now_text(),
+        )
+        self._store_accessor().save_payload(
+            self._NAMESPACE,
+            self._ITEM_ID,
+            {
+                "enabled": settings.enabled,
+                "registry_url": settings.registry_url,
+                "api_key": settings.api_key,
+                "updated_at": settings.updated_at,
+            },
+        )
+        return settings
+
+    def contains_settings(self) -> bool:
+        return self._store_accessor().contains_payload(self._NAMESPACE, self._ITEM_ID)
+
+    def db_path(self) -> str:
+        return "postgresql:cloud_user_config_items/lacp.registry_service_settings/default"
+
+
+def create_lacp_settings_repository(data_dir_accessor: Callable[[], str]):
+    """按当前配置模式创建 LACP Registry 服务设置仓储。
+
+    PostgreSQL 云端用户配置启用时只装配云端仓储；未启用时只装配本地 SQLite 仓储。
+    禁止云端失败后静默回退本地，避免形成双权威。
+    """
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.config import ConfigRegistry
+
+    if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+        store = PostgresUserConfigStore(
+            lambda: ConfigRegistry.instance().cloud_user_config_database,
+        )
+        return PostgresLacpSettingsRepository(lambda: store)
+    return LacpSettingsRepository(data_dir_accessor)
+
+
+def _nullable_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _utc_now_text() -> str:

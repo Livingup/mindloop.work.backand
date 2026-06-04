@@ -62,7 +62,11 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 #### 用户全局配置云端 PostgreSQL 边界
 
-`cloud_user_config_database` 的 YAML 段只保存云端 PostgreSQL 默认连接元数据；真正可用的 PostgreSQL 启动凭据（包括 password，以及必要时同一组 host/port/database/username）属于每台机器本地用户数据，由 runtime bootstrap 本地存储覆盖，不能写入同一个云端 PostgreSQL 库以免形成自举悖论。缺少本机 bootstrap 凭据时，REST 服务只能进入初始化引导有限模式，不得把 prompt snippets、Agent definitions、主 LLM Registry、图像生成 LLM Registry、OSS 设置等跨机器共享配置悄悄落回本地权威。启用 PostgreSQL 后，这些共享数据直连同一个 PostgreSQL 权威库；仓储不得增加本地缓存或另建同步 API。MCP、Skill、LACP、context/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等混合或本机数据不属于该云端迁移范围，除非后续重新做范围设计并获确认。
+`cloud_user_config_database` 的 YAML 段只保存云端 PostgreSQL 默认连接元数据；真正可用的 PostgreSQL 启动凭据（包括 password，以及必要时同一组 host/port/database/username）属于每台机器本地用户数据，由 runtime bootstrap 本地存储覆盖，不能写入同一个云端 PostgreSQL 库以免形成自举悖论。缺少本机 bootstrap 凭据时，REST 服务只能进入初始化引导有限模式，不得把已批准的共享配置悄悄落回本地权威。
+
+本机到云端的数据迁移只能通过一次性运维入口执行，例如 `spread-ai config migrate-user-global-to-cloud` 或等价手工脚本；不得在 runtime bootstrap、服务启动或普通业务请求中自动导入本机数据。完成迁移后再切换共享域 CRUD 权威。启用 PostgreSQL 后，已批准共享域必须直连同一个 PostgreSQL 权威库，仓储不得增加本地缓存、云端失败后的本地 fallback 或另建同步 API。
+
+当前已批准共享/云端权威范围包括 prompt snippets、Agent definitions、主 LLM Registry、图像生成 LLM Registry、图像生成运行时设置、Web Tools 运行时设置、`streamable-http` MCP 服务定义、LACP registry-service 设置，以及通过 bootstrap 配置的 OSS 对象存储设置。`stdio` MCP 服务定义、LACP instance registrations/runtime state、Skill、context/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等仍属于本机或混合数据，不得进入云端用户共享配置，除非后续重新做范围设计并获确认。
 
 ### 会话消息模块（conversation_message）
 

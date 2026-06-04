@@ -223,20 +223,19 @@ class PostgresObjectStorageSettingsRepository:
 
 
 def create_object_storage_settings_repository(data_dir_accessor: Callable[[], str]):
-    """按当前三层配置边界创建对象存储设置仓储。"""
-    try:
-        from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
-        from agent_runtime.config import ConfigRegistry
+    """按当前配置模式创建对象存储设置仓储。
 
-        cloud_config = ConfigRegistry.instance().cloud_user_config_database
-        if cloud_config.is_postgresql_enabled:
-            store = PostgresUserConfigStore(
-                lambda: ConfigRegistry.instance().cloud_user_config_database,
-            )
-            return PostgresObjectStorageSettingsRepository(lambda: store)
-    except Exception:
-        # 配置尚未初始化或云端连接不可用时，保留本地仓储作为启动/诊断路径。
-        pass
+    PostgreSQL 云端用户配置启用时只装配云端仓储；未启用时只装配本地 SQLite 仓储。
+    禁止云端失败后静默回退本地，避免形成双权威。
+    """
+    from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+    from agent_runtime.config import ConfigRegistry
+
+    if ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+        store = PostgresUserConfigStore(
+            lambda: ConfigRegistry.instance().cloud_user_config_database,
+        )
+        return PostgresObjectStorageSettingsRepository(lambda: store)
     return ObjectStorageSettingsRepository(data_dir_accessor)
 
 
@@ -257,7 +256,7 @@ def _default_object_storage_settings() -> ObjectStorageRuntimeSettings:
 
 def _object_storage_settings_from_payload(
     payload: dict[str, Any],
- ) -> ObjectStorageRuntimeSettings:
+) -> ObjectStorageRuntimeSettings:
     return ObjectStorageRuntimeSettings(
         gateway_provider=_normalize_gateway_provider(payload.get("gateway_provider")),
         object_storage_endpoint=str(payload.get("object_storage_endpoint") or DEFAULT_OBJECT_STORAGE_ENDPOINT),
@@ -281,7 +280,7 @@ def _object_storage_settings_from_payload(
 
 def _object_storage_settings_payload(
     settings: ObjectStorageRuntimeSettings,
- ) -> dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "gateway_provider": settings.gateway_provider,
         "object_storage_endpoint": settings.object_storage_endpoint,

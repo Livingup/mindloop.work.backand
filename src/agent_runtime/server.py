@@ -80,12 +80,12 @@ def create_app() -> FastAPI:
         create_image_generation_router,
     )
     from agent_runtime.image_generation.service import ImageGenerationService
-    from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
+    from agent_runtime.image_generation.settings_repository import create_image_generation_settings_repository
     from agent_runtime.web_tools.north_gateway.web_tools_rest_adapter import (
         create_web_tools_router,
     )
     from agent_runtime.web_tools.service import WebToolsService
-    from agent_runtime.web_tools.settings_repository import WebToolsSettingsRepository
+    from agent_runtime.web_tools.settings_repository import create_web_tools_settings_repository
     from agent_runtime.file_resource.shared_service import get_file_resource_service
     from agent_runtime.system_settings.system_settings_factory import (
         SystemSettingsFactory,
@@ -170,14 +170,14 @@ def create_app() -> FastAPI:
     llm_model_registry_gateway = LlmModelRegistryFactory.create()
     image_generation_registry_gateway = LlmModelRegistryFactory.create_image_generation_registry()
     image_generation_service = ImageGenerationService(
-        settings_repository=ImageGenerationSettingsRepository(
+        settings_repository=create_image_generation_settings_repository(
             lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
         ),
         llm_registry_gateway=image_generation_registry_gateway,
         file_resource_service=get_file_resource_service(),
     )
     web_tools_service = WebToolsService(
-        settings_repository=WebToolsSettingsRepository(
+        settings_repository=create_web_tools_settings_repository(
             lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
         ),
         llm_registry_gateway=llm_model_registry_gateway,

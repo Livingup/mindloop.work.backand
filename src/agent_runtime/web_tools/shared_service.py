@@ -17,10 +17,10 @@ def get_web_tools_service() -> WebToolsService:
             from agent_runtime.config import ConfigRegistry
             from agent_runtime.llm_client.llm_client_factory import LlmClientFactory
             from agent_runtime.llm_model_registry.llm_model_registry_factory import LlmModelRegistryFactory
-            from agent_runtime.web_tools.settings_repository import WebToolsSettingsRepository
+            from agent_runtime.web_tools.settings_repository import create_web_tools_settings_repository
 
             _web_tools_service = WebToolsService(
-                settings_repository=WebToolsSettingsRepository(
+                settings_repository=create_web_tools_settings_repository(
                     data_dir_accessor=lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
                 ),
                 llm_registry_gateway=LlmModelRegistryFactory.create(),

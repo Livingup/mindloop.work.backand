@@ -7,7 +7,7 @@ from agent_runtime.config import ConfigRegistry
 from agent_runtime.lacp.client import LacpClient
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
-from agent_runtime.lacp.settings_repository import LacpSettingsRepository
+from agent_runtime.lacp.settings_repository import LacpSettingsRepository, create_lacp_settings_repository
 
 if TYPE_CHECKING:
     from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
@@ -27,7 +27,7 @@ class LacpFactory:
     def create_settings_repository(cls) -> LacpSettingsRepository:
         with cls._lock:
             if cls._settings_repository is None:
-                cls._settings_repository = LacpSettingsRepository(
+                cls._settings_repository = create_lacp_settings_repository(
                     lambda: ConfigRegistry.instance().lacp.data_dir,
                 )
             return cls._settings_repository
