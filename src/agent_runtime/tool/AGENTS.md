@@ -121,9 +121,10 @@ def end_task(request: EndTaskRequest, ctx: ToolRuntimeContext) -> BaseToolResult
 各 LLM 平台 SDK（OpenAI / Claude / Gemini）对工具 JSON Schema 的格式要求不同。本模块采用以下策略：
 
 1. **生成**：由各平台实现 `ToolSchemaGenerator` 接口，使用各自 SDK 从函数签名（类型注解 + Pydantic 模型）解析生成该平台所需格式的 JSON Schema。
-2. **缓存**：生成后的 Schema 按 `(tool_name, platform)` 索引缓存，同一工具同一平台只生成一次。
-3. **查询**：对外查询工具时返回各平台的 Schema，调用 LLM 时直接取缓存，无需重复生成。
-4. **Gemini 嵌套模型兼容**：Gemini 生成器会内联 Pydantic JSON Schema 中的 `$defs/$ref`，以支持 `agent_lifecycle` 这类包含嵌套结构化参数的工具。
+2. **净化**：`ToolSchemaCache` 在缓存前统一净化所有 Provider 的 LLM 可见工具 Schema，递归移除 Pydantic / SDK 自动生成的 `title`，避免 LLM 把 schema 标题误当作真实参数名；参数名只能以 `properties` 的 key 和 `required` 为准。
+3. **缓存**：生成并净化后的 Schema 按 `(tool_name, platform)` 索引缓存，同一工具同一平台只生成一次。
+4. **查询**：对外查询工具时返回各平台的净化后 Schema，调用 LLM 时直接取缓存，无需重复生成。
+5. **Gemini 嵌套模型兼容**：Gemini 生成器会内联 Pydantic JSON Schema 中的 `$defs/$ref`，以支持 `agent_lifecycle` 这类包含嵌套结构化参数的工具。
 
 ### ToolSchemaGenerator 接口
 

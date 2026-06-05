@@ -8,6 +8,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from agent_runtime.tool.infrastructure.llm_tool_schema_sanitizer import (
+    sanitize_llm_tool_schema,
+)
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
 from agent_runtime.tool.tool_schema_generator import ToolSchemaGenerator
 
@@ -58,7 +61,7 @@ class ToolSchemaCache:
         if cache_key not in self._cache:
             if platform not in self._generators:
                 raise KeyError(f"未注册平台 Schema 生成器: {platform}")
-            schema = self._generators[platform].generate(tool_def)
+            schema = sanitize_llm_tool_schema(self._generators[platform].generate(tool_def))
             self._cache[cache_key] = schema
             logger.debug(
                 "生成并缓存 Schema: tool=%s, platform=%s",
