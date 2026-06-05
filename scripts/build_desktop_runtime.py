@@ -44,6 +44,10 @@ def main() -> None:
         "agent_runtime",
         "--collect-data",
         "agent_runtime",
+        "--collect-all",
+        "psycopg",
+        "--copy-metadata",
+        "psycopg",
         str(repo_root / "src" / "agent_runtime" / "desktop_server.py"),
     ]
     subprocess.run(command, cwd=repo_root, check=True)
