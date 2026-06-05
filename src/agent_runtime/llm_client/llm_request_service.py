@@ -55,6 +55,7 @@ _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
     "llm.tool_call.arguments.completed",
 }
 logger = logging.getLogger(__name__)
+_DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
 
 
 class LlmRequestService:
@@ -461,6 +462,14 @@ class LlmProviderModelServiceUnavailable(RuntimeError):
         )
 
 
+class LlmRequestTimeoutError(TimeoutError):
+    """单次 LLM 请求 attempt 超过业务级总耗时上限。"""
+
+    def __init__(self, *, timeout_seconds: float) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"LLM 请求单次 attempt 超过业务级总超时 {timeout_seconds:g} 秒。")
+
+
 def _merge_request_params(request: LlmPromptRequest) -> dict[str, Any]:
     """合并 registry 自定义 JSON 字段和本轮覆盖参数。"""
     resolved = request.resolved_model
@@ -838,7 +847,12 @@ def _as_llm_service_failure(exc: Exception) -> Exception:
     return service_error
 
 
-async def _await_client_request(awaitable: Any, request: LlmPromptRequest) -> Any:
+async def _await_client_request(
+    awaitable: Any,
+    request: LlmPromptRequest,
+    *,
+    attempt_timeout_seconds: float = _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS,
+) -> Any:
     task = asyncio.create_task(awaitable)
     observer = request.request_canceller_observer
     unregister: Callable[[], None] | None = None
@@ -850,7 +864,20 @@ async def _await_client_request(awaitable: Any, request: LlmPromptRequest) -> An
 
         unregister = observer(cancel_request)
     try:
-        return await task
+        if attempt_timeout_seconds <= 0:
+            return await task
+        done, _pending = await asyncio.wait({task}, timeout=attempt_timeout_seconds)
+        if task in done:
+            return await task
+        task.cancel()
+        try:
+            await task
+        except LlmRequestCancelled:
+            if request.cancellation_checker is not None and request.cancellation_checker():
+                raise
+        except asyncio.CancelledError:
+            pass
+        raise LlmRequestTimeoutError(timeout_seconds=attempt_timeout_seconds)
     except asyncio.CancelledError:
         if request.cancellation_checker is not None and request.cancellation_checker():
             raise LlmRequestCancelled("LLM request cancelled.") from None

@@ -15,7 +15,11 @@ from agent_runtime.conversation_message.message.models import Conversation, Tool
 from agent_runtime.conversation_message.infrastructure.sqlite_conversation_repository import SqliteConversationRepository
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled, _post_json
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
-from agent_runtime.llm_client.llm_request_service import _await_client_request
+from agent_runtime.llm_client.llm_request_service import (
+    LlmRequestTimeoutError,
+    _await_client_request,
+    _is_llm_service_call_failure,
+)
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
 from agent_runtime.tool.local_tool_service import LocalToolService
 from agent_runtime.tool.tool_execution_models import BaseToolResult
@@ -150,6 +154,33 @@ class LlmRequestCancellationTests(unittest.TestCase):
             with self.assertRaises(LlmRequestCancelled):
                 await _await_client_request(_never_finishes(), request)
             self.assertTrue(unregister_called)
+
+        asyncio.run(run_case())
+
+    def test_llm_request_attempt_timeout_cancels_inner_task_and_is_retryable(self) -> None:
+        async def run_case() -> None:
+            inner_cancelled = asyncio.Event()
+
+            async def never_completes() -> None:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    inner_cancelled.set()
+
+            request = LlmPromptRequest(
+                conversation=object(),
+                resolved_model=object(),
+            )
+            with self.assertRaises(LlmRequestTimeoutError) as ctx:
+                await _await_client_request(
+                    never_completes(),
+                    request,
+                    attempt_timeout_seconds=0.01,
+                )
+
+            self.assertEqual(ctx.exception.timeout_seconds, 0.01)
+            self.assertTrue(_is_llm_service_call_failure(ctx.exception))
+            await asyncio.wait_for(inner_cancelled.wait(), timeout=1)
 
         asyncio.run(run_case())
 
