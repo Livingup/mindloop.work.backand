@@ -375,10 +375,7 @@ class TerminalService:
         read_command = self._get_read_command(terminal_id, command_id)
         effective_limit_chars = min(max(limit_chars, 1000), self._max_output_chars_per_read)
         if effective_wait_timeout_ms > 0:
-            if read_command is not None:
-                await self._wait_for_command_completion_or_timeout(terminal_id, command_id, effective_wait_timeout_ms)
-            else:
-                await self._wait_for_output(terminal_id, command_id, after_chunk_index, effective_wait_timeout_ms)
+            await asyncio.sleep(effective_wait_timeout_ms / 1000)
             terminal = self._require_terminal(scope, terminal_id)
             read_command = self._get_read_command(terminal_id, command_id)
         result: TerminalOutputReadResult
@@ -811,38 +808,6 @@ class TerminalService:
             )
         except Exception:
             return
-
-    async def _wait_for_output(
-        self,
-        terminal_id: str,
-        command_id: str | None,
-        after_chunk_index: int | None,
-        wait_timeout_ms: int,
-    ) -> None:
-        deadline = asyncio.get_running_loop().time() + wait_timeout_ms / 1000
-        while asyncio.get_running_loop().time() < deadline:
-            chunks = self._repo.list_output_chunks(
-                terminal_id,
-                command_id=command_id,
-                after_chunk_index=after_chunk_index,
-                limit=1,
-            )
-            if chunks:
-                return
-            await asyncio.sleep(0.2)
-
-    async def _wait_for_command_completion_or_timeout(
-        self,
-        terminal_id: str,
-        command_id: str,
-        wait_timeout_ms: int,
-    ) -> None:
-        deadline = asyncio.get_running_loop().time() + wait_timeout_ms / 1000
-        while asyncio.get_running_loop().time() < deadline:
-            command = self._get_read_command(terminal_id, command_id)
-            if command is not None and command.status in TERMINAL_COMMAND_FINISHED_STATUSES:
-                return
-            await asyncio.sleep(0.2)
 
     def _get_read_command(self, terminal_id: str, command_id: str | None) -> TerminalCommand | None:
         if command_id is None:

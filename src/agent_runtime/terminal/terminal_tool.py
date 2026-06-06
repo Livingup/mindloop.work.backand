@@ -29,7 +29,7 @@ class TerminalExecuteCommandToolRequest(BaseToolRequest):
 
 class TerminalReadOutputToolRequest(BaseToolRequest):
     terminal_id: str = Field(description="要观察的终端 ID，必须来自 terminal_create 或 terminal_list。")
-    command_id: str = Field(description="要观察的命令 ID，必须来自 terminal_execute_command 返回的 command_id；用于查看该命令相关输出和完成状态。")
+    command_id: str = Field(description="要观察的命令 ID，必须来自 terminal_execute_command 返回的 command_id；用于关联读取该命令产生的终端输出，不表示后端会判断 shell 命令是否完成。")
     mode: Literal["tail", "page", "since", "search"] = Field(default="tail", description="读取方式；可选值仅限 tail、page、since、search。tail 读取终端最新可见输出，page 分页读取输出，since 读取指定输出块之后的新内容，search 搜索输出文本。")
     tail_lines: int = Field(default=80, ge=1, le=1000, description="tail 模式最多返回最新多少行；取值范围为 1 到 1000。")
     offset: int = Field(default=0, ge=0, description="page 模式从第几个输出块开始读取；取值必须大于等于 0；该值不是文本行号。")
@@ -114,7 +114,7 @@ async def terminal_execute_command(request: TerminalExecuteCommandToolRequest, c
 
 @tool(
     name="terminal_read_output",
-    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式；默认读取最新输出并限制返回字符数。返回结果包含输出文本、分页位置、是否还有更多内容，以及可用时的 command_status、command_finished、command_exit_code、command_completed_at。wait_timeout_ms 表示读取前等待的时间（毫秒），需要根据目标命令的预估完成时间合理设置；短命令使用较小等待时间，构建、测试等长命令可使用更长等待时间，不要默认填最大值。是否需要继续等待或写入输入，由你结合命令状态和输出内容判断。",
+    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式；默认读取最新输出并限制返回字符数。返回结果包含输出文本、分页位置、是否还有更多内容，以及可用时的命令记录状态字段；这些状态字段不代表后端判断当前 shell 命令已经完成。wait_timeout_ms 表示读取前固定等待的时间（毫秒），到达等待时间后读取当前可用输出；短命令使用较小等待时间，构建、测试等长命令可使用更长等待时间，不要默认填最大值。是否需要继续等待或写入输入，应由你结合终端文本自行判断。",
     group="terminal",
     category="business",
 )
