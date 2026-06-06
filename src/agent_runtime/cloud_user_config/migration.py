@@ -167,8 +167,15 @@ def migrate_local_user_global_config_to_postgresql(
     会话历史、项目数据、stdio MCP 本机路径、LACP instance registrations、上下文压缩 job/archive 等不属于迁移范围。
     """
     from agent_runtime.config import ConfigRegistry
+    from agent_runtime.cloud_user_config.bootstrap_settings import (
+        CloudUserConfigBootstrapSettingsRepository,
+    )
 
-    cloud_config = ConfigRegistry.instance().cloud_user_config_database
+    base_config = ConfigRegistry.instance().cloud_user_config_database
+    settings = CloudUserConfigBootstrapSettingsRepository(
+        lambda: base_config.bootstrap_data_dir,
+    ).get_settings()
+    cloud_config = settings.to_database_config(base_config) if settings and settings.configured else base_config
     if not cloud_config.is_postgresql_enabled:
         raise ValueError(
             "cloud_user_config_database 未启用 PostgreSQL；请先在运行配置中设置 "
@@ -176,7 +183,7 @@ def migrate_local_user_global_config_to_postgresql(
         )
 
     store = PostgresUserConfigStore(
-        lambda: ConfigRegistry.instance().cloud_user_config_database,
+        lambda: cloud_config,
     )
     store.ensure_schema()
 

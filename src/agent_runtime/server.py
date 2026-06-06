@@ -5,6 +5,7 @@ import logging
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from threading import RLock
 
 import uvicorn
 from fastapi import FastAPI
@@ -17,6 +18,31 @@ logger = logging.getLogger("agent_runtime.serve")
 
 # 所有前端离开后，只有连续 30 分钟没有新的任务/执行活动，才允许自动释放 scene。
 SCENE_VACANT_IDLE_EXPIRATION_SECONDS: float = 30 * 60
+
+
+class _SwitchableRuntimeComponent:
+    """线程安全的运行时组件代理。
+
+    bootstrap 首启时普通 API 被限制，但路由和服务对象仍可能已经持有局部组件引用。
+    该代理允许 durable readiness 完成后在同一进程把这些引用切换到完整模式组件，
+    避免继续使用启动时的本地 bootstrap 仓储。
+    """
+
+    def __init__(self, target: object) -> None:
+        self._target = target
+        self._lock = RLock()
+
+    @property
+    def target(self) -> object:
+        with self._lock:
+            return self._target
+
+    def set_target(self, target: object) -> None:
+        with self._lock:
+            self._target = target
+
+    def __getattr__(self, name: str):
+        return getattr(self.target, name)
 
 
 def load_runtime_config(
@@ -86,7 +112,10 @@ def create_app() -> FastAPI:
     )
     from agent_runtime.web_tools.service import WebToolsService
     from agent_runtime.web_tools.settings_repository import create_web_tools_settings_repository
-    from agent_runtime.file_resource.shared_service import get_file_resource_service
+    from agent_runtime.file_resource.shared_service import (
+        get_file_resource_service,
+        reset_file_resource_services_for_runtime_mode_change,
+    )
     from agent_runtime.system_settings.system_settings_factory import (
         SystemSettingsFactory,
     )
@@ -147,15 +176,18 @@ def create_app() -> FastAPI:
     cloud_user_config_database_active_at_start = (
         ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled
     )
-    prompt_gateway = PromptTemplateFactory.create()
+    runtime_full_mode_active = cloud_user_config_database_active_at_start
+    runtime_full_mode_lock = RLock()
+
+    prompt_gateway = _SwitchableRuntimeComponent(PromptTemplateFactory.create())
     tool_gateway = LocalToolFactory.create()
     skill_gateway = SkillFactory.create()
-    mcp_gateway = McpClientFactory.create()
+    mcp_gateway = _SwitchableRuntimeComponent(McpClientFactory.create())
     from agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools import (
         configure as configure_mcp_meta_tools,
     )
     configure_mcp_meta_tools(mcp_gateway)
-    agent_definition_gateway = AgentDefinitionFactory.create()
+    agent_definition_gateway = _SwitchableRuntimeComponent(AgentDefinitionFactory.create())
     communication_gateway = CommunicationFactory.create()
     chat_bubble_service = ChatBubbleFactory.create()
     conversation_repository = SqliteConversationRepository(
@@ -172,46 +204,173 @@ def create_app() -> FastAPI:
         scene_gateway=scene_gateway,
         communication_gateway=communication_gateway,
     )
-    llm_model_registry_gateway = LlmModelRegistryFactory.create()
-    image_generation_registry_gateway = LlmModelRegistryFactory.create_image_generation_registry()
-    image_generation_service = ImageGenerationService(
-        settings_repository=create_image_generation_settings_repository(
-            lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
-        ),
-        llm_registry_gateway=image_generation_registry_gateway,
-        file_resource_service=get_file_resource_service(),
+    llm_model_registry_gateway = _SwitchableRuntimeComponent(LlmModelRegistryFactory.create())
+    image_generation_registry_gateway = _SwitchableRuntimeComponent(
+        LlmModelRegistryFactory.create_image_generation_registry()
     )
-    web_tools_service = WebToolsService(
-        settings_repository=create_web_tools_settings_repository(
-            lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
-        ),
-        llm_registry_gateway=llm_model_registry_gateway,
-        llm_request_service=LlmClientFactory.create(),
+    file_resource_service = _SwitchableRuntimeComponent(get_file_resource_service())
+    image_generation_service = _SwitchableRuntimeComponent(
+        ImageGenerationService(
+            settings_repository=create_image_generation_settings_repository(
+                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+            ),
+            llm_registry_gateway=image_generation_registry_gateway,
+            file_resource_service=file_resource_service,
+        )
+    )
+    web_tools_service = _SwitchableRuntimeComponent(
+        WebToolsService(
+            settings_repository=create_web_tools_settings_repository(
+                lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+            ),
+            llm_registry_gateway=llm_model_registry_gateway,
+            llm_request_service=LlmClientFactory.create(),
+        )
     )
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
-    if cloud_user_config_database_active_at_start:
-        codex_oauth_service.ensure_builtin_provider()
-    else:
+    if not cloud_user_config_database_active_at_start:
         logger.info("Runtime 处于 bootstrap 限制模式，跳过内置 Codex Provider 写入以避免本地 LLM Registry 成为共享配置权威。")
     codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
     runtime_auth_service = RuntimeAuthFactory.create_service()
     llm_http_trace_service = LlmHttpTraceFactory.create()
-    agent_execution_engine = AgentExecutionFactory.create(
-        mcp_client_gateway=mcp_gateway,
+    agent_execution_engine = _SwitchableRuntimeComponent(
+        AgentExecutionFactory.create(
+            mcp_client_gateway=mcp_gateway,
+        )
     )
-    lacp_bridge = LacpFactory.create_bridge(
-        runtime_gateway=agent_runtime_gateway,
-        agent_definition_gateway=agent_definition_gateway,
-        execution_engine=agent_execution_engine,
+    lacp_bridge = _SwitchableRuntimeComponent(
+        LacpFactory.create_bridge(
+            runtime_gateway=agent_runtime_gateway,
+            agent_definition_gateway=agent_definition_gateway,
+            execution_engine=agent_execution_engine,
+        )
     )
     lacp_client = LacpFactory.create_client()
-    lacp_settings_repository = LacpFactory.create_settings_repository()
+    lacp_settings_repository = _SwitchableRuntimeComponent(LacpFactory.create_settings_repository())
     terminal_gateway = TerminalFactory.create()
     logs_management_service = LogsManagementService()
     system_settings_gateway = SystemSettingsFactory.create()
     event_loop_monitor = EventLoopLagMonitor()
     runtime_loop: asyncio.AbstractEventLoop | None = None
     detach_tasks: set[asyncio.Task[None]] = set()
+    auto_connect_task: asyncio.Task | None = None
+    lacp_start_task: asyncio.Task | None = None
+    config_cache_poll_task: asyncio.Task | None = None
+    codex_provider_task: asyncio.Task | None = None
+    codex_oauth_callback_server_started = False
+
+    async def auto_connect_mcp_services() -> None:
+        logger.info("正在调度已启用 MCP 服务的后台连接…")
+        try:
+            results = await mcp_gateway.connect_all_enabled()
+            logger.info("MCP 服务后台连接已调度：%d", len(results))
+            for service_id, error in results.items():
+                if error is not None:
+                    logger.warning("MCP 服务当前连接异常：%s — %s", service_id, error)
+        except (Exception, asyncio.CancelledError) as e:
+            logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
+
+    async def ensure_codex_builtin_provider() -> None:
+        try:
+            await asyncio.to_thread(codex_oauth_service.ensure_builtin_provider)
+        except (Exception, asyncio.CancelledError) as e:
+            logger.warning("内置 Codex Provider 后台同步失败，Runtime 将继续运行：%s", e, exc_info=True)
+
+    def _rebuild_full_mode_components() -> None:
+        nonlocal lacp_client
+
+        reset_file_resource_services_for_runtime_mode_change()
+        LacpFactory.reset_for_runtime_mode_change()
+
+        prompt_gateway.set_target(PromptTemplateFactory.create())
+        mcp_gateway.set_target(McpClientFactory.create())
+        configure_mcp_meta_tools(mcp_gateway)
+        agent_definition_gateway.set_target(AgentDefinitionFactory.create())
+        llm_model_registry_gateway.set_target(LlmModelRegistryFactory.create())
+        image_generation_registry_gateway.set_target(
+            LlmModelRegistryFactory.create_image_generation_registry()
+        )
+        file_resource_service.set_target(get_file_resource_service())
+        image_generation_service.set_target(
+            ImageGenerationService(
+                settings_repository=create_image_generation_settings_repository(
+                    lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+                ),
+                llm_registry_gateway=image_generation_registry_gateway,
+                file_resource_service=file_resource_service,
+            )
+        )
+        web_tools_service.set_target(
+            WebToolsService(
+                settings_repository=create_web_tools_settings_repository(
+                    lambda: ConfigRegistry.instance().llm_model_registry.registry_dir,
+                ),
+                llm_registry_gateway=llm_model_registry_gateway,
+                llm_request_service=LlmClientFactory.create(),
+            )
+        )
+        agent_execution_engine.set_target(
+            AgentExecutionFactory.create(
+                mcp_client_gateway=mcp_gateway,
+            )
+        )
+        lacp_client = LacpFactory.create_client()
+        lacp_bridge.set_target(
+            LacpFactory.create_bridge(
+                runtime_gateway=agent_runtime_gateway,
+                agent_definition_gateway=agent_definition_gateway,
+                execution_engine=agent_execution_engine,
+            )
+        )
+        lacp_settings_repository.set_target(LacpFactory.create_settings_repository())
+
+    def _activate_runtime_full_mode_if_ready() -> bool:
+        nonlocal runtime_full_mode_active
+
+        if runtime_full_mode_active:
+            return True
+        if not ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+            return False
+        with runtime_full_mode_lock:
+            if runtime_full_mode_active:
+                return True
+            if not ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled:
+                return False
+            _rebuild_full_mode_components()
+            runtime_full_mode_active = True
+        _schedule_full_mode_background_services()
+        logger.info("Runtime bootstrap durable readiness 已完成，已在当前进程切换到完整共享配置模式。")
+        return True
+
+    def _schedule_full_mode_background_services() -> None:
+        loop = runtime_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(_start_full_mode_background_services_on_loop)
+        except RuntimeError:
+            logger.exception("Runtime 完整模式后台服务调度失败。")
+
+    def _start_full_mode_background_services_on_loop() -> None:
+        nonlocal auto_connect_task, lacp_start_task, config_cache_poll_task
+        nonlocal codex_provider_task, codex_oauth_callback_server_started
+
+        if config_cache_poll_task is None or config_cache_poll_task.done():
+            config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
+                lambda: ConfigRegistry.instance().cloud_user_config_database,
+            )
+        if not codex_oauth_callback_server_started:
+            codex_oauth_callback_server.start()
+            codex_oauth_callback_server_started = True
+        if codex_provider_task is None or codex_provider_task.done():
+            codex_provider_task = asyncio.create_task(
+                ensure_codex_builtin_provider(),
+                name="codex-oauth-builtin-provider-sync",
+            )
+        if auto_connect_task is None or auto_connect_task.done():
+            auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
+        if lacp_start_task is None or lacp_start_task.done():
+            lacp_start_task = asyncio.create_task(lacp_client.start())
 
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
     from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
@@ -326,31 +485,12 @@ def create_app() -> FastAPI:
     async def lifespan(application: FastAPI):
         nonlocal runtime_loop
 
-        async def auto_connect_mcp_services() -> None:
-            logger.info("正在调度已启用 MCP 服务的后台连接…")
-            try:
-                results = await mcp_gateway.connect_all_enabled()
-                logger.info("MCP 服务后台连接已调度：%d", len(results))
-                for service_id, error in results.items():
-                    if error is not None:
-                        logger.warning("MCP 服务当前连接异常：%s — %s", service_id, error)
-            except (Exception, asyncio.CancelledError) as e:
-                logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
-
         runtime_loop = asyncio.get_running_loop()
         event_loop_monitor.start()
         runtime_network_monitor.start()
         scene_session_registry.start()
-        auto_connect_task: asyncio.Task | None = None
-        lacp_start_task: asyncio.Task | None = None
-        config_cache_poll_task: asyncio.Task | None = None
-        if cloud_user_config_database_active_at_start:
-            config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
-                lambda: ConfigRegistry.instance().cloud_user_config_database,
-            )
-            codex_oauth_callback_server.start()
-            auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
-            lacp_start_task = asyncio.create_task(lacp_client.start())
+        if runtime_full_mode_active:
+            _start_full_mode_background_services_on_loop()
         else:
             logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接、LACP 启动与 Codex OAuth 回调服务。")
         try:
@@ -375,9 +515,13 @@ def create_app() -> FastAPI:
                 config_cache_poll_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):
                     await config_cache_poll_task
+            if codex_provider_task is not None and not codex_provider_task.done():
+                codex_provider_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await codex_provider_task
             await lacp_client.shutdown()
             await mcp_gateway.shutdown()
-            if cloud_user_config_database_active_at_start:
+            if codex_oauth_callback_server_started:
                 codex_oauth_callback_server.stop()
             await event_loop_monitor.stop()
             runtime_network_monitor.stop()
@@ -404,18 +548,28 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def runtime_bootstrap_guard_middleware(request, call_next):
         path = request.url.path
-        if (
-            path.startswith("/api/")
-            and not cloud_user_config_database_active_at_start
-            and not _is_runtime_bootstrap_exempt_path(path)
-        ):
-            return JSONResponse(
-                {
-                    "detail": "Runtime 尚未完成云端用户共享配置库初始化；请先完成 /api/runtime-bootstrap 引导并重启 Runtime。",
-                    "bootstrap_required": True,
-                },
-                status_code=503,
-            )
+        if path.startswith("/api/") and not _is_runtime_bootstrap_exempt_path(path):
+            try:
+                full_mode_ready = _activate_runtime_full_mode_if_ready()
+            except Exception as exc:  # noqa: BLE001 - 请求守卫需要把同进程激活失败稳定暴露给前端
+                logger.exception("Runtime bootstrap 已完成但完整模式激活失败。")
+                return JSONResponse(
+                    {
+                        "detail": f"Runtime bootstrap 已完成，但当前进程切换完整模式失败：{exc}",
+                        "bootstrap_required": False,
+                        "restricted": True,
+                    },
+                    status_code=503,
+                )
+            if not full_mode_ready:
+                return JSONResponse(
+                    {
+                        "detail": "Runtime 尚未完成本机 bootstrap durable readiness；请先完成 /api/runtime-bootstrap 引导。",
+                        "bootstrap_required": True,
+                        "restricted": True,
+                    },
+                    status_code=503,
+                )
         return await call_next(request)
 
     @app.middleware("http")
@@ -499,6 +653,7 @@ def create_app() -> FastAPI:
     app.include_router(
         create_runtime_bootstrap_router(
             cloud_user_config_database_active_at_start=cloud_user_config_database_active_at_start,
+            on_bootstrap_ready=_activate_runtime_full_mode_if_ready,
         ),
         prefix="/api/runtime-bootstrap",
         tags=["Runtime 初始化引导"],
@@ -543,7 +698,7 @@ def create_app() -> FastAPI:
             session_registry=scene_session_registry,
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
-            file_resource_service=get_file_resource_service(),
+            file_resource_service=file_resource_service,
             communication_gateway=communication_gateway,
             runtime_health_snapshot=event_loop_monitor.snapshot,
         ),

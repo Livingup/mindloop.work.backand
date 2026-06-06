@@ -14,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from agent_runtime.cloud_user_config.config import CloudUserConfigDatabaseConfig
+from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
 
 logger = logging.getLogger("agent_runtime.cloud_user_config.postgres_store")
 
@@ -117,10 +118,15 @@ $$;
 
 @dataclass(frozen=True, slots=True)
 class CloudUserConfigCacheSnapshot:
-    """PostgreSQL 配置表当前数据和数据库侧版本号快照。"""
+    """共享配置表当前数据和数据库侧版本号快照。"""
 
     revision: int
     items: dict[tuple[str, str], dict[str, Any]]
+    config_key: tuple[object, ...] | None = None
+
+
+class CloudUserConfigWriteUnavailableError(RuntimeError):
+    """PostgreSQL 写权威暂不可用，禁止把共享配置写入本地快照伪造成功。"""
 
 
 def _config_key(config: CloudUserConfigDatabaseConfig) -> tuple[object, ...]:
@@ -136,10 +142,10 @@ def _config_key(config: CloudUserConfigDatabaseConfig) -> tuple[object, ...]:
 class PostgresUserConfigStore:
     """面向仓储实现的 PostgreSQL JSONB 配置存储与本机缓存网关。
 
-    PostgreSQL 的 cloud_user_config_items 是用户共享配置权威；数据库侧 trigger 维护
-    cloud_user_config_revision_state.revision。Runtime 本机进程只缓存配置 payload 和
-    已加载 revision，不生成业务版本号。前端和后端业务仓储统一通过本 store 获取配置，
-    store 在启动和后台轮询中发现数据库 revision 变化后刷新本机内存缓存。
+    PostgreSQL 的 cloud_user_config_items 是用户共享配置写权威；数据库侧 trigger 维护
+    cloud_user_config_revision_state.revision。Runtime 本机通过机器本地持久化快照支持
+    离线冷启动读取，再把快照加载为进程内热缓存。写入必须先成功落到 PostgreSQL，随后
+    重新拉取权威快照并同步更新进程缓存与本地持久化快照，禁止离线写入本地快照形成双权威。
     """
 
     _cache_lock = threading.RLock()
@@ -147,8 +153,14 @@ class PostgresUserConfigStore:
     _cache_items: dict[tuple[str, str], dict[str, Any]] = {}
     _cache_config_key: tuple[object, ...] | None = None
 
-    def __init__(self, config_accessor: Callable[[], CloudUserConfigDatabaseConfig]) -> None:
+    def __init__(
+        self,
+        config_accessor: Callable[[], CloudUserConfigDatabaseConfig],
+        *,
+        local_state_repository: CloudUserConfigLocalStateRepository | None = None,
+    ) -> None:
         self._config_accessor = config_accessor
+        self._local_state_repository = local_state_repository
 
     @classmethod
     def reset_process_cache_for_tests(cls) -> None:
@@ -191,38 +203,56 @@ class PostgresUserConfigStore:
             return dict(payload) if payload is not None else None
 
     def save_payload(self, namespace: str, item_id: str, payload: dict[str, Any]) -> int:
-        """保存配置 payload，并读取数据库侧 trigger 更新后的 revision 刷新本机缓存。"""
+        """按 write-through 语义保存共享配置。
 
-        self.ensure_schema()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO cloud_user_config_items (namespace, item_id, payload)
-                VALUES (%s, %s, %s)
-                ON CONFLICT(namespace, item_id) DO UPDATE SET
-                    payload = excluded.payload,
-                    updated_at = now()
-                """,
-                (namespace, item_id, Jsonb(payload)),
-            )
-            conn.commit()
-        return self.reload_cache_from_database().revision
+        PostgreSQL 是唯一写权威；写入成功后重新拉取权威快照，更新进程热缓存和机器本地
+        持久化快照，使设置页保存成功后本机立即生效。PG 不可用时不写本地快照，避免双权威。
+        """
+
+        try:
+            self.ensure_schema()
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO cloud_user_config_items (namespace, item_id, payload)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT(namespace, item_id) DO UPDATE SET
+                        payload = excluded.payload,
+                        updated_at = now()
+                    """,
+                    (namespace, item_id, Jsonb(payload)),
+                )
+                conn.commit()
+            return self.reload_cache_from_database().revision
+        except CloudUserConfigWriteUnavailableError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 写路径需要统一暴露临时不可用语义
+            raise CloudUserConfigWriteUnavailableError(
+                "云端共享配置 PostgreSQL 暂不可用，配置修改未保存；请稍后重试。"
+            ) from exc
 
     def delete_payload(self, namespace: str, item_id: str) -> bool:
-        self.ensure_schema()
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                DELETE FROM cloud_user_config_items
-                WHERE namespace = %s AND item_id = %s
-                """,
-                (namespace, item_id),
-            )
-            deleted = (cursor.rowcount or 0) > 0
-            conn.commit()
-        if deleted:
-            self.reload_cache_from_database()
-        return deleted
+        try:
+            self.ensure_schema()
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM cloud_user_config_items
+                    WHERE namespace = %s AND item_id = %s
+                    """,
+                    (namespace, item_id),
+                )
+                deleted = (cursor.rowcount or 0) > 0
+                conn.commit()
+            if deleted:
+                self.reload_cache_from_database()
+            return deleted
+        except CloudUserConfigWriteUnavailableError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 写路径需要统一暴露临时不可用语义
+            raise CloudUserConfigWriteUnavailableError(
+                "云端共享配置 PostgreSQL 暂不可用，配置删除未保存；请稍后重试。"
+            ) from exc
 
     def contains_payload(self, namespace: str, item_id: str) -> bool:
         self.ensure_cache_loaded()
@@ -230,7 +260,7 @@ class PostgresUserConfigStore:
             return (namespace, item_id) in self._cache_items
 
     def ensure_cache_loaded(self) -> CloudUserConfigCacheSnapshot:
-        """确保本机缓存已从 PostgreSQL 配置表加载。"""
+        """确保进程缓存已优先从机器本地持久化快照加载。"""
 
         config_key = _config_key(self._config_accessor())
         with self._cache_lock:
@@ -238,17 +268,18 @@ class PostgresUserConfigStore:
                 return CloudUserConfigCacheSnapshot(
                     revision=self._cache_revision,
                     items={key: dict(value) for key, value in self._cache_items.items()},
+                    config_key=config_key,
                 )
-        return self.reload_cache_from_database()
+        snapshot = self._load_cache_snapshot_from_local_state(config_key)
+        self._apply_process_cache(snapshot)
+        return snapshot
 
     def reload_cache_from_database(self) -> CloudUserConfigCacheSnapshot:
-        """从 PostgreSQL 全量拉取配置表和数据库侧 revision，覆盖本机内存缓存。"""
+        """从 PostgreSQL 全量拉取配置表和 revision，并同步进程缓存与本机持久化快照。"""
 
         snapshot = self._read_cache_snapshot_from_database()
-        with self._cache_lock:
-            self.__class__._cache_revision = snapshot.revision
-            self.__class__._cache_items = {key: dict(value) for key, value in snapshot.items.items()}
-            self.__class__._cache_config_key = _config_key(self._config_accessor())
+        self._apply_process_cache(snapshot)
+        self._save_cache_snapshot_to_local_state(snapshot)
         return snapshot
 
     def refresh_cache_if_revision_changed(self) -> CloudUserConfigCacheSnapshot:
@@ -265,6 +296,7 @@ class PostgresUserConfigStore:
             return CloudUserConfigCacheSnapshot(
                 revision=self._cache_revision or 0,
                 items={key: dict(value) for key, value in self._cache_items.items()},
+                config_key=config_key,
             )
 
     def get_current_config_revision(self) -> int:
@@ -304,6 +336,44 @@ class PostgresUserConfigStore:
         with self._connect() as conn:
             return self._load_cache_snapshot(conn)
 
+    def _load_cache_snapshot_from_local_state(
+        self,
+        config_key: tuple[object, ...],
+    ) -> CloudUserConfigCacheSnapshot:
+        local_snapshot = self._local_state().get_snapshot(expected_config_key=config_key)
+        if local_snapshot is None:
+            raise RuntimeError(
+                "本机共享配置快照不存在或与当前 PostgreSQL 配置不匹配；无法离线读取共享配置。"
+            )
+        return CloudUserConfigCacheSnapshot(
+            revision=local_snapshot.revision,
+            items={key: dict(value) for key, value in local_snapshot.items.items()},
+            config_key=local_snapshot.config_key,
+        )
+
+    def _apply_process_cache(self, snapshot: CloudUserConfigCacheSnapshot) -> None:
+        config_key = snapshot.config_key or _config_key(self._config_accessor())
+        with self._cache_lock:
+            self.__class__._cache_revision = snapshot.revision
+            self.__class__._cache_items = {key: dict(value) for key, value in snapshot.items.items()}
+            self.__class__._cache_config_key = config_key
+
+    def _save_cache_snapshot_to_local_state(self, snapshot: CloudUserConfigCacheSnapshot) -> None:
+        config_key = snapshot.config_key or _config_key(self._config_accessor())
+        self._local_state().save_snapshot(
+            config_key=config_key,
+            revision=snapshot.revision,
+            items={key: dict(value) for key, value in snapshot.items.items()},
+        )
+
+    def _local_state(self) -> CloudUserConfigLocalStateRepository:
+        if self._local_state_repository is not None:
+            return self._local_state_repository
+        self._local_state_repository = CloudUserConfigLocalStateRepository(
+            lambda: self._config_accessor().bootstrap_data_dir,
+        )
+        return self._local_state_repository
+
     def _read_database_revision(self) -> int:
         self.ensure_schema()
         with self._connect() as conn:
@@ -325,7 +395,11 @@ class PostgresUserConfigStore:
             (str(row["namespace"]), str(row["item_id"])): dict(row["payload"])
             for row in rows
         }
-        return CloudUserConfigCacheSnapshot(revision=revision, items=items)
+        return CloudUserConfigCacheSnapshot(
+            revision=revision,
+            items=items,
+            config_key=_config_key(self._config_accessor()),
+        )
 
     def _current_config_revision(self, conn: psycopg.Connection[dict[str, Any]]) -> int:
         row = conn.execute(

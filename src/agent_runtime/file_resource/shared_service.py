@@ -35,3 +35,12 @@ def get_file_resource_upload_task_service():
 
             _file_resource_upload_task_service = FileResourceUploadTaskService(get_file_resource_service())
         return _file_resource_upload_task_service
+
+
+def reset_file_resource_services_for_runtime_mode_change() -> None:
+    """清理文件资源服务单例，以便 bootstrap 完成后按最新共享配置模式重建。"""
+    global _file_resource_service, _file_resource_upload_task_service
+    with _file_resource_upload_task_service_lock:
+        _file_resource_upload_task_service = None
+    with _file_resource_service_lock:
+        _file_resource_service = None

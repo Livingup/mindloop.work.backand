@@ -64,9 +64,10 @@ class LlmModelRegistryFactory:
         装配链路：SQLite 仓储 → 领域服务 → 北向网关。
         """
         repository = LlmModelRegistryFactory._create_repository()
-        service = LlmModelRegistryService(repository)
-        for metadata in builtin_llm_model_metadata():
-            service.ensure_builtin_model_metadata(metadata)
+        service = LlmModelRegistryService(
+            repository,
+            builtin_model_metadata=builtin_llm_model_metadata(),
+        )
         return LlmModelRegistryGatewayImpl(service)
 
     @staticmethod
@@ -95,9 +96,8 @@ class LlmModelRegistryFactory:
         service = LlmModelRegistryService(
             repository,
             external_provider_model_resolver=external_provider_model_resolver,
+            builtin_model_metadata=builtin_image_generation_model_metadata(),
         )
-        for metadata in builtin_image_generation_model_metadata():
-            service.ensure_builtin_model_metadata(metadata)
         return ImageGenerationLlmRegistryGateway(
             image_registry_gateway=LlmModelRegistryGatewayImpl(service),
             llm_registry_gateway=llm_registry_gateway,

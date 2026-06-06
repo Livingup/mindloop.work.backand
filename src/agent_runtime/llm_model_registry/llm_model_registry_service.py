@@ -172,28 +172,34 @@ class LlmModelRegistryService:
         repository: LlmModelRegistryRepository,
         *,
         external_provider_model_resolver: ExternalProviderModelResolver | None = None,
+        builtin_model_metadata: tuple[LlmModelMetadata, ...] = (),
     ) -> None:
         # LLM 注册仓储。该仓储负责用户自定义模型元数据、服务商定义和执行策略组的持久化与查询，
         # 是后续 Agent 执行引擎选择 LLM 服务商、模型、策略和协议参数的数据基础。
         self._repository = repository
         self._external_provider_model_resolver = external_provider_model_resolver
+        # 内置模型元数据属于运行时静态能力，不属于用户共享配置写入内容。
+        # PostgreSQL 共享配置冷启动时通过内存只读默认值提供，避免离线场景因自动写入内置元数据阻塞启动。
+        self._builtin_model_metadata = {metadata.model_id: metadata for metadata in builtin_model_metadata}
 
     # ── 模型元数据管理 ──────────────────────────────────────
 
     def list_model_metadata(self) -> list[LlmModelMetadata]:
         """列出所有模型型号元数据。"""
-        return self._repository.find_all_model_metadata()
+        metadata_by_id = {item.model_id: item for item in self._repository.find_all_model_metadata()}
+        metadata_by_id.update(self._builtin_model_metadata)
+        return list(metadata_by_id.values())
 
     def get_model_metadata(self, model_id: str) -> LlmModelMetadata:
         """按 model_id 获取模型元数据；不存在时抛出 KeyError。"""
-        metadata = self._repository.find_model_metadata_by_id(model_id)
+        metadata = self._find_model_metadata_by_id(model_id)
         if metadata is None:
             raise KeyError(f"LLM 模型元数据不存在: {model_id}")
         return metadata
 
     def save_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
         """Save custom model metadata."""
-        existing = self._repository.find_model_metadata_by_id(metadata.model_id)
+        existing = self._find_model_metadata_by_id(metadata.model_id)
         if existing is not None and existing.source == LLM_MODEL_SOURCE_BUILTIN:
             raise ValueError(f"Builtin LLM model metadata cannot be edited: {metadata.model_id}")
         if metadata.source == LLM_MODEL_SOURCE_BUILTIN:
@@ -205,7 +211,7 @@ class LlmModelRegistryService:
     def ensure_builtin_model_metadata(self, metadata: LlmModelMetadata) -> LlmModelMetadata:
         if metadata.source != LLM_MODEL_SOURCE_BUILTIN:
             raise ValueError(f"Builtin LLM model metadata source must be builtin: {metadata.model_id}")
-        existing = self._repository.find_model_metadata_by_id(metadata.model_id)
+        existing = self._find_model_metadata_by_id(metadata.model_id)
         if existing == metadata:
             return existing
         self._repository.save_model_metadata(metadata)
@@ -217,7 +223,7 @@ class LlmModelRegistryService:
 
         如果已有服务商模型接入项引用该模型，则拒绝删除，避免服务商定义留下悬空 model_id。
         """
-        existing = self._repository.find_model_metadata_by_id(model_id)
+        existing = self._find_model_metadata_by_id(model_id)
         if existing is not None and existing.source == LLM_MODEL_SOURCE_BUILTIN:
             raise ValueError(f"Builtin LLM model metadata cannot be deleted: {model_id}")
         referenced_by = [
@@ -232,6 +238,12 @@ class LlmModelRegistryService:
             )
         if self._repository.delete_model_metadata(model_id):
             logger.info("删除 LLM 模型元数据: %s", model_id)
+
+    def _find_model_metadata_by_id(self, model_id: str) -> LlmModelMetadata | None:
+        return self._builtin_model_metadata.get(model_id) or self._repository.find_model_metadata_by_id(model_id)
+
+    def _contains_model_metadata(self, model_id: str) -> bool:
+        return model_id in self._builtin_model_metadata or self._repository.contains_model_metadata(model_id)
 
     # ── 服务商定义管理 ──────────────────────────────────────
 
@@ -254,7 +266,7 @@ class LlmModelRegistryService:
         missing_model_ids = sorted({
             binding.model_id
             for binding in provider.models
-            if not self._repository.contains_model_metadata(binding.model_id)
+            if not self._contains_model_metadata(binding.model_id)
         })
         if missing_model_ids:
             raise ValueError(

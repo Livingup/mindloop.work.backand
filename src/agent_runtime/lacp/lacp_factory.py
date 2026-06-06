@@ -24,6 +24,14 @@ class LacpFactory:
     _bridge: 'AgentRuntimeLacpBridge' | None = None
 
     @classmethod
+    def reset_for_runtime_mode_change(cls) -> None:
+        """清理依赖当前共享配置模式的缓存实例。"""
+        with cls._lock:
+            cls._settings_repository = None
+            cls._client = None
+            cls._bridge = None
+
+    @classmethod
     def create_settings_repository(cls) -> LacpSettingsRepository:
         with cls._lock:
             if cls._settings_repository is None:

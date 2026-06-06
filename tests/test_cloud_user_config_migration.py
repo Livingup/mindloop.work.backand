@@ -14,6 +14,7 @@ from agent_runtime.cloud_user_config.north_gateway import (
     bootstrap_rest_adapter as bootstrap_module,
 )
 from agent_runtime.cloud_user_config.bootstrap_settings import CloudUserConfigBootstrapSettingsRepository
+from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
 from agent_runtime.cloud_user_config.config import (
     CloudUserConfigDatabaseConfig,
     CloudUserConfigDatabasePoolConfig,
@@ -99,6 +100,22 @@ class _FakePostgresUserConfigStore:
     def ensure_schema(self) -> None:
         # 触发配置访问，确保测试覆盖机器本地 bootstrap 凭据覆盖 YAML 元数据后的密码校验路径。
         self._config_accessor().require_password()
+
+    def reload_cache_from_database(self):
+        config = self._config_accessor()
+        CloudUserConfigLocalStateRepository(
+            lambda: config.bootstrap_data_dir,
+        ).save_snapshot(
+            config_key=(
+                config.host,
+                config.port,
+                config.database,
+                config.username,
+                config.sslmode,
+            ),
+            revision=1,
+            items={key: dict(value) for key, value in type(self).items.items()},
+        )
 
 
 def test_migrate_local_user_global_config_to_postgresql_copies_approved_domains(
@@ -277,12 +294,33 @@ def test_runtime_bootstrap_configure_saves_credentials_without_migration_before_
 
     assert response.status_code == 200
     body = response.json()
-    assert body["restart_required"] is True
+    assert body["restart_required"] is False
     assert body["ready"] is False
-    assert body["bootstrap_required"] is False
+    assert body["bootstrap_required"] is True
     assert body["cloud_user_config_database"]["configured"] is True
     assert body["cloud_user_config_database"]["active_at_start"] is False
+    assert body["cloud_user_config_database"]["shared_config_snapshot_ready"] is True
+    assert body["missing_required_items"] == ["object_storage_decision"]
     assert _FakePostgresUserConfigStore.items == {}
+
+    try:
+        ConfigRegistry.load(str(tmp_path / "agent_runtime.yaml"), watch=False)
+        skip_response = TestClient(app).post(
+            "/api/runtime-bootstrap/configure",
+            json={
+                "cloud_user_config_database": None,
+                "object_storage_settings": None,
+                "object_storage_skipped": True,
+            },
+        )
+    finally:
+        ConfigRegistry.reset()
+
+    assert skip_response.status_code == 200
+    skip_body = skip_response.json()
+    assert skip_body["ready"] is True
+    assert skip_body["bootstrap_required"] is False
+    assert skip_body["object_storage"]["skipped"] is True
 
 
 def test_cloud_enabled_shared_domain_repositories_use_postgresql_authority(
@@ -298,26 +336,40 @@ def test_cloud_enabled_shared_domain_repositories_use_postgresql_authority(
     )
     data_root = tmp_path / "data"
     _write_runtime_config(tmp_path / "agent_runtime.yaml", data_root)
+    durable_config = CloudUserConfigDatabaseConfig(
+        enabled=True,
+        backend="postgresql",
+        host="db.mindloop.chat",
+        port=25432,
+        database="agent_runtime",
+        username="agent_runtime_client",
+        password="postgres-secret",
+        sslmode="require",
+        bootstrap_data_dir=str(data_root / "cloud-user-config"),
+        pool=CloudUserConfigDatabasePoolConfig(
+            min_size=1,
+            max_size=5,
+            connect_timeout_seconds=10,
+        ),
+    )
     CloudUserConfigBootstrapSettingsRepository(
         lambda: str(data_root / "cloud-user-config")
-    ).save_config(
-        CloudUserConfigDatabaseConfig(
-            enabled=True,
-            backend="postgresql",
-            host="db.mindloop.chat",
-            port=25432,
-            database="agent_runtime",
-            username="agent_runtime_client",
-            password="postgres-secret",
-            sslmode="require",
-            bootstrap_data_dir=str(data_root / "cloud-user-config"),
-            pool=CloudUserConfigDatabasePoolConfig(
-                min_size=1,
-                max_size=5,
-                connect_timeout_seconds=10,
-            ),
-        )
+    ).save_config(durable_config)
+    local_state_repository = CloudUserConfigLocalStateRepository(
+        lambda: str(data_root / "cloud-user-config")
     )
+    local_state_repository.save_snapshot(
+        config_key=(
+            durable_config.host,
+            durable_config.port,
+            durable_config.database,
+            durable_config.username,
+            durable_config.sslmode,
+        ),
+        revision=1,
+        items={},
+    )
+    local_state_repository.mark_object_storage_skipped()
 
     try:
         ConfigRegistry.load(str(tmp_path / "agent_runtime.yaml"), watch=False)

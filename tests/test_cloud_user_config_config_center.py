@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
 
 from agent_runtime.cloud_user_config.postgres_store import (
     CloudUserConfigCacheSnapshot,
@@ -23,6 +26,7 @@ class _FakeDatabaseConfig:
     database: str = "agent"
     username: str = "agent"
     sslmode: str = "prefer"
+    bootstrap_data_dir: str = ""
     pool: _FakePoolConfig = _FakePoolConfig()
 
     def require_password(self) -> str:
@@ -30,8 +34,12 @@ class _FakeDatabaseConfig:
 
 
 class _FakeCachedConfigStore(PostgresUserConfigStore):
-    def __init__(self) -> None:
-        super().__init__(lambda: _FakeDatabaseConfig())
+    def __init__(self, bootstrap_data_dir: str) -> None:
+        self._config = _FakeDatabaseConfig(bootstrap_data_dir=bootstrap_data_dir)
+        super().__init__(
+            lambda: self._config,
+            local_state_repository=CloudUserConfigLocalStateRepository(lambda: bootstrap_data_dir),
+        )
         self.database_revision = 1
         self.database_items: dict[tuple[str, str], dict[str, Any]] = {
             ("prompt_snippet", "welcome"): {"name": "welcome", "text": "v1"},
@@ -54,9 +62,11 @@ class _FakeCachedConfigStore(PostgresUserConfigStore):
         return self.database_revision
 
 
-def test_backend_cache_loads_postgres_config_snapshot_and_serves_reads_from_memory() -> None:
+def test_backend_cache_loads_postgres_config_snapshot_and_serves_reads_from_memory(tmp_path: Path) -> None:
     _FakeCachedConfigStore.reset_process_cache_for_tests()
-    store = _FakeCachedConfigStore()
+    store = _FakeCachedConfigStore(str(tmp_path / "cloud-user-config"))
+    store.reload_cache_from_database()
+    _FakeCachedConfigStore.reset_process_cache_for_tests()
 
     assert store.list_payloads("prompt_snippet") == [{"name": "welcome", "text": "v1"}]
     assert store.get_payload("prompt_snippet", "welcome") == {"name": "welcome", "text": "v1"}
@@ -67,9 +77,11 @@ def test_backend_cache_loads_postgres_config_snapshot_and_serves_reads_from_memo
     assert store.snapshot_reads == 1
 
 
-def test_backend_poll_refreshes_memory_cache_only_when_database_revision_changes() -> None:
+def test_backend_poll_refreshes_memory_cache_only_when_database_revision_changes(tmp_path: Path) -> None:
     _FakeCachedConfigStore.reset_process_cache_for_tests()
-    store = _FakeCachedConfigStore()
+    store = _FakeCachedConfigStore(str(tmp_path / "cloud-user-config"))
+    store.reload_cache_from_database()
+    _FakeCachedConfigStore.reset_process_cache_for_tests()
 
     store.ensure_cache_loaded()
     unchanged = store.refresh_cache_if_revision_changed()

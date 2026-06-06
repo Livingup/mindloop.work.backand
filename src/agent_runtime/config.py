@@ -653,19 +653,54 @@ def _build_cloud_user_config_database_config(data: dict[str, Any]) -> CloudUserC
 def _apply_cloud_user_config_bootstrap(
     base_config: CloudUserConfigDatabaseConfig,
 ) -> CloudUserConfigDatabaseConfig:
-    """叠加机器本地保存的云端用户配置库连接凭据。"""
+    """只在机器本地 durable bootstrap 完成后叠加 PostgreSQL 凭据。
+
+    保存连接凭据本身不等于 Runtime 已可进入完整共享配置模式；必须同时存在匹配的本机
+    共享配置快照、OSS 已配置或显式跳过、以及本机完成标记，才能把 PostgreSQL 连接
+    暴露给普通共享配置仓储。这样首启/未完成引导保持后端本地限制模式，避免桌面启动路径
+    被同步 PostgreSQL 访问阻塞。
+    """
     try:
         from agent_runtime.cloud_user_config.bootstrap_settings import (
             CloudUserConfigBootstrapSettingsRepository,
         )
+        from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
 
         repository = CloudUserConfigBootstrapSettingsRepository(
             lambda: base_config.bootstrap_data_dir,
         )
-        return repository.get_effective_database_config(base_config)
+        settings = repository.get_settings()
+        if settings is None or not settings.configured:
+            return base_config
+        effective_config = settings.to_database_config(base_config)
+        readiness = CloudUserConfigLocalStateRepository(
+            lambda: base_config.bootstrap_data_dir,
+        ).get_readiness(
+            credentials_saved=True,
+            expected_config_key=_cloud_user_config_database_key(effective_config),
+        )
+        if not readiness.completed:
+            if readiness.error_message:
+                logger.warning(
+                    "云端用户配置 bootstrap 本机状态未就绪，继续使用 YAML 默认值: %s",
+                    readiness.error_message,
+                )
+            return base_config
+        return effective_config
     except Exception:
-        logger.exception("读取云端用户配置 bootstrap 凭据失败，继续使用 YAML 默认值。")
+        logger.exception("读取云端用户配置 bootstrap 状态失败，继续使用 YAML 默认值。")
         return base_config
+
+
+def _cloud_user_config_database_key(config: CloudUserConfigDatabaseConfig) -> tuple[object, ...]:
+    """生成本机共享配置快照与 PostgreSQL 连接配置的匹配键，不包含密码。"""
+    return (
+        config.host,
+        config.port,
+        config.database,
+        config.username,
+        config.sslmode,
+    )
 
 
 def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
