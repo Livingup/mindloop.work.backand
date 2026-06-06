@@ -19,6 +19,7 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from agent_runtime.conversation_message.message.models import (
@@ -187,7 +188,10 @@ class SqliteConversationRepository:
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / "conversations.db"
-        self._conn = sqlite3.connect(str(db_path))
+        # Agent 执行会在 FastAPI 请求线程与后台执行线程之间切换；同一仓储连接允许跨线程复用，
+        # 但所有 SQLite 与对应 JSONL 文件访问必须由仓储锁串行化，避免同一连接并发操作。
+        self._lock = RLock()
+        self._conn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
@@ -196,7 +200,8 @@ class SqliteConversationRepository:
 
     def close(self) -> None:
         """关闭底层数据库连接。"""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ── 核心增删改查 ─────────────────────────────────────────────
 
@@ -204,118 +209,127 @@ class SqliteConversationRepository:
         self, conv: Conversation, *, task_id: str, thread_id: str,
         agent_id: str, agent_instance_id: str,
     ) -> None:
-        c = self._conn
-        c.execute(
-            "INSERT INTO conversations (id, task_id, thread_id, agent_id, agent_instance_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (conv.id, task_id, thread_id, agent_id, agent_instance_id),
-        )
-        self._upsert_state(conv.id, conv.state)
-        c.commit()
-        # 写入已有消息（创建时通常为空）。
-        if conv.messages:
-            self._write_messages_file(task_id, conv.id, conv.messages)
-        else:
-            # 确保目录和空文件存在。
-            path = self._msg_path(task_id, conv.id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch()
+        with self._lock:
+            c = self._conn
+            c.execute(
+                "INSERT INTO conversations (id, task_id, thread_id, agent_id, agent_instance_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (conv.id, task_id, thread_id, agent_id, agent_instance_id),
+            )
+            self._upsert_state(conv.id, conv.state)
+            c.commit()
+            # 写入已有消息（创建时通常为空）。
+            if conv.messages:
+                self._write_messages_file(task_id, conv.id, conv.messages)
+            else:
+                # 确保目录和空文件存在。
+                path = self._msg_path(task_id, conv.id)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
 
     async def get(self, conversation_id: str) -> Conversation:
-        c = self._conn
+        with self._lock:
+            c = self._conn
 
-        row = c.execute(
-            "SELECT id, task_id FROM conversations WHERE id = ?",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Conversation not found: {conversation_id}")
-        task_id = row[1]
+            row = c.execute(
+                "SELECT id, task_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Conversation not found: {conversation_id}")
+            task_id = row[1]
 
-        # 从 JSONL 文件读取消息列表。
-        messages = self._read_messages_file(task_id, conversation_id)
+            # 从 JSONL 文件读取消息列表。
+            messages = self._read_messages_file(task_id, conversation_id)
 
-        # 从 SQLite 读取会话派生状态。
-        sr = c.execute(
-            "SELECT providers, vendors, modalities, image_count, pdf_page_count, last_context_usage "
-            "FROM conversation_state WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()
-        state = ConversationState(
-            providers=json.loads(sr[0]),
-            vendors=json.loads(sr[1]),
-            modalities=json.loads(sr[2]),
-            image_count=sr[3],
-            pdf_page_count=sr[4],
-            last_context_usage=json.loads(sr[5]) if sr[5] else None,
-        ) if sr else ConversationState()
+            # 从 SQLite 读取会话派生状态。
+            sr = c.execute(
+                "SELECT providers, vendors, modalities, image_count, pdf_page_count, last_context_usage "
+                "FROM conversation_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            state = ConversationState(
+                providers=json.loads(sr[0]),
+                vendors=json.loads(sr[1]),
+                modalities=json.loads(sr[2]),
+                image_count=sr[3],
+                pdf_page_count=sr[4],
+                last_context_usage=json.loads(sr[5]) if sr[5] else None,
+            ) if sr else ConversationState()
 
-        # 从 SQLite 读取各 LLM 供应商的会话状态。
-        ps_rows = c.execute(
-            "SELECT provider, state FROM provider_state WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchall()
-        provider_state: dict[str, Any] = {r[0]: json.loads(r[1]) for r in ps_rows}
+            # 从 SQLite 读取各 LLM 供应商的会话状态。
+            ps_rows = c.execute(
+                "SELECT provider, state FROM provider_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchall()
+            provider_state: dict[str, Any] = {r[0]: json.loads(r[1]) for r in ps_rows}
 
-        return Conversation(
-            id=conversation_id,
-            messages=messages,
-            state=state,
-            provider_state=provider_state,
-        )
+            return Conversation(
+                id=conversation_id,
+                messages=messages,
+                state=state,
+                provider_state=provider_state,
+            )
 
     async def save(self, conv: Conversation) -> None:
-        c = self._conn
-        cid = conv.id
-        task_id = self._get_task_id(cid)
-        # 覆写 JSONL 消息文件。
-        self._write_messages_file(task_id, cid, conv.messages)
-        # 覆写会话派生状态。
-        self._upsert_state(cid, conv.state)
-        c.execute("DELETE FROM provider_state WHERE conversation_id = ?", (cid,))
-        for provider, ps in conv.provider_state.items():
-            c.execute(
-                "INSERT OR REPLACE INTO provider_state "
-                "(conversation_id, provider, state) VALUES (?, ?, ?)",
-                (cid, provider, json.dumps(ps, ensure_ascii=False)),
-            )
-        c.commit()
+        with self._lock:
+            c = self._conn
+            cid = conv.id
+            task_id = self._get_task_id(cid)
+            if not task_id:
+                raise KeyError(f"Conversation not found: {cid}")
+            # 覆写 JSONL 消息文件。
+            self._write_messages_file(task_id, cid, conv.messages)
+            # 覆写会话派生状态。
+            self._upsert_state(cid, conv.state)
+            c.execute("DELETE FROM provider_state WHERE conversation_id = ?", (cid,))
+            for provider, ps in conv.provider_state.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO provider_state "
+                    "(conversation_id, provider, state) VALUES (?, ?, ?)",
+                    (cid, provider, json.dumps(ps, ensure_ascii=False)),
+                )
+            c.commit()
 
     async def delete(self, conversation_id: str) -> None:
-        task_id = self._get_task_id(conversation_id)
-        # 删除 JSONL 消息文件。
-        if task_id:
-            path = self._msg_path(task_id, conversation_id)
-            path.unlink(missing_ok=True)
-        # SQLite 外键 CASCADE 自动删除关联的状态行。
-        self._conn.execute(
-            "DELETE FROM conversations WHERE id = ?", (conversation_id,),
-        )
-        self._conn.commit()
+        with self._lock:
+            task_id = self._get_task_id(conversation_id)
+            # 删除 JSONL 消息文件。
+            if task_id:
+                path = self._msg_path(task_id, conversation_id)
+                path.unlink(missing_ok=True)
+            # SQLite 外键 CASCADE 自动删除关联的状态行。
+            self._conn.execute(
+                "DELETE FROM conversations WHERE id = ?", (conversation_id,),
+            )
+            self._conn.commit()
 
     # ── 增量操作 ─────────────────────────────────────────────────
 
     async def append_message(self, conversation_id: str, msg: UniMessage) -> None:
-        task_id = self._get_task_id(conversation_id)
-        if not task_id:
-            raise KeyError(f"Conversation not found: {conversation_id}")
-        path = self._msg_path(task_id, conversation_id)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(_message_to_json_line(msg) + "\n")
+        with self._lock:
+            task_id = self._get_task_id(conversation_id)
+            if not task_id:
+                raise KeyError(f"Conversation not found: {conversation_id}")
+            path = self._msg_path(task_id, conversation_id)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(_message_to_json_line(msg) + "\n")
 
     async def save_state(self, conversation_id: str, state: ConversationState) -> None:
-        self._upsert_state(conversation_id, state)
-        self._conn.commit()
+        with self._lock:
+            self._upsert_state(conversation_id, state)
+            self._conn.commit()
 
     async def save_provider_state(
         self, conversation_id: str, provider: str, state: Any,
     ) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO provider_state "
-            "(conversation_id, provider, state) VALUES (?, ?, ?)",
-            (conversation_id, provider, json.dumps(state, ensure_ascii=False)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO provider_state "
+                "(conversation_id, provider, state) VALUES (?, ?, ?)",
+                (conversation_id, provider, json.dumps(state, ensure_ascii=False)),
+            )
+            self._conn.commit()
 
     async def save_pending_tool_result(
         self,
@@ -323,74 +337,81 @@ class SqliteConversationRepository:
         assistant_message_index: int,
         result_part: ToolResultPart,
     ) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO pending_tool_results "
-            "(conversation_id, assistant_message_index, tool_use_ref, result_part) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                conversation_id,
-                assistant_message_index,
-                result_part.tool_use_ref,
-                json.dumps(_part_to_dict(result_part), ensure_ascii=False),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO pending_tool_results "
+                "(conversation_id, assistant_message_index, tool_use_ref, result_part) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    conversation_id,
+                    assistant_message_index,
+                    result_part.tool_use_ref,
+                    json.dumps(_part_to_dict(result_part), ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
 
     async def list_pending_tool_results(
         self,
         conversation_id: str,
         assistant_message_index: int,
     ) -> list[ToolResultPart]:
-        rows = self._conn.execute(
-            "SELECT result_part FROM pending_tool_results "
-            "WHERE conversation_id = ? AND assistant_message_index = ?",
-            (conversation_id, assistant_message_index),
-        ).fetchall()
-        results: list[ToolResultPart] = []
-        for row in rows:
-            part = _dict_to_part(json.loads(row[0]))
-            if isinstance(part, ToolResultPart):
-                results.append(part)
-        return results
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT result_part FROM pending_tool_results "
+                "WHERE conversation_id = ? AND assistant_message_index = ?",
+                (conversation_id, assistant_message_index),
+            ).fetchall()
+            results: list[ToolResultPart] = []
+            for row in rows:
+                part = _dict_to_part(json.loads(row[0]))
+                if isinstance(part, ToolResultPart):
+                    results.append(part)
+            return results
 
     async def clear_pending_tool_results(
         self,
         conversation_id: str,
         assistant_message_index: int,
     ) -> None:
-        self._conn.execute(
-            "DELETE FROM pending_tool_results "
-            "WHERE conversation_id = ? AND assistant_message_index = ?",
-            (conversation_id, assistant_message_index),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM pending_tool_results "
+                "WHERE conversation_id = ? AND assistant_message_index = ?",
+                (conversation_id, assistant_message_index),
+            )
+            self._conn.commit()
 
     # ── 层级查询 ─────────────────────────────────────────────────
 
     async def list_by_task(self, task_id: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT id FROM conversations WHERE task_id = ?", (task_id,),
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM conversations WHERE task_id = ?", (task_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
 
     async def list_by_thread(self, thread_id: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT id FROM conversations WHERE thread_id = ?", (thread_id,),
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM conversations WHERE thread_id = ?", (thread_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
 
     async def list_by_agent(self, agent_id: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT id FROM conversations WHERE agent_id = ?", (agent_id,),
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM conversations WHERE agent_id = ?", (agent_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
 
     async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT id FROM conversations WHERE agent_instance_id = ?",
-            (agent_instance_id,),
-        ).fetchall()
-        return [r[0] for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM conversations WHERE agent_instance_id = ?",
+                (agent_instance_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
 
     # ── 内部辅助方法 ─────────────────────────────────────────────
 

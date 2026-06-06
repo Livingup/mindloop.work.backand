@@ -85,6 +85,7 @@ Desktop.ini
 !/tests/test_cloud_user_config_config_center.py
 !/tests/test_logs_management_service.py
 !/tests/test_tool_schema_sanitizer.py
+!/tests/test_sqlite_threaded_repositories.py
 
 /web-frontend/
 

@@ -4,6 +4,7 @@ import json
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from agent_runtime.context_compression.models import CompressionJob
@@ -51,28 +52,41 @@ class ContextCompressionArchiveRepository:
         self._summaries_dir = self._data_dir / "summaries"
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
         self._summaries_dir.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._data_dir / "context_compression.db"))
+        # 压缩流程可由后台执行线程触发；同一长生命周期仓储连接允许跨线程复用，
+        # 但 job 元数据与归档文件写入必须在仓储锁内串行化。
+        self._lock = RLock()
+        self._conn = sqlite3.connect(
+            str(self._data_dir / "context_compression.db"),
+            timeout=30,
+            check_same_thread=False,
+        )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
     def next_compression_index(self, *, task_id: str, agent_instance_id: str, root_conversation_id: str) -> int:
-        row = self._conn.execute(
-            "SELECT MAX(compression_index) FROM context_compression_jobs "
-            "WHERE task_id = ? AND agent_instance_id = ? AND root_conversation_id = ? AND status = 'completed'",
-            (task_id, agent_instance_id, root_conversation_id),
-        ).fetchone()
-        value = row[0] if row else None
-        return int(value or 0) + 1
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(compression_index) FROM context_compression_jobs "
+                "WHERE task_id = ? AND agent_instance_id = ? AND root_conversation_id = ? AND status = 'completed'",
+                (task_id, agent_instance_id, root_conversation_id),
+            ).fetchone()
+            value = row[0] if row else None
+            return int(value or 0) + 1
 
     def root_conversation_id_for(self, *, agent_instance_id: str, source_conversation_id: str) -> str:
-        row = self._conn.execute(
-            "SELECT root_conversation_id FROM context_compression_jobs "
-            "WHERE agent_instance_id = ? AND target_conversation_id = ? AND status = 'completed' "
-            "ORDER BY compression_index DESC LIMIT 1",
-            (agent_instance_id, source_conversation_id),
-        ).fetchone()
-        return str(row[0]) if row else source_conversation_id
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT root_conversation_id FROM context_compression_jobs "
+                "WHERE agent_instance_id = ? AND target_conversation_id = ? AND status = 'completed' "
+                "ORDER BY compression_index DESC LIMIT 1",
+                (agent_instance_id, source_conversation_id),
+            ).fetchone()
+            return str(row[0]) if row else source_conversation_id
 
     def upsert_job(
         self,
@@ -81,51 +95,52 @@ class ContextCompressionArchiveRepository:
         source_conversation: Conversation | None = None,
         target_conversation: Conversation | None = None,
     ) -> None:
-        final_summary_path = self._write_final_summary(job) if job.final_markdown else None
-        before_path = self._write_snapshot(job.job_id, "before", source_conversation) if source_conversation is not None else None
-        after_path = self._write_snapshot(job.job_id, "after", target_conversation) if target_conversation is not None else None
-        range_value = job.range
-        metadata = {
-            "summary_message_id": job.summary_message_id,
-            "section_items": [item.to_dict() for item in job.section_items],
-            "completed_sections": sorted(job.completed_sections),
-            "issues": list(job.issues),
-            "verifier_result": job.verifier_result,
-        }
-        self._conn.execute(
-            "INSERT OR REPLACE INTO context_compression_jobs ("
-            "job_id, task_id, thread_id, agent_id, agent_instance_id, root_conversation_id, "
-            "source_conversation_id, target_conversation_id, compression_index, status, "
-            "compressed_start_index, compressed_end_index, retained_tail_start_index, retained_tail_end_index, "
-            "retained_tail_anchor, input_mode, final_summary_path, before_messages_snapshot_path, "
-            "after_messages_snapshot_path, metadata_json, created_at, completed_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                job.job_id,
-                job.task_id,
-                job.thread_id,
-                job.agent_id,
-                job.agent_instance_id,
-                job.root_conversation_id,
-                job.source_conversation_id,
-                job.target_conversation_id,
-                job.compression_index,
-                job.status,
-                range_value.compressed_start_index if range_value else None,
-                range_value.compressed_end_index if range_value else None,
-                range_value.retained_tail_start_index if range_value else None,
-                range_value.retained_tail_end_index if range_value else None,
-                range_value.retained_tail_anchor if range_value else None,
-                job.input_mode,
-                final_summary_path,
-                before_path,
-                after_path,
-                json.dumps(metadata, ensure_ascii=False),
-                job.created_at.isoformat(),
-                job.completed_at.isoformat() if job.completed_at else None,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            final_summary_path = self._write_final_summary(job) if job.final_markdown else None
+            before_path = self._write_snapshot(job.job_id, "before", source_conversation) if source_conversation is not None else None
+            after_path = self._write_snapshot(job.job_id, "after", target_conversation) if target_conversation is not None else None
+            range_value = job.range
+            metadata = {
+                "summary_message_id": job.summary_message_id,
+                "section_items": [item.to_dict() for item in job.section_items],
+                "completed_sections": sorted(job.completed_sections),
+                "issues": list(job.issues),
+                "verifier_result": job.verifier_result,
+            }
+            self._conn.execute(
+                "INSERT OR REPLACE INTO context_compression_jobs ("
+                "job_id, task_id, thread_id, agent_id, agent_instance_id, root_conversation_id, "
+                "source_conversation_id, target_conversation_id, compression_index, status, "
+                "compressed_start_index, compressed_end_index, retained_tail_start_index, retained_tail_end_index, "
+                "retained_tail_anchor, input_mode, final_summary_path, before_messages_snapshot_path, "
+                "after_messages_snapshot_path, metadata_json, created_at, completed_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job.job_id,
+                    job.task_id,
+                    job.thread_id,
+                    job.agent_id,
+                    job.agent_instance_id,
+                    job.root_conversation_id,
+                    job.source_conversation_id,
+                    job.target_conversation_id,
+                    job.compression_index,
+                    job.status,
+                    range_value.compressed_start_index if range_value else None,
+                    range_value.compressed_end_index if range_value else None,
+                    range_value.retained_tail_start_index if range_value else None,
+                    range_value.retained_tail_end_index if range_value else None,
+                    range_value.retained_tail_anchor if range_value else None,
+                    job.input_mode,
+                    final_summary_path,
+                    before_path,
+                    after_path,
+                    json.dumps(metadata, ensure_ascii=False),
+                    job.created_at.isoformat(),
+                    job.completed_at.isoformat() if job.completed_at else None,
+                ),
+            )
+            self._conn.commit()
 
     def _write_final_summary(self, job: CompressionJob) -> str:
         path = self._summaries_dir / f"{job.job_id}.md"
