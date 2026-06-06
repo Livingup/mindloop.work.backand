@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from contextlib import suppress
 from typing import Any
 
@@ -26,6 +27,7 @@ from agent_runtime.runtime_network_monitor import (
 
 
 COMMUNICATION_SSE_EVENT_TYPE = "communication.message"
+COMMUNICATION_SSE_PING_EVENT_TYPE = "communication.ping"
 
 
 class CommunicationStreamCreateBody(BaseModel):
@@ -226,7 +228,13 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                         next_message = asyncio.create_task(anext(subscription))
                     else:
                         keepalive_count += 1
+                        # comment keep-alive 服务代理/网关保活；named ping 供浏览器 JS 观测 transport 活性。
                         yield ": keep-alive\n\n"
+                        yield _format_sse_ping(
+                            stream_id=stream_id,
+                            sent_count=sent_count,
+                            keepalive_count=keepalive_count,
+                        )
             except Exception as exc:
                 close_reason = exc.__class__.__name__
                 runtime_network_monitor.record({
@@ -298,6 +306,21 @@ def _format_sse_message(message: CommunicationMessage) -> str:
     """把通信消息格式化为 SSE 帧。"""
     payload = json.dumps(message.to_dict(), ensure_ascii=False, separators=(",", ":"))
     return f"id: {message.seq}\nevent: {COMMUNICATION_SSE_EVENT_TYPE}\ndata: {payload}\n\n"
+
+
+def _format_sse_ping(*, stream_id: str, sent_count: int, keepalive_count: int) -> str:
+    """格式化浏览器可见的 SSE ping 帧，不占用业务 seq，也不写入通信消息日志。"""
+    payload = json.dumps(
+        {
+            "stream_id": stream_id,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "sent_count": sent_count,
+            "keepalive_count": keepalive_count,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"event: {COMMUNICATION_SSE_PING_EVENT_TYPE}\ndata: {payload}\n\n"
 
 
 def _last_event_id_to_seq(value: str | None) -> int:
