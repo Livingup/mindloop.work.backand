@@ -15,12 +15,14 @@ from agent_runtime.auth.models import (
     AuthenticatedRuntimeSession,
     RuntimeAccount,
     RuntimeDeviceSession,
- )
+)
 
 ACCOUNT_STATUS_ACTIVE = "active"
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 200_000
 DEFAULT_SESSION_TTL_DAYS = 30
+MIN_RUNTIME_PASSWORD_LENGTH = 12
+PASSWORD_COMPLEXITY_MIN_CLASSES = 3
 
 
 class RuntimeAuthService:
@@ -109,8 +111,7 @@ class RuntimeAuthService:
         normalized_username = _normalize_username(username)
         if not normalized_username:
             raise ValueError("账号名不能为空。")
-        if len(password) < 6:
-            raise ValueError("密码长度至少需要 6 位。")
+        validate_runtime_password_policy(password)
         now = _now_text()
         return RuntimeAccount(
             account_id=f"acct-{uuid4()}",
@@ -149,6 +150,25 @@ class RuntimeAuthService:
 
 def _normalize_username(value: str) -> str:
     return value.strip().lower()
+
+
+def validate_runtime_password_policy(password: str) -> None:
+    """校验 Runtime 本地首账号密码强度。"""
+    if len(password) < MIN_RUNTIME_PASSWORD_LENGTH:
+        raise ValueError(f"密码长度至少需要 {MIN_RUNTIME_PASSWORD_LENGTH} 位。")
+    character_class_count = sum(
+        (
+            any(ch.islower() for ch in password),
+            any(ch.isupper() for ch in password),
+            any(ch.isdigit() for ch in password),
+            any(not ch.isalnum() for ch in password),
+        )
+    )
+    if character_class_count < PASSWORD_COMPLEXITY_MIN_CLASSES:
+        raise ValueError(
+            "密码至少需要包含小写字母、大写字母、数字、符号中的 "
+            f"{PASSWORD_COMPLEXITY_MIN_CLASSES} 类。"
+        )
 
 
 def _now() -> datetime:

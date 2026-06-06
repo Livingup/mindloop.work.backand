@@ -44,11 +44,19 @@ _ensure_standard_streams()
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="开发/诊断场景显式传入的 env 覆盖文件；正式 release 启动不使用。",
 )
+@click.option(
+    "--frontend-dist-dir",
+    "frontend_dist_dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="正式 release 浏览器/移动端 HTTP 前端的 Vite dist 目录；不传则只提供 Runtime API。",
+)
 @click.option("--host", default=None, help="开发/诊断场景监听地址覆盖；正式 release 启动不传该参数。")
 @click.option("--port", default=None, type=int, help="开发/诊断场景监听端口覆盖；正式 release 启动不传该参数。")
 def main(
     config_file_path: Path,
     env_file_path: Path | None,
+    frontend_dist_dir: Path | None,
     host: str | None,
     port: int | None,
 ) -> None:
@@ -58,6 +66,7 @@ def main(
         host=host,
         port=port,
         watch=False,
+        frontend_dist_dir=frontend_dist_dir,
     )
 
 

@@ -9,6 +9,12 @@ from pydantic import BaseModel, Field
 
 from agent_runtime.auth.auth_service import RuntimeAuthService
 from agent_runtime.auth.models import AuthenticatedRuntimeSession
+from agent_runtime.auth.rate_limiter import InMemoryFixedWindowRateLimiter
+
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 8
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 60
+BOOTSTRAP_RATE_LIMIT_MAX_ATTEMPTS = 5
+BOOTSTRAP_RATE_LIMIT_WINDOW_SECONDS = 300
 
 
 class RuntimeAuthStatusResponse(BaseModel):
@@ -54,8 +60,21 @@ class RuntimeAuthMeResponse(BaseModel):
     session: RuntimeAuthDeviceSessionResponse | None = None
 
 
-def create_runtime_auth_router(auth_service: RuntimeAuthService) -> APIRouter:
+def create_runtime_auth_router(
+    auth_service: RuntimeAuthService,
+    *,
+    login_rate_limiter: InMemoryFixedWindowRateLimiter | None = None,
+    bootstrap_rate_limiter: InMemoryFixedWindowRateLimiter | None = None,
+) -> APIRouter:
     router = APIRouter()
+    login_rate_limiter = login_rate_limiter or InMemoryFixedWindowRateLimiter(
+        max_attempts=LOGIN_RATE_LIMIT_MAX_ATTEMPTS,
+        window_seconds=LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    bootstrap_rate_limiter = bootstrap_rate_limiter or InMemoryFixedWindowRateLimiter(
+        max_attempts=BOOTSTRAP_RATE_LIMIT_MAX_ATTEMPTS,
+        window_seconds=BOOTSTRAP_RATE_LIMIT_WINDOW_SECONDS,
+    )
 
     @router.get("/status", response_model=RuntimeAuthStatusResponse)
     def status() -> RuntimeAuthStatusResponse:
@@ -68,6 +87,11 @@ def create_runtime_auth_router(auth_service: RuntimeAuthService) -> APIRouter:
 
     @router.post("/bootstrap", response_model=RuntimeAuthLoginResponse)
     def bootstrap(body: RuntimeAuthRequestBody, request: Request) -> RuntimeAuthLoginResponse:
+        _enforce_rate_limit(
+            bootstrap_rate_limiter,
+            _rate_limit_key(request, "bootstrap", body.username),
+            "初始化尝试过于频繁，请稍后重试。",
+        )
         try:
             session, token = auth_service.bootstrap(
                 username=body.username,
@@ -82,6 +106,11 @@ def create_runtime_auth_router(auth_service: RuntimeAuthService) -> APIRouter:
 
     @router.post("/login", response_model=RuntimeAuthLoginResponse)
     def login(body: RuntimeAuthRequestBody, request: Request) -> RuntimeAuthLoginResponse:
+        _enforce_rate_limit(
+            login_rate_limiter,
+            _rate_limit_key(request, "login", body.username),
+            "登录尝试过于频繁，请稍后重试。",
+        )
         try:
             session, token = auth_service.login(
                 username=body.username,
@@ -114,6 +143,27 @@ def create_runtime_auth_router(auth_service: RuntimeAuthService) -> APIRouter:
         )
 
     return router
+
+
+def _enforce_rate_limit(
+    limiter: InMemoryFixedWindowRateLimiter,
+    key: str,
+    detail: str,
+) -> None:
+    decision = limiter.consume(key)
+    if decision.allowed:
+        return
+    raise HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": str(decision.retry_after_seconds)},
+    )
+
+
+def _rate_limit_key(request: Request, action: str, username: str) -> str:
+    client_host = request.client.host if request.client is not None else "unknown"
+    normalized_username = username.strip().lower() or "unknown"
+    return f"{action}:{client_host}:{normalized_username}"
 
 
 def _login_response(

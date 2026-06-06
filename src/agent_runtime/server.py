@@ -12,7 +12,15 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from agent_runtime.auth.runtime_access_policy import (
+    LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
+    NO_ACCOUNT_API_RESTRICTED_DETAIL,
+    RuntimeBootstrapAccessPolicy,
+    is_first_run_local_only_path,
+    is_no_account_api_allowed_path,
+)
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.frontend_static import mount_frontend_static
 
 logger = logging.getLogger("agent_runtime.serve")
 
@@ -58,7 +66,11 @@ def load_runtime_config(
     )
 
 
-def create_app() -> FastAPI:
+def create_app(
+    frontend_dist_dir: str | Path | None = None,
+    *,
+    runtime_bind_host: str | None = None,
+) -> FastAPI:
     from agent_runtime.prompt_template.prompt_template_factory import PromptTemplateFactory
     from agent_runtime.prompt_template.north_gateway.prompt_snippet_rest_adapter import (
         create_prompt_snippet_router,
@@ -527,14 +539,43 @@ def create_app() -> FastAPI:
             runtime_network_monitor.stop()
             runtime_loop = None
 
+    effective_runtime_bind_host = runtime_bind_host or ConfigRegistry.instance().agent_runtime_service.service_host
+    runtime_bootstrap_access_policy = RuntimeBootstrapAccessPolicy(effective_runtime_bind_host)
+
     app = FastAPI(title="spread-ai", description="通用 Agent 运行时环境服务", lifespan=lifespan)
 
     @app.middleware("http")
     async def runtime_auth_middleware(request, call_next):
         path = request.url.path
-        if not path.startswith("/api/") or _is_runtime_auth_exempt_path(path):
+        if not path.startswith("/api/"):
+            return await call_next(request)
+        if path == "/api/health":
             return await call_next(request)
         if not runtime_auth_service.has_accounts():
+            method = request.method.upper()
+            if not is_no_account_api_allowed_path(path, method):
+                return JSONResponse(
+                    {
+                        "detail": NO_ACCOUNT_API_RESTRICTED_DETAIL,
+                        "bootstrap_required": True,
+                        "auth_required": False,
+                    },
+                    status_code=401,
+                )
+            if (
+                is_first_run_local_only_path(path, method)
+                and not runtime_bootstrap_access_policy.allows_first_run_request(request)
+            ):
+                return JSONResponse(
+                    {
+                        "detail": LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
+                        "bootstrap_required": True,
+                        "local_bootstrap_required": True,
+                    },
+                    status_code=403,
+                )
+            return await call_next(request)
+        if _is_runtime_auth_exempt_path(path):
             return await call_next(request)
         auth_session = runtime_auth_service.authenticate_token(_runtime_auth_token_from_request(request))
         if auth_session is None:
@@ -549,6 +590,14 @@ def create_app() -> FastAPI:
     async def runtime_bootstrap_guard_middleware(request, call_next):
         path = request.url.path
         if path.startswith("/api/") and not _is_runtime_bootstrap_exempt_path(path):
+            # 中间件栈中 bootstrap guard 位于认证外层；账号尚未创建或请求未认证时，
+            # 必须把请求继续交给 runtime_auth_middleware，让 no-account 最小 API 表面
+            # 和普通 401 登录态错误优先生效，避免用 bootstrap readiness 503 掩盖认证边界。
+            if (
+                not runtime_auth_service.has_accounts()
+                or runtime_auth_service.authenticate_token(_runtime_auth_token_from_request(request)) is None
+            ):
+                return await call_next(request)
             try:
                 full_mode_ready = _activate_runtime_full_mode_if_ready()
             except Exception as exc:  # noqa: BLE001 - 请求守卫需要把同进程激活失败稳定暴露给前端
@@ -626,13 +675,21 @@ def create_app() -> FastAPI:
         response.headers["x-network-trace-id"] = trace_id
         return response
 
+    @app.middleware("http")
+    async def runtime_security_headers_middleware(request, call_next):
+        response = await call_next(request)
+        for header_name, header_value in _runtime_security_response_headers().items():
+            response.headers.setdefault(header_name, header_value)
+        return response
+
     # Starlette 后添加的 middleware 会成为更外层包装；CORS 必须包在认证与 bootstrap guard 外侧，
     # 否则 Electron renderer 的 OPTIONS 预检不带登录 token 时会先被认证中间件拦截为 401。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_runtime_cors_allow_origins(),
+        allow_origin_regex=_runtime_cors_allow_origin_regex(),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Network-Trace-Id"],
         expose_headers=["x-network-trace-id"],
         allow_credentials=False,
     )
@@ -793,6 +850,7 @@ def create_app() -> FastAPI:
         prefix="/api/scene",
         tags=["Scene Terminal"],
     )
+    mount_frontend_static(app, frontend_dist_dir)
     return app
 
 
@@ -815,6 +873,41 @@ def _is_key_network_path(path: str) -> bool:
     )
 
 
+def _runtime_security_response_headers() -> dict[str, str]:
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "X-Frame-Options": "DENY",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob: https:; "
+            "font-src 'self' data:; "
+            "connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; "
+            "media-src 'self' data: blob: https:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'; "
+            "form-action 'none'"
+        ),
+    }
+
+
+def _runtime_cors_allow_origins() -> list[str]:
+    return [
+        "app://renderer",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://[::1]:5173",
+    ]
+
+
+def _runtime_cors_allow_origin_regex() -> str:
+    return r"^https?://(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$"
+
+
 def _is_runtime_auth_exempt_path(path: str) -> bool:
     return path == "/api/health" or path.startswith("/api/auth/")
 
@@ -824,7 +917,6 @@ def _is_runtime_bootstrap_exempt_path(path: str) -> bool:
         path == "/api/health"
         or path.startswith("/api/auth/")
         or path.startswith("/api/runtime-bootstrap/")
-        or path.startswith("/api/system-settings")
     )
 
 
@@ -864,6 +956,7 @@ def run_server(
     host: str | None = None,
     port: int | None = None,
     watch: bool = True,
+    frontend_dist_dir: str | Path | None = None,
 ) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -871,10 +964,11 @@ def run_server(
         datefmt="%H:%M:%S",
     )
     load_runtime_config(config_file_path, env_file_path, watch=watch)
-    app = create_app()
     runtime_cfg = ConfigRegistry.instance().agent_runtime_service
+    effective_host = host or runtime_cfg.service_host
+    app = create_app(frontend_dist_dir=frontend_dist_dir, runtime_bind_host=effective_host)
     uvicorn.run(
         app,
-        host=host or runtime_cfg.service_host,
+        host=effective_host,
         port=port or runtime_cfg.service_port,
     )
