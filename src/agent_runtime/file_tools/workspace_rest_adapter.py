@@ -7,6 +7,8 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from agent_runtime.subprocess_utils import hidden_subprocess_kwargs
+
 
 class WorkspaceTreeRequest(BaseModel):
     directory_path: str = Field(description="要读取工作区目录树的目录路径。")
@@ -148,6 +150,7 @@ def _run_git(root: Path, *args: str) -> tuple[bool, str]:
             errors="replace",
             text=True,
             timeout=_GIT_COMMAND_TIMEOUT_SECONDS,
+            **hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False, ""

@@ -613,4 +613,7 @@ def _process_env() -> dict[str, str]:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if sys.platform.startswith("win"):
         env.setdefault("PYTHONUTF8", "1")
+        # winpty 在未设置该调试开关时默认隐藏 agent console；release GUI 进程不能继承
+        # 用户环境中的 WINPTY_SHOW_CONSOLE=1，否则 Agent terminal_create 会短暂弹出黑框。
+        env.pop("WINPTY_SHOW_CONSOLE", None)
     return env
