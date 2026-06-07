@@ -23,7 +23,6 @@ from agent_runtime.context_compression.summary_tools import ContextSummaryToolEx
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
-from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
 from agent_runtime.llm_client.llm_request_service import LlmProviderModelServiceUnavailable, LlmRequestService
@@ -469,12 +468,13 @@ def _worker_render_options(
     resolved_model: ResolvedLlmProviderModel,
     worker_input: ContextCompressionWorkerInput,
 ) -> dict[str, Any]:
-    if resolved_model.api_format != API_FORMAT_OPENAI_RESPONSES:
-        return {}
-    prompt_cache_key = worker_input.openai_responses_prompt_cache_key
-    if not prompt_cache_key or not prompt_cache_key.strip():
-        return {}
-    return {"prompt_cache_key": prompt_cache_key}
+    """返回 Worker 请求的协议渲染选项。
+
+    Worker 不显式覆盖 OpenAI Responses prompt_cache_key；OpenAIAdapter 会在无覆盖时
+    使用当前 Worker Conversation.id 作为缓存 key，避免复用被压缩目标 Agent 会话缓存。
+    """
+    del resolved_model, worker_input
+    return {}
 
 
 def _worker_finished(job: CompressionJob, worker_role: str, output_section: str | None) -> bool:

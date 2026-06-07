@@ -53,7 +53,7 @@ from agent_runtime.context_compression.transcript_snapshot import build_transcri
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.context_compression.worker_runner import ContextCompressionWorkerRunner
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
-from agent_runtime.conversation_message.message.models import PROVIDER_OPENAI, Conversation, ImagePart, PdfPart, ToolResultPart, UniMessage
+from agent_runtime.conversation_message.message.models import Conversation, ImagePart, PdfPart, ToolResultPart, UniMessage
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
@@ -556,10 +556,6 @@ class ContextCompressionService:
                         range_plan.compressed_start_index:range_plan.compressed_end_index + 1
                     ]
                 ),
-                openai_responses_prompt_cache_key=_source_openai_responses_prompt_cache_key(
-                    source_conversation,
-                    range_plan,
-                ),
             )
         transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
         return ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text=transcript)
@@ -630,22 +626,6 @@ def _select_worker_input_mode_and_candidates(
 
 def _compressed_range_messages(conversation: Conversation, range_plan: CompressionRange) -> tuple[UniMessage, ...]:
     return tuple(conversation.messages[range_plan.compressed_start_index:range_plan.compressed_end_index + 1])
-
-
-def _source_openai_responses_prompt_cache_key(
-    conversation: Conversation,
-    range_plan: CompressionRange,
-) -> str | None:
-    """返回原生历史 Worker 可复用的源 OpenAI Responses prompt_cache_key。"""
-    provider_state = conversation.provider_state.get(PROVIDER_OPENAI)
-    if isinstance(provider_state, dict):
-        prompt_cache_key = provider_state.get("prompt_cache_key")
-        if isinstance(prompt_cache_key, str) and prompt_cache_key.strip():
-            return prompt_cache_key
-
-    if any(message.source_provider == PROVIDER_OPENAI for message in _compressed_range_messages(conversation, range_plan)):
-        return conversation.id
-    return None
 
 
 def _required_native_input_modalities(messages: tuple[UniMessage, ...]) -> set[str]:

@@ -11,14 +11,15 @@ class ContextCompressionWorkerInput:
 
     transcript_snapshot 模式只传递一条文本 user 消息；native_multimodal_history
     模式会把待压缩的原始会话消息作为 Worker 历史消息，再追加一条压缩分析指令。
-    当原生历史来源于 OpenAI Responses 会话时，可携带源会话的 prompt_cache_key，
-    让 Worker 复用同一历史前缀缓存，但不复用源会话 relay session。
+
+    Worker 每次执行都会创建独立临时 Conversation。OpenAI Responses 协议的
+    prompt_cache_key 应保持该 Worker Conversation 自己的默认会话 ID，不从被压缩
+    的目标 Agent 会话继承缓存 key 或 relay session。
     """
 
     input_mode: str
     user_text: str
     history_messages: tuple[UniMessage, ...] = ()
-    openai_responses_prompt_cache_key: str | None = None
 
     @property
     def uses_history_messages(self) -> bool:

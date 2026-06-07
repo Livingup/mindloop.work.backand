@@ -1,7 +1,6 @@
 import sqlite3
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 
 from agent_runtime.context_compression.compression_service import (
@@ -210,29 +209,19 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(worker_input.input_mode, "native_multimodal_history")
         self.assertTrue(worker_input.uses_history_messages)
         self.assertEqual(worker_input.history_messages, tuple(conversation.messages[:2]))
-        self.assertEqual(worker_input.openai_responses_prompt_cache_key, "source-cache-key")
+        self.assertFalse(hasattr(worker_input, "openai_responses_prompt_cache_key"))
+        self.assertNotIn("source-cache-key", worker_input.user_text)
         self.assertIn("只用于上下文压缩分析", worker_input.user_text)
         self.assertIn("compressed_message_range: 0..1", worker_input.user_text)
         self.assertNotIn("retained tail", worker_input.user_text)
 
-    def test_worker_render_options_reuses_prompt_cache_key_for_openai_responses_only(self) -> None:
+    def test_worker_render_options_does_not_override_prompt_cache_key(self) -> None:
         worker_input = ContextCompressionWorkerInput(
             input_mode="native_multimodal_history",
             user_text="compress",
-            openai_responses_prompt_cache_key="source-cache-key",
         )
 
-        self.assertEqual(
-            _worker_render_options(_candidate("openai"), worker_input),
-            {"prompt_cache_key": "source-cache-key"},
-        )
-        self.assertEqual(
-            _worker_render_options(
-                replace(_candidate("anthropic"), api_format="anthropic_messages"),
-                worker_input,
-            ),
-            {},
-        )
+        self.assertEqual(_worker_render_options(_candidate("openai"), worker_input), {})
 
     async def test_transcript_worker_input_preserves_multimodal_resource_locator_text(self) -> None:
         conversation = create_conversation()
