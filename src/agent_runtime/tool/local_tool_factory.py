@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 from agent_runtime.tool._global_registry import get_global_repository
 from agent_runtime.tool.infrastructure.claude_schema_generator import (
     ClaudeSchemaGenerator,
@@ -36,6 +38,7 @@ class LocalToolFactory:
     @staticmethod
     def create(
         schema_cache: ToolSchemaCache | None = None,
+        execution_loop_logger: Any | None = None,
     ) -> LocalToolGatewayImpl:
         """创建本地工具北向网关实例。
 
@@ -64,5 +67,12 @@ class LocalToolFactory:
             schema_cache.register_generator(ClaudeSchemaGenerator())
             schema_cache.register_generator(GeminiSchemaGenerator())
             schema_cache.register_generator(ZhipuChatCompletionsSchemaGenerator())
-        service = LocalToolService(repository=repository, schema_cache=schema_cache)
-        return LocalToolGatewayImpl(service=service)
+        service = LocalToolService(
+            repository=repository,
+            schema_cache=schema_cache,
+            execution_loop_logger=execution_loop_logger,
+        )
+        return LocalToolGatewayImpl(
+            service=service,
+            execution_loop_logger=execution_loop_logger,
+        )

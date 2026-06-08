@@ -97,6 +97,7 @@ def create_app(
         create_agent_runtime_router,
     )
     from agent_runtime.agent.agent_execution_factory import AgentExecutionFactory
+    from agent_runtime.agent.execution_loop_logger import AgentExecutionLoopLogger
     from agent_runtime.llm_model_registry.llm_model_registry_factory import (
         LlmModelRegistryFactory,
     )
@@ -190,9 +191,12 @@ def create_app(
     )
     runtime_full_mode_active = cloud_user_config_database_active_at_start
     runtime_full_mode_lock = RLock()
+    execution_loop_logger = AgentExecutionLoopLogger(
+        trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
+    )
 
     prompt_gateway = _SwitchableRuntimeComponent(PromptTemplateFactory.create())
-    tool_gateway = LocalToolFactory.create()
+    tool_gateway = LocalToolFactory.create(execution_loop_logger=execution_loop_logger)
     skill_gateway = SkillFactory.create()
     mcp_gateway = _SwitchableRuntimeComponent(McpClientFactory.create())
     from agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools import (
@@ -248,6 +252,7 @@ def create_app(
     agent_execution_engine = _SwitchableRuntimeComponent(
         AgentExecutionFactory.create(
             mcp_client_gateway=mcp_gateway,
+            execution_loop_logger=execution_loop_logger,
         )
     )
     lacp_bridge = _SwitchableRuntimeComponent(
@@ -324,6 +329,7 @@ def create_app(
         agent_execution_engine.set_target(
             AgentExecutionFactory.create(
                 mcp_client_gateway=mcp_gateway,
+                execution_loop_logger=execution_loop_logger,
             )
         )
         lacp_client = LacpFactory.create_client()
@@ -498,6 +504,7 @@ def create_app(
         nonlocal runtime_loop
 
         runtime_loop = asyncio.get_running_loop()
+        execution_loop_logger.start()
         event_loop_monitor.start()
         runtime_network_monitor.start()
         scene_session_registry.start()
@@ -537,6 +544,8 @@ def create_app(
                 codex_oauth_callback_server.stop()
             await event_loop_monitor.stop()
             runtime_network_monitor.stop()
+            with suppress(Exception, asyncio.CancelledError):
+                await execution_loop_logger.stop()
             runtime_loop = None
 
     effective_runtime_bind_host = runtime_bind_host or ConfigRegistry.instance().agent_runtime_service.service_host
