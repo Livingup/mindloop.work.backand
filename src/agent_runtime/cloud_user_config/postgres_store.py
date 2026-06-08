@@ -19,6 +19,10 @@ from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStat
 logger = logging.getLogger("agent_runtime.cloud_user_config.postgres_store")
 
 CONFIG_CENTER_POLL_INTERVAL_SECONDS = 5
+# PostgreSQL advisory locks are scoped to the current database. 该常量只用于串行化
+# cloud_user_config schema 初始化，避免多台 Runtime release 同时 CREATE OR REPLACE
+# FUNCTION / CREATE TRIGGER 时并发更新 PostgreSQL 系统 catalog。
+_SCHEMA_INITIALIZATION_ADVISORY_LOCK_ID = 732145908367451201
 
 _SCHEMA_TABLE_SQL = """\
 CREATE TABLE IF NOT EXISTS cloud_user_config_items (
@@ -152,6 +156,8 @@ class PostgresUserConfigStore:
     _cache_revision: int | None = None
     _cache_items: dict[tuple[str, str], dict[str, Any]] = {}
     _cache_config_key: tuple[object, ...] | None = None
+    _schema_lock = threading.RLock()
+    _schema_initialized_config_keys: set[tuple[object, ...]] = set()
 
     def __init__(
         self,
@@ -170,6 +176,8 @@ class PostgresUserConfigStore:
             cls._cache_revision = None
             cls._cache_items = {}
             cls._cache_config_key = None
+        with cls._schema_lock:
+            cls._schema_initialized_config_keys = set()
 
     @classmethod
     def start_background_revision_polling(
@@ -307,17 +315,47 @@ class PostgresUserConfigStore:
             return self._current_config_revision(conn)
 
     def ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(_SCHEMA_TABLE_SQL)
-            conn.execute(_SCHEMA_INDEX_SQL)
-            conn.execute(_SCHEMA_REVISION_SEQUENCE_SQL)
-            conn.execute(_SCHEMA_REVISION_STATE_TABLE_SQL)
-            conn.execute(_SCHEMA_REVISION_STATE_INIT_SQL)
-            conn.execute(_SCHEMA_TOUCH_TRIGGER_FUNCTION_SQL)
-            conn.execute(_SCHEMA_ITEM_UPDATED_AT_FUNCTION_SQL)
-            conn.execute(_SCHEMA_ITEM_UPDATED_AT_TRIGGER_SQL)
-            conn.execute(_SCHEMA_TOUCH_TRIGGER_SQL)
-            conn.commit()
+        """确保共享配置 PostgreSQL schema 已初始化。
+
+        Runtime 正常运行期会高频轮询 revision；该路径不能每轮重复执行 DDL。schema
+        初始化按 PostgreSQL 连接配置 key 在进程内去重，并通过 PostgreSQL advisory
+        transaction lock 在多台 release / 多进程同时启动时串行化，避免并发 CREATE OR
+        REPLACE FUNCTION / CREATE TRIGGER 更新系统 catalog 导致 tuple concurrently updated。
+        """
+
+        config_key = _config_key(self._config_accessor())
+        with self._schema_lock:
+            if config_key in self._schema_initialized_config_keys:
+                return
+            with self._connect() as conn:
+                self._lock_schema_initialization(conn)
+                self._execute_schema_initialization(conn)
+                conn.commit()
+            self.__class__._schema_initialized_config_keys = {
+                *self._schema_initialized_config_keys,
+                config_key,
+            }
+
+    def _lock_schema_initialization(self, conn: psycopg.Connection[dict[str, Any]]) -> None:
+        """获取数据库级 schema 初始化事务锁。"""
+
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s)",
+            (_SCHEMA_INITIALIZATION_ADVISORY_LOCK_ID,),
+        )
+
+    def _execute_schema_initialization(self, conn: psycopg.Connection[dict[str, Any]]) -> None:
+        """执行 cloud_user_config 共享配置 schema DDL。"""
+
+        conn.execute(_SCHEMA_TABLE_SQL)
+        conn.execute(_SCHEMA_INDEX_SQL)
+        conn.execute(_SCHEMA_REVISION_SEQUENCE_SQL)
+        conn.execute(_SCHEMA_REVISION_STATE_TABLE_SQL)
+        conn.execute(_SCHEMA_REVISION_STATE_INIT_SQL)
+        conn.execute(_SCHEMA_TOUCH_TRIGGER_FUNCTION_SQL)
+        conn.execute(_SCHEMA_ITEM_UPDATED_AT_FUNCTION_SQL)
+        conn.execute(_SCHEMA_ITEM_UPDATED_AT_TRIGGER_SQL)
+        conn.execute(_SCHEMA_TOUCH_TRIGGER_SQL)
 
     async def _poll_database_revision(self, interval_seconds: int) -> None:
         try:
