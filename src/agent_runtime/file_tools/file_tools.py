@@ -19,7 +19,8 @@ from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolRe
 
 MAX_FILE_READ_LINE_COUNT = 1500
 MAX_FILE_READ_FILES = 5
-MAX_CHARS_PER_LINE = 50000
+MAX_FILE_READ_MAX_CHARS_PER_LINE = 2000
+MAX_LINE_SLICE_CHARS = 50000
 
 
 class FileReadRange(BaseModel):
@@ -46,9 +47,9 @@ class FileReadRequest(BaseToolRequest):
 
 
 class FileReadLineSliceRequest(BaseToolRequest):
-    file_path: str = Field(description="要读取超大行的文件绝对路径或当前进程可解析的文件路径。")
+    file_path: str = Field(description="要读取大行内容的文件绝对路径或当前进程可解析的文件路径。")
     line_number: int = Field(ge=1, description="1-based 目标行号；取值必须大于等于 1。")
-    char_start: int = Field(ge=1, description=f"1-based 起始字符位置；取值必须大于等于 1。每次调用由工具内部固定最多返回 {MAX_CHARS_PER_LINE} 个字符，不能由 Agent 调整。")
+    char_start: int = Field(ge=1, description=f"1-based 行内起始字符位置；取值必须大于等于 1。每次调用由工具内部固定最多返回 {MAX_LINE_SLICE_CHARS} 个字符，不能由 Agent 调整。")
     encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
 
 
@@ -388,69 +389,47 @@ def _read_text_window(path: Path, request: FileReadRange, encoding: str | None) 
     raise UnicodeDecodeError("unknown", b"", 0, 1, message)
 
 
+class FileReadLineTooLongError(ValueError):
+    def __init__(self, long_lines: list[tuple[int, int]]) -> None:
+        self.long_lines = long_lines
+        long_line_details = "，".join(f"第 {line_number} 行 {line_char_count} 字符" for line_number, line_char_count in long_lines)
+        super().__init__(
+            "文件读取失败，部分行内容过大，这些大行请单独使用 file_read_line_slice 工具读取："
+            f"{long_line_details}。"
+            f"file_read 行范围读取单行上限为 {MAX_FILE_READ_MAX_CHARS_PER_LINE} 字符。"
+            "调用 file_read_line_slice 时传入 file_path、line_number、char_start；"
+            "如需继续读取，使用返回的 next_char_start。"
+        )
+
+
 def _read_text_window_with_encoding(path: Path, request: FileReadRange, encoding: str) -> dict[str, Any]:
-    selected_lines: list[dict[str, Any]] = []
-    line_truncations: list[dict[str, Any]] = []
-    has_more_lines = False
+    selected_lines: list[str] = []
+    long_lines: list[tuple[int, int]] = []
     total_lines = 0
     start_line = request.start_line
     last_requested_line = request.start_line + request.line_count - 1
 
     with path.open("r", encoding=encoding, errors="strict") as file:
         for total_lines, raw_line in enumerate(file, start=1):
-            if total_lines < start_line:
-                continue
-            if total_lines > last_requested_line:
-                has_more_lines = True
-                continue
-
             line = raw_line.rstrip("\n")
-            line_char_count = len(line)
-            truncated_line = line_char_count > MAX_CHARS_PER_LINE
-            line_item: dict[str, Any] = {
-                "line_number": total_lines,
-                "text": line[:MAX_CHARS_PER_LINE] if truncated_line else line,
-            }
-            if truncated_line:
-                truncation = {
-                    "line_number": total_lines,
-                    "truncated": True,
-                    "char_start": 1,
-                    "char_end": MAX_CHARS_PER_LINE,
-                    "line_char_count": line_char_count,
-                    "next_char_start": MAX_CHARS_PER_LINE + 1,
-                    "continue_with": "file_read_line_slice",
-                }
-                line_item.update(truncation)
-                line_truncations.append(truncation)
-            selected_lines.append(line_item)
+            if start_line <= total_lines <= last_requested_line:
+                line_char_count = len(line)
+                if line_char_count > MAX_FILE_READ_MAX_CHARS_PER_LINE:
+                    long_lines.append((total_lines, line_char_count))
+                else:
+                    selected_lines.append(line)
+
+    if long_lines:
+        raise FileReadLineTooLongError(long_lines)
 
     returned_line_count = len(selected_lines)
     end_line = start_line + returned_line_count - 1 if returned_line_count else start_line - 1
-    truncated = has_more_lines or bool(line_truncations)
-    next_start_line = end_line + 1 if has_more_lines and end_line < total_lines else None
-    if has_more_lines and line_truncations:
-        truncation_reason = "line_count_limit_and_max_chars_per_line_limit"
-    elif has_more_lines:
-        truncation_reason = "line_count_limit"
-    elif line_truncations:
-        truncation_reason = "max_chars_per_line_limit"
-    else:
-        truncation_reason = None
-
-    segment: dict[str, Any] = {
+    return {
         "start_line": request.start_line,
         "end_line": end_line,
         "total_lines": total_lines,
-        "next_start_line": next_start_line,
-        "truncated": truncated,
         "lines": selected_lines,
     }
-    if truncation_reason is not None:
-        segment["truncation_reason"] = truncation_reason
-    if line_truncations:
-        segment["line_truncations"] = line_truncations
-    return segment
 
 
 def _read_line_slice(path: Path, request: FileReadLineSliceRequest) -> tuple[dict[str, Any], str]:
@@ -496,7 +475,7 @@ def _read_line_slice_with_encoding(path: Path, request: FileReadLineSliceRequest
             "line_char_count": line_char_count,
         }
 
-    text = target_line[start_index : start_index + MAX_CHARS_PER_LINE]
+    text = target_line[start_index : start_index + MAX_LINE_SLICE_CHARS]
     char_end = start_index + len(text)
     has_more = char_end < line_char_count
     return {
@@ -609,9 +588,13 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
 
     try:
         segments: list[dict[str, Any]] = []
+        total_lines: int | None = None
         for range_request in file_request.ranges:
             segment_output, _segment_encoding = _read_text_window(path, range_request, file_request.encoding)
+            total_lines = segment_output.pop("total_lines")
             segments.append(segment_output)
+    except FileReadLineTooLongError as exc:
+        return False, _file_read_failure(output_base, "LineTooLong", str(exc))
     except UnicodeDecodeError as exc:
         return False, _file_read_failure(output_base, "DecodeError", str(exc))
     except OSError as exc:
@@ -620,6 +603,7 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
     output: dict[str, Any] = {
         **output_base,
         "content_sha256": _sha256_file(path),
+        "total_lines": total_lines if total_lines is not None else 0,
         "segments": segments,
     }
     return True, output
@@ -627,7 +611,7 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
 
 @tool(
     name="file_read",
-    description=f"批量读取一个或多个文本文件的指定行范围，返回按文件和范围组织的 lines 数组，行号与文本分离。files 一次最多 {MAX_FILE_READ_FILES} 个；读取单个文件时传一个文件项；每个文件可包含多个 ranges，每段 line_count 取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。返回中如有 line_truncations，可用 file_read_line_slice 续读超长单行。",
+    description=f"批量读取一个或多个文本文件的指定行范围，返回紧凑文本结构：file 层包含 total_lines，segment 层包含 start_line、end_line 和 lines 字符串数组。files 一次最多 {MAX_FILE_READ_FILES} 个；每段 line_count 取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。行范围读取中单行超过 {MAX_FILE_READ_MAX_CHARS_PER_LINE} 字符时，该文件读取失败；请根据 error_message 使用 file_read_line_slice 按行号和行内偏移单独读取大行内容。",
     group="file",
     category="system",
 )
@@ -655,7 +639,7 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
 
 @tool(
     name="file_read_line_slice",
-    description="仅当 file_read 返回 line_truncations 表示遇到超大行时，才使用本工具单独续读该超大行的后续字符片段；不要用于普通多行文件读取。每次调用从指定 line_number 和 char_start 开始，由工具内部固定最多返回 50000 个字符，不能由 Agent 调整。",
+    description=f"用于单独读取大行内容的行内偏移读取工具；当 file_read 提示部分行内容过大时，传入 file_path、line_number 和 char_start 读取该行从指定字符开始的片段。每次调用由工具内部固定最多返回 {MAX_LINE_SLICE_CHARS} 个字符；如返回 has_more=true，再用 next_char_start 继续读取。",
     group="file",
     category="system",
 )

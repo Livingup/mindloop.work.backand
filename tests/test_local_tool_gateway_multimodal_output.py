@@ -10,7 +10,7 @@ from agent_runtime.file_tools.file_tools import (
     FileReadLineSliceRequest,
     FileReadRange,
     FileReadRequest,
-    MAX_CHARS_PER_LINE,
+    MAX_FILE_READ_MAX_CHARS_PER_LINE,
     file_read,
     file_read_line_slice,
 )
@@ -166,16 +166,15 @@ def test_file_read_output_contains_only_llm_visible_fields(tmp_path):
     file_output = result.output["files"][0]
     assert file_output["file_path"] == str(target.resolve())
     assert file_output["content_sha256"] == hashlib.sha256(target.read_bytes()).hexdigest()
-    assert set(file_output) == {"file_path", "content_sha256", "segments"}
+    assert file_output["total_lines"] == 2
+    assert set(file_output) == {"file_path", "content_sha256", "total_lines", "segments"}
 
     segment = file_output["segments"][0]
-    assert segment["start_line"] == 1
-    assert segment["end_line"] == 1
-    assert segment["total_lines"] == 2
-    assert segment["next_start_line"] == 2
-    assert segment["truncated"] is True
-    assert segment["truncation_reason"] == "line_count_limit"
-    assert segment["lines"] == [{"line_number": 1, "text": "alpha"}]
+    assert segment == {
+        "start_line": 1,
+        "end_line": 1,
+        "lines": ["alpha"],
+    }
 
     for unexpected_key in {
         "requested_file_count",
@@ -192,46 +191,54 @@ def test_file_read_output_contains_only_llm_visible_fields(tmp_path):
         "newline_counts",
         "has_final_newline",
         "warnings",
+        "next_start_line",
+        "truncated",
+        "truncation_reason",
+        "line_truncations",
     }:
         assert unexpected_key not in result.output
         assert unexpected_key not in file_output
         assert unexpected_key not in segment
 
 
-def test_file_read_marks_only_truncated_lines_with_continuation_fields(tmp_path):
+def test_file_read_fails_when_requested_range_contains_large_lines(tmp_path):
     target = tmp_path / "long.txt"
-    target.write_text("x" * (MAX_CHARS_PER_LINE + 2), encoding="utf-8")
+    target.write_text(
+        "small\n"
+        + "x" * (MAX_FILE_READ_MAX_CHARS_PER_LINE + 1)
+        + "\nok\n"
+        + "y" * (MAX_FILE_READ_MAX_CHARS_PER_LINE + 123)
+        + "\n",
+        encoding="utf-8",
+    )
 
     result = file_read(
         FileReadRequest(
             files=[
                 FileReadFileRequest(
                     file_path=str(target),
-                    ranges=[FileReadRange(start_line=1, line_count=1)],
+                    ranges=[FileReadRange(start_line=1, line_count=4)],
                 ),
             ],
         ),
     )
 
-    segment = result.output["files"][0]["segments"][0]
-    line = segment["lines"][0]
+    assert result.success is False
+    assert result.error_code == "FileReadBatchFailed"
+    file_output = result.output["files"][0]
+    assert set(file_output) == {"file_path", "success", "error_code", "error_message"}
+    assert file_output["file_path"] == str(target.resolve())
+    assert file_output["success"] is False
+    assert file_output["error_code"] == "LineTooLong"
 
-    assert line["truncated"] is True
-    assert line["char_start"] == 1
-    assert line["char_end"] == MAX_CHARS_PER_LINE
-    assert line["next_char_start"] == MAX_CHARS_PER_LINE + 1
-    assert line["continue_with"] == "file_read_line_slice"
-    assert segment["line_truncations"] == [
-        {
-            "line_number": 1,
-            "truncated": True,
-            "char_start": 1,
-            "char_end": MAX_CHARS_PER_LINE,
-            "line_char_count": MAX_CHARS_PER_LINE + 2,
-            "next_char_start": MAX_CHARS_PER_LINE + 1,
-            "continue_with": "file_read_line_slice",
-        },
-    ]
+    error_message = file_output["error_message"]
+    assert "文件读取失败，部分行内容过大" in error_message
+    assert "file_read_line_slice" in error_message
+    assert f"第 2 行 {MAX_FILE_READ_MAX_CHARS_PER_LINE + 1} 字符" in error_message
+    assert f"第 4 行 {MAX_FILE_READ_MAX_CHARS_PER_LINE + 123} 字符" in error_message
+    assert "max_chars_per_line" not in error_message
+    assert "large_lines" not in file_output
+    assert "read_request" not in file_output
 
 
 def test_file_read_line_slice_output_excludes_encoding_diagnostics(tmp_path):
