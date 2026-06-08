@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from agent_runtime.agent_definition.agent_definition import AgentDefinition
+from agent_runtime.agent_definition.agent_definition import AgentDefinition, SystemPromptSegment
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 
@@ -31,6 +31,35 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         engine = object.__new__(AgentExecutionEngine)
         engine._local_tool_gateway = _LocalToolGateway(tools)
         return engine
+
+    def test_system_prompt_starts_with_communication_context_and_instance_id(self) -> None:
+        engine = self._engine_with_local_tools(
+            _local_tool("message_user", category="lifecycle"),
+        )
+        prompt = engine._render_system_prompt(
+            AgentDefinition(
+                agent_id="agent-c",
+                group="default",
+                system_prompt=(
+                    SystemPromptSegment(text="业务 Agent 自定义系统提示词。"),
+                ),
+            ),
+            "agent-instance-self",
+            "G:\\project\\agent",
+            {},
+            (_llm_tool("message_user"),),
+        )
+
+        self.assertIsNotNone(prompt)
+        prompt_text = prompt or ""
+        self.assertTrue(prompt_text.startswith("# 沟通环境与身份"))
+        self.assertIn("当前 Agent 实例 ID：`agent-instance-self`", prompt_text)
+        self.assertIn("使用 `lacp` MCP 服务提供的 `lacp_send_message` 工具", prompt_text)
+        self.assertIn("禁止与远程 Agent 进行无意义礼貌性往返", prompt_text)
+        self.assertLess(
+            prompt_text.index("# 沟通环境与身份"),
+            prompt_text.index("业务 Agent 自定义系统提示词。"),
+        )
 
     def test_tool_usage_notice_injects_builtin_tool_ban_and_available_runtime_tool_guidance(self) -> None:
         engine = self._engine_with_local_tools(

@@ -1480,6 +1480,7 @@ class AgentExecutionEngine:
             )
             system_prompt = self._render_system_prompt(
                 agent_definition,
+                instance.instance_id,
                 instance.current_working_directory,
                 render_options,
                 tools,
@@ -1681,11 +1682,12 @@ class AgentExecutionEngine:
     def _render_system_prompt(
         self,
         definition: AgentDefinition,
+        agent_instance_id: str,
         current_working_directory: str,
         render_options: dict[str, Any],
         llm_tools: tuple[LlmToolDefinition, ...],
     ) -> str | None:
-        """按 AgentDefinition.system_prompt 顺序拼接最终系统提示词。"""
+        """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。"""
         segments: list[str] = []
         for segment in definition.system_prompt:
             if segment.text is not None:
@@ -1694,7 +1696,7 @@ class AgentExecutionEngine:
                 snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
-        runtime_context_prompt = _build_runtime_context_prompt(current_working_directory)
+        runtime_context_prompt = _build_runtime_context_prompt(agent_instance_id, current_working_directory)
         mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
         skills_prompt = self._build_skills_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
@@ -1702,8 +1704,8 @@ class AgentExecutionEngine:
         return "\n\n".join(
             item
             for item in (
-                text,
                 runtime_context_prompt,
+                text,
                 mcp_services_prompt,
                 skills_prompt,
                 lifecycle_prompt,
@@ -2357,10 +2359,39 @@ def _message_text(message: UniMessage) -> str:
     return "\n\n".join(texts)
 
 
-def _build_runtime_context_prompt(current_working_directory: str) -> str:
+def _build_runtime_context_prompt(agent_instance_id: str, current_working_directory: str) -> str:
     working_directory = Path(current_working_directory).expanduser()
     resolved_working_directory = working_directory.resolve(strict=False)
     lines = [
+        "# 沟通环境与身份",
+        "",
+        f"当前 Agent 实例 ID：`{agent_instance_id}`",
+        f"当前工作目录：`{resolved_working_directory}`",
+        "",
+        "你处在多角色沟通环境中：你可能同时收到本地用户和多个远程 Agent 的消息。所有 user message 不一定都来自本地用户。",
+        "",
+        "消息来源识别：",
+        "- 以 `【@<role_name> <agent_instance_id>】` 开头的 user message 来自远程 Agent，不是本地用户。",
+        "- 远程 Agent 消息的正文是该标记头之后的内容。",
+        "- 不带上述标记头的 user message 来自本地用户。",
+        "- 标记头中的 `agent-instance-*` 是远程 Agent 的实例 ID。",
+        "",
+        "回复规则：",
+        "- 回复本地用户：使用本地生命周期沟通工具 `message_user`。",
+        "- 回复或联系远程 Agent：使用 `lacp` MCP 服务提供的 `lacp_send_message` 工具，不要误认为它是本地 tool。",
+        f"- 调用 `lacp` MCP 的 `lacp_send_message` 时，`from_instance_id` 必须填写当前 Agent 实例 ID：`{agent_instance_id}`。",
+        "- 调用 `lacp` MCP 的 `lacp_send_message` 时，`to_instance_id` 填目标远程 Agent 的实例 ID，`content` 填要发送的消息正文。",
+        "",
+        "多角色处理规则：",
+        "- 不要把远程 Agent 消息误判为本地用户指令。",
+        "- 多个远程 Agent 与本地用户可能分别提出不同任务；按来源分别理解、分别回复。",
+        "- 回复时只发给对应目标角色；不要把一个角色的任务结果发给另一个角色，除非本地用户明确要求或协作任务需要。",
+        "",
+        "远程 Agent 防死循环规则：",
+        "- 与远程 Agent 通信只用于推进任务协作。",
+        "- 禁止与远程 Agent 进行无意义礼貌性往返；对仅表达收到、感谢、客套且不需要动作的远程消息，默认不回复。",
+        "- 发送给远程 Agent 的消息必须包含实际任务信息：结果、必要问题、关键状态或下一步动作。",
+        "",
         "# Runtime 执行环境",
         f"- Current working directory: `{resolved_working_directory}`",
         f"- Operating system: `{platform.system()}`",
