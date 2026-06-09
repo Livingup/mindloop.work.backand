@@ -12,7 +12,6 @@ from agent_runtime.context_compression.default_prompts import (
     CONTEXT_COMPRESSION_WORKER_NAMES,
     get_default_worker_prompt,
 )
-from agent_runtime.context_compression.prompt_loader import ensure_default_worker_prompts
 from agent_runtime.context_compression.prompt_repository import (
     ContextCompressionWorkerPrompt,
     ContextCompressionWorkerPromptRepository,
@@ -81,14 +80,14 @@ _WORKER_METADATA: tuple[dict[str, str], ...] = (
     },
     {
         "name": "FinalAssemblerWorker",
-        "title": "最终 Markdown 汇编",
-        "description": "将各分段 Worker 提取的结构化条目整合为一份连贯、有序的最终 Markdown 摘要，用作压缩后的对话上下文。",
+        "title": "最终汇编（兼容）",
+        "description": "保留旧版 LLM 最终汇编 Worker 的配置入口；当前默认链路由程序按固定章节确定性生成 Markdown 草稿。",
         "group": WORKER_GROUP_FINAL_ASSEMBLY,
     },
     {
         "name": "FinalVerifierWorker",
-        "title": "最终校验",
-        "description": "对最终 Markdown 进行校验，发现遗漏、错误或不一致的内容并提示问题，仅在启用校验时执行。",
+        "title": "最终校验与编辑",
+        "description": "读取原始历史证据和程序化 Markdown 草稿，检查遗漏、错误或上下文断裂，并通过草稿行编辑工具做小范围最终修订。",
         "group": WORKER_GROUP_FINAL_VERIFICATION,
     },
 )
@@ -122,7 +121,7 @@ class ContextCompressionWorkerContentsResponse(BaseModel):
 
 class ContextCompressionPromptStatusResponse(BaseModel):
     use_default: bool
-    updated_at: str
+    updated_at: str | None = None
 
 
 class ContextCompressionWorkerResponse(BaseModel):
@@ -154,7 +153,7 @@ class ContextCompressionWorkerPromptDetailResponse(BaseModel):
     default_text: str
     override_text: str | None
     effective_text: str
-    updated_at: str
+    updated_at: str | None = None
 
 
 class ContextCompressionWorkerPromptUpdateBody(BaseModel):
@@ -269,7 +268,6 @@ def create_context_compression_router(
     @router.get("/workers", response_model=list[ContextCompressionWorkerResponse])
     async def list_workers() -> list[ContextCompressionWorkerResponse]:
         repository = _require_prompt_repository(prompt_repository)
-        ensure_default_worker_prompts(repository)
         prompt_index: dict[tuple[str, str], ContextCompressionWorkerPrompt] = {}
         for prompt in repository.list_prompts():
             prompt_index[(prompt.input_mode, prompt.worker_name)] = prompt
@@ -278,11 +276,9 @@ def create_context_compression_router(
             prompt_status: dict[str, ContextCompressionPromptStatusResponse] = {}
             for input_mode in SUPPORTED_INPUT_MODES:
                 prompt = prompt_index.get((input_mode, metadata["name"]))
-                if prompt is None:
-                    continue
                 prompt_status[input_mode] = ContextCompressionPromptStatusResponse(
-                    use_default=not prompt.is_custom,
-                    updated_at=prompt.updated_at,
+                    use_default=prompt is None,
+                    updated_at=prompt.updated_at if prompt is not None else None,
                 )
             group = metadata["group"]
             workers.append(
@@ -309,12 +305,16 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        prompt = repository.upsert_default(
+        override = repository.get_prompt(
             input_mode=input_mode,
             worker_name=worker_name,
-            default_prompt_text=default_text,
         )
-        return _prompt_detail_response(prompt)
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=override,
+        )
 
     @router.put(
         "/workers/{worker_name}/prompts/{input_mode}",
@@ -329,11 +329,6 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        repository.upsert_default(
-            input_mode=input_mode,
-            worker_name=worker_name,
-            default_prompt_text=default_text,
-        )
         try:
             prompt = repository.update_prompt(
                 input_mode=input_mode,
@@ -344,7 +339,12 @@ def create_context_compression_router(
             raise HTTPException(status_code=404, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return _prompt_detail_response(prompt)
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=prompt,
+        )
 
     @router.post(
         "/workers/{worker_name}/prompts/{input_mode}/reset",
@@ -358,16 +358,16 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        repository.upsert_default(
-            input_mode=input_mode,
-            worker_name=worker_name,
-            default_prompt_text=default_text,
-        )
         try:
-            prompt = repository.reset_prompt(input_mode=input_mode, worker_name=worker_name)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        return _prompt_detail_response(prompt)
+            repository.reset_prompt(input_mode=input_mode, worker_name=worker_name)
+        except KeyError:
+            pass
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=None,
+        )
 
     return router
 
@@ -545,15 +545,19 @@ def _validate_input_mode(input_mode: str) -> None:
 
 
 def _prompt_detail_response(
-    prompt: ContextCompressionWorkerPrompt,
+    *,
+    worker_name: str,
+    input_mode: str,
+    default_text: str,
+    override: ContextCompressionWorkerPrompt | None,
 ) -> ContextCompressionWorkerPromptDetailResponse:
-    override_text = prompt.prompt_text if prompt.is_custom else None
+    override_text = override.prompt_text if override is not None else None
     return ContextCompressionWorkerPromptDetailResponse(
-        worker_name=prompt.worker_name,
-        input_mode=prompt.input_mode,
-        use_default=not prompt.is_custom,
-        default_text=prompt.default_prompt_text,
+        worker_name=worker_name,
+        input_mode=input_mode,
+        use_default=override is None,
+        default_text=default_text,
         override_text=override_text,
-        effective_text=prompt.prompt_text,
-        updated_at=prompt.updated_at,
+        effective_text=override_text if override_text is not None else default_text,
+        updated_at=override.updated_at if override is not None else None,
     )
