@@ -88,6 +88,7 @@ Desktop.ini
 !/tests/test_execution_loop_logger.py
 !/tests/test_sqlite_threaded_repositories.py
 !/tests/test_release_windows_subprocess_visibility.py
+!/tests/test_context_compression_worker_contents.py
 
 /web-frontend/
 

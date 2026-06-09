@@ -152,6 +152,7 @@ def create_app(
     from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import (
         create_file_resource_router,
     )
+    from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
     from agent_runtime.context_compression.north_gateway.context_compression_rest_adapter import (
         create_context_compression_router,
     )
@@ -214,6 +215,9 @@ def create_app(
     )
     context_compression_settings_repository = create_context_compression_settings_repository(
         lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+    )
+    context_compression_archive_repository = ContextCompressionArchiveRepository(
+        ConfigRegistry.instance().context_compression.archive_data_dir,
     )
     scene_gateway = SceneFactory.create()
     agent_runtime_gateway = AgentRuntimeFactory.create(
@@ -845,6 +849,7 @@ def create_app(
             prompt_repository=context_compression_prompt_repository,
             settings_repository=context_compression_settings_repository,
             llm_registry_gateway=llm_model_registry_gateway,
+            archive_repository=context_compression_archive_repository,
             config_accessor=lambda: ConfigRegistry.instance().context_compression,
         ),
         prefix="/api/context-compression",

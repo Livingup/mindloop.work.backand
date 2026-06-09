@@ -5,7 +5,9 @@ from collections.abc import Callable
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.config import ContextCompressionConfig
+from agent_runtime.context_compression.models import SECTION_WORKERS, SECTION_WORKER_TITLES
 from agent_runtime.context_compression.default_prompts import (
     CONTEXT_COMPRESSION_WORKER_NAMES,
     get_default_worker_prompt,
@@ -91,6 +93,11 @@ _WORKER_METADATA: tuple[dict[str, str], ...] = (
     },
 )
 
+_SECTION_TO_WORKER_NAME: dict[str, str] = {
+    section: worker_name
+    for worker_name, section in SECTION_WORKERS
+}
+
 
 class ContextCompressionMarkdownResponse(BaseModel):
     conversation_id: str
@@ -100,6 +107,17 @@ class ContextCompressionMarkdownResponse(BaseModel):
     matched_reference: str
     summary_message_id: str | None = None
     archive_job_id: str | None = None
+
+
+class ContextCompressionWorkerReadableContentResponse(BaseModel):
+    worker_name: str
+    title: str
+    content_markdown: str
+
+
+class ContextCompressionWorkerContentsResponse(BaseModel):
+    job_id: str
+    workers: list[ContextCompressionWorkerReadableContentResponse]
 
 
 class ContextCompressionPromptStatusResponse(BaseModel):
@@ -149,6 +167,7 @@ def create_context_compression_router(
     prompt_repository: ContextCompressionWorkerPromptRepository | None = None,
     settings_repository: ContextCompressionSettingsRepository | None = None,
     llm_registry_gateway: LlmModelRegistryGateway | None = None,
+    archive_repository: ContextCompressionArchiveRepository | None = None,
     config_accessor: Callable[[], ContextCompressionConfig] | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -189,6 +208,21 @@ def create_context_compression_router(
             matched_reference=matched_reference,
             summary_message_id=summary_message_id,
             archive_job_id=archive_job_id,
+        )
+
+    @router.get(
+        "/jobs/{job_id}/worker-contents",
+        response_model=ContextCompressionWorkerContentsResponse,
+    )
+    async def get_worker_contents(job_id: str) -> ContextCompressionWorkerContentsResponse:
+        repository = _require_archive_repository(archive_repository)
+        try:
+            section_items = repository.get_section_items(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"上下文压缩 job 不存在: {job_id}")
+        return ContextCompressionWorkerContentsResponse(
+            job_id=job_id,
+            workers=_worker_content_responses(section_items),
         )
 
     @router.get("/settings", response_model=ContextCompressionSettingsResponse)
@@ -384,6 +418,54 @@ def _contains_reference(candidate: object, value: str) -> bool:
     if isinstance(candidate, list | tuple):
         return any(_contains_reference(item, value) for item in candidate)
     return False
+
+
+def _require_archive_repository(
+    archive_repository: ContextCompressionArchiveRepository | None,
+) -> ContextCompressionArchiveRepository:
+    if archive_repository is None:
+        raise HTTPException(status_code=503, detail="上下文压缩归档仓储未配置。")
+    return archive_repository
+
+
+def _worker_content_responses(
+    section_items: list[dict[str, object]],
+) -> list[ContextCompressionWorkerReadableContentResponse]:
+    grouped_contents: dict[str, list[str]] = {worker_name: [] for worker_name, _section in SECTION_WORKERS}
+    for item in section_items:
+        section = str(item.get("section") or "").strip()
+        worker_name = str(item.get("worker_name") or "").strip()
+        if worker_name not in grouped_contents:
+            worker_name = _SECTION_TO_WORKER_NAME.get(section, "")
+        if worker_name not in grouped_contents:
+            continue
+        raw_content = item.get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        if content:
+            grouped_contents[worker_name].append(content)
+
+    responses: list[ContextCompressionWorkerReadableContentResponse] = []
+    for worker_name, section in SECTION_WORKERS:
+        responses.append(
+            ContextCompressionWorkerReadableContentResponse(
+                worker_name=worker_name,
+                title=SECTION_WORKER_TITLES.get(section, worker_name),
+                content_markdown=_join_readable_contents(grouped_contents.get(worker_name, [])),
+            )
+        )
+    return responses
+
+
+def _join_readable_contents(contents: list[str]) -> str:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for content in contents:
+        normalized = "\n".join(line.rstrip() for line in content.strip().splitlines()).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return "\n\n".join(deduped)
 
 
 def _require_prompt_repository(
