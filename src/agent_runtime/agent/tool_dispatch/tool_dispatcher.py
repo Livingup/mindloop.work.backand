@@ -69,9 +69,9 @@ class ToolDispatchResult:
 class AgentToolDispatcher:
     """Agent 内部工具调度器。
 
-    调度器只暴露当前 AgentDefinition 明确允许的本地工具和 MCP 工具。LLM 请求前，
-    build_llm_tools() 生成可传给对应 SDK 平台的工具 schema；LLM 返回工具调用后，
-    dispatch_tool_call() 再次执行 allowlist 校验并调用本地工具或 MCP 工具。
+    调度器只把当前 AgentDefinition 明确允许的本地工具暴露给 LLM。MCP 服务通过
+    本地 MCP 元工具（mcp_get_tool_detail、mcp_call_tool 等）间接访问，不再把
+    AgentDefinition.mcp_tools 展开成 mcp__service__tool 直连工具 schema。
     """
 
     def __init__(
@@ -85,7 +85,7 @@ class AgentToolDispatcher:
         # 本地工具北向网关。用于读取本地工具 schema 和执行本地工具函数。
         self._local_tool_gateway = local_tool_gateway
 
-        # MCP 客户端北向网关。AgentDefinition 声明 mcp_tools 时必须配置该网关。
+        # MCP 客户端北向网关。MCP 元工具和兼容性 MCP 分发路径通过该网关访问远端服务。
         self._mcp_client_gateway = mcp_client_gateway
 
         # 运行时事件发布器。用于把工具调用生命周期推送到通用通信流。
@@ -98,7 +98,7 @@ class AgentToolDispatcher:
         agent_definition: AgentDefinition,
         api_format: str,
     ) -> tuple[LlmToolDefinition, ...]:
-        """根据 AgentDefinition 能力边界构建本轮 LLM 可见工具定义。"""
+        """根据 AgentDefinition 本地工具能力边界构建本轮 LLM 可见工具定义。"""
         tools: list[LlmToolDefinition] = []
         for tool_name in self._visible_local_tool_names(agent_definition):
             detail = self._local_tool_gateway.get_tool(tool_name)
@@ -106,36 +106,6 @@ class AgentToolDispatcher:
             if schema is None:
                 raise ValueError(f"本地工具 {tool_name} 缺少 {api_format} 协议格式 schema。")
             tools.append(LlmToolDefinition(name=tool_name, schema=schema, source="local"))
-
-        if agent_definition.mcp_tools:
-            if self._mcp_client_gateway is None:
-                raise RuntimeError("当前 Agent 定义了 MCP 工具，但执行器未配置 McpClientGateway。")
-            for binding in agent_definition.mcp_tools:
-                details = await self._mcp_client_gateway.get_tool_detail(
-                    binding.service_id,
-                    list(binding.tool_ids),
-                )
-                detail_map = {detail.name: detail for detail in details}
-                for tool_name in binding.tool_ids:
-                    detail = detail_map.get(tool_name)
-                    if detail is None:
-                        raise KeyError(f"MCP 工具不存在: {binding.service_id}/{tool_name}")
-                    exposed_name = build_mcp_exposed_tool_name(binding.service_id, tool_name)
-                    schema = _build_mcp_tool_schema(
-                        api_format=api_format,
-                        exposed_name=exposed_name,
-                        description=detail.description,
-                        input_schema=detail.input_schema,
-                    )
-                    tools.append(
-                        LlmToolDefinition(
-                            name=exposed_name,
-                            schema=schema,
-                            source="mcp",
-                            mcp_service_id=binding.service_id,
-                            mcp_tool_name=tool_name,
-                        )
-                    )
         return tuple(tools)
 
     async def dispatch_tool_call(

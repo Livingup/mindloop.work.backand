@@ -2067,9 +2067,74 @@ class AgentExecutionEngine:
                 )
                 skipped_for_modalities = True
                 continue
+            def _record_prompt_preparation_step(
+                stage: str,
+                status: str,
+                summary: str,
+                details: dict[str, Any] | None = None,
+                expected_next: str | None = None,
+            ) -> None:
+                step_details = {
+                    "task_id": task.task_id,
+                    "conversation_id": conversation.id,
+                    "candidate_index": candidate_index,
+                    "provider_id": resolved_model.provider_id,
+                    "binding_id": resolved_model.binding_id,
+                    "model_id": resolved_model.model_id,
+                    "api_format": resolved_model.api_format,
+                }
+                if details:
+                    step_details.update(details)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage=stage,
+                    status=status,
+                    summary=summary,
+                    details=step_details,
+                    expected_next=expected_next,
+                )
+
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.start",
+                "started",
+                "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
+                {
+                    "agent_definition_id": agent_definition.agent_id,
+                    "local_tool_id_count": len(agent_definition.tool_ids),
+                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                },
+                "llm.prompt.tools.build.complete",
+            )
             tools = await self._tool_dispatcher.build_llm_tools(
                 agent_definition=agent_definition,
                 api_format=resolved_model.api_format,
+            )
+            tool_source_counts: dict[str, int] = {}
+            for tool in tools:
+                tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.complete",
+                "completed",
+                "LLM 可见工具 schema 构建完成。",
+                {
+                    "tool_schema_count": len(tools),
+                    "tool_names": [tool.name for tool in tools],
+                    "tool_source_counts": tool_source_counts,
+                    "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
+                },
+                "llm.prompt.render.start",
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.start",
+                "started",
+                "开始渲染系统提示词。",
+                {
+                    "system_prompt_segment_count": len(agent_definition.system_prompt),
+                    "skill_id_count": len(agent_definition.skill_ids),
+                    "render_option_keys": sorted(render_options.keys()),
+                },
+                "llm.prompt.agent_segments.start",
             )
             system_prompt = self._render_system_prompt(
                 agent_definition,
@@ -2077,6 +2142,17 @@ class AgentExecutionEngine:
                 instance.current_working_directory,
                 render_options,
                 tools,
+                prompt_step_recorder=_record_prompt_preparation_step,
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.complete",
+                "completed",
+                "系统提示词渲染完成。",
+                {
+                    "system_prompt_present": system_prompt is not None,
+                    "system_prompt_length": len(system_prompt or ""),
+                },
+                "llm.prompt.prepared",
             )
             self._record_execution_loop_step(
                 instance_id=instance.instance_id,
@@ -2366,8 +2442,36 @@ class AgentExecutionEngine:
         current_working_directory: str,
         render_options: dict[str, Any],
         llm_tools: tuple[LlmToolDefinition, ...],
+        *,
+        prompt_step_recorder: Callable[[str, str, str, dict[str, Any] | None, str | None], None] | None = None,
     ) -> str | None:
         """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。"""
+
+        def _record_prompt_step(
+            stage: str,
+            status: str,
+            summary: str,
+            details: dict[str, Any] | None = None,
+            expected_next: str | None = None,
+        ) -> None:
+            if prompt_step_recorder is None:
+                return
+            prompt_step_recorder(stage, status, summary, details, expected_next)
+
+        template_ids = tuple(
+            segment.template_id for segment in definition.system_prompt if segment.template_id is not None
+        )
+        _record_prompt_step(
+            "llm.prompt.agent_segments.start",
+            "started",
+            "开始读取 AgentDefinition 系统提示词片段。",
+            {
+                "system_prompt_segment_count": len(definition.system_prompt),
+                "template_segment_count": len(template_ids),
+                "template_ids": list(template_ids),
+            },
+            "llm.prompt.agent_segments.complete",
+        )
         segments: list[str] = []
         for segment in definition.system_prompt:
             if segment.text is not None:
@@ -2376,12 +2480,113 @@ class AgentExecutionEngine:
                 snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
+        _record_prompt_step(
+            "llm.prompt.agent_segments.complete",
+            "completed",
+            "AgentDefinition 系统提示词片段读取完成。",
+            {
+                "rendered_segment_count": len(segments),
+                "agent_prompt_text_length": len(text),
+            },
+            "llm.prompt.runtime_context.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.runtime_context.start",
+            "started",
+            "开始构造运行时上下文提示词。",
+            {
+                "agent_instance_id": agent_instance_id,
+                "current_working_directory": current_working_directory,
+            },
+            "llm.prompt.runtime_context.complete",
+        )
         runtime_context_prompt = _build_runtime_context_prompt(agent_instance_id, current_working_directory)
+        _record_prompt_step(
+            "llm.prompt.runtime_context.complete",
+            "completed",
+            "运行时上下文提示词构造完成。",
+            {"runtime_context_prompt_length": len(runtime_context_prompt)},
+            "llm.prompt.mcp_services.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.mcp_services.start",
+            "started",
+            "开始构造 MCP 服务提示词。",
+            {
+                "bound_mcp_service_count": len(definition.mcp_tools),
+                "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in definition.mcp_tools),
+            },
+            "llm.prompt.mcp_services.complete",
+        )
         mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
+        _record_prompt_step(
+            "llm.prompt.mcp_services.complete",
+            "completed",
+            "MCP 服务提示词构造完成。",
+            {
+                "mcp_services_prompt_present": bool(mcp_services_prompt),
+                "mcp_services_prompt_length": len(mcp_services_prompt),
+            },
+            "llm.prompt.skills.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.skills.start",
+            "started",
+            "开始构造 Skill 提示词。",
+            {"skill_id_count": len(definition.skill_ids)},
+            "llm.prompt.skills.complete",
+        )
         skills_prompt = self._build_skills_prompt(definition)
+        _record_prompt_step(
+            "llm.prompt.skills.complete",
+            "completed",
+            "Skill 提示词构造完成。",
+            {
+                "skills_prompt_present": bool(skills_prompt),
+                "skills_prompt_length": len(skills_prompt),
+            },
+            "llm.prompt.lifecycle.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.lifecycle.start",
+            "started",
+            "开始构造 lifecycle runtime 提示词。",
+            {"render_option_keys": sorted(render_options.keys())},
+            "llm.prompt.lifecycle.complete",
+        )
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
+        _record_prompt_step(
+            "llm.prompt.lifecycle.complete",
+            "completed",
+            "lifecycle runtime 提示词构造完成。",
+            {
+                "lifecycle_prompt_present": bool(lifecycle_prompt),
+                "lifecycle_prompt_length": len(lifecycle_prompt),
+            },
+            "llm.prompt.tool_usage_notice.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.start",
+            "started",
+            "开始构造工具使用注意事项提示词。",
+            {"llm_tool_names": [tool.name for tool in llm_tools]},
+            "llm.prompt.tool_usage_notice.complete",
+        )
         tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
-        return "\n\n".join(
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.complete",
+            "completed",
+            "工具使用注意事项提示词构造完成。",
+            {"tool_usage_notice_length": len(tool_usage_notice)},
+            "llm.prompt.assemble.complete",
+        )
+
+        system_prompt = "\n\n".join(
             item
             for item in (
                 runtime_context_prompt,
@@ -2393,6 +2598,17 @@ class AgentExecutionEngine:
             )
             if item.strip()
         ) or None
+        _record_prompt_step(
+            "llm.prompt.assemble.complete",
+            "completed",
+            "系统提示词各片段拼接完成。",
+            {
+                "system_prompt_present": system_prompt is not None,
+                "system_prompt_length": len(system_prompt or ""),
+            },
+            "llm.prompt.render.complete",
+        )
+        return system_prompt
 
     def _build_mcp_services_prompt(
         self,
@@ -2413,14 +2629,9 @@ class AgentExecutionEngine:
         if not available_services:
             return ""
 
-        tools_by_service: dict[str, list[LlmToolDefinition]] = {sid: [] for sid in service_ids}
-        for tool in llm_tools:
-            if tool.source != "mcp" or not tool.mcp_service_id or not tool.mcp_tool_name:
-                continue
-            if tool.mcp_service_id in tools_by_service:
-                tools_by_service[tool.mcp_service_id].append(tool)
+        tool_ids_by_service = {binding.service_id: tuple(binding.tool_ids) for binding in definition.mcp_tools}
 
-        # system prompt 仅注入 MCP 服务与可用工具摘要；参数 schema 仍通过正式 tool schema 暴露给模型。
+        # system prompt 仅注入 MCP 服务和 AgentDefinition 授权工具名摘要；具体参数 schema 通过 MCP 元工具按需读取。
         lines = ["# 可用的 MCP 服务列表"]
         for service in available_services:
             description = service.description or ""
@@ -2428,21 +2639,18 @@ class AgentExecutionEngine:
                 lines.append(f"- `{service.service_id}`：{description}")
             else:
                 lines.append(f"- `{service.service_id}`")
-            service_tools = tools_by_service.get(service.service_id, [])
-            if not service_tools:
-                continue
-            lines.append("  - 可用工具：")
-            for tool in service_tools:
-                tool_name = tool.mcp_tool_name or tool.name
-                tool_description = self._tool_schema_description(tool.schema)
-                if tool_description:
-                    lines.append(f"    - `{tool_name}`：{tool_description}")
-                else:
+            service_tool_ids = tool_ids_by_service.get(service.service_id, ())
+            if service_tool_ids:
+                lines.append("  - 可用工具：")
+                for tool_name in service_tool_ids:
                     lines.append(f"    - `{tool_name}`")
         lines.append("## 使用方式")
         lines.append(
-            "上方只列出 MCP 服务和可用工具摘要；工具参数 schema 不写入系统提示词，"
-            "以本轮工具定义中对应 MCP tool 的参数 schema 为准。"
+            "上方只列出 MCP 服务和 AgentDefinition 授权工具名摘要；工具参数 schema 不会直接注入 LLM tools。"
+        )
+        lines.append(
+            "使用 MCP 工具时，必须先调用本地元工具 mcp_get_tool_detail 获取 inputSchema，"
+            "再调用 mcp_call_tool 执行；不要直接构造 mcp__{service_id}__{tool_name} 工具名。"
         )
         return "\n".join(lines)
 
