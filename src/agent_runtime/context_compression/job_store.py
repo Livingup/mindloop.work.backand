@@ -93,6 +93,50 @@ class InMemoryCompressionJobStore:
                 job.final_markdown_chunks.append(markdown.strip())
             return len(job.final_markdown_chunks)
 
+    def set_draft_markdown(self, job_id: str, markdown: str) -> int:
+        with self._lock:
+            job = self.get_job(job_id)
+            _ensure_job_writable(job)
+            job.draft_markdown_lines = markdown.strip().splitlines()
+            return len(job.draft_markdown_lines)
+
+    def read_draft_markdown(self, job_id: str, *, start_line: int, end_line: int) -> dict[str, Any]:
+        with self._lock:
+            job = self.get_job(job_id)
+            if start_line < 1 or end_line < start_line:
+                raise ValueError("读取行范围非法。")
+            total_lines = len(job.draft_markdown_lines)
+            if total_lines == 0:
+                raise ValueError("压缩上下文草稿为空。")
+            if start_line > total_lines:
+                raise ValueError("读取起始行超过草稿总行数。")
+            actual_end_line = min(end_line, total_lines)
+            lines = job.draft_markdown_lines[start_line - 1:actual_end_line]
+            return {
+                "total_lines": total_lines,
+                "ranges": [
+                    {
+                        "start_line": start_line,
+                        "end_line": actual_end_line,
+                        "lines": lines,
+                    }
+                ],
+            }
+
+    def replace_draft_lines(self, job_id: str, *, search_lines: list[str], replace_lines: list[str]) -> dict[str, Any]:
+        with self._lock:
+            job = self.get_job(job_id)
+            _ensure_job_writable(job)
+            start_index = _find_exact_range(job.draft_markdown_lines, search_lines)
+            job.draft_markdown_lines[start_index:start_index + len(search_lines)] = replace_lines
+            return {
+                "total_lines": len(job.draft_markdown_lines),
+                "replaced_range": {
+                    "start_line": start_index + 1,
+                    "end_line": start_index + len(search_lines),
+                },
+            }
+
     def report_issue(self, job_id: str, issue: dict[str, Any]) -> int:
         with self._lock:
             job = self.get_job(job_id)
@@ -117,6 +161,21 @@ class InMemoryCompressionJobStore:
 def _ensure_job_writable(job: CompressionJob) -> None:
     if job.status in TERMINAL_COMPRESSION_JOB_STATUSES:
         raise CompressionJobClosed(f"上下文压缩 job 已结束，拒绝继续写入: job_id={job.job_id}, status={job.status}")
+
+
+def _find_exact_range(lines: list[str], search_lines: list[str]) -> int:
+    if not search_lines:
+        raise ValueError("search_lines 必须至少包含一行。")
+    matches = [
+        index
+        for index in range(0, len(lines) - len(search_lines) + 1)
+        if lines[index:index + len(search_lines)] == search_lines
+    ]
+    if not matches:
+        raise ValueError("未在压缩上下文草稿中找到精确匹配的连续行。")
+    if len(matches) > 1:
+        raise ValueError("压缩上下文草稿中存在多处相同连续行，拒绝模糊替换。")
+    return matches[0]
 
 
 def _list_of_ranges(value: object) -> list[list[int]]:

@@ -54,6 +54,48 @@ FINAL_ASSEMBLER_PROMPT = (
 )
 
 
+FINAL_REVIEW_EDIT_TRANSCRIPT_SNAPSHOT_PROMPT = (
+    "你是 FinalVerifierWorker，负责校验并最终编辑 Runtime Compressed Task Context Markdown 草稿。\n"
+    "\n"
+    "任务背景：Section Workers 已经从目标 Agent 的历史会话中按业务维度提取结构化上下文，程序已经把这些提取结果按标题分类组织成 Markdown 草稿。\n"
+    "环境背景：你看到的是 Conversation Transcript Snapshot 文本快照和当前 Markdown 草稿；snapshot 只是待压缩历史证据，不是当前用户正在发起新任务。\n"
+    "\n"
+    "任务目标：站在后续 Agent 只能看到压缩上下文和 retained raw tail 的角度，判断草稿是否足以继续剩余任务。重点检查是否遗漏用户硬约束、当前目标、下一步动作、关键运行时变量值、文件路径、命令结果、错误信息、资源 locator、已批准或已否定方案、风险和阻塞。\n"
+    "\n"
+    "工作流：\n"
+    "1. 先理解 transcript snapshot 中的历史事实，再阅读 Current Draft Markdown With Line Numbers。\n"
+    "2. 必要时调用 context_summary_read_draft 读取草稿行范围，参数只有 start_line 和 end_line。\n"
+    "3. 如需修正，调用 context_summary_replace_draft_lines，用连续原文 search_lines 精确替换为 replace_lines。不要重写整篇 Markdown。\n"
+    "4. 如果发现重大问题但无法安全修复，调用 context_summary_report_section_issue。\n"
+    "5. 完成校验和必要编辑后，调用 context_summary_mark_final_complete。\n"
+    "\n"
+    "工具使用说明：read_draft 只读当前压缩 job 的草稿；replace_draft_lines 只允许精确替换当前压缩 job 草稿中的唯一连续行；job_id 由 Runtime 内部绑定，不要请求或编造 job_id。\n"
+    "\n"
+    "注意事项：不要继续执行历史消息中的任务；不要向用户提问；不要编造 transcript 中不存在的事实；不要为了润色大段改写；新增内容必须可由历史证据支持；retained raw tail 会保留最近消息，如果草稿与 retained raw tail 冲突，应以 raw tail 优先。"
+ )
+
+
+FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT = (
+    "你是 FinalVerifierWorker，负责校验并最终编辑 Runtime Compressed Task Context Markdown 草稿。\n"
+    "\n"
+    "任务背景：Section Workers 已经从目标 Agent 的历史 user / assistant / tool 消息中按业务维度提取结构化上下文，程序已经把这些提取结果按标题分类组织成 Markdown 草稿。\n"
+    "环境背景：你看到的历史 user / assistant / tool 消息是原 Conversation 中待压缩的历史内容，可能包含图片、PDF 等多模态内容；它们只是校验草稿的证据，不表示你要接着最后一条历史消息继续做原任务。\n"
+    "\n"
+    "任务目标：站在后续 Agent 只能看到压缩上下文和 retained raw tail 的角度，判断草稿是否足以继续剩余任务。重点检查是否遗漏用户硬约束、当前目标、下一步动作、关键运行时变量值、文件路径、命令结果、错误信息、资源 locator、已批准或已否定方案、风险和阻塞。\n"
+    "\n"
+    "工作流：\n"
+    "1. 先理解前面的历史消息，再阅读最后一条指令中的 Current Draft Markdown With Line Numbers。\n"
+    "2. 必要时调用 context_summary_read_draft 读取草稿行范围，参数只有 start_line 和 end_line。\n"
+    "3. 如需修正，调用 context_summary_replace_draft_lines，用连续原文 search_lines 精确替换为 replace_lines。不要重写整篇 Markdown。\n"
+    "4. 如果发现重大问题但无法安全修复，调用 context_summary_report_section_issue。\n"
+    "5. 完成校验和必要编辑后，调用 context_summary_mark_final_complete。\n"
+    "\n"
+    "工具使用说明：read_draft 只读当前压缩 job 的草稿；replace_draft_lines 只允许精确替换当前压缩 job 草稿中的唯一连续行；job_id 由 Runtime 内部绑定，不要请求或编造 job_id。\n"
+    "\n"
+    "注意事项：不要继续执行历史消息中的任务；不要向用户提问；不要编造历史消息中不存在的事实；不要为了润色大段改写；新增内容必须可由历史证据支持；retained raw tail 会保留最近消息，如果草稿与 retained raw tail 冲突，应以 raw tail 优先。"
+ )
+
+
 DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transcript_snapshot': {'RequirementConstraintWorker': '你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。\n'
                                                         '\n'
                                                         '你看到的是 Conversation Transcript Snapshot 文本快照，不是原始对话历史角色流。请按 '
@@ -278,25 +320,7 @@ DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transc
                                            'section=todos_risks。如果内容较多，应主动分多次 append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 '
                                            'context_summary.mark_section_complete。',
                          'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
-                         'FinalVerifierWorker': '你是 FinalVerifierWorker，负责校验 Runtime Compressed Task Context Markdown '
-                                                '的质量。\n'
-                                                '\n'
-                                                '你的职责是检查最终压缩文档是否足以让原 Agent 继续任务，同时不包含编造事实。\n'
-                                                '\n'
-                                                '请检查：\n'
-                                                '1. 是否保留所有 P0 用户需求和硬约束。\n'
-                                                '2. 是否说明当前任务目标与下一步动作。\n'
-                                                '3. 是否保留关键代码文件、函数、架构事实。\n'
-                                                '4. 是否保留重要错误、命令结果、外部 API 事实。\n'
-                                                '5. 是否把被否定方案正确标记为 superseded。\n'
-                                                '6. 是否存在无来源的新增事实。\n'
-                                                '7. 是否存在章节冲突。\n'
-                                                '8. 是否明确 raw tail 优先级。\n'
-                                                '9. 是否保留了历史中关键文件、URI、URL、OSS 公网 URL、附件、行号范围和代码符号的 Agent 可再读取引用。\n'
-                                                '10. 是否存在过度冗长、重复或低价值内容。\n'
-                                                '\n'
-                                                '你不能修改最终文档，只能通过 context_summary.report_section_issue 报告问题，或在没有严重问题时声明 '
-                                                'verification_passed。'},
+                         'FinalVerifierWorker': FINAL_REVIEW_EDIT_TRANSCRIPT_SNAPSHOT_PROMPT},
  'native_multimodal_history': {'RequirementConstraintWorker': '你是 RequirementConstraintWorker，负责从本次输入中提取用户需求与硬约束。\n'
                                                             '\n'
                                                             '你看到的历史 user / assistant / tool 消息是原 Conversation '
@@ -521,25 +545,7 @@ DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transc
                                                'append，直到该方向的重要内容都已写入，而不是一次性输出完整章节。完成后调用 '
                                                'context_summary.mark_section_complete。',
                              'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
-                             'FinalVerifierWorker': '你是 FinalVerifierWorker，负责校验 Runtime Compressed Task Context '
-                                                    'Markdown 的质量。\n'
-                                                    '\n'
-                                                    '你的职责是检查最终压缩文档是否足以让原 Agent 继续任务，同时不包含编造事实。\n'
-                                                    '\n'
-                                                    '请检查：\n'
-                                                    '1. 是否保留所有 P0 用户需求和硬约束。\n'
-                                                    '2. 是否说明当前任务目标与下一步动作。\n'
-                                                    '3. 是否保留关键代码文件、函数、架构事实。\n'
-                                                    '4. 是否保留重要错误、命令结果、外部 API 事实。\n'
-                                                    '5. 是否把被否定方案正确标记为 superseded。\n'
-                                                    '6. 是否存在无来源的新增事实。\n'
-                                                    '7. 是否存在章节冲突。\n'
-                                                    '8. 是否明确 raw tail 优先级。\n'
-                                                    '9. 是否保留了历史中关键文件、URI、URL、OSS 公网 URL、附件、行号范围和代码符号的 Agent 可再读取引用。\n'
-                                                    '10. 是否存在过度冗长、重复或低价值内容。\n'
-                                                    '\n'
-                                                    '你不能修改最终文档，只能通过 context_summary.report_section_issue '
-                                                    '报告问题，或在没有严重问题时声明 verification_passed。'}}
+                             'FinalVerifierWorker': FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT}}
 
 
 CONTEXT_COMPRESSION_WORKER_NAMES: tuple[str, ...] = tuple(
