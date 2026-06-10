@@ -231,8 +231,7 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIsNotNone(prompt)
         prompt_text = prompt or ""
         self.assertIn("# 可用子 Agent", prompt_text)
-        self.assertIn("`research-agent`", prompt_text)
-        self.assertIn("负责检索资料、整理事实依据，并把调研结论回传给父 Agent。", prompt_text)
+        self.assertIn("- agent定义id：`research-agent`；功能：负责检索资料、整理事实依据，并把调研结论回传给父 Agent。", prompt_text)
         self.assertIn("create_subagent", prompt_text)
         self.assertIn("send_agent_message", prompt_text)
         self.assertNotIn("子 Agent 内部系统提示词不应泄漏给父 Agent。", prompt_text)

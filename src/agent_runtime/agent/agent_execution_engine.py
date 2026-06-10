@@ -1813,14 +1813,8 @@ class AgentExecutionEngine:
         for sub_agent_definition in available_definitions:
             name = (sub_agent_definition.name or "").strip()
             description = (sub_agent_definition.description or "").strip()
-            if name and description:
-                lines.append(f"- `{sub_agent_definition.agent_id}`（{name}）：{description}")
-            elif description:
-                lines.append(f"- `{sub_agent_definition.agent_id}`：{description}")
-            elif name:
-                lines.append(f"- `{sub_agent_definition.agent_id}`（{name}）：未填写用途说明。")
-            else:
-                lines.append(f"- `{sub_agent_definition.agent_id}`：未填写用途说明。")
+            function_desc = description or name or "未填写用途说明。"
+            lines.append(f"- agent定义id：`{sub_agent_definition.agent_id}`；功能：{function_desc}")
         return "\n".join(lines)
 
     def _build_skills_prompt(self, definition: AgentDefinition) -> str:
