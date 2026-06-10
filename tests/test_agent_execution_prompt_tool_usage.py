@@ -1,13 +1,16 @@
 import asyncio
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
+from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import SqliteAgentRuntimeRepository
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, SystemPromptSegment
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 from agent_runtime.subagent.subagent_runtime import SubagentRuntime
+from agent_runtime.subagent.subagent_tool import EndSubagentRequest
 
 
 class _LocalToolGateway:
@@ -200,6 +203,57 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertEqual(service.list_unreleased_child_agent_instances("agent-instance-root"), [])
         with self.assertRaises(KeyError):
             service.get_agent_instance("agent-instance-child")
+
+    def test_sqlite_releasing_child_agent_deletes_instance_without_breaking_task_reload(self) -> None:
+        with TemporaryDirectory() as data_dir:
+            repository = SqliteAgentRuntimeRepository(data_dir)
+            try:
+                service = AgentRuntimeService(repository)
+                service.create_task_with_root_agent_instance(
+                    task_id="task-sqlite-delete-release",
+                    root_instance_id="agent-instance-root",
+                    thread_id="thread-root",
+                    current_working_directory="G:\\project\\agent",
+                    agent_definition_id="parent-agent",
+                    llm_provider_id="provider",
+                    llm_model_binding_id="model",
+                )
+                service.create_child_agent_instance(
+                    task_id="task-sqlite-delete-release",
+                    parent_instance_id="agent-instance-root",
+                    child_instance_id="agent-instance-child",
+                    thread_id="thread-child",
+                    current_working_directory="G:\\project\\agent",
+                    agent_definition_id="child-agent",
+                    llm_provider_id="provider",
+                    llm_model_binding_id="model",
+                )
+
+                updated_task, released_instances = service.release_child_agent_instance(
+                    "agent-instance-root",
+                    "agent-instance-child",
+                    reason="parent_agent_ended_subagent",
+                )
+
+                self.assertEqual([instance.instance_id for instance in released_instances], ["agent-instance-child"])
+                self.assertTrue(updated_task.child_relation_of("agent-instance-child").is_released)
+                reloaded_task = service.get_task("task-sqlite-delete-release")
+                self.assertEqual(reloaded_task.agent_instance_ids, ("agent-instance-root",))
+                self.assertIsNone(reloaded_task.child_relation_of("agent-instance-child"))
+                self.assertEqual(service.list_unreleased_child_agent_instances("agent-instance-root"), [])
+                self.assertEqual(
+                    [instance.instance_id for instance in service.list_task_agent_instances("task-sqlite-delete-release")],
+                    ["agent-instance-root"],
+                )
+                with self.assertRaises(KeyError):
+                    service.get_agent_instance("agent-instance-child")
+            finally:
+                repository.close()
+
+    def test_end_subagent_request_uses_only_child_instance_ids_list(self) -> None:
+        fields = EndSubagentRequest.model_fields
+        self.assertIn("child_agent_instance_ids", fields)
+        self.assertNotIn("child_agent_instance_id", fields)
 
     def test_tool_usage_notice_injects_builtin_tool_ban_and_available_runtime_tool_guidance(self) -> None:
         engine = self._engine_with_local_tools(

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
-from agent_runtime.agent.agent_task import AgentParentChildRelation
+from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import CreateChildAgentInstanceRequest
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 
@@ -222,7 +222,7 @@ class SubagentRuntime:
     ) -> dict[str, Any]:
         normalized_child_ids = tuple(dict.fromkeys(child_id.strip() for child_id in child_instance_ids if child_id.strip()))
         if not normalized_child_ids:
-            raise ValueError("child_agent_instance_id 或 child_agent_instance_ids 至少提供一个。")
+            raise ValueError("child_agent_instance_ids 至少提供一个。")
         results: list[dict[str, Any]] = []
         all_released_ids: list[str] = []
         task_id: str | None = None
@@ -245,7 +245,7 @@ class SubagentRuntime:
                 parent_instance_id=parent_instance_id,
                 child_instance_id=child_instance_id,
                 released_agent_instance_ids=released_ids,
-                task_id=updated_task.task_id,
+                task=updated_task,
                 reason=reason,
             )
         return {
@@ -253,7 +253,6 @@ class SubagentRuntime:
             "task_id": task_id,
             "parent_agent_instance_id": parent_instance_id,
             "child_agent_instance_ids": list(normalized_child_ids),
-            "child_agent_instance_id": normalized_child_ids[0] if len(normalized_child_ids) == 1 else None,
             "released_agent_instance_ids": all_released_ids,
             "results": results,
             "reason": reason,
@@ -315,10 +314,9 @@ class SubagentRuntime:
         parent_instance_id: str,
         child_instance_id: str,
         released_agent_instance_ids: list[str],
-        task_id: str,
+        task: AgentTask,
         reason: str,
     ) -> None:
-        task = self._runtime_gateway.get_task(task_id)
         context = RuntimeCommunicationContext(
             stream_id=_default_stream_id_for_task(task.scene_id, task.task_id),
             actor_type="agent_instance",

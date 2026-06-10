@@ -33,8 +33,7 @@ class GetAgentStatusRequest(BaseToolRequest):
 class EndSubagentRequest(BaseToolRequest):
     """释放当前 Agent 直接创建的一个或多个子 Agent。"""
 
-    child_agent_instance_id: str | None = Field(default=None, description="要释放的直接子 Agent 实例 ID。兼容旧调用；释放会级联释放该子 Agent 的未释放后代。")
-    child_agent_instance_ids: list[str] | None = Field(default=None, description="要批量释放的直接子 Agent 实例 ID 列表。每个条目都必须是当前 Agent 直接创建且尚未释放的子 Agent。")
+    child_agent_instance_ids: list[str] = Field(description="要释放的直接子 Agent 实例 ID 列表；只释放一个子 Agent 时传入单元素列表。每个条目都必须是当前 Agent 直接创建且尚未释放的子 Agent。")
     reason: str = Field(default="parent_agent_ended_subagent", description="释放原因摘要。")
 
 
@@ -109,14 +108,9 @@ def get_agent_status(request: GetAgentStatusRequest, ctx: ToolRuntimeContext) ->
 async def end_subagent(request: EndSubagentRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     if not ctx.agent_instance_id:
         raise ValueError("缺少当前 Agent 实例上下文，不能释放子 Agent。")
-    child_instance_ids: list[str] = []
-    if request.child_agent_instance_id:
-        child_instance_ids.append(request.child_agent_instance_id)
-    if request.child_agent_instance_ids:
-        child_instance_ids.extend(request.child_agent_instance_ids)
     output = await get_subagent_runtime().end_subagents(
         parent_instance_id=ctx.agent_instance_id,
-        child_instance_ids=child_instance_ids,
+        child_instance_ids=request.child_agent_instance_ids,
         reason=request.reason,
     )
     return BaseToolResult(output=output, metadata={"subagent_action": "end_subagent"})

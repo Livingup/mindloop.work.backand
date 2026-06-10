@@ -228,7 +228,8 @@ class SqliteAgentRuntimeRepository:
                 stored_instance_ids=tuple(json.loads(row[2])),
                 relations=relations,
             )
-            return _row_to_task(row, relations, instance_ids)
+            live_relations = self._filter_task_relations_for_live_instances(relations, instance_ids)
+            return _row_to_task(row, live_relations, instance_ids)
 
     def list_tasks(self) -> list[AgentTask]:
         """列出当前仓储中的全部任务。"""
@@ -250,7 +251,8 @@ class SqliteAgentRuntimeRepository:
                     stored_instance_ids=tuple(json.loads(row[2])),
                     relations=relations,
                 )
-                tasks.append(_row_to_task(row, relations, instance_ids))
+                live_relations = self._filter_task_relations_for_live_instances(relations, instance_ids)
+                tasks.append(_row_to_task(row, live_relations, instance_ids))
             return tasks
 
     def save_agent_instance(self, instance: AgentInstance) -> None:
@@ -350,7 +352,8 @@ class SqliteAgentRuntimeRepository:
                     stored_instance_ids=tuple(json.loads(row[2])),
                     relations=relations,
                 )
-                tasks.append(_row_to_task(row, relations, instance_ids))
+                live_relations = self._filter_task_relations_for_live_instances(relations, instance_ids)
+                tasks.append(_row_to_task(row, live_relations, instance_ids))
             return tasks
 
     def contains_task(self, task_id: str) -> bool:
@@ -486,6 +489,23 @@ class SqliteAgentRuntimeRepository:
         ).fetchall() if ordered else []
         existing_ids = {row[0] for row in rows}
         return tuple(instance_id for instance_id in ordered if instance_id in existing_ids)
+
+    def _filter_task_relations_for_live_instances(
+        self,
+        relations: tuple[AgentParentChildRelation, ...],
+        instance_ids: tuple[str, ...],
+    ) -> tuple[AgentParentChildRelation, ...]:
+        """过滤 released 后 runtime instance 已删除的历史关系，保持 AgentTask 活跃关系树可重建。"""
+        live_instance_ids = set(instance_ids)
+        return tuple(
+            relation
+            for relation in relations
+            if not relation.is_released
+            or (
+                relation.parent_instance_id in live_instance_ids
+                and relation.child_instance_id in live_instance_ids
+            )
+        )
 
 
 _INSTANCE_SELECT_SQL = """
