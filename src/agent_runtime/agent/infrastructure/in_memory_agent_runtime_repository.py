@@ -65,6 +65,18 @@ class InMemoryAgentRuntimeRepository(AgentRuntimeRepository):
         with self._lock:
             return self._instances.get(instance_id)
 
+    def delete_agent_instance(self, instance_id: str) -> None:
+        """从运行态仓储中删除一次性 Agent 实例，并维护线程索引。"""
+        with self._lock:
+            old = self._instances.pop(instance_id, None)
+            if old is None:
+                return
+            bucket = self._instances_by_thread.get(old.thread_id)
+            if bucket is not None:
+                bucket.discard(instance_id)
+                if not bucket:
+                    self._instances_by_thread.pop(old.thread_id, None)
+
     def list_agent_instances_by_task(self, task_id: str) -> list[AgentInstance]:
         """按任务内实例顺序列出某个任务下的全部 Agent 实例。"""
         with self._lock:

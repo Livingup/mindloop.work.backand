@@ -2186,12 +2186,14 @@ class AgentExecutionEngine:
             task = self._runtime_gateway.get_task(task_id)
             if task.root_agent_instance_id != instance_id:
                 relation = task.child_relation_of(instance_id)
+                released_agent_instance_ids: list[str] = []
                 if relation is not None and not relation.is_released:
-                    self._runtime_gateway.release_child_agent_instance(
+                    _updated_task, released_instances = self._runtime_gateway.release_child_agent_instance(
                         relation.parent_instance_id,
                         instance_id,
                         reason="child_agent_completed",
                     )
+                    released_agent_instance_ids = [instance.instance_id for instance in released_instances]
                 else:
                     self._runtime_gateway.pause_agent_instance(instance_id)
                 self._trace_recorder.record_completed(trace_path)
@@ -2202,6 +2204,7 @@ class AgentExecutionEngine:
                     instance_id=instance_id,
                     loop_decision=loop_decision,
                     tool_results=tool_results,
+                    extra_payload={"released_agent_instance_ids": released_agent_instance_ids},
                 )
                 return
             await self._delete_task_terminals(task_id)
@@ -2228,12 +2231,14 @@ class AgentExecutionEngine:
             task = self._runtime_gateway.get_task(task_id)
             if task.root_agent_instance_id != instance_id:
                 relation = task.child_relation_of(instance_id)
+                released_agent_instance_ids: list[str] = []
                 if relation is not None and not relation.is_released:
-                    self._runtime_gateway.release_child_agent_instance(
+                    _updated_task, released_instances = self._runtime_gateway.release_child_agent_instance(
                         relation.parent_instance_id,
                         instance_id,
                         reason=failure_message,
                     )
+                    released_agent_instance_ids = [instance.instance_id for instance in released_instances]
                 else:
                     self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
                 self._trace_recorder.record_failure(trace_path, failure_message)
@@ -2245,6 +2250,7 @@ class AgentExecutionEngine:
                     loop_decision=loop_decision,
                     tool_results=tool_results,
                     failure_message=failure_message,
+                    extra_payload={"released_agent_instance_ids": released_agent_instance_ids},
                 )
                 return
             await self._delete_task_terminals(task_id)
@@ -2283,6 +2289,7 @@ class AgentExecutionEngine:
         loop_decision: LoopDecision,
         tool_results: list[BaseToolResult],
         failure_message: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
     ) -> None:
         """发布工具结果驱动的 Agent 循环决策事件。"""
         frontend_messages = [
@@ -2290,17 +2297,20 @@ class AgentExecutionEngine:
             for result in tool_results
             if result.frontend_message is not None
         ]
+        payload = {
+            "task_id": task_id,
+            "agent_instance_id": instance_id,
+            "loop_decision": loop_decision,
+            "tool_result_count": len(tool_results),
+            "frontend_messages": frontend_messages,
+            "failure_message": failure_message,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
         await self._event_publisher.publish(
             communication_context,
             event_type,
-            {
-                "task_id": task_id,
-                "agent_instance_id": instance_id,
-                "loop_decision": loop_decision,
-                "tool_result_count": len(tool_results),
-                "frontend_messages": frontend_messages,
-                "failure_message": failure_message,
-            },
+            payload,
             source="agent_execution_engine",
         )
 
@@ -2475,6 +2485,7 @@ def _build_runtime_context_prompt(agent_instance_id: str, current_working_direct
         "",
         "本地父/子 Agent 协作规则：",
         "- 本地父/子 Agent 通信只用于同一任务内的分工、结果回传、状态查询或释放子 Agent。",
+        "- 父 Agent 负责管理子 Agent 的生命周期；当你确定后面一定不需要使用某个子 Agent 时，请主动结束该子 Agent。",
         "- 本地子 Agent 与远程 LACP Agent 是不同机制；不要用 `lacp_send_message` 联系本地子 Agent，也不要用 subagent 工具联系远程 Agent。",
         "- 对仅表达收到、感谢、客套且不需要动作的本地父/子 Agent 消息，默认不回复，避免本地 Agent 间空转。",
         "",
@@ -2484,7 +2495,6 @@ def _build_runtime_context_prompt(agent_instance_id: str, current_working_direct
         f"- OS release: `{platform.release()}`",
         f"- OS version: `{platform.version()}`",
         f"- Machine: `{platform.machine()}`",
-        f"- Python platform: `{platform.platform()}`",
     ]
     git_roots = _discover_git_roots_under(resolved_working_directory)
     if git_roots:

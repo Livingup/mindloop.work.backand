@@ -301,9 +301,8 @@ class AgentRuntimeService:
                 released_by_instance_id=parent_instance_id,
                 reason=reason,
             )
-            released_instances = self._reset_released_agent_instances(
+            released_instances = self._delete_released_agent_instances(
                 release_instance_ids,
-                failure_message=reason,
             )
             self._repository.save_task(updated_task)
             return updated_task, released_instances
@@ -327,9 +326,8 @@ class AgentRuntimeService:
                 released_by_instance_id=None,
                 reason=reason,
             )
-            released_instances = self._reset_released_agent_instances(
+            released_instances = self._delete_released_agent_instances(
                 release_instance_ids,
-                failure_message=reason,
             )
             self._repository.save_task(updated_task)
             return updated_task, released_instances
@@ -386,13 +384,12 @@ class AgentRuntimeService:
                 released_by_instance_id=None,
                 reason="scene_task_completed",
             )
-            self._reset_released_agent_instances(
+            self._delete_released_agent_instances(
                 tuple(
                     relation.child_instance_id
                     for relation in task.parent_child_relations
                     if not relation.is_released
                 ),
-                failure_message="Scene task completed; subagent released.",
             )
             updated_instance = instance.reset_for_next_scene_task()
             self._repository.save_task(updated_task)
@@ -662,9 +659,8 @@ class AgentRuntimeService:
                     released_by_instance_id=None,
                     reason=release_reason,
                 )
-                self._reset_released_agent_instances(
+                self._delete_released_agent_instances(
                     release_instance_ids,
-                    failure_message=release_reason,
                 )
             self._repository.save_task(updated)
             return updated
@@ -730,24 +726,18 @@ class AgentRuntimeService:
             stack.extend(reversed(task.unreleased_children_of(current_id)))
         return tuple(ordered)
 
-    def _reset_released_agent_instances(
+    def _delete_released_agent_instances(
         self,
         instance_ids: tuple[str, ...],
-        *,
-        failure_message: str,
     ) -> list[AgentInstance]:
-        """把释放后的子 Agent 执行载体恢复为 ready，并记录释放原因。"""
+        """删除已释放的一次性子 Agent 实例，并返回删除前快照供调用方发布事件。"""
         released_instances: list[AgentInstance] = []
         for instance_id in instance_ids:
             instance = self._repository.get_agent_instance(instance_id)
             if instance is None:
                 continue
-            updated = instance.transition_to(
-                AGENT_INSTANCE_STATUS_READY,
-                failure_message=failure_message,
-            )
-            self._repository.save_agent_instance(updated)
-            released_instances.append(updated)
+            self._repository.delete_agent_instance(instance_id)
+            released_instances.append(instance)
         return released_instances
 
     def _ensure_scene_root_instance(self, task: AgentTask, instance: AgentInstance) -> None:

@@ -30,6 +30,9 @@ class AgentRuntimeRepository(Protocol):
     def get_agent_instance(self, instance_id: str) -> AgentInstance | None:
         """按 instance_id 获取 Agent 实例运行态。"""
 
+    def delete_agent_instance(self, instance_id: str) -> None:
+        """从运行态仓储中删除一次性 Agent 实例。"""
+
     def list_agent_instances_by_task(self, task_id: str) -> list[AgentInstance]:
         """列出某个任务下的全部 Agent 实例。"""
 

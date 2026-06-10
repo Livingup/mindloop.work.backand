@@ -299,6 +299,15 @@ class SqliteAgentRuntimeRepository:
             ).fetchone()
             return _row_to_instance(row) if row else None
 
+    def delete_agent_instance(self, instance_id: str) -> None:
+        """从运行态仓储中删除一次性 Agent 实例。"""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM agent_instances WHERE instance_id = ?",
+                (instance_id,),
+            )
+            self._conn.commit()
+
     def list_agent_instances_by_task(self, task_id: str) -> list[AgentInstance]:
         """列出某个任务下的全部 Agent 实例。"""
         with self._lock:
@@ -469,10 +478,14 @@ class SqliteAgentRuntimeRepository:
         ).fetchall()
         for row in rows:
             add(row[0])
-        for relation in relations:
-            add(relation.parent_instance_id)
-            add(relation.child_instance_id)
-        return tuple(ordered)
+        existing_ids = set(ordered)
+        rows = self._conn.execute(
+            "SELECT instance_id FROM agent_instances WHERE instance_id IN (%s)"
+            % ",".join("?" for _ in ordered),
+            tuple(ordered),
+        ).fetchall() if ordered else []
+        existing_ids = {row[0] for row in rows}
+        return tuple(instance_id for instance_id in ordered if instance_id in existing_ids)
 
 
 _INSTANCE_SELECT_SQL = """

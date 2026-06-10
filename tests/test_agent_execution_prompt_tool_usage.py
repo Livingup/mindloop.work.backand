@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
+from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, SystemPromptSegment
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
@@ -120,8 +122,10 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIn("使用 `lacp` MCP 服务提供的 `lacp_send_message` 工具", prompt_text)
         self.assertIn("`【@本地Agent <agent_name_or_id> <agent_instance_id>】`", prompt_text)
         self.assertIn("使用本地 subagent 工具", prompt_text)
+        self.assertIn("父 Agent 负责管理子 Agent 的生命周期", prompt_text)
         self.assertIn("不要用 `lacp_send_message` 联系本地子 Agent", prompt_text)
         self.assertIn("禁止与远程 Agent 进行无意义礼貌性往返", prompt_text)
+        self.assertNotIn("Python platform", prompt_text)
         self.assertLess(
             prompt_text.index("# 沟通环境与身份"),
             prompt_text.index("业务 Agent 自定义系统提示词。"),
@@ -159,6 +163,43 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertEqual(call["message_metadata"]["local_agent"]["instance_id"], "agent-instance-child")
         self.assertEqual(call["message_metadata"]["subagent"]["from_instance_id"], "agent-instance-child")
         self.assertEqual(call["message_metadata"]["subagent"]["to_instance_id"], "agent-instance-parent")
+
+    def test_releasing_child_agent_deletes_runtime_instance_and_marks_relation_released(self) -> None:
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        service.create_task_with_root_agent_instance(
+            task_id="task-delete-release",
+            root_instance_id="agent-instance-root",
+            thread_id="thread-root",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="parent-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        service.create_child_agent_instance(
+            task_id="task-delete-release",
+            parent_instance_id="agent-instance-root",
+            child_instance_id="agent-instance-child",
+            thread_id="thread-child",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="child-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+
+        updated_task, released_instances = service.release_child_agent_instance(
+            "agent-instance-root",
+            "agent-instance-child",
+            reason="parent_agent_ended_subagent",
+        )
+
+        self.assertEqual([instance.instance_id for instance in released_instances], ["agent-instance-child"])
+        relation = updated_task.child_relation_of("agent-instance-child")
+        self.assertIsNotNone(relation)
+        self.assertTrue(relation.is_released)
+        self.assertEqual(relation.release_reason, "parent_agent_ended_subagent")
+        self.assertEqual(service.list_unreleased_child_agent_instances("agent-instance-root"), [])
+        with self.assertRaises(KeyError):
+            service.get_agent_instance("agent-instance-child")
 
     def test_tool_usage_notice_injects_builtin_tool_ban_and_available_runtime_tool_guidance(self) -> None:
         engine = self._engine_with_local_tools(

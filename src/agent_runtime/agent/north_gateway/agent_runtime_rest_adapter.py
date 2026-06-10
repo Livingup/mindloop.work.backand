@@ -626,8 +626,21 @@ def create_agent_runtime_router(
             )
             active_client_count = session_registry.active_client_count(scene_id)
 
-        agent_instances = gateway.list_task_agent_instances(response.task.task_id)
         parent_child_relations = gateway.list_task_parent_child_relations(response.task.task_id)
+        active_parent_child_relations = [
+            relation
+            for relation in parent_child_relations
+            if not relation.is_released
+        ]
+        active_instance_ids = {response.instance.instance_id} | {
+            relation.child_instance_id
+            for relation in active_parent_child_relations
+        }
+        agent_instances = [
+            instance
+            for instance in gateway.list_task_agent_instances(response.task.task_id)
+            if instance.instance_id in active_instance_ids
+        ]
         return AttachSceneResponseModel(
             mode=response.mode,
             task=_task_response(response.task),
@@ -646,7 +659,7 @@ def create_agent_runtime_router(
             ],
             parent_child_relations=[
                 _relation_response(relation)
-                for relation in parent_child_relations
+                for relation in active_parent_child_relations
             ],
             communication_stream_id=response.communication_stream_id,
             event_stream_url=response.event_stream_url,

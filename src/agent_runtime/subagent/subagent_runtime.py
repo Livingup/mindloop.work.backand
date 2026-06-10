@@ -200,24 +200,62 @@ class SubagentRuntime:
             for child in children
         ]
 
-    def end_subagent(
+    async def end_subagent(
         self,
         *,
         parent_instance_id: str,
         child_instance_id: str,
         reason: str,
     ) -> dict[str, Any]:
-        updated_task, released_instances = self._runtime_gateway.release_child_agent_instance(
-            parent_instance_id,
-            child_instance_id,
+        return await self.end_subagents(
+            parent_instance_id=parent_instance_id,
+            child_instance_ids=[child_instance_id],
             reason=reason,
         )
+
+    async def end_subagents(
+        self,
+        *,
+        parent_instance_id: str,
+        child_instance_ids: list[str],
+        reason: str,
+    ) -> dict[str, Any]:
+        normalized_child_ids = tuple(dict.fromkeys(child_id.strip() for child_id in child_instance_ids if child_id.strip()))
+        if not normalized_child_ids:
+            raise ValueError("child_agent_instance_id 或 child_agent_instance_ids 至少提供一个。")
+        results: list[dict[str, Any]] = []
+        all_released_ids: list[str] = []
+        task_id: str | None = None
+        for child_instance_id in normalized_child_ids:
+            updated_task, released_instances = self._runtime_gateway.release_child_agent_instance(
+                parent_instance_id,
+                child_instance_id,
+                reason=reason,
+            )
+            released_ids = [instance.instance_id for instance in released_instances]
+            task_id = updated_task.task_id
+            all_released_ids.extend(released_ids)
+            results.append(
+                {
+                    "child_agent_instance_id": child_instance_id,
+                    "released_agent_instance_ids": released_ids,
+                }
+            )
+            await self._publish_subagent_released(
+                parent_instance_id=parent_instance_id,
+                child_instance_id=child_instance_id,
+                released_agent_instance_ids=released_ids,
+                task_id=updated_task.task_id,
+                reason=reason,
+            )
         return {
             "status": "ended",
-            "task_id": updated_task.task_id,
+            "task_id": task_id,
             "parent_agent_instance_id": parent_instance_id,
-            "child_agent_instance_id": child_instance_id,
-            "released_agent_instance_ids": [instance.instance_id for instance in released_instances],
+            "child_agent_instance_ids": list(normalized_child_ids),
+            "child_agent_instance_id": normalized_child_ids[0] if len(normalized_child_ids) == 1 else None,
+            "released_agent_instance_ids": all_released_ids,
+            "results": results,
             "reason": reason,
         }
 
@@ -269,6 +307,41 @@ class SubagentRuntime:
             reverse_relation is not None
             and not reverse_relation.is_released
             and reverse_relation.parent_instance_id == to_instance_id
+        )
+
+    async def _publish_subagent_released(
+        self,
+        *,
+        parent_instance_id: str,
+        child_instance_id: str,
+        released_agent_instance_ids: list[str],
+        task_id: str,
+        reason: str,
+    ) -> None:
+        task = self._runtime_gateway.get_task(task_id)
+        context = RuntimeCommunicationContext(
+            stream_id=_default_stream_id_for_task(task.scene_id, task.task_id),
+            actor_type="agent_instance",
+            actor_id=parent_instance_id,
+            trace_id=None,
+            metadata={
+                "task_id": task.task_id,
+                "scene_id": task.scene_id,
+                "agent_instance_id": child_instance_id,
+                "parent_agent_instance_id": parent_instance_id,
+            },
+        )
+        await self._event_publisher.publish(
+            context,
+            "agent.subagent.released",
+            {
+                "task_id": task.task_id,
+                "parent_agent_instance_id": parent_instance_id,
+                "child_agent_instance_id": child_instance_id,
+                "released_agent_instance_ids": released_agent_instance_ids,
+                "reason": reason,
+            },
+            source="subagent_runtime",
         )
 
     async def _publish_subagent_created(
