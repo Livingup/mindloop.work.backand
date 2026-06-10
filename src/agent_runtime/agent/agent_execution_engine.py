@@ -1699,6 +1699,7 @@ class AgentExecutionEngine:
         runtime_context_prompt = _build_runtime_context_prompt(agent_instance_id, current_working_directory)
         mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
         skills_prompt = self._build_skills_prompt(definition)
+        available_subagents_prompt = self._build_available_subagents_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
         tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
         return "\n\n".join(
@@ -1708,6 +1709,7 @@ class AgentExecutionEngine:
                 text,
                 mcp_services_prompt,
                 skills_prompt,
+                available_subagents_prompt,
                 lifecycle_prompt,
                 tool_usage_notice,
             )
@@ -1778,6 +1780,48 @@ class AgentExecutionEngine:
             if isinstance(function_description, str):
                 return function_description
         return ""
+
+    def _build_available_subagents_prompt(self, definition: AgentDefinition) -> str:
+        """构造当前 Agent 可创建子 Agent 的系统提示词摘要。"""
+        if not definition.available_sub_agent_ids:
+            return ""
+
+        available_definitions: list[AgentDefinition] = []
+        for sub_agent_id in definition.available_sub_agent_ids:
+            try:
+                sub_agent_definition = self._agent_definition_gateway.get_agent_definition(sub_agent_id)
+            except KeyError:
+                logger.warning(
+                    "Agent 定义声明的可用子 Agent 不存在，已跳过提示词注入: parent=%s, child=%s",
+                    definition.agent_id,
+                    sub_agent_id,
+                )
+                continue
+            if sub_agent_definition.disabled:
+                continue
+            available_definitions.append(sub_agent_definition)
+
+        if not available_definitions:
+            return ""
+
+        lines = [
+            "# 可用子 Agent",
+            "当前 Agent 可通过 `create_subagent` 工具创建下列直接子 Agent。"
+            "创建时 `agent_definition_id` 必须使用下方列出的定义 ID；"
+            "子 Agent 创建后可通过 `send_agent_message` 发送任务协作消息。",
+        ]
+        for sub_agent_definition in available_definitions:
+            name = (sub_agent_definition.name or "").strip()
+            description = (sub_agent_definition.description or "").strip()
+            if name and description:
+                lines.append(f"- `{sub_agent_definition.agent_id}`（{name}）：{description}")
+            elif description:
+                lines.append(f"- `{sub_agent_definition.agent_id}`：{description}")
+            elif name:
+                lines.append(f"- `{sub_agent_definition.agent_id}`（{name}）：未填写用途说明。")
+            else:
+                lines.append(f"- `{sub_agent_definition.agent_id}`：未填写用途说明。")
+        return "\n".join(lines)
 
     def _build_skills_prompt(self, definition: AgentDefinition) -> str:
         if not definition.skill_ids or self._skill_gateway is None:

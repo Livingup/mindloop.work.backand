@@ -14,6 +14,14 @@ class _LocalToolGateway:
         return self._tools
 
 
+class _AgentDefinitionGateway:
+    def __init__(self, definitions):
+        self._definitions = {definition.agent_id: definition for definition in definitions}
+
+    def get_agent_definition(self, agent_id: str) -> AgentDefinition:
+        return self._definitions[agent_id]
+
+
 def _local_tool(tool_name: str, *, category: str = "business", always_enabled: bool = True):
     return SimpleNamespace(
         tool_name=tool_name,
@@ -27,9 +35,10 @@ def _llm_tool(tool_name: str) -> LlmToolDefinition:
 
 
 class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
-    def _engine_with_local_tools(self, *tools) -> AgentExecutionEngine:
+    def _engine_with_local_tools(self, *tools, agent_definitions=()) -> AgentExecutionEngine:
         engine = object.__new__(AgentExecutionEngine)
         engine._local_tool_gateway = _LocalToolGateway(tools)
+        engine._agent_definition_gateway = _AgentDefinitionGateway(agent_definitions)
         return engine
 
     def test_system_prompt_starts_with_communication_context_and_instance_id(self) -> None:
@@ -103,6 +112,40 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertNotIn("图片生成请使用generate_image工具", notice)
         self.assertNotIn("网络搜索请使用web_search，read_url_context工具", notice)
         self.assertNotIn("禁止并发调用", notice)
+
+    def test_system_prompt_injects_available_subagent_ids_and_descriptions(self) -> None:
+        engine = self._engine_with_local_tools(
+            _local_tool("create_subagent"),
+            _local_tool("send_agent_message"),
+            agent_definitions=(
+                AgentDefinition(
+                    agent_id="research-agent",
+                    name="资料调研",
+                    description="负责检索资料、整理事实依据，并把调研结论回传给父 Agent。",
+                    system_prompt=(SystemPromptSegment(text="子 Agent 内部系统提示词不应泄漏给父 Agent。"),),
+                ),
+            ),
+        )
+        prompt = engine._render_system_prompt(
+            AgentDefinition(
+                agent_id="parent-agent",
+                group="default",
+                available_sub_agent_ids=("research-agent",),
+            ),
+            "agent-instance-parent",
+            "G:\\project\\agent",
+            {},
+            (_llm_tool("create_subagent"), _llm_tool("send_agent_message")),
+        )
+
+        self.assertIsNotNone(prompt)
+        prompt_text = prompt or ""
+        self.assertIn("# 可用子 Agent", prompt_text)
+        self.assertIn("`research-agent`", prompt_text)
+        self.assertIn("负责检索资料、整理事实依据，并把调研结论回传给父 Agent。", prompt_text)
+        self.assertIn("create_subagent", prompt_text)
+        self.assertIn("send_agent_message", prompt_text)
+        self.assertNotIn("子 Agent 内部系统提示词不应泄漏给父 Agent。", prompt_text)
 
 
 if __name__ == "__main__":
