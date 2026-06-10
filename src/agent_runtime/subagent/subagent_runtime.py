@@ -129,14 +129,15 @@ class SubagentRuntime:
         if not self._can_message(task_id=task.task_id, from_instance_id=source.instance_id, to_instance_id=target.instance_id):
             raise PermissionError("只能在未释放的直接父子 Agent 之间发送消息。")
         source_definition = self._agent_definition_gateway.get_agent_definition(source.agent_definition_id)
-        user_text = f"【@{source_definition.name or source_definition.agent_id} {source.instance_id}】{content}"
+        source_name = source_definition.name or source_definition.agent_id
+        user_text = f"【@本地Agent {source_name} {source.instance_id}】{content}"
         metadata = {
             "source_type": "local_agent",
             "transport": "subagent",
             "channel": "subagent",
             "display_text": content,
             "local_agent": {
-                "name": source_definition.name or source_definition.agent_id,
+                "name": source_name,
                 "agent_definition_id": source.agent_definition_id,
                 "instance_id": source.instance_id,
             },
