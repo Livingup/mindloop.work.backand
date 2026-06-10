@@ -2146,6 +2146,26 @@ class AgentExecutionEngine:
             return
         if loop_decision == "complete":
             task = self._runtime_gateway.get_task(task_id)
+            if task.root_agent_instance_id != instance_id:
+                relation = task.child_relation_of(instance_id)
+                if relation is not None and not relation.is_released:
+                    self._runtime_gateway.release_child_agent_instance(
+                        relation.parent_instance_id,
+                        instance_id,
+                        reason="child_agent_completed",
+                    )
+                else:
+                    self._runtime_gateway.pause_agent_instance(instance_id)
+                self._trace_recorder.record_completed(trace_path)
+                await self._publish_loop_decision_event(
+                    communication_context,
+                    "agent.subagent.completed",
+                    task_id=task_id,
+                    instance_id=instance_id,
+                    loop_decision=loop_decision,
+                    tool_results=tool_results,
+                )
+                return
             await self._delete_task_terminals(task_id)
             if task.scene_id is not None:
                 self._runtime_gateway.complete_scene_task_and_reset_root_agent_instance(
@@ -2167,6 +2187,28 @@ class AgentExecutionEngine:
             return
         if loop_decision == "fail":
             failure_message = _failure_message_from_tool_results(tool_results)
+            task = self._runtime_gateway.get_task(task_id)
+            if task.root_agent_instance_id != instance_id:
+                relation = task.child_relation_of(instance_id)
+                if relation is not None and not relation.is_released:
+                    self._runtime_gateway.release_child_agent_instance(
+                        relation.parent_instance_id,
+                        instance_id,
+                        reason=failure_message,
+                    )
+                else:
+                    self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
+                self._trace_recorder.record_failure(trace_path, failure_message)
+                await self._publish_loop_decision_event(
+                    communication_context,
+                    "agent.subagent.failed",
+                    task_id=task_id,
+                    instance_id=instance_id,
+                    loop_decision=loop_decision,
+                    tool_results=tool_results,
+                    failure_message=failure_message,
+                )
+                return
             await self._delete_task_terminals(task_id)
             self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
             self._runtime_gateway.fail_task(task_id, failure_message)

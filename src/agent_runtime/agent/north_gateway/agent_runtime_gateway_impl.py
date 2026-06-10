@@ -121,8 +121,38 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
         return self._service.list_task_parent_child_relations(task_id)
 
     def list_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
-        """列出指定 Agent 实例的直接子实例。"""
+        """列出指定 Agent 实例的历史直接子实例。"""
         return self._service.list_child_agent_instances(parent_instance_id)
+
+    def list_unreleased_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
+        """列出指定 Agent 实例当前未释放的直接子实例。"""
+        return self._service.list_unreleased_child_agent_instances(parent_instance_id)
+
+    def release_child_agent_instance(
+        self,
+        parent_instance_id: str,
+        child_instance_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放父 Agent 直接创建的子 Agent 及其未释放后代。"""
+        return self._service.release_child_agent_instance(
+            parent_instance_id,
+            child_instance_id,
+            reason=reason,
+        )
+
+    def release_task_child_agent_instances(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放任务内全部未释放子 Agent。"""
+        return self._service.release_task_child_agent_instances(
+            task_id,
+            reason=reason,
+        )
 
     def get_parent_agent_instance(self, child_instance_id: str) -> AgentInstance | None:
         """查询指定 Agent 实例的父实例；根实例返回 None。"""

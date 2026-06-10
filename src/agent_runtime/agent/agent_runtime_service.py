@@ -260,11 +260,79 @@ class AgentRuntimeService:
         return task.parent_child_relations
 
     def list_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
-        """列出指定 Agent 实例的直接子实例。"""
+        """列出指定 Agent 实例的全部历史直接子实例。"""
         parent_instance = self._get_required_instance(parent_instance_id)
         task = self._get_required_task(parent_instance.task_id)
         child_ids = task.children_of(parent_instance_id)
         return [self._get_required_instance(child_id) for child_id in child_ids]
+
+    def list_unreleased_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
+        """列出指定 Agent 实例当前仍未释放的直接子实例。"""
+        parent_instance = self._get_required_instance(parent_instance_id)
+        task = self._get_required_task(parent_instance.task_id)
+        child_ids = task.unreleased_children_of(parent_instance_id)
+        return [self._get_required_instance(child_id) for child_id in child_ids]
+
+    def release_child_agent_instance(
+        self,
+        parent_instance_id: str,
+        child_instance_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放父 Agent 直接创建的子 Agent 及其未释放后代。"""
+        _require_non_blank(reason, "release_reason")
+        with self._lock:
+            parent_instance = self._get_required_instance(parent_instance_id)
+            child_instance = self._get_required_instance(child_instance_id)
+            if parent_instance.task_id != child_instance.task_id:
+                raise ValueError("父 Agent 与子 Agent 不属于同一任务。")
+            task = self._get_required_task(parent_instance.task_id)
+            relation = task.child_relation_of(child_instance_id)
+            if relation is None:
+                raise ValueError(f"子 Agent 实例不属于任务父子关系树: {child_instance_id}")
+            if relation.parent_instance_id != parent_instance_id:
+                raise ValueError("只能释放当前 Agent 直接创建的子 Agent。")
+            if relation.is_released:
+                raise ValueError(f"子 Agent 已释放: {child_instance_id}")
+            release_instance_ids = self._collect_unreleased_child_tree(task, child_instance_id)
+            updated_task = task.release_child_tree(
+                child_instance_id,
+                released_by_instance_id=parent_instance_id,
+                reason=reason,
+            )
+            released_instances = self._reset_released_agent_instances(
+                release_instance_ids,
+                failure_message=reason,
+            )
+            self._repository.save_task(updated_task)
+            return updated_task, released_instances
+
+    def release_task_child_agent_instances(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放任务内全部未释放子 Agent 租约。"""
+        _require_non_blank(reason, "release_reason")
+        with self._lock:
+            task = self._get_required_task(task_id)
+            release_instance_ids = tuple(
+                relation.child_instance_id
+                for relation in task.parent_child_relations
+                if not relation.is_released
+            )
+            updated_task = task.release_all_children(
+                released_by_instance_id=None,
+                reason=reason,
+            )
+            released_instances = self._reset_released_agent_instances(
+                release_instance_ids,
+                failure_message=reason,
+            )
+            self._repository.save_task(updated_task)
+            return updated_task, released_instances
 
     def get_parent_agent_instance(self, child_instance_id: str) -> AgentInstance | None:
         """查询指定 Agent 实例的父实例；根实例返回 None。"""
@@ -314,7 +382,18 @@ class AgentRuntimeService:
             task = self._get_required_task(task_id)
             instance = self._get_required_instance(root_instance_id)
             self._ensure_scene_root_instance(task, instance)
-            updated_task = task.transition_to(AGENT_TASK_STATUS_COMPLETED)
+            updated_task = task.transition_to(AGENT_TASK_STATUS_COMPLETED).release_all_children(
+                released_by_instance_id=None,
+                reason="scene_task_completed",
+            )
+            self._reset_released_agent_instances(
+                tuple(
+                    relation.child_instance_id
+                    for relation in task.parent_child_relations
+                    if not relation.is_released
+                ),
+                failure_message="Scene task completed; subagent released.",
+            )
             updated_instance = instance.reset_for_next_scene_task()
             self._repository.save_task(updated_task)
             self._repository.save_agent_instance(updated_instance)
@@ -568,6 +647,25 @@ class AgentRuntimeService:
                 target_status,
                 failure_message=failure_message,
             )
+            if target_status in {AGENT_TASK_STATUS_COMPLETED, AGENT_TASK_STATUS_FAILED}:
+                release_reason = (
+                    "task_completed"
+                    if target_status == AGENT_TASK_STATUS_COMPLETED
+                    else (failure_message or "task_failed")
+                )
+                release_instance_ids = tuple(
+                    relation.child_instance_id
+                    for relation in updated.parent_child_relations
+                    if not relation.is_released
+                )
+                updated = updated.release_all_children(
+                    released_by_instance_id=None,
+                    reason=release_reason,
+                )
+                self._reset_released_agent_instances(
+                    release_instance_ids,
+                    failure_message=release_reason,
+                )
             self._repository.save_task(updated)
             return updated
 
@@ -615,6 +713,42 @@ class AgentRuntimeService:
         _require_non_blank(instance_id, "instance_id")
         if self._repository.contains_agent_instance(instance_id):
             raise ValueError(f"Agent 实例已存在: {instance_id}")
+
+    def _collect_unreleased_child_tree(
+        self,
+        task: AgentTask,
+        child_instance_id: str,
+    ) -> tuple[str, ...]:
+        """收集指定子 Agent 及其所有未释放后代实例 ID。"""
+        ordered: list[str] = []
+        stack = [child_instance_id]
+        while stack:
+            current_id = stack.pop()
+            if current_id in ordered:
+                continue
+            ordered.append(current_id)
+            stack.extend(reversed(task.unreleased_children_of(current_id)))
+        return tuple(ordered)
+
+    def _reset_released_agent_instances(
+        self,
+        instance_ids: tuple[str, ...],
+        *,
+        failure_message: str,
+    ) -> list[AgentInstance]:
+        """把释放后的子 Agent 执行载体恢复为 ready，并记录释放原因。"""
+        released_instances: list[AgentInstance] = []
+        for instance_id in instance_ids:
+            instance = self._repository.get_agent_instance(instance_id)
+            if instance is None:
+                continue
+            updated = instance.transition_to(
+                AGENT_INSTANCE_STATUS_READY,
+                failure_message=failure_message,
+            )
+            self._repository.save_agent_instance(updated)
+            released_instances.append(updated)
+        return released_instances
 
     def _ensure_scene_root_instance(self, task: AgentTask, instance: AgentInstance) -> None:
         """校验实例是指定 Scene task 的 root agent instance。"""

@@ -220,7 +220,27 @@ class AgentRuntimeGateway(Protocol):
         """列出任务内 Agent 父子关系树边集合。"""
 
     def list_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
-        """列出指定 Agent 实例的直接子实例。"""
+        """列出指定 Agent 实例的历史直接子实例。"""
+
+    def list_unreleased_child_agent_instances(self, parent_instance_id: str) -> list[AgentInstance]:
+        """列出指定 Agent 实例当前未释放的直接子实例。"""
+
+    def release_child_agent_instance(
+        self,
+        parent_instance_id: str,
+        child_instance_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放父 Agent 直接创建的子 Agent 及其未释放后代。"""
+
+    def release_task_child_agent_instances(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+    ) -> tuple[AgentTask, list[AgentInstance]]:
+        """释放任务内全部未释放子 Agent。"""
 
     def get_parent_agent_instance(self, child_instance_id: str) -> AgentInstance | None:
         """查询指定 Agent 实例的父实例；根实例返回 None。"""

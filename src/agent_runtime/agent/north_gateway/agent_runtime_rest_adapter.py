@@ -19,7 +19,7 @@ from agent_runtime.agent.agent_execution_engine import (
     AgentInterruptResult,
     AgentMessageSubmissionResult,
 )
-from agent_runtime.agent.agent_task import AgentTask
+from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
     AttachSceneRequest,
@@ -292,6 +292,18 @@ class AttachSceneBody(BaseModel):
     client_kind: str = "unknown"
 
 
+class AgentParentChildRelationResponse(BaseModel):
+    relation_id: str
+    task_id: str
+    parent_agent_instance_id: str
+    child_agent_instance_id: str
+    created_at: str
+    released_at: str | None = None
+    release_reason: str | None = None
+    released_by_agent_instance_id: str | None = None
+    released: bool = False
+
+
 class AttachSceneResponseModel(BaseModel):
     """attach scene 响应。
 
@@ -302,6 +314,8 @@ class AttachSceneResponseModel(BaseModel):
     mode: str
     task: AgentRuntimeTaskResponse
     root_agent_instance: AgentInstanceResponse
+    agent_instances: list[AgentInstanceResponse] = Field(default_factory=list)
+    parent_child_relations: list[AgentParentChildRelationResponse] = Field(default_factory=list)
     communication_stream_id: str
     event_stream_url: str
     client_session_id: str | None = None
@@ -612,6 +626,8 @@ def create_agent_runtime_router(
             )
             active_client_count = session_registry.active_client_count(scene_id)
 
+        agent_instances = gateway.list_task_agent_instances(response.task.task_id)
+        parent_child_relations = gateway.list_task_parent_child_relations(response.task.task_id)
         return AttachSceneResponseModel(
             mode=response.mode,
             task=_task_response(response.task),
@@ -620,6 +636,18 @@ def create_agent_runtime_router(
                 conversation_repository,
                 llm_registry_gateway,
             ),
+            agent_instances=[
+                await _instance_response(
+                    instance,
+                    conversation_repository,
+                    llm_registry_gateway,
+                )
+                for instance in agent_instances
+            ],
+            parent_child_relations=[
+                _relation_response(relation)
+                for relation in parent_child_relations
+            ],
             communication_stream_id=response.communication_stream_id,
             event_stream_url=response.event_stream_url,
             client_session_id=client_session_id,
@@ -1191,6 +1219,20 @@ def _task_response(task: AgentTask) -> AgentRuntimeTaskResponse:
         created_at=_datetime_text(task.created_at),
         updated_at=_datetime_text(task.updated_at),
         scene_id=task.scene_id,
+    )
+
+
+def _relation_response(relation: AgentParentChildRelation) -> AgentParentChildRelationResponse:
+    return AgentParentChildRelationResponse(
+        relation_id=relation.relation_id,
+        task_id=relation.task_id,
+        parent_agent_instance_id=relation.parent_instance_id,
+        child_agent_instance_id=relation.child_instance_id,
+        created_at=_datetime_text(relation.created_at),
+        released_at=_datetime_text(relation.released_at) if relation.released_at else None,
+        release_reason=relation.release_reason,
+        released_by_agent_instance_id=relation.released_by_instance_id,
+        released=relation.is_released,
     )
 
 

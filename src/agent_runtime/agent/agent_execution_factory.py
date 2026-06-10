@@ -184,4 +184,13 @@ class AgentExecutionFactory:
             agent_definition_gateway=agent_definition_gateway,
             execution_engine=engine,
         )
+        from agent_runtime.subagent.subagent_runtime import configure_subagent_runtime
+
+        configure_subagent_runtime(
+            runtime_gateway=runtime_gateway,
+            agent_definition_gateway=agent_definition_gateway,
+            llm_registry_gateway=llm_registry_gateway,
+            execution_engine=engine,
+            event_publisher=event_publisher,
+        )
         return engine

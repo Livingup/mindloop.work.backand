@@ -81,8 +81,17 @@ class AgentParentChildRelation:
     # 子 Agent 实例 ID。每个非根实例只能有一个父实例。
     child_instance_id: str
 
-    # 关系创建时间。父子关系是任务执行过程中的事实记录，本轮不提供删除能力。
+    # 关系创建时间。父子关系是任务执行过程中的事实记录，不通过删除表达生命周期结束。
     created_at: datetime = None  # type: ignore[assignment]
+
+    # 子 Agent 由父 Agent 显式释放或 task 终态清理时写入；为空表示仍处于可通信的活跃租约。
+    released_at: datetime | None = None
+
+    # 释放原因摘要，用于区分父 Agent 主动释放、级联释放和 task 终态自动清理。
+    release_reason: str | None = None
+
+    # 发起释放的 Agent 实例 ID；task 终态自动清理可为空。
+    released_by_instance_id: str | None = None
 
     def __post_init__(self) -> None:
         """校验父子关系的基础字段。"""
@@ -92,8 +101,17 @@ class AgentParentChildRelation:
         _require_non_blank(self.child_instance_id, "child_instance_id")
         if self.parent_instance_id == self.child_instance_id:
             raise ValueError("parent_instance_id 不能等于 child_instance_id。")
+        if self.release_reason is not None and not self.release_reason.strip():
+            raise ValueError("release_reason 不能是空白字符串。")
+        if self.released_by_instance_id is not None:
+            _require_non_blank(self.released_by_instance_id, "released_by_instance_id")
         if self.created_at is None:
             object.__setattr__(self, "created_at", _utc_now())
+
+    @property
+    def is_released(self) -> bool:
+        """父子关系租约是否已经释放。"""
+        return self.released_at is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,22 +265,117 @@ class AgentTask:
             values["failure_message"] = failure_message
         return replace(self, **values)
 
-    def parent_of(self, instance_id: str) -> str | None:
-        """查询指定实例的父实例 ID；根实例返回 None。"""
+    def parent_of(self, instance_id: str, *, include_released: bool = True) -> str | None:
+        """查询指定实例的父实例 ID；根实例返回 None。
+
+        include_released=False 时只把尚未释放的父子关系视为有效父关系，供子 Agent 通信、
+        展示和释放权限判断使用；默认保留历史行为，按任务关系事实返回父实例。
+        """
         if instance_id == self.root_agent_instance_id:
             return None
         for relation in self.parent_child_relations:
-            if relation.child_instance_id == instance_id:
+            if relation.child_instance_id == instance_id and (include_released or not relation.is_released):
                 return relation.parent_instance_id
         return None
 
-    def children_of(self, instance_id: str) -> tuple[str, ...]:
-        """查询指定实例的直接子实例 ID 列表。"""
+    def children_of(self, instance_id: str, *, include_released: bool = True) -> tuple[str, ...]:
+        """查询指定实例的直接子实例 ID 列表。
+
+        默认返回完整历史关系；include_released=False 时只返回仍未释放的直接子 Agent。
+        """
         return tuple(
             relation.child_instance_id
             for relation in self.parent_child_relations
-            if relation.parent_instance_id == instance_id
+            if relation.parent_instance_id == instance_id and (include_released or not relation.is_released)
         )
+
+    def unreleased_children_of(self, instance_id: str) -> tuple[str, ...]:
+        """查询指定实例当前仍未释放的直接子 Agent 实例 ID。"""
+        return self.children_of(instance_id, include_released=False)
+
+    def child_relation_of(self, child_instance_id: str) -> AgentParentChildRelation | None:
+        """查询子实例对应的父子关系；根实例或未知实例返回 None。"""
+        for relation in self.parent_child_relations:
+            if relation.child_instance_id == child_instance_id:
+                return relation
+        return None
+
+    def release_child_tree(
+        self,
+        child_instance_id: str,
+        *,
+        released_by_instance_id: str | None,
+        reason: str,
+        at: datetime | None = None,
+    ) -> "AgentTask":
+        """释放某个子 Agent 及其尚未释放的后代租约。
+
+        父子关系作为历史事实保留，释放只写入 relation 的 release 字段。释放子树可以避免
+        孙级 Agent 在父 Agent 被释放后继续作为活跃实例悬挂。
+        """
+        _require_non_blank(child_instance_id, "child_instance_id")
+        _require_non_blank(reason, "release_reason")
+        if released_by_instance_id is not None:
+            _require_non_blank(released_by_instance_id, "released_by_instance_id")
+        target_relation = self.child_relation_of(child_instance_id)
+        if target_relation is None:
+            raise ValueError(f"子 Agent 实例不属于任务父子关系树: {child_instance_id}")
+        if target_relation.is_released:
+            return self
+        release_at = at or _utc_now()
+        release_child_ids = self._collect_unreleased_descendants(child_instance_id)
+        release_child_ids.add(child_instance_id)
+        updated_relations = tuple(
+            replace(
+                relation,
+                released_at=release_at,
+                release_reason=reason,
+                released_by_instance_id=released_by_instance_id,
+            )
+            if relation.child_instance_id in release_child_ids and not relation.is_released
+            else relation
+            for relation in self.parent_child_relations
+        )
+        return replace(self, parent_child_relations=updated_relations, updated_at=release_at)
+
+    def release_all_children(
+        self,
+        *,
+        released_by_instance_id: str | None,
+        reason: str,
+        at: datetime | None = None,
+    ) -> "AgentTask":
+        """释放任务内全部尚未释放的子 Agent 租约。"""
+        _require_non_blank(reason, "release_reason")
+        if released_by_instance_id is not None:
+            _require_non_blank(released_by_instance_id, "released_by_instance_id")
+        if not any(not relation.is_released for relation in self.parent_child_relations):
+            return self
+        release_at = at or _utc_now()
+        updated_relations = tuple(
+            replace(
+                relation,
+                released_at=release_at,
+                release_reason=reason,
+                released_by_instance_id=released_by_instance_id,
+            )
+            if not relation.is_released
+            else relation
+            for relation in self.parent_child_relations
+        )
+        return replace(self, parent_child_relations=updated_relations, updated_at=release_at)
+
+    def _collect_unreleased_descendants(self, instance_id: str) -> set[str]:
+        """收集某实例下尚未释放的所有后代子实例 ID。"""
+        descendants: set[str] = set()
+        stack = list(self.unreleased_children_of(instance_id))
+        while stack:
+            child_id = stack.pop()
+            if child_id in descendants:
+                continue
+            descendants.add(child_id)
+            stack.extend(self.unreleased_children_of(child_id))
+        return descendants
 
     def _validate_relation_tree(self, instance_ids: set[str]) -> None:
         """校验父子关系集合满足单根树约束。"""

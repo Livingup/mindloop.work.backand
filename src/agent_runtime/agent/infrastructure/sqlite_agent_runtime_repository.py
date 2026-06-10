@@ -67,11 +67,14 @@ CREATE INDEX IF NOT EXISTS idx_agent_instances_thread ON agent_instances(thread_
 CREATE INDEX IF NOT EXISTS idx_agent_instances_status ON agent_instances(status);
 
 CREATE TABLE IF NOT EXISTS agent_parent_child_relations (
-    relation_id        TEXT PRIMARY KEY,
-    task_id            TEXT NOT NULL,
-    parent_instance_id TEXT NOT NULL,
-    child_instance_id  TEXT NOT NULL,
-    created_at         TEXT NOT NULL
+    relation_id             TEXT PRIMARY KEY,
+    task_id                 TEXT NOT NULL,
+    parent_instance_id      TEXT NOT NULL,
+    child_instance_id       TEXT NOT NULL,
+    created_at              TEXT NOT NULL,
+    released_at             TEXT,
+    release_reason          TEXT,
+    released_by_instance_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_agent_relations_task   ON agent_parent_child_relations(task_id);
 CREATE INDEX IF NOT EXISTS idx_agent_relations_parent ON agent_parent_child_relations(parent_instance_id);
@@ -184,8 +187,9 @@ class SqliteAgentRuntimeRepository:
             self._conn.executemany(
                 """
                 INSERT OR REPLACE INTO agent_parent_child_relations (
-                    relation_id, task_id, parent_instance_id, child_instance_id, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    relation_id, task_id, parent_instance_id, child_instance_id, created_at,
+                    released_at, release_reason, released_by_instance_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -194,6 +198,9 @@ class SqliteAgentRuntimeRepository:
                         relation.parent_instance_id,
                         relation.child_instance_id,
                         _datetime_to_text(relation.created_at),
+                        _optional_datetime_to_text(relation.released_at),
+                        relation.release_reason,
+                        relation.released_by_instance_id,
                     )
                     for relation in task.parent_child_relations
                 ],
@@ -387,12 +394,32 @@ class SqliteAgentRuntimeRepository:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_scene ON agent_tasks(scene_id)"
         )
+        relation_columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(agent_parent_child_relations)").fetchall()
+        }
+        if "released_at" not in relation_columns:
+            self._conn.execute(
+                "ALTER TABLE agent_parent_child_relations "
+                "ADD COLUMN released_at TEXT"
+            )
+        if "release_reason" not in relation_columns:
+            self._conn.execute(
+                "ALTER TABLE agent_parent_child_relations "
+                "ADD COLUMN release_reason TEXT"
+            )
+        if "released_by_instance_id" not in relation_columns:
+            self._conn.execute(
+                "ALTER TABLE agent_parent_child_relations "
+                "ADD COLUMN released_by_instance_id TEXT"
+            )
 
     def _load_task_relations(self, task_id: str) -> tuple[AgentParentChildRelation, ...]:
         """加载指定 task 的父子关系树边集合。"""
         rows = self._conn.execute(
             """
-            SELECT relation_id, task_id, parent_instance_id, child_instance_id, created_at
+            SELECT relation_id, task_id, parent_instance_id, child_instance_id, created_at,
+                   released_at, release_reason, released_by_instance_id
             FROM agent_parent_child_relations
             WHERE task_id = ?
             ORDER BY created_at ASC
@@ -406,6 +433,9 @@ class SqliteAgentRuntimeRepository:
                 parent_instance_id=row[2],
                 child_instance_id=row[3],
                 created_at=_text_to_datetime(row[4]),
+                released_at=_optional_text_to_datetime(row[5]),
+                release_reason=row[6],
+                released_by_instance_id=row[7],
             )
             for row in rows
         )
