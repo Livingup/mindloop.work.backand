@@ -333,6 +333,10 @@ Agent 实例关闭时，客户端 SHOULD 通过 WS 发送注销消息。所有�
   "from_workspace": "C:/project/LACP",
   "to_instance_id": "claude-code-001",
   "content": "帮我测试下这个页面",
+  "attachments": [
+    {"kind": "image", "url": "https://example.test/screenshot.png", "name": "screenshot.png", "mime_type": "image/png"},
+    {"kind": "pdf", "url": "https://example.test/spec.pdf", "name": "spec.pdf", "mime_type": "application/pdf"}
+  ],
   "timestamp": "2025-01-15T10:30:00Z"
 }
 ```
@@ -346,7 +350,8 @@ Agent 实例关闭时，客户端 SHOULD 通过 WS 发送注销消息。所有�
 | `from_role_name` | string | 发送方角色名称 |
 | `from_workspace` | string | 发送方工作目录，可选；用于客户端标题展示。若发送方未注册 workspace，则该字段缺省，且 MUST 不拼接进 `content` |
 | `to_instance_id` | string | 目标实例 ID。客户端 MUST 使用该字段把消息路由到正确的本地 Agent 实例对话 |
-| `content` | string | 消息内容，原样透传 |
+| `content` | string | 消息内容，原样透传；attachments-only 消息中该字段为空字符串 |
+| `attachments` | array | 可选结构化附件列表。每项包含 `kind`（`image` 或 `pdf`）、`url`（http/https 远程文件 URL）、可选 `name`、可选 `mime_type`；客户端 MUST 按 URL-first 方式接入资源，不得从 `content` 中解析附件 URL |
 | `timestamp` | string | 发送时间，ISO 8601 |
 
 ### 7.2 确认帧（客户端 → 注册中心）
@@ -365,7 +370,7 @@ Agent 实例关闭时，客户端 SHOULD 通过 WS 发送注销消息。所有�
 |----|------|------|
 | `type` | string | 固定 `"ack"` |
 | `message_id` | string | 对应推送消息的 `message_id` |
-| `received` | boolean | `true` 表示消息已接收，并已作为 user message 插入到该推送帧 `to_instance_id` 指定的目标实例对话 |
+| `received` | boolean | `true` 表示消息已接收，且文本/附件已完成客户端侧接入与校验，并已作为 user message 插入到该推送帧 `to_instance_id` 指定的目标实例对话；带附件消息若远程 URL 接入、文件类型校验或统一文件输入限制校验失败，应返回 `false` |
 
 ### 7.3 消息处理规则
 
@@ -373,7 +378,8 @@ Agent 实例关闭时，客户端 SHOULD 通过 WS 发送注销消息。所有�
 |----|------|
 | **MUST 回复 ack** | 收到 `message` 帧后 MUST 回复 `ack` 帧，否则注册中心在 **5 秒**后视为投递失败 |
 | **插入 user message** | 客户端 MUST 将消息作为一条 **user message** 插入到 `to_instance_id` 指定的目标 Agent 实例当前对话中 |
-| **插入格式** | `【{source_tag}】{content}`，如：`【@Manus manus-a3f8】帮我测试下这个页面` |
+| **插入格式** | 文本显示仍为 `【{source_tag}】{content}`，如：`【@Manus manus-a3f8】帮我测试下这个页面`；附件作为结构化资源随消息入队，不拼接进文本 |
+| **附件接入** | 客户端收到 `attachments[]` 后，MUST 按 image/pdf 远程 URL 创建本地文件资源，并在入队前复用自身统一文件输入限制策略；超限或类型不匹配时不得入队成功 |
 | **实例路由** | 客户端 MUST 根据 `to_instance_id` 路由消息到正确的本地 Agent 实例，不能依赖共享 WebSocket 连接上下文推断目标实例 |
 
 ## 8. 上报执行观察
@@ -570,7 +576,7 @@ delay = min(1秒 × 2^重试次数, 30秒)
 |----|---------|---------|---------|
 | `register_ack` | 注册结果 | `request_id`, `success`, `error_code`(失败时) | 处理结果 |
 | `unregister_ack` | 注销结果 | `request_id`, `success`, `error_code`(失败时) | 处理结果 |
-| `message` | 有消息送达 | `message_id`, `source_tag`, `from_instance_id`, `from_role_name`, `to_instance_id`, `content`, `timestamp` | MUST 回复 `ack`，MUST 按 `to_instance_id` 路由并插入 user message |
+| `message` | 有消息送达 | `message_id`, `source_tag`, `from_instance_id`, `from_role_name`, `to_instance_id`, `content`, 可选 `attachments`, `timestamp` | MUST 回复 `ack`，MUST 按 `to_instance_id` 路由并插入 user message；有附件时 MUST 先完成 URL 资源接入与文件输入限制校验 |
 | `execution_observation_ack` | 执行观察上报结果 | `request_id`, `success`, `error_code`(失败时) | 处理结果 |
 | Ping 帧 | 心跳检测 | (WebSocket 协议帧，非 JSON) | MUST 回复 Pong（通常自动处理） |
 

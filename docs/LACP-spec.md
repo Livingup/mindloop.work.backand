@@ -115,7 +115,7 @@ LACP 采用星型架构，LACP Registry 作为中心服务节点。每个 Agent 
 |----|------|------|----------|
 | 1 | **来源标记识别** | 能识别对话中以 `【@角色名 实例ID】` 开头的 user message，理解这是来自其他 Agent 的消息而非人类用户的输入。 | 系统提示词 |
 | 2 | **Agent 发现** | 需要与其他 Agent 协作时，调用 `lacp_discover` 工具查询当前在线的 Agent 实例列表，了解有哪些 Agent 可以沟通、各自擅长什么。 | MCP Tool |
-| 3 | **消息发送** | 调用 `lacp_send_message` 工具向目标 Agent 发送消息，需提供自身 `from_instance_id`、目标 `to_instance_id` 和消息内容 `content`。 | MCP Tool |
+| 3 | **消息发送** | 调用 `lacp_send_message` 工具向目标 Agent 发送消息，需提供自身 `from_instance_id`、目标 `to_instance_id`，并提供文本 `content` 或结构化 `attachments[]` 中至少一项。 | MCP Tool |
 | 4 | **状态查询** | 调用 `lacp_query_status` 工具查询指定 Agent 实例的注册状态和最近执行观察快照，用于在发送消息前确认目标是否可达，或在发送消息后跟踪目标的当前状态、摘要和工具调用轨迹。 | MCP Tool |
 | 5 | **协作意图理解** | 根据消息内容理解其他 Agent 的请求意图，自主决定如何处理（执行任务、回复结果、拒绝请求等）。协议不干预 Agent 的内部决策。 | LLM 自身能力 |
 | 6 | **回复路由** | 处理完其他 Agent 的请求后，能通过 `lacp_send_message` 将结果回复给发送方（从收到的消息中提取 `from_instance_id` 作为回复目标）。 | MCP Tool + 系统提示词 |
@@ -184,7 +184,7 @@ LACP 采用星型架构，LACP Registry 作为中心服务节点。每个 Agent 
 | 3 | **WS 消息：注销实例** | 收到客户端发送的 `type: "unregister"` 消息后，接收 `instance_id` 参数，将实例从注册表中移除。对不存在的 ID 注销返回成功（幂等性）。 | §4.3 |
 | 4 | **WebSocket 端点** | 提供 `/ws` 端点，并在服务元信息中发布 WS 端点路径。连接建立后，客户端通过该连接注册/注销、接收消息、上报执行观察。 | §4.2, §7.4 |
 | 5 | **注册表维护** | 维护内存中的实例注册表，存储每个实例的 `instance_id`、`role_name`、`description`、`status`、`registered_at` 等信息。维护 `instance_id → WebSocket 连接` 的映射关系。 | §4.1, §7 |
-| 6 | **消息路由与推送（核心）** | 收到 MCP Server 转交的消息发送请求后：①查找 `to_instance_id` 对应的实例；②验证实例在线且 WebSocket 可用；③构造推送消息帧（含 `type`、`message_id`、`source_tag`、`from_instance_id`、`from_role_name`、`to_instance_id`、`content`、`timestamp`）；④通过 WebSocket 推送至目标 LACP 客户端；⑤等待确认帧（5秒超时）；⑥返回投递结果。 | §6.1, §6.2 |
+| 6 | **消息路由与推送（核心）** | 收到 MCP Server 转交的消息发送请求后：①查找 `to_instance_id` 对应的实例；②验证实例在线且 WebSocket 可用；③构造推送消息帧（含 `type`、`message_id`、`source_tag`、`from_instance_id`、`from_role_name`、`to_instance_id`、`content`、可选 `attachments`、`timestamp`）；④通过 WebSocket 推送至目标 LACP 客户端；⑤等待确认帧（5秒超时）；⑥返回投递结果。 | §6.1, §6.2 |
 | 7 | **消息 ID 生成** | 为每条投递的消息生成唯一的 `message_id`，用于推送消息帧与确认帧的关联。 | §6.2.1 |
 | 8 | **来源标记构造** | 根据发送方的 `role_name` 和 `instance_id` 构造 `source_tag`，格式为 `@角色名 实例ID`，如 `@Manus manus-a3f8`。 | §6.2.1 |
 | 9 | **发送方验证** | 消息发送时 MUST 验证 `from_instance_id` 已注册，否则拒绝发送并返回 `SEND.SENDER_NOT_REGISTERED` 错误。 | §6.1.3 |
@@ -205,7 +205,7 @@ LACP 采用星型架构，LACP Registry 作为中心服务节点。每个 Agent 
 | # | 能力（Tool） | 输入参数 | 输出 | 说明 | 对应协议章节 |
 |----|------------|----------|------|------|------------|
 | 1 | **`lacp_discover`** | `role_name`（可选，按角色名筛选） | `instances` 数组，每项含 `instance_id`、`role_name`、`description` | 查询当前已注册的 Agent 实例列表。仅返回注册表中存在的实例（均为在线状态），不包含内部连接信息。不传 `role_name` 则返回全部实例。 | §5 |
-| 2 | **`lacp_send_message`** | `from_instance_id`（发送方）、`to_instance_id`（目标方）、`content`（消息内容） | `success`、`error_code`（失败时）、`error_message`（失败时） | 向目标 Agent 实例发送消息。MCP Server 收到调用后，将请求转交注册中心进行消息路由与 WebSocket 推送。同步投递、快速返回，不等待目标 Agent 处理结果。 | §6 |
+| 2 | **`lacp_send_message`** | `from_instance_id`（发送方）、`to_instance_id`（目标方）、可选 `content`、可选 `attachments[]`（image/pdf URL 列表；`content` 或 `attachments` 至少提供一项） | `success`、`error_code`（失败时）、`error_message`（失败时） | 向目标 Agent 实例发送文本和/或结构化图片/PDF 附件。MCP Server 收到调用后，将请求转交注册中心进行消息路由与 WebSocket 推送。同步投递、快速返回，不等待目标 Agent 后续执行结果。 | §6 |
 | 3 | **`lacp_query_status`** | `instance_id`（目标实例 ID） | `instance_id`、`role_name`、`status`、`description`、`registered_at`、`execution`（执行观察快照） | 查询指定 Agent 实例的当前注册状态和最近执行观察快照。不存在的 `instance_id` 返回 `QUERY.NOT_FOUND`。注册中心直接读取客户端主动上报的观察缓存，不再通过 WS 反向拉取状态。只读操作。 | §7 |
 
 > **边界说明：** MCP Server 是 Agent/运行时侧 MCP Client 与注册中心之间的工具调用桥梁。它只负责将 MCP Tool 调用转化为对注册中心内部能力的调用，自身不维护状态、不存储数据。注册/注销操作不在 MCP Server 中暴露——那是 LACP 客户端通过 WebSocket 连接直接与注册中心交互完成的程序行为。
@@ -478,7 +478,10 @@ Agent/运行时侧 MCP Client 可以通过 MCP Server 查询当前注册中心�
 |------|------|------|------|
 | `from_instance_id` | string | 是 | 发送方 Agent 实例 ID。 |
 | `to_instance_id` | string | 是 | 目标 Agent 实例 ID。 |
-| `content` | string | 是 | 消息内容。协议不关心内容格式，原样投递。 |
+| `content` | string | 否 | 消息内容。协议不关心内容格式，原样投递；缺省时按空字符串处理。 |
+| `attachments` | array | 否 | 结构化文件附件列表。每项包含 `kind`（`image` 或 `pdf`）、`url`（http/https 远程文件 URL）、可选 `name`、可选 `mime_type`。 |
+
+`content` 去除空白后非空，或 `attachments.length > 0`，二者必须至少满足一项；附件 URL MUST 作为结构化字段透传，MUST NOT 拼接或降级进 `content`。
 
 #### 6.1.2 发送响应
 
@@ -514,7 +517,8 @@ Agent/运行时侧 MCP Client 可以通过 MCP Server 查询当前注册中心�
 | `from_role_name` | string | 发送方角色名称。 |
 | `from_workspace` | string | 发送方工作目录，可选；用于目标客户端标题展示。若发送方未注册 workspace，则该字段缺省，且 MUST 不拼接进 `content`。 |
 | `to_instance_id` | string | 目标实例 ID。LACP 客户端 MUST 使用该字段将消息路由到正确的本地 Agent 实例对话。 |
-| `content` | string | 消息内容，原样透传。 |
+| `content` | string | 消息内容，原样透传；attachments-only 消息中该字段为空字符串。 |
+| `attachments` | array | 可选结构化附件列表，字段同发送请求。目标客户端 MUST 按 URL-first 方式接入 image/pdf 资源，不得从 `content` 中解析附件 URL。 |
 | `timestamp` | string | 消息发送时间，ISO 8601 格式。 |
 
 示例：
@@ -541,7 +545,7 @@ LACP 客户端收到推送消息后，MUST 通过同一 WebSocket 连接返回�
 |------|------|------|
 | `type` | string | 消息类型，固定为 `"ack"` 。 |
 | `message_id` | string | 对应推送消息的 `message_id`，用于关联确认。 |
-| `received` | boolean | 是否成功接收。`true` 表示消息已被接收，并已作为 user message 插入到原推送帧 `to_instance_id` 指定的目标实例对话中。 |
+| `received` | boolean | 是否成功接收。`true` 表示消息已被接收，且文本/附件已通过客户端侧接入与校验，并作为 user message 插入到原推送帧 `to_instance_id` 指定的目标实例对话中；带附件消息若在远程 URL 接入、文件类型校验或统一文件输入限制校验中失败，客户端 MUST 返回 `received=false`。 |
 
 示例：
 

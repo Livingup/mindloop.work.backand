@@ -76,6 +76,25 @@ class LacpInstanceRegistration:
 
 
 @dataclass(frozen=True, slots=True)
+class LacpMessageAttachment:
+    kind: str
+    url: str
+    name: str | None = None
+    mime_type: str | None = None
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "LacpMessageAttachment":
+        if not isinstance(raw, dict):
+            return cls(kind="", url="")
+        return cls(
+            kind=str(raw.get("kind") or ""),
+            url=str(raw.get("url") or ""),
+            name=(str(raw["name"]) if raw.get("name") is not None else None),
+            mime_type=(str(raw["mime_type"]) if raw.get("mime_type") is not None else None),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LacpInboundMessage:
     message_id: str
     source_tag: str
@@ -85,6 +104,7 @@ class LacpInboundMessage:
     content: str
     from_workspace: str | None = None
     timestamp: str | None = None
+    attachments: tuple[LacpMessageAttachment, ...] = ()
 
     @classmethod
     def from_frame(cls, frame: dict[str, Any]) -> "LacpInboundMessage":
@@ -97,7 +117,16 @@ class LacpInboundMessage:
             to_instance_id=str(frame.get("to_instance_id") or ""),
             content=str(frame.get("content") or ""),
             timestamp=(str(frame["timestamp"]) if frame.get("timestamp") is not None else None),
+            attachments=_parse_message_attachments(frame.get("attachments")),
         )
+
+
+def _parse_message_attachments(value: Any) -> tuple[LacpMessageAttachment, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        return (LacpMessageAttachment(kind="", url=""),)
+    return tuple(LacpMessageAttachment.from_raw(item) for item in value)
 
 
 @dataclass(frozen=True, slots=True)
