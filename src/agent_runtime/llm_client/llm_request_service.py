@@ -156,6 +156,8 @@ class LlmRequestService:
                     metadata={"conversation_id": request.conversation.id},
                 )
                 _notify_request_event(request, "llm.request.started", request_payload)
+                if request.request_attempt_observer is not None:
+                    request.request_attempt_observer(dict(request_payload))
                 retry_target = _build_retry_target_payload(
                     resolved=resolved,
                     candidate_index=request.candidate_index,

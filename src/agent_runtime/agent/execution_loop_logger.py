@@ -60,10 +60,10 @@ class _ExecutionLogFrame:
     loop_index: int
     task_id: str
     instance_id: str
-    conversation_id: str | None
     stream_id: str | None
     started_at: str
     monotonic_started_at: float
+    metadata: dict[str, Any] = field(default_factory=dict)
     steps: list[_ExecutionLogStep] = field(default_factory=list)
     ended_at: str | None = None
     duration_ms: int | None = None
@@ -76,13 +76,13 @@ class _ExecutionLogFrame:
             "loop_index": self.loop_index,
             "task_id": self.task_id,
             "instance_id": self.instance_id,
-            "conversation_id": self.conversation_id,
             "stream_id": self.stream_id,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "duration_ms": self.duration_ms,
             "outcome": self.outcome,
             "final_summary": self.final_summary,
+            "metadata": self.metadata,
             "steps": [step.to_dict() for step in self.steps],
         }
 
@@ -177,12 +177,13 @@ class AgentExecutionLoopLogger:
         started_at = time.perf_counter()
         with self._lock:
             state = self._state_for(instance_id)
+            frame_metadata = _initial_frame_metadata(conversation_id=conversation_id)
             if frame_id in state.frames:
                 frame = state.frames[frame_id]
-                frame.conversation_id = conversation_id
                 frame.stream_id = stream_id
                 frame.started_at = now
                 frame.monotonic_started_at = started_at
+                frame.metadata = frame_metadata
                 frame.ended_at = None
                 frame.duration_ms = None
                 frame.outcome = None
@@ -195,10 +196,10 @@ class AgentExecutionLoopLogger:
                     loop_index=loop_index,
                     task_id=task_id,
                     instance_id=instance_id,
-                    conversation_id=conversation_id,
                     stream_id=stream_id,
                     started_at=now,
                     monotonic_started_at=started_at,
+                    metadata=frame_metadata,
                 )
                 state.frames[frame_id] = frame
             state.active_frame_id = frame_id
@@ -288,6 +289,102 @@ class AgentExecutionLoopLogger:
             self.request_flush(instance_id)
         except Exception:  # noqa: BLE001 - 诊断日志不能影响业务执行
             logger.exception("记录 Agent 执行循环诊断步骤失败: instance_id=%s stage=%s", instance_id, stage)
+
+    def update_frame_metadata(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None = None,
+        updates: dict[str, Any] | None = None,
+    ) -> None:
+        """更新当前 frame 的诊断元数据。失败不影响业务执行。"""
+        if not updates:
+            return
+        try:
+            sanitized_updates = _sanitize_for_log(updates)
+            with self._lock:
+                state = self._state_for(instance_id)
+                frame = self._frame_for_locked(state, frame_id or state.active_frame_id)
+                if frame is None:
+                    state.dropped_step_count += 1
+                    return
+                frame.metadata.update(sanitized_updates)
+            self.request_flush(instance_id)
+        except Exception:  # noqa: BLE001 - 诊断日志不能影响业务执行
+            logger.exception("更新 Agent 执行循环 frame 元数据失败: instance_id=%s", instance_id)
+
+    def record_llm_attempt(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None = None,
+        attempt: dict[str, Any],
+    ) -> None:
+        """把一次 LLM request attempt 关联到当前执行循环 frame。"""
+        try:
+            sanitized_attempt = _sanitize_for_log(_llm_attempt_metadata(attempt))
+            llm_request_id = sanitized_attempt.get("llm_request_id")
+            llm_call_id = sanitized_attempt.get("llm_call_id")
+            with self._lock:
+                state = self._state_for(instance_id)
+                frame = self._frame_for_locked(state, frame_id or state.active_frame_id)
+                if frame is None:
+                    state.dropped_step_count += 1
+                    return
+                metadata = _ensure_frame_metadata(frame.metadata)
+                if llm_call_id:
+                    metadata["llm_call_id"] = llm_call_id
+                if llm_request_id:
+                    metadata["active_llm_request_id"] = llm_request_id
+                    request_ids = metadata.setdefault("llm_request_ids", [])
+                    if llm_request_id not in request_ids:
+                        request_ids.append(llm_request_id)
+                attempts = metadata.setdefault("llm_attempts", [])
+                if not any(item.get("llm_request_id") == llm_request_id for item in attempts):
+                    attempts.append(sanitized_attempt)
+                else:
+                    for index, item in enumerate(attempts):
+                        if item.get("llm_request_id") == llm_request_id:
+                            attempts[index] = {**item, **sanitized_attempt}
+                            break
+                frame.metadata = metadata
+            self.request_flush(instance_id)
+        except Exception:  # noqa: BLE001 - 诊断日志不能影响业务执行
+            logger.exception("记录 Agent 执行循环 LLM attempt 元数据失败: instance_id=%s", instance_id)
+
+    def record_conversation_rebind(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None = None,
+        reason: str,
+        job_id: str | None,
+        source_conversation_id: str | None,
+        target_conversation_id: str | None,
+    ) -> None:
+        """把上下文压缩等 conversation rebind 写入当前 frame 元数据。"""
+        try:
+            rebind = _sanitize_for_log(
+                {
+                    "reason": reason,
+                    "job_id": job_id,
+                    "source_conversation_id": source_conversation_id,
+                    "target_conversation_id": target_conversation_id,
+                }
+            )
+            with self._lock:
+                state = self._state_for(instance_id)
+                frame = self._frame_for_locked(state, frame_id or state.active_frame_id)
+                if frame is None:
+                    state.dropped_step_count += 1
+                    return
+                metadata = _ensure_frame_metadata(frame.metadata)
+                metadata["active_conversation_id"] = target_conversation_id
+                metadata.setdefault("conversation_rebinds", []).append(rebind)
+                frame.metadata = metadata
+            self.request_flush(instance_id)
+        except Exception:  # noqa: BLE001 - 诊断日志不能影响业务执行
+            logger.exception("记录 Agent 执行循环 conversation rebind 元数据失败: instance_id=%s", instance_id)
 
     def record_instance_event(
         self,
@@ -403,8 +500,8 @@ class AgentExecutionLoopLogger:
 
     def _snapshot_locked(self, state: _ExecutionLogInstanceState) -> dict[str, Any]:
         return {
-            "schema_version": 1,
-            "description": "Rolling AgentInstance execution-loop diagnostic log. Only the latest frames are retained.",
+            "schema_version": 2,
+            "description": "Rolling AgentInstance execution-loop diagnostic log. Frames retain metadata for active conversation, LLM request attempts, and rebind lineage.",
             "generated_at": _utc_now_iso(),
             "instance_id": state.instance_id,
             "retained_frame_count": self._retained_frame_count,
@@ -449,6 +546,15 @@ class NoopAgentExecutionLoopLogger:
     def record_step(self, **_: Any) -> None:
         return None
 
+    def update_frame_metadata(self, **_: Any) -> None:
+        return None
+
+    def record_llm_attempt(self, **_: Any) -> None:
+        return None
+
+    def record_conversation_rebind(self, **_: Any) -> None:
+        return None
+
     def record_instance_event(self, **_: Any) -> None:
         return None
 
@@ -457,6 +563,49 @@ class NoopAgentExecutionLoopLogger:
 
     def log_file_path_for_instance(self, instance_id: str) -> Path:
         return Path(f"{_safe_filename(instance_id)}.log")
+
+
+def _initial_frame_metadata(*, conversation_id: str | None) -> dict[str, Any]:
+    return {
+        "initial_conversation_id": conversation_id,
+        "active_conversation_id": conversation_id,
+        "llm_call_id": None,
+        "active_llm_request_id": None,
+        "llm_request_ids": [],
+        "llm_attempts": [],
+        "conversation_rebinds": [],
+    }
+
+
+def _ensure_frame_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(metadata or {})
+    normalized.setdefault("initial_conversation_id", None)
+    normalized.setdefault("active_conversation_id", normalized.get("initial_conversation_id"))
+    normalized.setdefault("llm_call_id", None)
+    normalized.setdefault("active_llm_request_id", None)
+    normalized.setdefault("llm_request_ids", [])
+    normalized.setdefault("llm_attempts", [])
+    normalized.setdefault("conversation_rebinds", [])
+    return normalized
+
+
+def _llm_attempt_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "llm_request_id": payload.get("llm_request_id"),
+        "llm_call_id": payload.get("llm_call_id"),
+        "candidate_index": payload.get("candidate_index"),
+        "api_key_index": payload.get("api_key_index"),
+        "retry_index": payload.get("retry_index"),
+        "provider_id": payload.get("provider_id"),
+        "binding_id": payload.get("binding_id"),
+        "model_id": payload.get("model_id"),
+        "model_alias": payload.get("model_alias"),
+        "api_format": payload.get("api_format"),
+        "api_key_label": payload.get("api_key_label"),
+        "attempt_count": payload.get("attempt_count"),
+        "api_key_count": payload.get("api_key_count"),
+        "tool_count": payload.get("tool_count"),
+    }
 
 
 def _write_snapshot_file(path: Path, snapshot: dict[str, Any]) -> None:

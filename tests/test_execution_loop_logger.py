@@ -37,6 +37,50 @@ def test_execution_loop_logger_writes_one_safe_instance_file_and_retains_latest_
                     details={"candidate_count": 1},
                     expected_next="llm.request.start",
                 )
+                if loop_index == 4:
+                    logger.update_frame_metadata(
+                        instance_id=instance_id,
+                        frame_id=frame_id,
+                        updates={"llm_call_id": "llm-call-test"},
+                    )
+                    logger.record_llm_attempt(
+                        instance_id=instance_id,
+                        frame_id=frame_id,
+                        attempt={
+                            "llm_call_id": "llm-call-test",
+                            "llm_request_id": "llm-call-test:candidate-0:key-0:retry-0",
+                            "candidate_index": 0,
+                            "api_key_index": 0,
+                            "retry_index": 0,
+                            "provider_id": "provider-a",
+                            "binding_id": "binding-a",
+                            "model_id": "model-a",
+                            "model_alias": "model-alias-a",
+                        },
+                    )
+                    logger.record_llm_attempt(
+                        instance_id=instance_id,
+                        frame_id=frame_id,
+                        attempt={
+                            "llm_call_id": "llm-call-test",
+                            "llm_request_id": "llm-call-test:candidate-0:key-1:retry-0",
+                            "candidate_index": 0,
+                            "api_key_index": 1,
+                            "retry_index": 0,
+                            "provider_id": "provider-a",
+                            "binding_id": "binding-a",
+                            "model_id": "model-a",
+                            "model_alias": "model-alias-a",
+                        },
+                    )
+                    logger.record_conversation_rebind(
+                        instance_id=instance_id,
+                        frame_id=frame_id,
+                        reason="context_compression",
+                        job_id="job-1",
+                        source_conversation_id="conversation-4",
+                        target_conversation_id="conversation-4-compressed",
+                    )
                 logger.record_step(
                     instance_id=instance_id,
                     frame_id=frame_id,
@@ -72,6 +116,7 @@ def test_execution_loop_logger_writes_one_safe_instance_file_and_retains_latest_
         assert sorted(path.name for path in log_path.parent.glob("*.log")) == ["agent_instance_1_x.log"]
 
         snapshot = json.loads(log_path.read_text(encoding="utf-8"))
+        assert snapshot["schema_version"] == 2
         assert snapshot["instance_id"] == instance_id
         assert snapshot["retained_frame_count"] == 3
         assert snapshot["actual_frame_count"] == 3
@@ -82,6 +127,58 @@ def test_execution_loop_logger_writes_one_safe_instance_file_and_retains_latest_
             for frame in snapshot["frames"]
         )
         last_frame = snapshot["frames"][-1]
+        assert "conversation_id" not in last_frame
+        metadata = last_frame["metadata"]
+        assert metadata["initial_conversation_id"] == "conversation-4"
+        assert metadata["active_conversation_id"] == "conversation-4-compressed"
+        assert metadata["llm_call_id"] == "llm-call-test"
+        assert metadata["active_llm_request_id"] == "llm-call-test:candidate-0:key-1:retry-0"
+        assert metadata["llm_request_ids"] == [
+            "llm-call-test:candidate-0:key-0:retry-0",
+            "llm-call-test:candidate-0:key-1:retry-0",
+        ]
+        assert metadata["llm_attempts"] == [
+            {
+                "llm_request_id": "llm-call-test:candidate-0:key-0:retry-0",
+                "llm_call_id": "llm-call-test",
+                "candidate_index": 0,
+                "api_key_index": 0,
+                "retry_index": 0,
+                "provider_id": "provider-a",
+                "binding_id": "binding-a",
+                "model_id": "model-a",
+                "model_alias": "model-alias-a",
+                "api_format": None,
+                "api_key_label": None,
+                "attempt_count": None,
+                "api_key_count": None,
+                "tool_count": None,
+            },
+            {
+                "llm_request_id": "llm-call-test:candidate-0:key-1:retry-0",
+                "llm_call_id": "llm-call-test",
+                "candidate_index": 0,
+                "api_key_index": 1,
+                "retry_index": 0,
+                "provider_id": "provider-a",
+                "binding_id": "binding-a",
+                "model_id": "model-a",
+                "model_alias": "model-alias-a",
+                "api_format": None,
+                "api_key_label": None,
+                "attempt_count": None,
+                "api_key_count": None,
+                "tool_count": None,
+            },
+        ]
+        assert metadata["conversation_rebinds"] == [
+            {
+                "reason": "context_compression",
+                "job_id": "job-1",
+                "source_conversation_id": "conversation-4",
+                "target_conversation_id": "conversation-4-compressed",
+            }
+        ]
         assert last_frame["outcome"] == "pause"
         assert [step["stage"] for step in last_frame["steps"]] == [
             "frame.start",
@@ -130,6 +227,11 @@ def test_execution_loop_logger_bounds_instance_events_and_records_without_starte
         assert len(snapshot["instance_events"]) == 128
         assert snapshot["instance_events"][0]["stage"] == "event-2"
         assert snapshot["instance_events"][-1]["stage"] == "event-129"
+        assert snapshot["schema_version"] == 2
+        assert "conversation_id" not in snapshot["frames"][0]
+        assert snapshot["frames"][0]["metadata"]["initial_conversation_id"] == "conversation-1"
+        assert snapshot["frames"][0]["metadata"]["active_conversation_id"] == "conversation-1"
+        assert snapshot["frames"][0]["metadata"]["llm_request_ids"] == []
         assert snapshot["frames"][0]["outcome"] == "complete"
 
     asyncio.run(run_case())

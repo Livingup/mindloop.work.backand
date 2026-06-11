@@ -884,6 +884,78 @@ class AgentExecutionEngine:
                 exc_info=True,
             )
 
+    def _update_execution_frame_metadata(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None,
+        updates: dict[str, Any],
+    ) -> None:
+        """更新当前执行循环 frame 元数据。"""
+        try:
+            self._execution_loop_logger.update_frame_metadata(
+                instance_id=instance_id,
+                frame_id=frame_id,
+                updates=updates,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "更新 Agent 执行循环 frame 元数据失败: instance_id=%s frame_id=%s",
+                instance_id,
+                frame_id,
+                exc_info=True,
+            )
+
+    def _record_execution_llm_attempt(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None,
+        attempt: dict[str, Any],
+    ) -> None:
+        """记录当前 frame 关联的一次 LLM request attempt。"""
+        try:
+            self._execution_loop_logger.record_llm_attempt(
+                instance_id=instance_id,
+                frame_id=frame_id,
+                attempt=attempt,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "记录 Agent 执行循环 LLM attempt 失败: instance_id=%s frame_id=%s",
+                instance_id,
+                frame_id,
+                exc_info=True,
+            )
+
+    def _record_execution_conversation_rebind(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None,
+        reason: str,
+        job_id: str | None,
+        source_conversation_id: str | None,
+        target_conversation_id: str | None,
+    ) -> None:
+        """记录当前 frame 内的 conversation rebind。"""
+        try:
+            self._execution_loop_logger.record_conversation_rebind(
+                instance_id=instance_id,
+                frame_id=frame_id,
+                reason=reason,
+                job_id=job_id,
+                source_conversation_id=source_conversation_id,
+                target_conversation_id=target_conversation_id,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "记录 Agent 执行循环 conversation rebind 失败: instance_id=%s frame_id=%s",
+                instance_id,
+                frame_id,
+                exc_info=True,
+            )
+
     def _end_execution_loop_frame(
         self,
         *,
@@ -1098,6 +1170,7 @@ class AgentExecutionEngine:
                             request_overrides=request.request_overrides,
                             communication_context=communication_context,
                             interrupt_state=interrupt_state,
+                            execution_frame_id=current_frame_id,
                         ),
                         stage="llm_prompt",
                         task_id=task.task_id,
@@ -2023,10 +2096,26 @@ class AgentExecutionEngine:
         request_overrides: dict[str, Any],
         communication_context: RuntimeCommunicationContext,
         interrupt_state: _AgentExecutionInterruptState,
+        execution_frame_id: str | None,
     ) -> _PromptWithConversationResult:
         last_error: Exception | None = None
         skipped_for_modalities = False
         llm_call_id = f"llm-call-{uuid.uuid4().hex}"
+
+        def _observe_llm_request_attempt(payload: dict[str, Any]) -> None:
+            request_payload = dict(payload)
+            interrupt_state.current_llm_request = request_payload
+            self._record_execution_llm_attempt(
+                instance_id=instance.instance_id,
+                frame_id=execution_frame_id,
+                attempt=request_payload,
+            )
+
+        self._update_execution_frame_metadata(
+            instance_id=instance.instance_id,
+            frame_id=execution_frame_id,
+            updates={"llm_call_id": llm_call_id, "active_conversation_id": conversation.id},
+        )
         for candidate_index, resolved_model in enumerate(resolved_candidates):
             missing_modalities = _missing_input_modalities(conversation, resolved_model)
             if (
@@ -2222,14 +2311,24 @@ class AgentExecutionEngine:
                         request_canceller_observer=interrupt_state.register_current_llm_request_canceller,
                     )
                     if compression_result.created and compression_result.target_conversation is not None:
+                        source_conversation_id = conversation.id
                         conversation = compression_result.target_conversation
                         instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                         communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+                        job_id = compression_result.job.job_id if compression_result.job else None
+                        self._record_execution_conversation_rebind(
+                            instance_id=instance.instance_id,
+                            frame_id=execution_frame_id,
+                            reason="context_compression",
+                            job_id=job_id,
+                            source_conversation_id=source_conversation_id,
+                            target_conversation_id=conversation.id,
+                        )
                         self._trace_recorder.record_event(
                             trace_path,
                             "context_compression_completed",
                             {
-                                "job_id": compression_result.job.job_id if compression_result.job else None,
+                                "job_id": job_id,
                                 "target_conversation_id": conversation.id,
                             },
                         )
@@ -2300,11 +2399,7 @@ class AgentExecutionEngine:
                         else None,
                         cancellation_checker=lambda state=interrupt_state: state.requested,
                         request_canceller_observer=interrupt_state.register_current_llm_request_canceller,
-                        request_attempt_observer=lambda payload, state=interrupt_state: setattr(
-                            state,
-                            "current_llm_request",
-                            payload,
-                        ),
+                        request_attempt_observer=_observe_llm_request_attempt,
                     )
                 )
                 self._record_execution_loop_step(
