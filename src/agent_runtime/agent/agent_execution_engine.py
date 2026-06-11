@@ -336,32 +336,6 @@ class AgentExecutionEngine:
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
         self._execution_progress: dict[str, _AgentExecutionProgressState] = {}
 
-    def get_agent_execution_diagnostics(self, instance_id: str) -> dict[str, Any]:
-        handle = self._active_execution_handles.get(instance_id)
-        progress = self._execution_progress.get(instance_id)
-        now = time.time()
-        return {
-            "instance_id": instance_id,
-            "active_instance_registered": instance_id in self._active_instance_ids,
-            "active_handle_exists": handle is not None,
-            "execution_task_done": handle.task.done() if handle is not None else None,
-            "execution_task_cancelled": handle.task.cancelled() if handle is not None else None,
-            "interrupt_requested": handle.interrupt_state.requested if handle is not None else None,
-            "interrupt_reason": handle.interrupt_state.reason if handle is not None else None,
-            "interrupt_requested_elapsed_ms": (
-                int((time.perf_counter() - handle.interrupt_state.requested_at) * 1000)
-                if handle is not None and handle.interrupt_state.requested_at is not None
-                else None
-            ),
-            "current_llm_request": (
-                dict(handle.interrupt_state.current_llm_request)
-                if handle is not None and isinstance(handle.interrupt_state.current_llm_request, dict)
-                else None
-            ),
-            "progress": _execution_progress_snapshot(progress, now) if progress is not None else None,
-            "task_stack": _task_stack_snapshot(handle.task) if handle is not None else [],
-        }
-
     def _set_execution_phase(
         self,
         *,
@@ -3575,38 +3549,6 @@ async def _await_with_progress_logging(
             metadata,
         )
         raise
-
-
-def _execution_progress_snapshot(
-    progress: _AgentExecutionProgressState,
-    now: float,
-) -> dict[str, Any]:
-    return {
-        "task_id": progress.task_id,
-        "instance_id": progress.instance_id,
-        "stream_id": progress.stream_id,
-        "conversation_id": progress.conversation_id,
-        "phase": progress.phase,
-        "loop_index": progress.loop_index,
-        "phase_started_at": _datetime_from_timestamp(progress.phase_started_at),
-        "last_progress_at": _datetime_from_timestamp(progress.last_progress_at),
-        "phase_elapsed_ms": int(max(now - progress.phase_started_at, 0) * 1000),
-        "last_progress_elapsed_ms": int(max(now - progress.last_progress_at, 0) * 1000),
-        "metadata": dict(progress.metadata),
-        "running_tools": [dict(item) for item in progress.running_tools],
-    }
-
-
-def _task_stack_snapshot(task: asyncio.Task[Any]) -> list[dict[str, Any]]:
-    frames = task.get_stack(limit=12)
-    return [
-        {
-            "filename": frame.f_code.co_filename,
-            "function": frame.f_code.co_name,
-            "line_number": frame.f_lineno,
-        }
-        for frame in frames
-    ]
 
 
 def _datetime_from_timestamp(value: float) -> str:

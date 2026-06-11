@@ -769,8 +769,6 @@ def create_app(
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
             file_resource_service=file_resource_service,
-            communication_gateway=communication_gateway,
-            runtime_health_snapshot=event_loop_monitor.snapshot,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],
@@ -881,7 +879,6 @@ def _safe_network_path(path: str, query_params: dict[str, object]) -> str:
 def _is_key_network_path(path: str) -> bool:
     return (
         path == "/api/health"
-        or "diagnostics" in path
         or "attach" in path
         or "/events" in path
     )
