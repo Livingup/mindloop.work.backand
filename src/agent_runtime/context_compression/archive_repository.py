@@ -88,6 +88,24 @@ class ContextCompressionArchiveRepository:
             ).fetchone()
             return str(row[0]) if row else source_conversation_id
 
+    def get_section_items(self, job_id: str) -> list[dict[str, Any]]:
+        """读取上下文压缩 job 归档中的 Section Worker 提取条目。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata_json FROM context_compression_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"上下文压缩 job 不存在: {job_id}")
+        try:
+            metadata = json.loads(row[0] or "{}")
+        except (TypeError, ValueError):
+            return []
+        section_items = metadata.get("section_items") if isinstance(metadata, dict) else None
+        if not isinstance(section_items, list):
+            return []
+        return [dict(item) for item in section_items if isinstance(item, dict)]
+
     def upsert_job(
         self,
         job: CompressionJob,

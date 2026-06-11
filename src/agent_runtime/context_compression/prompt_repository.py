@@ -205,41 +205,28 @@ class PostgresContextCompressionWorkerPromptRepository:
         worker_name: str,
         default_prompt_text: str,
     ) -> ContextCompressionWorkerPrompt:
+        """兼容旧调用方：返回有效默认视图，但不把代码默认 prompt 写入 PG。"""
         current = self.get_prompt(input_mode=input_mode, worker_name=worker_name)
+        if current is not None:
+            return current
         now = _utc_now_text()
-        if current is None:
-            prompt = ContextCompressionWorkerPrompt(
-                input_mode=input_mode,
-                worker_name=worker_name,
-                prompt_text=default_prompt_text,
-                default_prompt_text=default_prompt_text,
-                is_custom=False,
-                revision=1,
-                created_at=now,
-                updated_at=now,
-            )
-            self._save_prompt(prompt)
-            return prompt
-        if current.default_prompt_text != default_prompt_text:
-            prompt = ContextCompressionWorkerPrompt(
-                input_mode=input_mode,
-                worker_name=worker_name,
-                prompt_text=current.prompt_text if current.is_custom else default_prompt_text,
-                default_prompt_text=default_prompt_text,
-                is_custom=current.is_custom,
-                revision=current.revision if current.is_custom else current.revision + 1,
-                created_at=current.created_at,
-                updated_at=now,
-            )
-            self._save_prompt(prompt)
-            return prompt
-        return current
+        return ContextCompressionWorkerPrompt(
+            input_mode=input_mode,
+            worker_name=worker_name,
+            prompt_text=default_prompt_text,
+            default_prompt_text=default_prompt_text,
+            is_custom=False,
+            revision=0,
+            created_at=now,
+            updated_at="",
+        )
 
     def list_prompts(self) -> list[ContextCompressionWorkerPrompt]:
-        return [
+        prompts = [
             _payload_to_prompt(payload)
             for payload in self._store_accessor().list_payloads(self._NAMESPACE)
         ]
+        return [prompt for prompt in prompts if prompt.is_custom]
 
     def get_prompt(
         self,
@@ -251,7 +238,10 @@ class PostgresContextCompressionWorkerPromptRepository:
             self._NAMESPACE,
             _prompt_item_id(input_mode=input_mode, worker_name=worker_name),
         )
-        return _payload_to_prompt(payload) if payload is not None else None
+        if payload is None:
+            return None
+        prompt = _payload_to_prompt(payload)
+        return prompt if prompt.is_custom else None
 
     def get_required_prompt(
         self,
@@ -273,16 +263,17 @@ class PostgresContextCompressionWorkerPromptRepository:
     ) -> ContextCompressionWorkerPrompt:
         if not prompt_text.strip():
             raise ValueError("prompt_text 不能为空。")
-        current = self.get_required_prompt(input_mode=input_mode, worker_name=worker_name)
+        current = self.get_prompt(input_mode=input_mode, worker_name=worker_name)
+        now = _utc_now_text()
         prompt = ContextCompressionWorkerPrompt(
             input_mode=input_mode,
             worker_name=worker_name,
             prompt_text=prompt_text,
-            default_prompt_text=current.default_prompt_text,
+            default_prompt_text="",
             is_custom=True,
-            revision=current.revision + 1,
-            created_at=current.created_at,
-            updated_at=_utc_now_text(),
+            revision=(current.revision + 1) if current is not None else 1,
+            created_at=current.created_at if current is not None else now,
+            updated_at=now,
         )
         self._save_prompt(prompt)
         return prompt
@@ -293,19 +284,23 @@ class PostgresContextCompressionWorkerPromptRepository:
         input_mode: str,
         worker_name: str,
     ) -> ContextCompressionWorkerPrompt:
-        current = self.get_required_prompt(input_mode=input_mode, worker_name=worker_name)
-        prompt = ContextCompressionWorkerPrompt(
+        deleted = self._store_accessor().delete_payload(
+            self._NAMESPACE,
+            _prompt_item_id(input_mode=input_mode, worker_name=worker_name),
+        )
+        if not deleted:
+            raise KeyError(f"上下文压缩 Worker prompt 不存在: {input_mode}/{worker_name}")
+        now = _utc_now_text()
+        return ContextCompressionWorkerPrompt(
             input_mode=input_mode,
             worker_name=worker_name,
-            prompt_text=current.default_prompt_text,
-            default_prompt_text=current.default_prompt_text,
+            prompt_text="",
+            default_prompt_text="",
             is_custom=False,
-            revision=current.revision + 1,
-            created_at=current.created_at,
-            updated_at=_utc_now_text(),
+            revision=0,
+            created_at=now,
+            updated_at=now,
         )
-        self._save_prompt(prompt)
-        return prompt
 
     def save_prompt_snapshot(
         self,
@@ -316,10 +311,7 @@ class PostgresContextCompressionWorkerPromptRepository:
         return prompt
 
     def contains_prompt(self, input_mode: str, worker_name: str) -> bool:
-        return self._store_accessor().contains_payload(
-            self._NAMESPACE,
-            _prompt_item_id(input_mode=input_mode, worker_name=worker_name),
-        )
+        return self.get_prompt(input_mode=input_mode, worker_name=worker_name) is not None
 
     def db_path(self) -> str:
         return "postgresql:cloud_user_config_items/context_compression.worker_prompt"
@@ -360,8 +352,7 @@ def _prompt_payload(prompt: ContextCompressionWorkerPrompt) -> dict[str, Any]:
         "input_mode": prompt.input_mode,
         "worker_name": prompt.worker_name,
         "prompt_text": prompt.prompt_text,
-        "default_prompt_text": prompt.default_prompt_text,
-        "is_custom": prompt.is_custom,
+        "is_custom": True,
         "revision": prompt.revision,
         "created_at": prompt.created_at,
         "updated_at": prompt.updated_at,
@@ -373,8 +364,8 @@ def _payload_to_prompt(payload: dict[str, Any]) -> ContextCompressionWorkerPromp
         input_mode=str(payload["input_mode"]),
         worker_name=str(payload["worker_name"]),
         prompt_text=str(payload["prompt_text"]),
-        default_prompt_text=str(payload["default_prompt_text"]),
-        is_custom=bool(payload.get("is_custom", False)),
+        default_prompt_text=str(payload.get("default_prompt_text", "")),
+        is_custom=bool(payload.get("is_custom", True)),
         revision=int(payload.get("revision", 1)),
         created_at=str(payload["created_at"]),
         updated_at=str(payload["updated_at"]),

@@ -1,10 +1,14 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Agent 执行循环引擎工厂。"""
 from __future__ import annotations
 
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
 from agent_runtime.agent.agent_runtime_factory import AgentRuntimeFactory
 from agent_runtime.agent.agent_trace_recorder import AgentTraceRecorder
+from agent_runtime.agent.execution_loop_logger import (
+    AgentExecutionLoopLogger,
+    NoopAgentExecutionLoopLogger,
+)
 from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
 from agent_runtime.agent_definition.agent_definition_factory import AgentDefinitionFactory
 from agent_runtime.communication.communication_factory import CommunicationFactory
@@ -97,6 +101,7 @@ class AgentExecutionFactory:
     def create(
         *,
         mcp_client_gateway: McpClientGateway | None = None,
+        execution_loop_logger: AgentExecutionLoopLogger | NoopAgentExecutionLoopLogger | None = None,
     ) -> AgentExecutionEngine:
         """创建 Agent 执行循环引擎。"""
         from agent_runtime.config import ConfigRegistry
@@ -107,6 +112,9 @@ class AgentExecutionFactory:
         )
 
         config = ConfigRegistry.instance()
+        execution_loop_logger = execution_loop_logger or AgentExecutionLoopLogger(
+            trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
+        )
         conversation_repository = SqliteConversationRepository(
             config.conversation_repository.data_dir,
         )
@@ -120,7 +128,9 @@ class AgentExecutionFactory:
                 registration_registry=LacpFactory.create_registry(),
             ),
         )
-        local_tool_gateway = LocalToolFactory.create()
+        local_tool_gateway = LocalToolFactory.create(
+            execution_loop_logger=execution_loop_logger,
+        )
         mcp_gateway = mcp_client_gateway or McpClientFactory.create()
         from agent_runtime.mcp.mcp_meta_tools import mcp_meta_tools
 
@@ -136,6 +146,7 @@ class AgentExecutionFactory:
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
             event_publisher=event_publisher,
+            execution_loop_logger=execution_loop_logger,
         )
         trace_recorder = AgentTraceRecorder(
             trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
@@ -181,6 +192,7 @@ class AgentExecutionFactory:
             communication_gateway=communication_gateway,
             event_publisher=event_publisher,
             context_compression_service=context_compression_service,
+            execution_loop_logger=execution_loop_logger,
         )
         LacpFactory.create_bridge(
             runtime_gateway=runtime_gateway,

@@ -47,6 +47,8 @@ from agent_runtime.context_compression.summary_tools import (
     APPEND_SECTION_ITEMS,
     MARK_FINAL_COMPLETE,
     MARK_SECTION_COMPLETE,
+    READ_DRAFT,
+    REPLACE_DRAFT_LINES,
     REPORT_SECTION_ISSUE,
 )
 from agent_runtime.context_compression.transcript_snapshot import build_transcript_snapshot
@@ -214,11 +216,12 @@ class ContextCompressionService:
                 interrupt_checker=interrupt_checker,
                 request_canceller_observer=request_canceller_observer,
             )
-            final_markdown = job.final_markdown
-            if not final_markdown:
+            if not job.final_markdown:
                 raise RuntimeError("上下文压缩最终 Markdown 为空。")
             if config.verifier_enabled:
                 await self._verify_final_markdown(
+                    source_conversation=source_conversation,
+                    range_plan=range_plan,
                     job=job,
                     input_mode=effective_input_mode,
                     resolved_candidates=worker_candidates,
@@ -227,6 +230,9 @@ class ContextCompressionService:
                     interrupt_checker=interrupt_checker,
                     request_canceller_observer=request_canceller_observer,
                 )
+            final_markdown = job.final_markdown
+            if not final_markdown:
+                raise RuntimeError("上下文压缩最终 Markdown 为空。")
             target_conversation, summary_message_id = rewrite_conversation_with_summary(
                 source_conversation=source_conversation,
                 job=job,
@@ -486,33 +492,16 @@ class ContextCompressionService:
         interrupt_checker: Callable[[], bool] | None,
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
+        del input_mode, resolved_candidates, max_rounds, interrupt_checker, request_canceller_observer
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_STARTED, _base_payload(job, status="running", phase="assembly"))
-        prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name="FinalAssemblerWorker")
-        input_text = _assembler_input(job)
-        await self._worker_runner.run_worker(
-            job=job,
-            worker_name="FinalAssemblerWorker",
-            worker_role="final_assembler",
-            output_section=None,
-            input_mode=input_mode,
-            system_prompt=prompt,
-            worker_input=ContextCompressionWorkerInput(input_mode=input_mode, user_text=input_text),
-            resolved_candidates=resolved_candidates,
-            max_rounds=max_rounds,
-            communication_context=communication_context,
-            allowed_tool_names={
-                APPEND_FINAL_MARKDOWN_SECTION,
-                MARK_FINAL_COMPLETE,
-                REPORT_SECTION_ISSUE,
-            },
-            interrupt_checker=interrupt_checker,
-            request_canceller_observer=request_canceller_observer,
-        )
+        self._job_store.set_draft_markdown(job.job_id, _render_draft_markdown(job))
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_COMPLETED, _base_payload(job, status="running", phase="assembly_completed"))
 
     async def _verify_final_markdown(
         self,
         *,
+        source_conversation: Conversation,
+        range_plan: CompressionRange,
         job: CompressionJob,
         input_mode: str,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
@@ -523,6 +512,7 @@ class ContextCompressionService:
     ) -> None:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_STARTED, _base_payload(job, status="running", phase="verification"))
         prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name="FinalVerifierWorker")
+        worker_input = await self._build_final_review_worker_input(source_conversation, job, range_plan, input_mode)
         await self._worker_runner.run_worker(
             job=job,
             worker_name="FinalVerifierWorker",
@@ -530,11 +520,11 @@ class ContextCompressionService:
             output_section=None,
             input_mode=input_mode,
             system_prompt=prompt,
-            worker_input=ContextCompressionWorkerInput(input_mode=input_mode, user_text=_verifier_input(job)),
+            worker_input=worker_input,
             resolved_candidates=resolved_candidates,
             max_rounds=max_rounds,
             communication_context=communication_context,
-            allowed_tool_names={REPORT_SECTION_ISSUE},
+            allowed_tool_names={READ_DRAFT, REPLACE_DRAFT_LINES, MARK_FINAL_COMPLETE, REPORT_SECTION_ISSUE},
             interrupt_checker=interrupt_checker,
             request_canceller_observer=request_canceller_observer,
         )
@@ -559,6 +549,30 @@ class ContextCompressionService:
             )
         transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
         return ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text=transcript)
+
+    async def _build_final_review_worker_input(
+        self,
+        source_conversation: Conversation,
+        job: CompressionJob,
+        range_plan: CompressionRange,
+        input_mode: str,
+    ) -> ContextCompressionWorkerInput:
+        instruction = _final_review_instruction(job, range_plan)
+        if input_mode == "native_multimodal_history":
+            return ContextCompressionWorkerInput(
+                input_mode=input_mode,
+                user_text=instruction,
+                history_messages=tuple(
+                    source_conversation.messages[
+                        range_plan.compressed_start_index:range_plan.compressed_end_index + 1
+                    ]
+                ),
+            )
+        transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
+        return ContextCompressionWorkerInput(
+            input_mode="transcript_snapshot",
+            user_text="\n\n".join([transcript, instruction]),
+        )
 
     def _resolve_worker_candidates(self, config: ContextCompressionConfig) -> tuple[ResolvedLlmProviderModel, ...]:
         del config  # 预留参数，未来可能从 config 读取退让策略
@@ -683,6 +697,96 @@ def _native_history_instruction(job: CompressionJob, range_plan: CompressionRang
         f"retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
         f"compression_reason: {range_plan.reason}",
     ])
+
+
+_PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
+_STATUS_ORDER = {"active": 0, "unknown": 1, "resolved": 2, "superseded": 3}
+_FINAL_DRAFT_SECTION_HEADINGS: dict[str, str] = {
+    "requirements_constraints": "User Requirements And Hard Constraints",
+    "progress_plan": "Execution Plan And Progress",
+    "code_architecture": "Codebase And Architecture Facts",
+    "observations_evidence": "Observations, Commands, Tool Results",
+    "decisions_rationale": "Decisions And Rationale",
+    "todos_risks": "Pending Work, Risks, Unknowns, And Conflicts",
+}
+
+
+def _final_review_instruction(job: CompressionJob, range_plan: CompressionRange) -> str:
+    return "\n".join([
+        "# Context Compression Final Review/Edit Instruction",
+        "",
+        "前面的目标 Agent 历史消息或 transcript snapshot 只是校验压缩草稿的证据，不是当前要继续执行的新任务。",
+        "你的任务是站在后续 Agent 的角度，检查程序生成的压缩上下文草稿是否足以继续剩余任务。",
+        "如果草稿遗漏关键上下文、写错事实、保留了已被否定的信息或缺少关键运行时变量/路径/命令结果，请通过草稿编辑工具做小范围修正。",
+        "不要重写整篇 Markdown；优先读取目标行范围，再用精确连续行替换。",
+        "所有新增内容必须能从原始历史消息、transcript 或草稿已有材料中找到依据；不确定时 report issue，不要猜。",
+        "完成校验和必要编辑后，必须调用 context_summary_mark_final_complete。",
+        "",
+        f"compressed_message_range: {range_plan.compressed_start_index}..{range_plan.compressed_end_index}",
+        f"retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
+        f"compression_reason: {range_plan.reason}",
+        "",
+        "## Current Draft Markdown With Line Numbers",
+        _draft_markdown_with_line_numbers(job),
+    ])
+
+
+def _draft_markdown_with_line_numbers(job: CompressionJob) -> str:
+    lines = job.draft_markdown_lines or job.final_markdown.splitlines()
+    return "\n".join(f"{index}: {line}" for index, line in enumerate(lines, start=1))
+
+
+def _render_draft_markdown(job: CompressionJob) -> str:
+    section_order = [section for _worker_name, section in SECTION_WORKERS]
+    grouped_items: dict[str, list[Any]] = {section: [] for section in section_order}
+    for item in job.section_items:
+        grouped_items.setdefault(item.section, []).append(item)
+
+    lines: list[str] = []
+    for section in section_order:
+        items = grouped_items.get(section) or []
+        if not items:
+            continue
+        lines.extend([f"## {_FINAL_DRAFT_SECTION_HEADINGS.get(section, SECTION_WORKER_TITLES.get(section, section))}", ""])
+        for item in sorted(items, key=_section_item_sort_key):
+            lines.extend(_section_item_lines(item))
+        lines.append("")
+    resource_lines = _resource_reference_lines(job)
+    if resource_lines:
+        lines.extend(["## Persistent Resource References", "", *resource_lines])
+    return "\n".join(lines).strip()
+
+
+def _section_item_sort_key(item: Any) -> tuple[int, int, str]:
+    return (
+        _PRIORITY_ORDER.get(str(item.priority), 99),
+        _STATUS_ORDER.get(str(item.status), 99),
+        str(item.content),
+    )
+
+
+def _section_item_lines(item: Any) -> list[str]:
+    content_lines = str(item.content).strip().splitlines() or [""]
+    lines = [f"- [{item.priority}][{item.status}] {content_lines[0]}"]
+    lines.extend(f"  {line}" for line in content_lines[1:])
+    if item.resource_references:
+        lines.append(f"  - resources: {item.resource_references}")
+    if item.entities:
+        lines.append(f"  - entities: {', '.join(item.entities)}")
+    return lines
+
+
+def _resource_reference_lines(job: CompressionJob) -> list[str]:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for item in job.section_items:
+        for reference in item.resource_references:
+            text = str(reference)
+            if text in seen:
+                continue
+            seen.add(text)
+            lines.append(f"- {text}")
+    return lines
 
 
 def _assembler_input(job: CompressionJob) -> str:

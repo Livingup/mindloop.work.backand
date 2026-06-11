@@ -97,6 +97,7 @@ def create_app(
         create_agent_runtime_router,
     )
     from agent_runtime.agent.agent_execution_factory import AgentExecutionFactory
+    from agent_runtime.agent.execution_loop_logger import AgentExecutionLoopLogger
     from agent_runtime.llm_model_registry.llm_model_registry_factory import (
         LlmModelRegistryFactory,
     )
@@ -151,6 +152,7 @@ def create_app(
     from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import (
         create_file_resource_router,
     )
+    from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
     from agent_runtime.context_compression.north_gateway.context_compression_rest_adapter import (
         create_context_compression_router,
     )
@@ -190,9 +192,12 @@ def create_app(
     )
     runtime_full_mode_active = cloud_user_config_database_active_at_start
     runtime_full_mode_lock = RLock()
+    execution_loop_logger = AgentExecutionLoopLogger(
+        trace_dir_accessor=lambda: ConfigRegistry.instance().agent_runtime.trace_dir,
+    )
 
     prompt_gateway = _SwitchableRuntimeComponent(PromptTemplateFactory.create())
-    tool_gateway = LocalToolFactory.create()
+    tool_gateway = LocalToolFactory.create(execution_loop_logger=execution_loop_logger)
     skill_gateway = SkillFactory.create()
     mcp_gateway = _SwitchableRuntimeComponent(McpClientFactory.create())
     from agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools import (
@@ -210,6 +215,9 @@ def create_app(
     )
     context_compression_settings_repository = create_context_compression_settings_repository(
         lambda: ConfigRegistry.instance().context_compression.archive_data_dir,
+    )
+    context_compression_archive_repository = ContextCompressionArchiveRepository(
+        ConfigRegistry.instance().context_compression.archive_data_dir,
     )
     scene_gateway = SceneFactory.create()
     agent_runtime_gateway = AgentRuntimeFactory.create(
@@ -248,6 +256,7 @@ def create_app(
     agent_execution_engine = _SwitchableRuntimeComponent(
         AgentExecutionFactory.create(
             mcp_client_gateway=mcp_gateway,
+            execution_loop_logger=execution_loop_logger,
         )
     )
     lacp_bridge = _SwitchableRuntimeComponent(
@@ -324,6 +333,7 @@ def create_app(
         agent_execution_engine.set_target(
             AgentExecutionFactory.create(
                 mcp_client_gateway=mcp_gateway,
+                execution_loop_logger=execution_loop_logger,
             )
         )
         lacp_client = LacpFactory.create_client()
@@ -498,6 +508,7 @@ def create_app(
         nonlocal runtime_loop
 
         runtime_loop = asyncio.get_running_loop()
+        execution_loop_logger.start()
         event_loop_monitor.start()
         runtime_network_monitor.start()
         scene_session_registry.start()
@@ -537,6 +548,8 @@ def create_app(
                 codex_oauth_callback_server.stop()
             await event_loop_monitor.stop()
             runtime_network_monitor.stop()
+            with suppress(Exception, asyncio.CancelledError):
+                await execution_loop_logger.stop()
             runtime_loop = None
 
     effective_runtime_bind_host = runtime_bind_host or ConfigRegistry.instance().agent_runtime_service.service_host
@@ -756,8 +769,6 @@ def create_app(
             chat_bubble_service=chat_bubble_service,
             conversation_repository=conversation_repository,
             file_resource_service=file_resource_service,
-            communication_gateway=communication_gateway,
-            runtime_health_snapshot=event_loop_monitor.snapshot,
         ),
         prefix="/api/agent-runtime",
         tags=["Agent 运行态"],
@@ -836,6 +847,7 @@ def create_app(
             prompt_repository=context_compression_prompt_repository,
             settings_repository=context_compression_settings_repository,
             llm_registry_gateway=llm_model_registry_gateway,
+            archive_repository=context_compression_archive_repository,
             config_accessor=lambda: ConfigRegistry.instance().context_compression,
         ),
         prefix="/api/context-compression",
@@ -867,7 +879,6 @@ def _safe_network_path(path: str, query_params: dict[str, object]) -> str:
 def _is_key_network_path(path: str) -> bool:
     return (
         path == "/api/health"
-        or "diagnostics" in path
         or "attach" in path
         or "/events" in path
     )

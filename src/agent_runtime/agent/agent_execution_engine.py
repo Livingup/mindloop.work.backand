@@ -22,6 +22,10 @@ from agent_runtime.agent.agent_instance import (
 )
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
+from agent_runtime.agent.execution_loop_logger import (
+    AgentExecutionLoopLogger,
+    NoopAgentExecutionLoopLogger,
+)
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
     CreateTaskWithRootAgentInstanceRequest,
@@ -300,6 +304,7 @@ class AgentExecutionEngine:
         communication_gateway: CommunicationGateway | None = None,
         event_publisher: RuntimeEventPublisher | None = None,
         context_compression_service: ContextCompressionService | None = None,
+        execution_loop_logger: AgentExecutionLoopLogger | NoopAgentExecutionLoopLogger | None = None,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -325,36 +330,11 @@ class AgentExecutionEngine:
         # 运行时事件发布器。所有 Agent/LLM/Tool 关键节点都通过逻辑 stream_id 发布。
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
         self._context_compression_service = context_compression_service
+        self._execution_loop_logger = execution_loop_logger or NoopAgentExecutionLoopLogger()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
         self._execution_progress: dict[str, _AgentExecutionProgressState] = {}
-
-    def get_agent_execution_diagnostics(self, instance_id: str) -> dict[str, Any]:
-        handle = self._active_execution_handles.get(instance_id)
-        progress = self._execution_progress.get(instance_id)
-        now = time.time()
-        return {
-            "instance_id": instance_id,
-            "active_instance_registered": instance_id in self._active_instance_ids,
-            "active_handle_exists": handle is not None,
-            "execution_task_done": handle.task.done() if handle is not None else None,
-            "execution_task_cancelled": handle.task.cancelled() if handle is not None else None,
-            "interrupt_requested": handle.interrupt_state.requested if handle is not None else None,
-            "interrupt_reason": handle.interrupt_state.reason if handle is not None else None,
-            "interrupt_requested_elapsed_ms": (
-                int((time.perf_counter() - handle.interrupt_state.requested_at) * 1000)
-                if handle is not None and handle.interrupt_state.requested_at is not None
-                else None
-            ),
-            "current_llm_request": (
-                dict(handle.interrupt_state.current_llm_request)
-                if handle is not None and isinstance(handle.interrupt_state.current_llm_request, dict)
-                else None
-            ),
-            "progress": _execution_progress_snapshot(progress, now) if progress is not None else None,
-            "task_stack": _task_stack_snapshot(handle.task) if handle is not None else [],
-        }
 
     def _set_execution_phase(
         self,
@@ -499,6 +479,22 @@ class AgentExecutionEngine:
             client_message_id=client_message_id,
             metadata=message_metadata,
         )
+        self._record_execution_instance_event(
+            instance_id=instance.instance_id,
+            stage="message.enqueue",
+            status="queued",
+            summary="用户消息已进入 AgentInstance 待处理队列。",
+            details={
+                "task_id": task.task_id,
+                "conversation_id": instance.conversation_id,
+                "pending_message_id": pending_message.message_id,
+                "client_message_id": pending_message.client_message_id,
+                "attachment_count": len(attachments),
+                "task_terminal_before_enqueue": task.is_terminal,
+                "instance_status_after_enqueue": instance.status,
+            },
+            expected_next="queue_or_launch_execution",
+        )
         request = AgentExecutionRequest.from_text(
             thread_id=instance.thread_id,
             current_working_directory=instance.current_working_directory,
@@ -529,6 +525,19 @@ class AgentExecutionEngine:
                 task.task_id,
             )
             instance = self._runtime_gateway.interrupt_agent_instance(instance.instance_id, failure_message)
+            self._record_execution_instance_event(
+                instance_id=instance.instance_id,
+                stage="orphan_running.repair",
+                status="repaired",
+                summary="持久态 running 但本进程无执行任务，已恢复为 ready。",
+                details={
+                    "task_id": task.task_id,
+                    "failure_message": failure_message,
+                    "active_in_memory_before_repair": active_in_memory,
+                    "instance_status_after_repair": instance.status,
+                },
+                expected_next="queue_or_launch_execution",
+            )
         is_running = (
             instance.status == AGENT_INSTANCE_STATUS_RUNNING
             or active_in_memory
@@ -541,6 +550,20 @@ class AgentExecutionEngine:
                 pending_message.message_id,
                 instance.status,
                 active_in_memory,
+            )
+            self._record_execution_instance_event(
+                instance_id=instance.instance_id,
+                stage="background_execution.queue",
+                status="already_running",
+                summary="AgentInstance 已有运行中执行，用户消息保留在队列等待下一轮 drain。",
+                details={
+                    "task_id": task.task_id,
+                    "pending_message_id": pending_message.message_id,
+                    "conversation_id": instance.conversation_id,
+                    "active_in_memory": active_in_memory,
+                    "instance_status": instance.status,
+                },
+                expected_next="existing_execution_drain_pending_user_messages",
             )
             return AgentMessageSubmissionResult(
                 status="queued",
@@ -561,6 +584,20 @@ class AgentExecutionEngine:
             pending_message.message_id,
         )
         self._active_instance_ids.add(instance.instance_id)
+        self._record_execution_instance_event(
+            instance_id=instance.instance_id,
+            stage="background_execution.launch",
+            status="accepted",
+            summary="AgentInstance 后台执行任务已准备启动。",
+            details={
+                "task_id": task.task_id,
+                "conversation_id": instance.conversation_id,
+                "pending_message_id": pending_message.message_id,
+                "communication_stream_id": communication_context.stream_id,
+                "active_instance_count": len(self._active_instance_ids),
+            },
+            expected_next="run_agent_instance",
+        )
         interrupt_state = _AgentExecutionInterruptState()
         task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request, interrupt_state=interrupt_state))
         self._active_execution_handles[instance.instance_id] = _AgentExecutionHandle(
@@ -589,6 +626,18 @@ class AgentExecutionEngine:
         task = self._runtime_gateway.get_task(instance.task_id)
         handle = self._active_execution_handles.get(instance_id)
         if handle is None:
+            self._record_execution_instance_event(
+                instance_id=instance.instance_id,
+                stage="interrupt.request",
+                status="not_running",
+                summary="收到中断请求，但当前进程没有该 AgentInstance 的运行中执行句柄。",
+                details={
+                    "task_id": task.task_id,
+                    "conversation_id": instance.conversation_id,
+                    "reason": reason,
+                    "instance_status": instance.status,
+                },
+            )
             return AgentInterruptResult(
                 status="not_running",
                 task_id=task.task_id,
@@ -601,6 +650,19 @@ class AgentExecutionEngine:
         handle.interrupt_state.reason = reason
         handle.interrupt_state.requested_at = time.perf_counter()
         handle.interrupt_state.cancel_current_llm_requests()
+        self._record_execution_instance_event(
+            instance_id=instance.instance_id,
+            stage="interrupt.request",
+            status="requested",
+            summary="用户中断请求已写入运行中执行句柄，并已通知当前 LLM 请求取消器。",
+            details={
+                "task_id": task.task_id,
+                "conversation_id": instance.conversation_id,
+                "reason": reason,
+                "has_active_handle": True,
+            },
+            expected_next="execution_loop_observe_interrupt",
+        )
         return AgentInterruptResult(
             status="interrupt_requested",
             task_id=task.task_id,
@@ -617,6 +679,16 @@ class AgentExecutionEngine:
         if handle is not None and handle.task is task:
             self._active_execution_handles.pop(instance_id, None)
         if task.cancelled():
+            self._record_execution_instance_event(
+                instance_id=instance_id,
+                stage="background_task.done",
+                status="cancelled",
+                summary="Agent 后台执行任务被取消，准备恢复持久运行态。",
+                details={
+                    "error_type": "CancelledError",
+                },
+                expected_next="background_exit_recover_instance",
+            )
             self._set_execution_phase(
                 task_id="",
                 instance_id=instance_id,
@@ -634,6 +706,17 @@ class AgentExecutionEngine:
             exc = task.exception()
             if exc is not None:
                 failure_message = str(exc) or exc.__class__.__name__
+                self._record_execution_instance_event(
+                    instance_id=instance_id,
+                    stage="background_task.done",
+                    status="failed",
+                    summary="Agent 后台执行任务异常结束，准备恢复持久运行态。",
+                    details={
+                        "error_type": exc.__class__.__name__,
+                        "error_message": failure_message,
+                    },
+                    expected_next="background_exit_recover_instance",
+                )
                 self._set_execution_phase(
                     task_id="",
                     instance_id=instance_id,
@@ -654,6 +737,13 @@ class AgentExecutionEngine:
                 if _is_process_control_exception(exc):
                     raise exc
                 return
+            self._record_execution_instance_event(
+                instance_id=instance_id,
+                stage="background_task.done",
+                status="completed",
+                summary="Agent 后台执行任务已正常结束并移出活动集合。",
+                details={},
+            )
             logger.info("Agent 后台执行结束: instance_id=%s", instance_id)
 
     def _recover_agent_instance_after_background_exit(
@@ -677,6 +767,123 @@ class AgentExecutionEngine:
                 "恢复异常结束的 Agent 实例状态失败: instance_id=%s, error_type=%s",
                 instance_id,
                 error_type,
+            )
+
+    def _record_execution_instance_event(
+        self,
+        *,
+        instance_id: str,
+        stage: str,
+        status: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+        expected_next: str | None = None,
+    ) -> None:
+        """记录不属于单轮 LLM/tool frame 的实例级执行诊断事件。"""
+        try:
+            self._execution_loop_logger.record_instance_event(
+                instance_id=instance_id,
+                stage=stage,
+                status=status,
+                summary=summary,
+                details=details or {},
+                expected_next=expected_next,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "记录 Agent 执行循环实例诊断事件失败: instance_id=%s stage=%s",
+                instance_id,
+                stage,
+                exc_info=True,
+            )
+
+    def _begin_execution_loop_frame(
+        self,
+        *,
+        task: AgentTask,
+        instance: AgentInstance,
+        loop_index: int,
+        conversation_id: str | None,
+        communication_context: RuntimeCommunicationContext,
+        details: dict[str, Any] | None = None,
+        expected_next: str | None = None,
+    ) -> str | None:
+        """开始记录一次从 LLM 请求到下一步决策的滚动诊断 frame。"""
+        try:
+            return self._execution_loop_logger.begin_frame(
+                task_id=task.task_id,
+                instance_id=instance.instance_id,
+                loop_index=loop_index,
+                conversation_id=conversation_id,
+                stream_id=communication_context.stream_id,
+                details=details or {},
+                expected_next=expected_next,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "开始 Agent 执行循环诊断 frame 失败: instance_id=%s loop_index=%s",
+                instance.instance_id,
+                loop_index,
+                exc_info=True,
+            )
+            return None
+
+    def _record_execution_loop_step(
+        self,
+        *,
+        instance_id: str,
+        stage: str,
+        status: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+        expected_next: str | None = None,
+        frame_id: str | None = None,
+    ) -> None:
+        """记录当前执行循环 frame 内的一个诊断步骤。"""
+        try:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                frame_id=frame_id,
+                stage=stage,
+                status=status,
+                summary=summary,
+                details=details or {},
+                expected_next=expected_next,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "记录 Agent 执行循环诊断步骤失败: instance_id=%s stage=%s",
+                instance_id,
+                stage,
+                exc_info=True,
+            )
+
+    def _end_execution_loop_frame(
+        self,
+        *,
+        instance_id: str,
+        frame_id: str | None,
+        outcome: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+        expected_next: str | None = None,
+    ) -> None:
+        """结束当前滚动诊断 frame，并尽力触发异步落盘。"""
+        try:
+            self._execution_loop_logger.end_frame(
+                instance_id=instance_id,
+                frame_id=frame_id,
+                outcome=outcome,
+                summary=summary,
+                details=details or {},
+                expected_next=expected_next,
+            )
+        except Exception:  # noqa: BLE001 - 诊断不能影响 Agent 热路径
+            logger.debug(
+                "结束 Agent 执行循环诊断 frame 失败: instance_id=%s frame_id=%s",
+                instance_id,
+                frame_id,
+                exc_info=True,
             )
 
     async def _run_agent_instance(
@@ -723,10 +930,37 @@ class AgentExecutionEngine:
                 phase="load_conversation",
             )
             conversation = await self._load_or_create_conversation(instance, request)
-            await self._repair_unmatched_tool_results(
+            self._record_execution_instance_event(
+                instance_id=instance.instance_id,
+                stage="conversation.loaded",
+                status="ready",
+                summary="Agent 执行已加载或创建会话。",
+                details={
+                    "task_id": task.task_id,
+                    "conversation_id": conversation.id,
+                    "message_count": len(conversation.messages),
+                    "trace_path": str(trace_path),
+                },
+                expected_next="repair_unmatched_tool_results",
+            )
+            repaired_unmatched_tool_results = await self._repair_unmatched_tool_results(
                 conversation,
                 reason="previous_execution_interrupted",
             )
+            if repaired_unmatched_tool_results:
+                self._record_execution_instance_event(
+                    instance_id=instance.instance_id,
+                    stage="tool_results.repair",
+                    status="repaired",
+                    summary="启动时发现上一轮 assistant 工具调用缺少 tool 结果，已补齐聚合 ROLE_TOOL 消息。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "reason": "previous_execution_interrupted",
+                        "message_count_after_repair": len(conversation.messages),
+                    },
+                    expected_next="loop_start",
+                )
             communication_context = communication_context.with_metadata(conversation_id=conversation.id)
             self._touch_execution_progress(instance.instance_id, metadata={"conversation_id": conversation.id})
 
@@ -766,9 +1000,38 @@ class AgentExecutionEngine:
                     trace_path=trace_path,
                 )
                 self._touch_execution_progress(instance.instance_id, metadata={"drained_user_message_count": drained_count})
+                self._record_execution_instance_event(
+                    instance_id=instance.instance_id,
+                    stage="pending_user_messages.drain",
+                    status="drained" if drained_count else "empty",
+                    summary="执行循环在下一次 LLM 请求前完成待处理用户消息队列消费。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "drained_count": drained_count,
+                        "message_count_after_drain": len(conversation.messages),
+                    },
+                    expected_next="llm_frame_start",
+                )
                 instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 resolved_candidates, unsupported_modality_strategy = self._resolve_instance_llm_policy(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
+                current_frame_id = self._begin_execution_loop_frame(
+                    task=task,
+                    instance=instance,
+                    loop_index=loop_index,
+                    conversation_id=conversation.id,
+                    communication_context=communication_context,
+                    details={
+                        "candidate_count": len(resolved_candidates),
+                        "unsupported_modality_strategy": unsupported_modality_strategy,
+                        "conversation_message_count": len(conversation.messages),
+                        "drained_user_message_count": drained_count,
+                        "agent_definition_id": agent_definition.agent_id,
+                    },
+                    expected_next="send_llm_prompt",
+                )
                 try:
                     self._set_execution_phase(
                         task_id=task.task_id,
@@ -780,6 +1043,21 @@ class AgentExecutionEngine:
                         metadata={
                             "candidate_count": len(resolved_candidates),
                         },
+                    )
+                    self._record_execution_loop_step(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        stage="llm.request.start",
+                        status="started",
+                        summary="准备渲染系统提示词、构建工具 schema 并向 LLM 发送请求。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "candidate_count": len(resolved_candidates),
+                            "unsupported_modality_strategy": unsupported_modality_strategy,
+                        },
+                        expected_next="llm.response.received",
                     )
                     prompt_result = await _await_with_progress_logging(
                         self._send_prompt_with_policy_failover(
@@ -808,6 +1086,19 @@ class AgentExecutionEngine:
                         ),
                     )
                 except LlmRequestCancelled:
+                    self._end_execution_loop_frame(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        outcome="interrupted",
+                        summary="LLM 请求被用户中断，执行循环将暂停并等待后续用户消息。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "interrupt_reason": interrupt_state.reason,
+                        },
+                        expected_next="pause_for_user_interrupt",
+                    )
                     return await self._pause_for_user_interrupt(
                         task=task,
                         instance=instance,
@@ -822,6 +1113,21 @@ class AgentExecutionEngine:
                 instance = prompt_result.instance
                 communication_context = communication_context.with_metadata(conversation_id=conversation.id)
                 assistant_message = llm_response.assistant_message
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="llm.response.received",
+                    status="received",
+                    summary="LLM 返回 assistant 消息，准备持久化并解析工具调用。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_part_count": len(assistant_message.content),
+                        "tool_use_count": len(_extract_tool_uses(assistant_message)),
+                    },
+                    expected_next="assistant_message.persisted",
+                )
                 _record_last_context_usage(conversation, llm_response)
                 self._set_execution_phase(
                     task_id=task.task_id,
@@ -832,6 +1138,21 @@ class AgentExecutionEngine:
                     loop_index=loop_index,
                 )
                 await self._conversation_repository.save(conversation)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="assistant_message.persisted",
+                    status="saved",
+                    summary="assistant 消息已写入 Conversation，并即将发布前端/运行时事件。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_message_index": len(conversation.messages) - 1,
+                        "message_count_after_save": len(conversation.messages),
+                    },
+                    expected_next="assistant_message.handle_tools",
+                )
                 self._trace_recorder.record_llm_response(trace_path, assistant_message)
                 await self._event_publisher.publish(
                     communication_context,
@@ -844,6 +1165,22 @@ class AgentExecutionEngine:
                 )
 
                 tool_uses = _extract_tool_uses(assistant_message)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="assistant_message.tool_uses.extracted",
+                    status="ready",
+                    summary="assistant 消息已完成工具调用解析，准备进入工具批执行或 plain-text fallback。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "tool_count": len(tool_uses),
+                        "tool_call_ids": [_tool_use_ref(tool_use) for tool_use in tool_uses],
+                        "tool_names": [tool_use.name for tool_use in tool_uses],
+                    },
+                    expected_next="tool_batch.start" if tool_uses else "plain_text_fallback",
+                )
                 if interrupt_state.requested:
                     if tool_uses:
                         tool_result_message, tool_results = await self._build_interrupted_tool_results(
@@ -855,6 +1192,21 @@ class AgentExecutionEngine:
                         conversation.append_message(tool_result_message)
                         await self._conversation_repository.save(conversation)
                         self._trace_recorder.record_tool_result(trace_path, tool_result_message)
+                    self._end_execution_loop_frame(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        outcome="interrupted",
+                        summary="assistant 响应已落库，但工具执行前收到用户中断，执行循环将暂停。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "tool_count": len(tool_uses),
+                            "interrupt_reason": interrupt_state.reason,
+                            "aggregated_interrupted_tool_message_saved": bool(tool_uses),
+                        },
+                        expected_next="pause_for_user_interrupt",
+                    )
                     return await self._pause_for_user_interrupt(
                         task=task,
                         instance=instance,
@@ -874,6 +1226,21 @@ class AgentExecutionEngine:
                             "threshold": _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD,
                         },
                     )
+                    self._record_execution_loop_step(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        stage="plain_text_fallback",
+                        status="threshold_reached" if plain_text_fallback_count >= _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD else "retry",
+                        summary="assistant 未返回工具调用，Runtime 按 plain-text fallback 策略处理。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "fallback_count": plain_text_fallback_count,
+                            "threshold": _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD,
+                        },
+                        expected_next="pause_task" if plain_text_fallback_count >= _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD else "next_llm_request",
+                    )
                     if plain_text_fallback_count >= _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD:
                         self._runtime_gateway.pause_agent_instance(instance.instance_id)
                         self._runtime_gateway.pause_task(task.task_id)
@@ -892,6 +1259,20 @@ class AgentExecutionEngine:
                                 "fallback_count": plain_text_fallback_count,
                             },
                             source="agent_execution_engine",
+                        )
+                        self._end_execution_loop_frame(
+                            instance_id=instance.instance_id,
+                            frame_id=current_frame_id,
+                            outcome="paused",
+                            summary="plain-text fallback 连续达到阈值，Runtime 已暂停 task/instance。",
+                            details={
+                                "task_id": task.task_id,
+                                "conversation_id": conversation.id,
+                                "loop_index": loop_index,
+                                "fallback_count": plain_text_fallback_count,
+                                "threshold": _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD,
+                            },
+                            expected_next="resume_from_pending_user_messages",
                         )
                         result = AgentExecutionResult(
                             task_id=task.task_id,
@@ -914,8 +1295,23 @@ class AgentExecutionEngine:
                         task, instance, request, conversation, communication_context, trace_path = next_execution
                         plain_text_fallback_count = 0
                         continue
+                    self._end_execution_loop_frame(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        outcome="continue",
+                        summary="plain-text fallback 未达到暂停阈值，执行循环将继续请求下一轮 LLM。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "fallback_count": plain_text_fallback_count,
+                            "threshold": _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD,
+                        },
+                        expected_next="next_llm_request",
+                    )
                     continue
                 plain_text_fallback_count = 0
+                assistant_message_index = len(conversation.messages) - 1
 
                 self._set_execution_phase(
                     task_id=task.task_id,
@@ -929,13 +1325,36 @@ class AgentExecutionEngine:
                         "tool_names": [tool_use.name for tool_use in tool_uses],
                     },
                 )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="tool_batch.start",
+                    status="started",
+                    summary="开始执行 assistant 消息中的工具批次。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_message_index": assistant_message_index,
+                        "tool_count": len(tool_uses),
+                        "tool_call_ids": [_tool_use_ref(tool_use) for tool_use in tool_uses],
+                        "tool_names": [tool_use.name for tool_use in tool_uses],
+                        "expected_durability_order": [
+                            "persist_each_finished_tool_result_as_pending",
+                            "append_and_save_aggregated_role_tool_message",
+                            "clear_pending_tool_result_rows",
+                            "select_and_apply_loop_decision",
+                        ],
+                    },
+                    expected_next="tool_batch.returned",
+                )
                 tool_result_message, tool_results = await _await_with_progress_logging(
                     self._execute_tool_uses(
                         agent_definition,
                         tool_uses,
                         communication_context,
                         conversation_id=conversation.id,
-                        assistant_message_index=len(conversation.messages) - 1,
+                        assistant_message_index=assistant_message_index,
                         interrupt_state=interrupt_state,
                     ),
                     stage="tool_batch",
@@ -950,6 +1369,25 @@ class AgentExecutionEngine:
                         instance_id,
                     ),
                 )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="tool_batch.returned",
+                    status="completed",
+                    summary="_execute_tool_uses 已返回，所有完成的工具结果应已先作为 pending tool result 落库。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_message_index": assistant_message_index,
+                        "tool_result_count": len(tool_results),
+                        "tool_result_refs": [part.tool_use_ref for part in tool_result_message.content],
+                        "loop_decisions": [result.loop_decision for result in tool_results],
+                        "conversation_message_count_before_aggregated_tool_message": len(conversation.messages),
+                        "next_durability_step": "append_and_save_aggregated_role_tool_message",
+                    },
+                    expected_next="tool_results.aggregate_message.saved",
+                )
                 self._set_execution_phase(
                     task_id=task.task_id,
                     instance_id=instance.instance_id,
@@ -958,11 +1396,67 @@ class AgentExecutionEngine:
                     phase="persist_tool_results",
                     loop_index=loop_index,
                 )
+                tool_message_index = len(conversation.messages)
                 conversation.append_message(tool_result_message)
                 await self._conversation_repository.save(conversation)
-                await self._clear_pending_tool_results(conversation.id, len(conversation.messages) - 2)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="tool_results.aggregate_message.saved",
+                    status="saved",
+                    summary="聚合 ROLE_TOOL 消息已追加并持久化到 Conversation。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_message_index": assistant_message_index,
+                        "aggregated_tool_message_index": tool_message_index,
+                        "tool_result_part_count": len(tool_result_message.content),
+                        "message_count_after_save": len(conversation.messages),
+                        "invariants": {
+                            "tool_result_count_matches_tool_uses": len(tool_results) == len(tool_uses),
+                            "tool_result_part_count_matches_tool_uses": len(tool_result_message.content) == len(tool_uses),
+                            "tool_message_follows_assistant_message": tool_message_index == assistant_message_index + 1,
+                        },
+                    },
+                    expected_next="pending_tool_results.clear",
+                )
+                await self._clear_pending_tool_results(conversation.id, assistant_message_index)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="pending_tool_results.cleared",
+                    status="cleared",
+                    summary="与 assistant 消息对应的 pending tool result 行已清理。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "assistant_message_index": assistant_message_index,
+                        "aggregated_tool_message_index": tool_message_index,
+                    },
+                    expected_next="loop_decision.select",
+                )
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    stage="loop_decision.selected",
+                    status=loop_decision,
+                    summary="Runtime 已根据工具结果优先级选出本轮最终 loop decision。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "tool_count": len(tool_results),
+                        "loop_decision": loop_decision,
+                        "loop_decisions": [result.loop_decision for result in tool_results],
+                        "priority_order": ["continue", "pause", "complete", "fail"],
+                        "expected_next_step": "check_interrupt_then_apply_or_continue",
+                    },
+                    expected_next="interrupt_check",
+                )
                 logger.info(
                     "Agent 循环工具结果已落库: task_id=%s, instance_id=%s, loop_index=%s, tool_count=%s, loop_decision=%s",
                     task.task_id,
@@ -972,6 +1466,21 @@ class AgentExecutionEngine:
                     loop_decision,
                 )
                 if interrupt_state.requested:
+                    self._end_execution_loop_frame(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        outcome="interrupted",
+                        summary="工具结果已完成持久化，但 loop decision 应用前收到用户中断，执行循环将暂停。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "tool_count": len(tool_results),
+                            "loop_decision_before_interrupt": loop_decision,
+                            "interrupt_reason": interrupt_state.reason,
+                        },
+                        expected_next="pause_for_user_interrupt",
+                    )
                     return await self._pause_for_user_interrupt(
                         task=task,
                         instance=instance,
@@ -989,6 +1498,34 @@ class AgentExecutionEngine:
                         trace_path=trace_path,
                         tool_results=tool_results,
                         communication_context=communication_context,
+                    )
+                    self._record_execution_loop_step(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        stage="loop_decision.applied",
+                        status=loop_decision,
+                        summary="非 continue loop decision 已应用到 task/instance 运行态。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "loop_decision": loop_decision,
+                        },
+                        expected_next="resume_from_pending_user_messages",
+                    )
+                    self._end_execution_loop_frame(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        outcome=loop_decision,
+                        summary="本轮执行已按非 continue loop decision 收敛，准备检查是否有排队用户消息。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "loop_index": loop_index,
+                            "loop_decision": loop_decision,
+                            "tool_count": len(tool_results),
+                        },
+                        expected_next="resume_from_pending_user_messages",
                     )
                     result = AgentExecutionResult(
                         task_id=task.task_id,
@@ -1011,6 +1548,20 @@ class AgentExecutionEngine:
                     task, instance, request, conversation, communication_context, trace_path = next_execution
                     plain_text_fallback_count = 0
                     continue
+                self._end_execution_loop_frame(
+                    instance_id=instance.instance_id,
+                    frame_id=current_frame_id,
+                    outcome="continue",
+                    summary="工具结果已重新插入 Conversation，loop decision 为 continue，准备进入下一轮 LLM 请求。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "loop_index": loop_index,
+                        "tool_count": len(tool_results),
+                        "loop_decision": loop_decision,
+                    },
+                    expected_next="next_llm_request",
+                )
 
             raise RuntimeError("Agent 执行循环异常结束。")
         except asyncio.CancelledError:
@@ -1472,13 +2023,115 @@ class AgentExecutionEngine:
                     },
                     source="agent_execution_engine",
                 )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage="llm.policy.candidate.skipped",
+                    status="skipped",
+                    summary="LLM 执行策略候选因不支持当前输入模态被跳过。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "missing_input_modalities": missing_modalities,
+                    },
+                    expected_next="next_policy_candidate",
+                )
                 skipped_for_modalities = True
                 continue
+            def _record_prompt_preparation_step(
+                stage: str,
+                status: str,
+                summary: str,
+                details: dict[str, Any] | None = None,
+                expected_next: str | None = None,
+            ) -> None:
+                step_details = {
+                    "task_id": task.task_id,
+                    "conversation_id": conversation.id,
+                    "candidate_index": candidate_index,
+                    "provider_id": resolved_model.provider_id,
+                    "binding_id": resolved_model.binding_id,
+                    "model_id": resolved_model.model_id,
+                    "api_format": resolved_model.api_format,
+                }
+                if details:
+                    step_details.update(details)
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage=stage,
+                    status=status,
+                    summary=summary,
+                    details=step_details,
+                    expected_next=expected_next,
+                )
+
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.start",
+                "started",
+                "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
+                {
+                    "agent_definition_id": agent_definition.agent_id,
+                    "local_tool_id_count": len(agent_definition.tool_ids),
+                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                },
+                "llm.prompt.tools.build.complete",
+            )
             tools = await self._tool_dispatcher.build_llm_tools(
                 agent_definition=agent_definition,
                 api_format=resolved_model.api_format,
             )
+            tool_source_counts: dict[str, int] = {}
+            for tool in tools:
+                tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.complete",
+                "completed",
+                "LLM 可见工具 schema 构建完成。",
+                {
+                    "tool_schema_count": len(tools),
+                    "tool_names": [tool.name for tool in tools],
+                    "tool_source_counts": tool_source_counts,
+                    "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
+                },
+                "llm.prompt.mcp_services.load.start",
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.mcp_services.load.start",
+                "started",
+                "开始加载 MCP 服务与工具摘要提示词。",
+                {
+                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                },
+                "llm.prompt.mcp_services.load.complete",
+            )
             mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
+            _record_prompt_preparation_step(
+                "llm.prompt.mcp_services.load.complete",
+                "completed",
+                "MCP 服务与工具摘要提示词加载完成。",
+                {
+                    "mcp_services_prompt_present": bool(mcp_services_prompt),
+                    "mcp_services_prompt_length": len(mcp_services_prompt),
+                },
+                "llm.prompt.render.start",
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.start",
+                "started",
+                "开始渲染系统提示词。",
+                {
+                    "system_prompt_segment_count": len(agent_definition.system_prompt),
+                    "skill_id_count": len(agent_definition.skill_ids),
+                    "available_sub_agent_id_count": len(agent_definition.available_sub_agent_ids),
+                    "render_option_keys": sorted(render_options.keys()),
+                },
+                "llm.prompt.agent_segments.start",
+            )
             system_prompt = self._render_system_prompt(
                 agent_definition,
                 instance.instance_id,
@@ -1486,6 +2139,37 @@ class AgentExecutionEngine:
                 render_options,
                 tools,
                 mcp_services_prompt=mcp_services_prompt,
+                prompt_step_recorder=_record_prompt_preparation_step,
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.complete",
+                "completed",
+                "系统提示词渲染完成。",
+                {
+                    "system_prompt_present": system_prompt is not None,
+                    "system_prompt_length": len(system_prompt or ""),
+                },
+                "llm.prompt.prepared",
+            )
+            self._record_execution_loop_step(
+                instance_id=instance.instance_id,
+                stage="llm.prompt.prepared",
+                status="prepared",
+                summary="已为当前候选构建 LLM 可见工具 schema 并渲染系统提示词。",
+                details={
+                    "task_id": task.task_id,
+                    "conversation_id": conversation.id,
+                    "candidate_index": candidate_index,
+                    "provider_id": resolved_model.provider_id,
+                    "binding_id": resolved_model.binding_id,
+                    "model_id": resolved_model.model_id,
+                    "api_format": resolved_model.api_format,
+                    "tool_schema_count": len(tools),
+                    "tool_names": [tool.name for tool in tools],
+                    "system_prompt_present": system_prompt is not None,
+                    "system_prompt_length": len(system_prompt or ""),
+                },
+                expected_next="context_compression_or_llm_request",
             )
             try:
                 if self._context_compression_service is not None:
@@ -1523,6 +2207,21 @@ class AgentExecutionEngine:
                                 "target_conversation_id": conversation.id,
                             },
                         )
+                    self._record_execution_loop_step(
+                        instance_id=instance.instance_id,
+                        stage="context_compression.checked",
+                        status="created" if compression_result.created else "unchanged",
+                        summary="上下文压缩服务已检查当前会话是否需要切换压缩后的 Conversation。",
+                        details={
+                            "task_id": task.task_id,
+                            "conversation_id": conversation.id,
+                            "candidate_index": candidate_index,
+                            "compression_created": compression_result.created,
+                            "target_conversation_id": getattr(compression_result.target_conversation, "id", None),
+                            "job_id": compression_result.job.job_id if compression_result.job else None,
+                        },
+                        expected_next="llm.candidate.request.start",
+                    )
                     if interrupt_state.requested:
                         raise LlmRequestCancelled("LLM request cancelled.")
                 self._set_execution_phase(
@@ -1537,6 +2236,24 @@ class AgentExecutionEngine:
                         "model_id": resolved_model.model_id,
                         "model_alias": resolved_model.model_alias,
                     },
+                )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage="llm.candidate.request.start",
+                    status="started",
+                    summary="开始调用当前 LLM 候选。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "model_alias": resolved_model.model_alias,
+                        "llm_call_id": llm_call_id,
+                        "has_next_candidate": candidate_index < len(resolved_candidates) - 1,
+                    },
+                    expected_next="llm.candidate.response",
                 )
                 response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
@@ -1564,6 +2281,22 @@ class AgentExecutionEngine:
                         ),
                     )
                 )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage="llm.candidate.response",
+                    status="succeeded",
+                    summary="当前 LLM 候选请求成功返回。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "llm_call_id": llm_call_id,
+                    },
+                    expected_next="assistant_message.persist",
+                )
                 return _PromptWithConversationResult(
                     response=response,
                     conversation=conversation,
@@ -1576,6 +2309,24 @@ class AgentExecutionEngine:
                 can_failover = (
                     candidate_index < len(resolved_candidates) - 1
                     and isinstance(exc, LlmProviderModelServiceUnavailable)
+                )
+                self._record_execution_loop_step(
+                    instance_id=instance.instance_id,
+                    stage="llm.candidate.response",
+                    status="failed",
+                    summary="当前 LLM 候选请求失败，Runtime 已判断是否可按策略 failover。",
+                    details={
+                        "task_id": task.task_id,
+                        "conversation_id": conversation.id,
+                        "candidate_index": candidate_index,
+                        "provider_id": resolved_model.provider_id,
+                        "binding_id": resolved_model.binding_id,
+                        "model_id": resolved_model.model_id,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "will_failover": can_failover,
+                    },
+                    expected_next="llm.policy.failover" if can_failover else "execution_failed",
                 )
                 await self._event_publisher.publish(
                     communication_context,
@@ -1690,8 +2441,35 @@ class AgentExecutionEngine:
         llm_tools: tuple[LlmToolDefinition, ...],
         *,
         mcp_services_prompt: str | None = None,
+        prompt_step_recorder: Callable[[str, str, str, dict[str, Any] | None, str | None], None] | None = None,
     ) -> str | None:
         """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。"""
+
+        def _record_prompt_step(
+            stage: str,
+            status: str,
+            summary: str,
+            details: dict[str, Any] | None = None,
+            expected_next: str | None = None,
+        ) -> None:
+            if prompt_step_recorder is None:
+                return
+            prompt_step_recorder(stage, status, summary, details, expected_next)
+
+        template_ids = tuple(
+            segment.template_id for segment in definition.system_prompt if segment.template_id is not None
+        )
+        _record_prompt_step(
+            "llm.prompt.agent_segments.start",
+            "started",
+            "开始读取 AgentDefinition 系统提示词片段。",
+            {
+                "system_prompt_segment_count": len(definition.system_prompt),
+                "template_segment_count": len(template_ids),
+                "template_ids": list(template_ids),
+            },
+            "llm.prompt.agent_segments.complete",
+        )
         segments: list[str] = []
         for segment in definition.system_prompt:
             if segment.text is not None:
@@ -1700,13 +2478,133 @@ class AgentExecutionEngine:
                 snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
+        _record_prompt_step(
+            "llm.prompt.agent_segments.complete",
+            "completed",
+            "AgentDefinition 系统提示词片段读取完成。",
+            {
+                "rendered_segment_count": len(segments),
+                "agent_prompt_text_length": len(text),
+            },
+            "llm.prompt.runtime_context.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.runtime_context.start",
+            "started",
+            "开始构造运行时上下文提示词。",
+            {
+                "agent_instance_id": agent_instance_id,
+                "current_working_directory": current_working_directory,
+            },
+            "llm.prompt.runtime_context.complete",
+        )
         runtime_context_prompt = _build_runtime_context_prompt(agent_instance_id, current_working_directory)
+        _record_prompt_step(
+            "llm.prompt.runtime_context.complete",
+            "completed",
+            "运行时上下文提示词构造完成。",
+            {"runtime_context_prompt_length": len(runtime_context_prompt)},
+            "llm.prompt.mcp_services.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.mcp_services.start",
+            "started",
+            "开始构造 MCP 服务提示词。",
+            {
+                "bound_mcp_service_count": len(definition.mcp_tools),
+                "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in definition.mcp_tools),
+                "preloaded_mcp_services_prompt_present": bool(mcp_services_prompt),
+            },
+            "llm.prompt.mcp_services.complete",
+        )
         rendered_mcp_services_prompt = mcp_services_prompt or self._build_mcp_services_prompt(definition)
+        _record_prompt_step(
+            "llm.prompt.mcp_services.complete",
+            "completed",
+            "MCP 服务提示词构造完成。",
+            {
+                "mcp_services_prompt_present": bool(rendered_mcp_services_prompt),
+                "mcp_services_prompt_length": len(rendered_mcp_services_prompt),
+            },
+            "llm.prompt.skills.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.skills.start",
+            "started",
+            "开始构造 Skill 提示词。",
+            {"skill_id_count": len(definition.skill_ids)},
+            "llm.prompt.skills.complete",
+        )
         skills_prompt = self._build_skills_prompt(definition)
+        _record_prompt_step(
+            "llm.prompt.skills.complete",
+            "completed",
+            "Skill 提示词构造完成。",
+            {
+                "skills_prompt_present": bool(skills_prompt),
+                "skills_prompt_length": len(skills_prompt),
+            },
+            "llm.prompt.available_subagents.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.available_subagents.start",
+            "started",
+            "开始构造可用子 Agent 提示词。",
+            {"available_sub_agent_id_count": len(definition.available_sub_agent_ids)},
+            "llm.prompt.available_subagents.complete",
+        )
         available_subagents_prompt = self._build_available_subagents_prompt(definition)
+        _record_prompt_step(
+            "llm.prompt.available_subagents.complete",
+            "completed",
+            "可用子 Agent 提示词构造完成。",
+            {
+                "available_subagents_prompt_present": bool(available_subagents_prompt),
+                "available_subagents_prompt_length": len(available_subagents_prompt),
+            },
+            "llm.prompt.lifecycle.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.lifecycle.start",
+            "started",
+            "开始构造 lifecycle runtime 提示词。",
+            {"render_option_keys": sorted(render_options.keys())},
+            "llm.prompt.lifecycle.complete",
+        )
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
+        _record_prompt_step(
+            "llm.prompt.lifecycle.complete",
+            "completed",
+            "lifecycle runtime 提示词构造完成。",
+            {
+                "lifecycle_prompt_present": bool(lifecycle_prompt),
+                "lifecycle_prompt_length": len(lifecycle_prompt),
+            },
+            "llm.prompt.tool_usage_notice.start",
+        )
+
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.start",
+            "started",
+            "开始构造工具使用注意事项提示词。",
+            {"llm_tool_names": [tool.name for tool in llm_tools]},
+            "llm.prompt.tool_usage_notice.complete",
+        )
         tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
-        return "\n\n".join(
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.complete",
+            "completed",
+            "工具使用注意事项提示词构造完成。",
+            {"tool_usage_notice_length": len(tool_usage_notice)},
+            "llm.prompt.assemble.complete",
+        )
+
+        system_prompt = "\n\n".join(
             item
             for item in (
                 runtime_context_prompt,
@@ -1719,6 +2617,17 @@ class AgentExecutionEngine:
             )
             if item.strip()
         ) or None
+        _record_prompt_step(
+            "llm.prompt.assemble.complete",
+            "completed",
+            "系统提示词各片段拼接完成。",
+            {
+                "system_prompt_present": system_prompt is not None,
+                "system_prompt_length": len(system_prompt or ""),
+            },
+            "llm.prompt.render.complete",
+        )
+        return system_prompt
 
     async def _load_mcp_services_prompt(self, definition: AgentDefinition) -> str:
         """按 AgentDefinition 的 MCP 绑定加载服务与工具摘要提示词。"""
@@ -1773,8 +2682,12 @@ class AgentExecutionEngine:
             return ""
 
         if tools_by_service is None:
-            tools_by_service = {binding.service_id: [(tool_id, None) for tool_id in binding.tool_ids] for binding in definition.mcp_tools}
+            tools_by_service = {
+                binding.service_id: [(tool_id, None) for tool_id in binding.tool_ids]
+                for binding in definition.mcp_tools
+            }
 
+        # system prompt 仅注入 MCP 服务和可用工具摘要；具体参数 schema 通过 MCP 元工具按需读取。
         lines = ["# 可用的 MCP 服务列表"]
         for service in available_services:
             description = service.description or ""
@@ -1799,7 +2712,8 @@ class AgentExecutionEngine:
         lines.append(
             "调用 MCP 工具时必须使用本地 MCP 代理工具：先用 `mcp_get_service_detail` 了解服务能力和使用指南，"
             "必要时用 `mcp_list_resources` / `mcp_read_resource` 读取资源；调用具体工具前必须先用 "
-            "`mcp_get_tool_detail` 获取参数 schema，再用 `mcp_call_tool` 执行。"
+            "`mcp_get_tool_detail` 获取参数 schema，再用 `mcp_call_tool` 执行；"
+            "不要直接构造 mcp__{service_id}__{tool_name} 工具名。"
         )
         return "\n".join(lines)
 
@@ -1974,6 +2888,21 @@ class AgentExecutionEngine:
         results_by_ref: dict[str, ToolDispatchResult] = {}
         tasks: list[tuple[ToolUsePart, asyncio.Task[ToolDispatchResult]]] = []
         instance_id = str(communication_context.metadata.get("agent_instance_id") or "")
+        if instance_id:
+            self._record_execution_loop_step(
+                instance_id=instance_id,
+                stage="tool_batch.dispatch_plan",
+                status="started",
+                summary="工具批执行函数已开始调度工具调用。",
+                details={
+                    "conversation_id": conversation_id,
+                    "assistant_message_index": assistant_message_index,
+                    "tool_count": len(tool_uses),
+                    "tool_call_ids": [_tool_use_ref(tool_use) for tool_use in tool_uses],
+                    "tool_names": [tool_use.name for tool_use in tool_uses],
+                },
+                expected_next="tool.dispatch.scheduled",
+            )
         running_tools: list[dict[str, Any]] = []
         for tool_use in tool_uses:
             if interrupt_state.requested:
@@ -1989,6 +2918,21 @@ class AgentExecutionEngine:
                     assistant_message_index,
                     cancelled_result.result_part,
                 )
+                if instance_id:
+                    self._record_execution_loop_step(
+                        instance_id=instance_id,
+                        stage="tool.pending_result.saved",
+                        status="cancelled",
+                        summary="用户中断导致工具未启动，取消结果已作为 pending tool result 持久化。",
+                        details={
+                            "conversation_id": conversation_id,
+                            "assistant_message_index": assistant_message_index,
+                            "tool_call_id": _tool_use_ref(tool_use),
+                            "tool_name": tool_use.name,
+                            "phase": "not_started",
+                        },
+                        expected_next="tool_batch.continue_dispatch",
+                    )
                 continue
             running_tools.append({
                 "tool_call_id": _tool_use_ref(tool_use),
@@ -1998,6 +2942,21 @@ class AgentExecutionEngine:
             })
             if instance_id:
                 self._set_execution_running_tools(instance_id, running_tools)
+                self._record_execution_loop_step(
+                    instance_id=instance_id,
+                    stage="tool.dispatch.scheduled",
+                    status="scheduled",
+                    summary="单个工具调用已创建 asyncio task 并加入 running_tools。",
+                    details={
+                        "conversation_id": conversation_id,
+                        "assistant_message_index": assistant_message_index,
+                        "tool_call_id": _tool_use_ref(tool_use),
+                        "tool_name": tool_use.name,
+                        "source": _tool_source(tool_use),
+                        "running_tool_count": len(running_tools),
+                    },
+                    expected_next="tool.dispatch.completed",
+                )
             tool_task = asyncio.create_task(self._execute_single_tool_use(
                 definition,
                 tool_use,
@@ -2033,6 +2992,25 @@ class AgentExecutionEngine:
                             result.result_part,
                         )
                         if instance_id:
+                            self._record_execution_loop_step(
+                                instance_id=instance_id,
+                                stage="tool.pending_result.saved",
+                                status="saved",
+                                summary="单个工具调用完成后，其 ToolResultPart 已先作为 pending tool result 持久化。",
+                                details={
+                                    "conversation_id": conversation_id,
+                                    "assistant_message_index": assistant_message_index,
+                                    "tool_call_id": result.result_part.tool_use_ref,
+                                    "tool_name": result.tool_name,
+                                    "source": result.source,
+                                    "success": result.tool_result.success,
+                                    "execution_status": result.tool_result.execution_status,
+                                    "loop_decision": result.tool_result.loop_decision,
+                                    "is_error": result.result_part.is_error,
+                                },
+                                expected_next="tool_batch.await_remaining_or_aggregate",
+                            )
+                        if instance_id:
                             tool_use_ref = _tool_use_ref(tool_use)
                             running_tools = [
                                 item
@@ -2046,12 +3024,40 @@ class AgentExecutionEngine:
                         task.cancel()
                 if instance_id:
                     self._set_execution_running_tools(instance_id, [])
+                    self._record_execution_loop_step(
+                        instance_id=instance_id,
+                        stage="tool_batch.running_tools.cleared",
+                        status="cleared",
+                        summary="工具批执行 finally 已清空运行中工具快照。",
+                        details={
+                            "conversation_id": conversation_id,
+                            "assistant_message_index": assistant_message_index,
+                            "task_count": len(tasks),
+                        },
+                        expected_next="tool_results.aggregate",
+                    )
         results = [results_by_ref[_tool_use_ref(tool_use)] for tool_use in tool_uses]
         tool_results = []
         for result in results:
             result_parts.append(result.result_part)
             tool_results.append(result.tool_result)
             await self._publish_tool_frontend_message(result.tool_result, result.result_part.tool_use_ref, communication_context)
+        if instance_id:
+            self._record_execution_loop_step(
+                instance_id=instance_id,
+                stage="tool_results.aggregate",
+                status="ready",
+                summary="工具批执行结果已按 assistant 工具调用顺序聚合为 ROLE_TOOL 消息内容。",
+                details={
+                    "conversation_id": conversation_id,
+                    "assistant_message_index": assistant_message_index,
+                    "tool_count": len(tool_results),
+                    "tool_result_refs": [part.tool_use_ref for part in result_parts],
+                    "loop_decisions": [result.loop_decision for result in tool_results],
+                    "frontend_message_count": sum(1 for result in tool_results if result.frontend_message is not None),
+                },
+                expected_next="return_to_execution_loop",
+            )
         logger.info(
             "Agent 工具批执行完成: tool_count=%s, loop_decisions=%s, 耗时=%sms",
             len(tool_results),
@@ -2613,7 +3619,7 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
         "first call `message_user(action=request_response)` to report results and wait for "
         "user verification; only after explicit user approval should you call `end_task`. "
         "For task failure use `fail_task` instead.\n"
-        "- `fail_task` tool: declare unrecoverable failure and terminate the loop. Use only when "
+        "- `fail_task` tool: declare unrecoverable failure and end the loop with a fail decision. Use only when "
         "you as the Agent judge that the task cannot proceed (missing required tool/permission, "
         "severely inconsistent input, repeated failures with no path forward). Routine tool "
         "exceptions are wrapped automatically by the framework — do not call `fail_task` for them. "
@@ -2738,38 +3744,6 @@ async def _await_with_progress_logging(
             metadata,
         )
         raise
-
-
-def _execution_progress_snapshot(
-    progress: _AgentExecutionProgressState,
-    now: float,
-) -> dict[str, Any]:
-    return {
-        "task_id": progress.task_id,
-        "instance_id": progress.instance_id,
-        "stream_id": progress.stream_id,
-        "conversation_id": progress.conversation_id,
-        "phase": progress.phase,
-        "loop_index": progress.loop_index,
-        "phase_started_at": _datetime_from_timestamp(progress.phase_started_at),
-        "last_progress_at": _datetime_from_timestamp(progress.last_progress_at),
-        "phase_elapsed_ms": int(max(now - progress.phase_started_at, 0) * 1000),
-        "last_progress_elapsed_ms": int(max(now - progress.last_progress_at, 0) * 1000),
-        "metadata": dict(progress.metadata),
-        "running_tools": [dict(item) for item in progress.running_tools],
-    }
-
-
-def _task_stack_snapshot(task: asyncio.Task[Any]) -> list[dict[str, Any]]:
-    frames = task.get_stack(limit=12)
-    return [
-        {
-            "filename": frame.f_code.co_filename,
-            "function": frame.f_code.co_name,
-            "line_number": frame.f_lineno,
-        }
-        for frame in frames
-    ]
 
 
 def _datetime_from_timestamp(value: float) -> str:

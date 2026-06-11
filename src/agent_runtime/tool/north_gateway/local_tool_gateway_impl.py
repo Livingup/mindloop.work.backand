@@ -24,8 +24,13 @@ class LocalToolGatewayImpl:
     实现 LocalToolGateway 协议，外部消费方通过此实例访问本模块能力。
     """
 
-    def __init__(self, service: LocalToolService) -> None:
+    def __init__(
+        self,
+        service: LocalToolService,
+        execution_loop_logger: Any | None = None,
+    ) -> None:
         self._service = service
+        self._execution_loop_logger = execution_loop_logger
 
     def list_tools(
         self,
@@ -75,11 +80,63 @@ class LocalToolGatewayImpl:
             trace_id=request.trace_id,
             communication_stream_id=request.communication_stream_id,
         )
-        result = await self._service.execute_tool(
-            request.tool_name,
-            request.params,
-            runtime_context=runtime_context,
-        )
+        if self._execution_loop_logger is not None and request.agent_instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=request.agent_instance_id,
+                stage="local_tool_gateway.execute",
+                status="started",
+                summary="本地工具北向网关已构造 ToolRuntimeContext，准备调用 LocalToolService。",
+                details={
+                    "request_id": request.request_id,
+                    "task_id": request.task_id,
+                    "conversation_id": request.conversation_id,
+                    "trace_id": request.trace_id,
+                    "communication_stream_id": request.communication_stream_id,
+                    "tool_name": request.tool_name,
+                },
+                expected_next="local_tool_service.execute",
+            )
+        try:
+            result = await self._service.execute_tool(
+                request.tool_name,
+                request.params,
+                runtime_context=runtime_context,
+            )
+        except Exception as exc:
+            if self._execution_loop_logger is not None and request.agent_instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=request.agent_instance_id,
+                    stage="local_tool_gateway.execute",
+                    status="failed",
+                    summary="本地工具北向网关调用 LocalToolService 失败。",
+                    details={
+                        "request_id": request.request_id,
+                        "task_id": request.task_id,
+                        "conversation_id": request.conversation_id,
+                        "tool_name": request.tool_name,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                    },
+                    expected_next="tool_dispatch.exception",
+                )
+            raise
+        if self._execution_loop_logger is not None and request.agent_instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=request.agent_instance_id,
+                stage="local_tool_gateway.execute",
+                status="completed",
+                summary="本地工具北向网关已收到 LocalToolService 统一工具结果。",
+                details={
+                    "request_id": request.request_id,
+                    "task_id": request.task_id,
+                    "conversation_id": request.conversation_id,
+                    "tool_name": request.tool_name,
+                    "success": result.success,
+                    "execution_status": result.execution_status,
+                    "loop_decision": result.loop_decision,
+                },
+                expected_next="tool_dispatch.normalize_result_part",
+            )
         payload = result.model_dump(mode="python", exclude={"output"})
         payload.pop("tool_name", None)
         return ToolExecuteResult(

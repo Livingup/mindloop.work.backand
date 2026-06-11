@@ -129,6 +129,7 @@ class CompressionJob:
     section_items: list[SectionItem] = field(default_factory=list)
     completed_sections: set[str] = field(default_factory=set)
     issues: list[dict[str, Any]] = field(default_factory=list)
+    draft_markdown_lines: list[str] = field(default_factory=list)
     final_markdown_chunks: list[str] = field(default_factory=list)
     verifier_result: dict[str, Any] | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -136,6 +137,8 @@ class CompressionJob:
 
     @property
     def final_markdown(self) -> str:
+        if self.draft_markdown_lines:
+            return "\n".join(self.draft_markdown_lines).strip()
         return "\n".join(chunk for chunk in self.final_markdown_chunks if chunk).strip()
 
 

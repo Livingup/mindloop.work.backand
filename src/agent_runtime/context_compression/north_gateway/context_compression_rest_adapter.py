@@ -5,12 +5,13 @@ from collections.abc import Callable
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.config import ContextCompressionConfig
+from agent_runtime.context_compression.models import SECTION_WORKERS, SECTION_WORKER_TITLES
 from agent_runtime.context_compression.default_prompts import (
     CONTEXT_COMPRESSION_WORKER_NAMES,
     get_default_worker_prompt,
 )
-from agent_runtime.context_compression.prompt_loader import ensure_default_worker_prompts
 from agent_runtime.context_compression.prompt_repository import (
     ContextCompressionWorkerPrompt,
     ContextCompressionWorkerPromptRepository,
@@ -79,17 +80,22 @@ _WORKER_METADATA: tuple[dict[str, str], ...] = (
     },
     {
         "name": "FinalAssemblerWorker",
-        "title": "最终 Markdown 汇编",
-        "description": "将各分段 Worker 提取的结构化条目整合为一份连贯、有序的最终 Markdown 摘要，用作压缩后的对话上下文。",
+        "title": "最终汇编（兼容）",
+        "description": "保留旧版 LLM 最终汇编 Worker 的配置入口；当前默认链路由程序按固定章节确定性生成 Markdown 草稿。",
         "group": WORKER_GROUP_FINAL_ASSEMBLY,
     },
     {
         "name": "FinalVerifierWorker",
-        "title": "最终校验",
-        "description": "对最终 Markdown 进行校验，发现遗漏、错误或不一致的内容并提示问题，仅在启用校验时执行。",
+        "title": "最终校验与编辑",
+        "description": "读取原始历史证据和程序化 Markdown 草稿，检查遗漏、错误或上下文断裂，并通过草稿行编辑工具做小范围最终修订。",
         "group": WORKER_GROUP_FINAL_VERIFICATION,
     },
 )
+
+_SECTION_TO_WORKER_NAME: dict[str, str] = {
+    section: worker_name
+    for worker_name, section in SECTION_WORKERS
+}
 
 
 class ContextCompressionMarkdownResponse(BaseModel):
@@ -102,9 +108,20 @@ class ContextCompressionMarkdownResponse(BaseModel):
     archive_job_id: str | None = None
 
 
+class ContextCompressionWorkerReadableContentResponse(BaseModel):
+    worker_name: str
+    title: str
+    content_markdown: str
+
+
+class ContextCompressionWorkerContentsResponse(BaseModel):
+    job_id: str
+    workers: list[ContextCompressionWorkerReadableContentResponse]
+
+
 class ContextCompressionPromptStatusResponse(BaseModel):
     use_default: bool
-    updated_at: str
+    updated_at: str | None = None
 
 
 class ContextCompressionWorkerResponse(BaseModel):
@@ -136,7 +153,7 @@ class ContextCompressionWorkerPromptDetailResponse(BaseModel):
     default_text: str
     override_text: str | None
     effective_text: str
-    updated_at: str
+    updated_at: str | None = None
 
 
 class ContextCompressionWorkerPromptUpdateBody(BaseModel):
@@ -149,6 +166,7 @@ def create_context_compression_router(
     prompt_repository: ContextCompressionWorkerPromptRepository | None = None,
     settings_repository: ContextCompressionSettingsRepository | None = None,
     llm_registry_gateway: LlmModelRegistryGateway | None = None,
+    archive_repository: ContextCompressionArchiveRepository | None = None,
     config_accessor: Callable[[], ContextCompressionConfig] | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -189,6 +207,21 @@ def create_context_compression_router(
             matched_reference=matched_reference,
             summary_message_id=summary_message_id,
             archive_job_id=archive_job_id,
+        )
+
+    @router.get(
+        "/jobs/{job_id}/worker-contents",
+        response_model=ContextCompressionWorkerContentsResponse,
+    )
+    async def get_worker_contents(job_id: str) -> ContextCompressionWorkerContentsResponse:
+        repository = _require_archive_repository(archive_repository)
+        try:
+            section_items = repository.get_section_items(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"上下文压缩 job 不存在: {job_id}")
+        return ContextCompressionWorkerContentsResponse(
+            job_id=job_id,
+            workers=_worker_content_responses(section_items),
         )
 
     @router.get("/settings", response_model=ContextCompressionSettingsResponse)
@@ -235,7 +268,6 @@ def create_context_compression_router(
     @router.get("/workers", response_model=list[ContextCompressionWorkerResponse])
     async def list_workers() -> list[ContextCompressionWorkerResponse]:
         repository = _require_prompt_repository(prompt_repository)
-        ensure_default_worker_prompts(repository)
         prompt_index: dict[tuple[str, str], ContextCompressionWorkerPrompt] = {}
         for prompt in repository.list_prompts():
             prompt_index[(prompt.input_mode, prompt.worker_name)] = prompt
@@ -244,11 +276,9 @@ def create_context_compression_router(
             prompt_status: dict[str, ContextCompressionPromptStatusResponse] = {}
             for input_mode in SUPPORTED_INPUT_MODES:
                 prompt = prompt_index.get((input_mode, metadata["name"]))
-                if prompt is None:
-                    continue
                 prompt_status[input_mode] = ContextCompressionPromptStatusResponse(
-                    use_default=not prompt.is_custom,
-                    updated_at=prompt.updated_at,
+                    use_default=prompt is None,
+                    updated_at=prompt.updated_at if prompt is not None else None,
                 )
             group = metadata["group"]
             workers.append(
@@ -275,12 +305,16 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        prompt = repository.upsert_default(
+        override = repository.get_prompt(
             input_mode=input_mode,
             worker_name=worker_name,
-            default_prompt_text=default_text,
         )
-        return _prompt_detail_response(prompt)
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=override,
+        )
 
     @router.put(
         "/workers/{worker_name}/prompts/{input_mode}",
@@ -295,11 +329,6 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        repository.upsert_default(
-            input_mode=input_mode,
-            worker_name=worker_name,
-            default_prompt_text=default_text,
-        )
         try:
             prompt = repository.update_prompt(
                 input_mode=input_mode,
@@ -310,7 +339,12 @@ def create_context_compression_router(
             raise HTTPException(status_code=404, detail=str(exc))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return _prompt_detail_response(prompt)
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=prompt,
+        )
 
     @router.post(
         "/workers/{worker_name}/prompts/{input_mode}/reset",
@@ -324,16 +358,16 @@ def create_context_compression_router(
         _validate_input_mode(input_mode)
         repository = _require_prompt_repository(prompt_repository)
         default_text = get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
-        repository.upsert_default(
-            input_mode=input_mode,
-            worker_name=worker_name,
-            default_prompt_text=default_text,
-        )
         try:
-            prompt = repository.reset_prompt(input_mode=input_mode, worker_name=worker_name)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        return _prompt_detail_response(prompt)
+            repository.reset_prompt(input_mode=input_mode, worker_name=worker_name)
+        except KeyError:
+            pass
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            input_mode=input_mode,
+            default_text=default_text,
+            override=None,
+        )
 
     return router
 
@@ -384,6 +418,54 @@ def _contains_reference(candidate: object, value: str) -> bool:
     if isinstance(candidate, list | tuple):
         return any(_contains_reference(item, value) for item in candidate)
     return False
+
+
+def _require_archive_repository(
+    archive_repository: ContextCompressionArchiveRepository | None,
+) -> ContextCompressionArchiveRepository:
+    if archive_repository is None:
+        raise HTTPException(status_code=503, detail="上下文压缩归档仓储未配置。")
+    return archive_repository
+
+
+def _worker_content_responses(
+    section_items: list[dict[str, object]],
+) -> list[ContextCompressionWorkerReadableContentResponse]:
+    grouped_contents: dict[str, list[str]] = {worker_name: [] for worker_name, _section in SECTION_WORKERS}
+    for item in section_items:
+        section = str(item.get("section") or "").strip()
+        worker_name = str(item.get("worker_name") or "").strip()
+        if worker_name not in grouped_contents:
+            worker_name = _SECTION_TO_WORKER_NAME.get(section, "")
+        if worker_name not in grouped_contents:
+            continue
+        raw_content = item.get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        if content:
+            grouped_contents[worker_name].append(content)
+
+    responses: list[ContextCompressionWorkerReadableContentResponse] = []
+    for worker_name, section in SECTION_WORKERS:
+        responses.append(
+            ContextCompressionWorkerReadableContentResponse(
+                worker_name=worker_name,
+                title=SECTION_WORKER_TITLES.get(section, worker_name),
+                content_markdown=_join_readable_contents(grouped_contents.get(worker_name, [])),
+            )
+        )
+    return responses
+
+
+def _join_readable_contents(contents: list[str]) -> str:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for content in contents:
+        normalized = "\n".join(line.rstrip() for line in content.strip().splitlines()).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return "\n\n".join(deduped)
 
 
 def _require_prompt_repository(
@@ -463,15 +545,19 @@ def _validate_input_mode(input_mode: str) -> None:
 
 
 def _prompt_detail_response(
-    prompt: ContextCompressionWorkerPrompt,
+    *,
+    worker_name: str,
+    input_mode: str,
+    default_text: str,
+    override: ContextCompressionWorkerPrompt | None,
 ) -> ContextCompressionWorkerPromptDetailResponse:
-    override_text = prompt.prompt_text if prompt.is_custom else None
+    override_text = override.prompt_text if override is not None else None
     return ContextCompressionWorkerPromptDetailResponse(
-        worker_name=prompt.worker_name,
-        input_mode=prompt.input_mode,
-        use_default=not prompt.is_custom,
-        default_text=prompt.default_prompt_text,
+        worker_name=worker_name,
+        input_mode=input_mode,
+        use_default=override is None,
+        default_text=default_text,
         override_text=override_text,
-        effective_text=prompt.prompt_text,
-        updated_at=prompt.updated_at,
+        effective_text=override_text if override_text is not None else default_text,
+        updated_at=override.updated_at if override is not None else None,
     )

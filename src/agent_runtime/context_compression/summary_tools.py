@@ -18,6 +18,8 @@ from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 APPEND_SECTION_ITEMS = "context_summary_append_section_items"
 MARK_SECTION_COMPLETE = "context_summary_mark_section_complete"
 APPEND_FINAL_MARKDOWN_SECTION = "context_summary_append_final_markdown_section"
+READ_DRAFT = "context_summary_read_draft"
+REPLACE_DRAFT_LINES = "context_summary_replace_draft_lines"
 MARK_FINAL_COMPLETE = "context_summary_mark_final_complete"
 REPORT_SECTION_ISSUE = "context_summary_report_section_issue"
 
@@ -82,6 +84,18 @@ class ContextSummaryToolExecutor:
                 raise ValueError("markdown 必须是非空字符串。")
             chunks = self._job_store.append_final_markdown(job_id, markdown)
             return {"success": True, "final_markdown_chunks": chunks}
+        if tool_use.name == READ_DRAFT:
+            return self._job_store.read_draft_markdown(
+                job_id,
+                start_line=_ensure_int(arguments.get("start_line"), "start_line"),
+                end_line=_ensure_int(arguments.get("end_line"), "end_line"),
+            )
+        if tool_use.name == REPLACE_DRAFT_LINES:
+            return self._job_store.replace_draft_lines(
+                job_id,
+                search_lines=_string_list(arguments.get("search_lines"), "search_lines", allow_empty=False),
+                replace_lines=_string_list(arguments.get("replace_lines"), "replace_lines", allow_empty=True),
+            )
         if tool_use.name == MARK_FINAL_COMPLETE:
             self._job_store.update_status(job_id, "assembled")
             return {"success": True, "status": "assembled"}
@@ -120,8 +134,32 @@ _TOOL_DEFINITIONS: tuple[tuple[str, str, dict[str, Any]], ...] = (
         {"type": "object", "properties": {"markdown": {"type": "string", "description": "最终压缩 Markdown 的一个章节或片段，必须是非空字符串。"}}, "required": ["markdown"]},
     ),
     (
+        READ_DRAFT,
+        "读取当前压缩 job 的最终 Markdown 草稿行范围。参数只有 start_line 和 end_line，均为 1-based 闭区间；返回 total_lines 和 ranges[].lines。job_id 由 Runtime 内部绑定，不允许模型传入。",
+        {
+            "type": "object",
+            "properties": {
+                "start_line": {"type": "integer", "description": "1-based 起始行号。"},
+                "end_line": {"type": "integer", "description": "1-based 结束行号，闭区间。"},
+            },
+            "required": ["start_line", "end_line"],
+        },
+    ),
+    (
+        REPLACE_DRAFT_LINES,
+        "精确替换当前压缩 job 草稿中的连续行。search_lines 必须来自读取工具返回的连续原文行；replace_lines 为替换后的完整行数组，可为空数组表示删除。job_id 由 Runtime 内部绑定，不允许模型传入。",
+        {
+            "type": "object",
+            "properties": {
+                "search_lines": {"type": "array", "items": {"type": "string"}, "description": "要精确匹配的连续原文行，至少一行。"},
+                "replace_lines": {"type": "array", "items": {"type": "string"}, "description": "替换后的完整行数组，可为空。"},
+            },
+            "required": ["search_lines", "replace_lines"],
+        },
+    ),
+    (
         MARK_FINAL_COMPLETE,
-        "对应 context_summary.mark_final_complete。声明最终 Markdown 已经全部写入。无需参数。",
+        "对应 context_summary.mark_final_complete。声明当前压缩上下文草稿已经校验和最终编辑完成。无需参数。",
         {"type": "object", "properties": {}},
     ),
     (
@@ -152,3 +190,19 @@ def _ensure_dict(value: object) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise ValueError("工具参数必须是 JSON 对象。")
+
+
+def _ensure_int(value: object, field_name: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} 必须是整数。") from exc
+
+
+def _string_list(value: object, field_name: str, *, allow_empty: bool) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} 必须是字符串数组。")
+    result = [str(item) for item in value]
+    if not allow_empty and not result:
+        raise ValueError(f"{field_name} 必须至少包含一行。")
+    return result

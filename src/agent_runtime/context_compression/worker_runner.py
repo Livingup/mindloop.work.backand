@@ -480,7 +480,7 @@ def _worker_render_options(
 def _worker_finished(job: CompressionJob, worker_role: str, output_section: str | None) -> bool:
     if worker_role == "section_worker" and output_section is not None:
         return output_section in job.completed_sections
-    if worker_role == "final_assembler":
+    if worker_role in {"final_assembler", "final_verifier"}:
         return job.status == "assembled"
     return False
 

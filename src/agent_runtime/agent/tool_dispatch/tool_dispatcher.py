@@ -8,6 +8,10 @@ import time
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
+from agent_runtime.agent.execution_loop_logger import (
+    AgentExecutionLoopLogger,
+    NoopAgentExecutionLoopLogger,
+)
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, McpToolBinding
 from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
@@ -66,8 +70,8 @@ class AgentToolDispatcher:
     """Agent 内部工具调度器。
 
     调度器只暴露当前 AgentDefinition 明确允许的本地工具和 always-enabled 本地工具。
-    AgentDefinition.mcp_tools 只用于系统提示词中的 MCP 服务摘要，不会被展开为 LLM tools；
-    远端 MCP 服务通过 mcp_get_tool_detail / mcp_call_tool 等本地代理工具访问。
+    AgentDefinition.mcp_tools 只用于系统提示词中的 MCP 服务与工具摘要，不会被展开为 LLM tools；
+    远端 MCP 服务通过 mcp_get_service_detail / mcp_get_tool_detail / mcp_call_tool 等本地代理工具访问。
     """
 
     def __init__(
@@ -76,15 +80,17 @@ class AgentToolDispatcher:
         local_tool_gateway: LocalToolGateway,
         mcp_client_gateway: McpClientGateway | None = None,
         event_publisher: RuntimeEventPublisher | None = None,
+        execution_loop_logger: AgentExecutionLoopLogger | NoopAgentExecutionLoopLogger | None = None,
     ) -> None:
         # 本地工具北向网关。用于读取本地工具 schema 和执行本地工具函数。
         self._local_tool_gateway = local_tool_gateway
 
-        # MCP 客户端北向网关。AgentDefinition 声明 mcp_tools 时必须配置该网关。
+        # MCP 客户端北向网关。MCP 元工具和兼容性 MCP 分发路径通过该网关访问远端服务。
         self._mcp_client_gateway = mcp_client_gateway
 
         # 运行时事件发布器。用于把工具调用生命周期推送到通用通信流。
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
+        self._execution_loop_logger = execution_loop_logger or NoopAgentExecutionLoopLogger()
 
     async def build_llm_tools(
         self,
@@ -92,7 +98,7 @@ class AgentToolDispatcher:
         agent_definition: AgentDefinition,
         api_format: str,
     ) -> tuple[LlmToolDefinition, ...]:
-        """根据 AgentDefinition 能力边界构建本轮 LLM 可见工具定义。"""
+        """根据 AgentDefinition 本地工具能力边界构建本轮 LLM 可见工具定义。"""
         tools: list[LlmToolDefinition] = []
         for tool_name in self._visible_local_tool_names(agent_definition):
             detail = self._local_tool_gateway.get_tool(tool_name)
@@ -118,6 +124,24 @@ class AgentToolDispatcher:
         source = "mcp" if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX) else "local"
         tool_call_id = _tool_use_ref(tool_use)
         started_at = time.perf_counter()
+        metadata = communication_context.metadata if communication_context is not None else {}
+        instance_id = str(metadata.get("agent_instance_id") or "")
+        if instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="tool_dispatch.routing",
+                status="started",
+                summary="工具调度器已收到一次 LLM 工具调用，准备按来源路由到 local 或 MCP。",
+                details={
+                    "task_id": metadata.get("task_id"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_use.name,
+                    "source": source,
+                    "arguments_preview": _preview_arguments(tool_use.input),
+                },
+                expected_next="tool_dispatch.execute",
+            )
         logger.info(
             "Agent 工具调用开始: tool=%s, source=%s, tool_call_id=%s",
             tool_use.name,
@@ -147,10 +171,28 @@ class AgentToolDispatcher:
                 tool_call_id,
             )
             if source == "mcp":
-                result = await self._dispatch_mcp_tool(agent_definition, tool_use)
+                result = await self._dispatch_mcp_tool(agent_definition, tool_use, communication_context)
             else:
                 result = await self._dispatch_local_tool(agent_definition, tool_use, communication_context)
         except Exception as exc:
+            if instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=instance_id,
+                    stage="tool_dispatch.execute",
+                    status="failed",
+                    summary="工具调度器执行工具调用失败。",
+                    details={
+                        "task_id": metadata.get("task_id"),
+                        "conversation_id": metadata.get("conversation_id"),
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_use.name,
+                        "source": source,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                    },
+                    expected_next="engine_build_exception_tool_result",
+                )
             logger.exception(
                 "Agent 工具调用失败: tool=%s, source=%s, tool_call_id=%s, 耗时=%sms",
                 tool_use.name,
@@ -178,6 +220,26 @@ class AgentToolDispatcher:
                 correlation_id=tool_call_id,
             )
             raise
+        if instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="tool_dispatch.execute",
+                status="completed",
+                summary="工具调度器已完成工具调用并得到统一工具结果。",
+                details={
+                    "task_id": metadata.get("task_id"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "tool_call_id": tool_call_id,
+                    "tool_name": result.tool_name,
+                    "source": result.source,
+                    "success": result.tool_result.success,
+                    "execution_status": result.tool_result.execution_status,
+                    "loop_decision": result.tool_result.loop_decision,
+                    "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                    "result_preview": _preview_tool_result(result.tool_result),
+                },
+                expected_next="tool_result_part.persist_pending",
+            )
         logger.info(
             "Agent 工具调用完成: tool=%s, source=%s, tool_call_id=%s, success=%s, execution_status=%s, loop_decision=%s, 耗时=%sms",
             result.tool_name,
@@ -218,10 +280,29 @@ class AgentToolDispatcher:
     ) -> ToolDispatchResult:
         """执行本地工具调用。"""
         detail = self._local_tool_gateway.get_tool(tool_use.name)
-        if tool_use.name not in agent_definition.tool_ids and not detail.always_enabled:
+        metadata = communication_context.metadata if communication_context is not None else {}
+        instance_id = str(metadata.get("agent_instance_id") or "")
+        is_allowed = tool_use.name in agent_definition.tool_ids or detail.always_enabled
+        if instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="tool_dispatch.local.allowlist",
+                status="allowed" if is_allowed else "denied",
+                summary="本地工具 allowlist 校验完成。",
+                details={
+                    "task_id": metadata.get("task_id"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "tool_call_id": _tool_use_ref(tool_use),
+                    "tool_name": tool_use.name,
+                    "agent_definition_id": agent_definition.agent_id,
+                    "declared_in_agent_tool_ids": tool_use.name in agent_definition.tool_ids,
+                    "always_enabled": detail.always_enabled,
+                },
+                expected_next="local_tool_gateway.execute" if is_allowed else "tool_dispatch.denied",
+            )
+        if not is_allowed:
             raise PermissionError(f"Agent {agent_definition.agent_id} 无权调用本地工具: {tool_use.name}")
         params = _ensure_dict_arguments(tool_use.input)
-        metadata = communication_context.metadata if communication_context is not None else {}
         result = await self._local_tool_gateway.execute_tool(
             ToolExecuteRequest(
                 tool_name=tool_use.name,
@@ -251,12 +332,54 @@ class AgentToolDispatcher:
         self,
         agent_definition: AgentDefinition,
         tool_use: ToolUsePart,
+        communication_context: RuntimeCommunicationContext | None,
     ) -> ToolDispatchResult:
         """执行 MCP 工具调用。"""
         if self._mcp_client_gateway is None:
             raise RuntimeError("当前执行器未配置 McpClientGateway，不能执行 MCP 工具。")
         service_id, tool_name = parse_mcp_exposed_tool_name(tool_use.name)
-        _ensure_mcp_tool_allowed(agent_definition.mcp_tools, service_id, tool_name)
+        metadata = communication_context.metadata if communication_context is not None else {}
+        instance_id = str(metadata.get("agent_instance_id") or "")
+        try:
+            _ensure_mcp_tool_allowed(agent_definition.mcp_tools, service_id, tool_name)
+        except Exception as exc:
+            if instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=instance_id,
+                    stage="tool_dispatch.mcp.allowlist",
+                    status="denied",
+                    summary="MCP 工具 allowlist 校验失败。",
+                    details={
+                        "task_id": metadata.get("task_id"),
+                        "conversation_id": metadata.get("conversation_id"),
+                        "tool_call_id": _tool_use_ref(tool_use),
+                        "exposed_tool_name": tool_use.name,
+                        "service_id": service_id,
+                        "tool_name": tool_name,
+                        "agent_definition_id": agent_definition.agent_id,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                    },
+                    expected_next="tool_dispatch.denied",
+                )
+            raise
+        if instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="tool_dispatch.mcp.allowlist",
+                status="allowed",
+                summary="MCP 工具 allowlist 校验通过，准备调用 MCP 客户端网关。",
+                details={
+                    "task_id": metadata.get("task_id"),
+                    "conversation_id": metadata.get("conversation_id"),
+                    "tool_call_id": _tool_use_ref(tool_use),
+                    "exposed_tool_name": tool_use.name,
+                    "service_id": service_id,
+                    "tool_name": tool_name,
+                    "agent_definition_id": agent_definition.agent_id,
+                },
+                expected_next="mcp_client.call_tool",
+            )
         params = _ensure_dict_arguments(tool_use.input)
         result = await self._mcp_client_gateway.call_tool(service_id, tool_name, params)
         output = normalize_mcp_tool_content_for_llm(result.content_blocks, fallback_text=result.content)

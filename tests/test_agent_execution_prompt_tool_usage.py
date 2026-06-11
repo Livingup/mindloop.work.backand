@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
 from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import SqliteAgentRuntimeRepository
+from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
 from agent_runtime.agent_definition.agent_definition import AgentDefinition, McpToolBinding, SystemPromptSegment
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
-from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
-from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_CHAT_COMPLETIONS
+from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_CHAT_COMPLETIONS, API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
+from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import McpServiceSummary
 from agent_runtime.subagent.subagent_runtime import SubagentRuntime
 from agent_runtime.subagent.subagent_tool import EndSubagentRequest
 
@@ -23,6 +24,8 @@ class _LocalToolGateway:
         return self._tools
 
     def get_tool(self, tool_name: str):
+        if tool_name not in {tool.tool_name for tool in self._tools}:
+            raise KeyError(tool_name)
         return SimpleNamespace(
             schemas={
                 API_FORMAT_OPENAI_CHAT_COMPLETIONS: {
@@ -32,6 +35,13 @@ class _LocalToolGateway:
                         "description": f"{tool_name} desc",
                         "parameters": {"type": "object", "properties": {}},
                     },
+                },
+                API_FORMAT_OPENAI_RESPONSES: {
+                    "type": "function",
+                    "name": tool_name,
+                    "description": f"{tool_name} meta tool.",
+                    "parameters": {"type": "object", "properties": {}},
+                    "strict": False,
                 },
             },
         )
@@ -46,24 +56,54 @@ class _AgentDefinitionGateway:
 
 
 class _McpGateway:
+    def __init__(self):
+        self.get_tool_detail_called = False
+        self.list_tools_service_id = None
+
     def list_services(self):
         return [
-            SimpleNamespace(
+            McpServiceSummary(
                 service_id="remote-search",
+                name="Remote Search",
                 description="远端搜索 MCP 服务",
+                transport_type="stdio",
+                enabled=True,
+                connected=True,
+            ),
+            McpServiceSummary(
+                service_id="codebase-rag",
+                name="Codebase RAG",
+                description="源码业务描述知识库",
+                transport_type="stdio",
+                enabled=True,
+                connected=True,
             ),
         ]
 
     async def list_tools(self, service_id: str):
         self.list_tools_service_id = service_id
-        return [
-            SimpleNamespace(
-                name="search",
-                description="执行远端搜索",
-            ),
-        ]
+        if service_id == "remote-search":
+            return [
+                SimpleNamespace(
+                    name="search",
+                    description="执行远端搜索",
+                ),
+            ]
+        if service_id == "codebase-rag":
+            return [
+                SimpleNamespace(
+                    name="codebase_search",
+                    description="检索代码库业务知识",
+                ),
+                SimpleNamespace(
+                    name="codebase_context_analysis",
+                    description="分析代码库上下文",
+                ),
+            ]
+        return []
 
-    async def get_tool_detail(self, service_id: str, tool_names: list[str]):
+    async def get_tool_detail(self, *_args, **_kwargs):
+        self.get_tool_detail_called = True
         raise AssertionError("执行循环不应把远端 MCP 工具详情展开为 LLM tools")
 
 
@@ -385,6 +425,95 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIn("远端 MCP 服务工具不会直接设置到本轮 LLM 请求 tools 中", prompt)
         self.assertIn("`mcp_get_tool_detail` 获取参数 schema", prompt)
         self.assertIn("`mcp_call_tool` 执行", prompt)
+        self.assertFalse(mcp_gateway.get_tool_detail_called)
+
+    def test_build_llm_tools_keeps_mcp_meta_tools_local_and_skips_direct_mcp_tool_exposure(self) -> None:
+        async def run_case() -> None:
+            mcp_gateway = _McpGateway()
+            dispatcher = AgentToolDispatcher(
+                local_tool_gateway=_LocalToolGateway((
+                    _local_tool("mcp_get_tool_detail"),
+                    _local_tool("mcp_call_tool"),
+                )),
+                mcp_client_gateway=mcp_gateway,
+            )
+
+            tools = await dispatcher.build_llm_tools(
+                agent_definition=AgentDefinition(
+                    agent_id="agent-mcp-tools",
+                    group="default",
+                    mcp_tools=(
+                        McpToolBinding(
+                            service_id="codebase-rag",
+                            tool_ids=("codebase_search", "codebase_context_analysis"),
+                        ),
+                    ),
+                ),
+                api_format=API_FORMAT_OPENAI_RESPONSES,
+            )
+
+            tool_names = [tool.name for tool in tools]
+            self.assertEqual(["mcp_get_tool_detail", "mcp_call_tool"], tool_names)
+            self.assertTrue(all(tool.source == "local" for tool in tools))
+            self.assertNotIn("mcp__codebase-rag__codebase_search", tool_names)
+            self.assertNotIn("mcp__codebase-rag__codebase_context_analysis", tool_names)
+            self.assertFalse(mcp_gateway.get_tool_detail_called)
+
+        asyncio.run(run_case())
+
+    def test_mcp_services_prompt_guides_meta_tools_and_records_prompt_preparation_steps(self) -> None:
+        engine = self._engine_with_local_tools(
+            _local_tool("mcp_get_tool_detail"),
+            _local_tool("mcp_call_tool"),
+        )
+        engine._mcp_client_gateway = _McpGateway()
+        records = []
+
+        def record_step(stage, status, summary, details, expected_next):
+            records.append(
+                {
+                    "stage": stage,
+                    "status": status,
+                    "summary": summary,
+                    "details": details or {},
+                    "expected_next": expected_next,
+                }
+            )
+
+        prompt = engine._render_system_prompt(
+            AgentDefinition(
+                agent_id="agent-mcp-prompt",
+                group="default",
+                mcp_tools=(
+                    McpToolBinding(
+                        service_id="codebase-rag",
+                        tool_ids=("codebase_search",),
+                    ),
+                ),
+            ),
+            "agent-instance-self",
+            "G:\\project\\agent",
+            {},
+            (_llm_tool("mcp_get_tool_detail"), _llm_tool("mcp_call_tool")),
+            prompt_step_recorder=record_step,
+        )
+
+        prompt_text = prompt or ""
+        self.assertIn("# 可用的 MCP 服务列表", prompt_text)
+        self.assertIn("`codebase-rag`", prompt_text)
+        self.assertIn("`codebase_search`", prompt_text)
+        self.assertIn("`mcp_get_tool_detail` 获取参数 schema", prompt_text)
+        self.assertIn("`mcp_call_tool` 执行", prompt_text)
+        self.assertNotIn("mcp__codebase-rag__codebase_search", prompt_text)
+
+        stages = [item["stage"] for item in records]
+        self.assertIn("llm.prompt.agent_segments.start", stages)
+        self.assertIn("llm.prompt.runtime_context.start", stages)
+        self.assertIn("llm.prompt.mcp_services.start", stages)
+        self.assertIn("llm.prompt.tool_usage_notice.start", stages)
+        self.assertIn("llm.prompt.assemble.complete", stages)
+        mcp_complete = next(item for item in records if item["stage"] == "llm.prompt.mcp_services.complete")
+        self.assertTrue(mcp_complete["details"]["mcp_services_prompt_present"])
 
     def test_system_prompt_injects_available_subagent_ids_and_descriptions(self) -> None:
         engine = self._engine_with_local_tools(

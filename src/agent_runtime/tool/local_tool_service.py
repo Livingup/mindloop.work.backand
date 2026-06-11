@@ -44,9 +44,11 @@ class LocalToolService:
         self,
         repository: LocalToolRepository,
         schema_cache: ToolSchemaCache,
+        execution_loop_logger: Any | None = None,
     ) -> None:
         self._repo = repository
         self._schema_cache = schema_cache
+        self._execution_loop_logger = execution_loop_logger
 
     # ── 业务用例 1：列出所有工具 ──────────────────────────────────────
 
@@ -127,9 +129,43 @@ class LocalToolService:
         """
         tool_def = self._repo.get_by_name(tool_name)
         started_at = time.perf_counter()
+        instance_id = runtime_context.agent_instance_id if runtime_context is not None else None
+        request_id = runtime_context.request_id if runtime_context is not None else None
+        if self._execution_loop_logger is not None and instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="local_tool_service.execute",
+                status="started",
+                summary="LocalToolService 已解析本地工具定义，准备构造工具函数调用参数。",
+                details={
+                    "request_id": request_id,
+                    "task_id": runtime_context.task_id if runtime_context is not None else None,
+                    "conversation_id": runtime_context.conversation_id if runtime_context is not None else None,
+                    "tool_name": tool_name,
+                    "allowed_loop_decisions": list(tool_def.allowed_loop_decisions),
+                    "param_keys": sorted(params),
+                },
+                expected_next="local_tool_service.invoke_callable",
+            )
         logger.info("执行本地工具: %s, 参数: %s", tool_name, params)
         try:
             kwargs = _build_tool_call_kwargs(tool_def.fn, params, runtime_context)
+            if self._execution_loop_logger is not None and instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=instance_id,
+                    stage="local_tool_service.invoke_callable",
+                    status="started",
+                    summary="本地工具函数调用参数已构造，准备执行同步或异步工具函数。",
+                    details={
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "injected_runtime_context": runtime_context is not None and any(
+                            value is runtime_context for value in kwargs.values()
+                        ),
+                        "kwarg_keys": sorted(kwargs),
+                    },
+                    expected_next="local_tool_service.normalize_result",
+                )
             result = tool_def.fn(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
@@ -144,6 +180,21 @@ class LocalToolService:
                 tool_name,
                 int((time.perf_counter() - started_at) * 1000),
             )
+            if self._execution_loop_logger is not None and instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=instance_id,
+                    stage="local_tool_service.execute",
+                    status="failed",
+                    summary="本地工具函数抛出异常，LocalToolService 将其转换为结构化失败结果。",
+                    details={
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "error_type": exc.__class__.__name__,
+                        "error_message": error_message,
+                        "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                    },
+                    expected_next="tool_result.error",
+                )
             return build_tool_error_result(
                 error_code=exc.__class__.__name__,
                 error_message=error_message,
@@ -157,6 +208,21 @@ class LocalToolService:
                 tool_def.allowed_loop_decisions,
                 int((time.perf_counter() - started_at) * 1000),
             )
+            if self._execution_loop_logger is not None and instance_id:
+                self._execution_loop_logger.record_step(
+                    instance_id=instance_id,
+                    stage="local_tool_service.loop_decision",
+                    status="denied",
+                    summary="本地工具返回的 loop decision 不在该工具允许集合内，将被转换为工具错误结果。",
+                    details={
+                        "request_id": request_id,
+                        "tool_name": tool_name,
+                        "returned_loop_decision": unified_result.loop_decision,
+                        "allowed_loop_decisions": list(tool_def.allowed_loop_decisions),
+                        "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                    },
+                    expected_next="tool_result.error",
+                )
             return build_tool_error_result(
                 error_code="LoopDecisionNotAllowed",
                 error_message=(
@@ -172,6 +238,23 @@ class LocalToolService:
             unified_result.loop_decision,
             int((time.perf_counter() - started_at) * 1000),
         )
+        if self._execution_loop_logger is not None and instance_id:
+            self._execution_loop_logger.record_step(
+                instance_id=instance_id,
+                stage="local_tool_service.execute",
+                status="completed",
+                summary="本地工具执行结果已归一化，并通过 loop decision 授权校验。",
+                details={
+                    "request_id": request_id,
+                    "tool_name": tool_name,
+                    "success": unified_result.success,
+                    "execution_status": unified_result.execution_status,
+                    "loop_decision": unified_result.loop_decision,
+                    "has_frontend_message": unified_result.frontend_message is not None,
+                    "duration_ms": int((time.perf_counter() - started_at) * 1000),
+                },
+                expected_next="local_tool_gateway.return_result",
+            )
         return unified_result
 
     # ── 业务用例 4：获取工具 wiki 列表 ────────────────────────────────
