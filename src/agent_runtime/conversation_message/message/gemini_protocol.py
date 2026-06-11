@@ -43,6 +43,10 @@ from agent_runtime.conversation_message.message.models import (
     UniPart,
 )
 from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_gemini_response_parts
+from agent_runtime.conversation_message.message.multimodal_url_markers import (
+    multimodal_file_close_marker,
+    multimodal_file_open_marker,
+)
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -204,6 +208,9 @@ async def _build_gemini_user(
             parts.append({"text": p.text})
         elif p.kind == "image":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if marker is not None:
+                parts.append({"text": marker})
             if resource.object_storage_url:
                 parts.append({
                     "fileData": {
@@ -214,8 +221,13 @@ async def _build_gemini_user(
             else:
                 data = _require_base64(resource.base64_content, p.resource_id)
                 parts.append({"inlineData": {"mimeType": resource.mime_type, "data": data}})
+            if marker is not None:
+                parts.append({"text": multimodal_file_close_marker()})
         elif p.kind == "pdf":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if marker is not None:
+                parts.append({"text": marker})
             if resource.object_storage_url:
                 parts.append({
                     "fileData": {
@@ -231,6 +243,8 @@ async def _build_gemini_user(
                         "data": data,
                     }
                 })
+            if marker is not None:
+                parts.append({"text": multimodal_file_close_marker()})
 
     return {"role": "user", "parts": parts}
 

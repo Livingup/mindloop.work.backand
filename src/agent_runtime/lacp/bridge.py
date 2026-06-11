@@ -111,6 +111,7 @@ class AgentRuntimeLacpBridge:
             "transport": "lacp",
             "channel": "lacp",
             "display_text": message.content,
+            "text_format": "markdown",
             "remote_agent": {
                 "name": message.from_role_name,
                 "id": message.from_instance_id,

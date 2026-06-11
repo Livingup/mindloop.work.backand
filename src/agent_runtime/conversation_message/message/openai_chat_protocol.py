@@ -29,6 +29,10 @@ from agent_runtime.conversation_message.message.tool_result_output import (
     prefix_tool_result_error_output,
     tool_result_output_to_text,
 )
+from agent_runtime.conversation_message.message.multimodal_url_markers import (
+    multimodal_file_close_marker,
+    multimodal_file_open_marker,
+)
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -143,19 +147,29 @@ async def _build_openai_chat_user(
         elif part.kind == "image":
             has_non_text_part = True
             resource = await resolve_resource_access(resolver, part.resource_id)
+            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if marker is not None:
+                content_blocks.append({"type": "text", "text": marker})
             image_url = resource.object_storage_url
             if not image_url:
                 data = _require_base64(resource.base64_content, part.resource_id)
                 image_url = f"data:{resource.mime_type};base64,{data}"
             content_blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+            if marker is not None:
+                content_blocks.append({"type": "text", "text": multimodal_file_close_marker()})
         elif part.kind == "pdf":
             has_non_text_part = True
             resource = await resolve_resource_access(resolver, part.resource_id)
+            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if marker is not None:
+                content_blocks.append({"type": "text", "text": marker})
             file_url = resource.object_storage_url
             if not file_url:
                 data = _require_base64(resource.base64_content, part.resource_id)
                 file_url = f"data:{resource.mime_type or 'application/pdf'};base64,{data}"
             content_blocks.append({"type": "file", "file": {"file_data": file_url}})
+            if marker is not None:
+                content_blocks.append({"type": "text", "text": multimodal_file_close_marker()})
 
     if not has_non_text_part:
         return {"role": "user", "content": "\n".join(text_parts)}

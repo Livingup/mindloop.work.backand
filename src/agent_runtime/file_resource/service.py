@@ -13,6 +13,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import mimetypes
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Callable
@@ -30,6 +34,7 @@ from agent_runtime.file_resource.north_gateway.resource_create_contracts import 
     Base64CreateRequest,
     FileResourceCreateResult,
     LocalFileCreateRequest,
+    RemoteUrlCreateRequest,
 )
 
 from agent_runtime.file_resource.south_gateway.object_storage.contracts import (
@@ -131,6 +136,32 @@ class FileResourceService:
             )
         return results
 
+    def create_resources_from_remote_urls(
+        self,
+        create_requests: list[RemoteUrlCreateRequest],
+        *,
+        progress_callback: FileResourceProgressCallback | None = None,
+        cancel_checker: FileResourceCancelChecker | None = None,
+    ) -> list[FileResourceCreateResult]:
+        """从远程 http/https URL 批量创建统一文件资源。
+
+        如果 URL 已经是本服务已知的对象存储 URL，则直接复用对应资源；否则下载内容后
+        复用统一接入流程完成 MIME 校验、哈希去重、本地缓存、对象存储上传和建档。
+        """
+
+        self._assert_valid_batch_size(len(create_requests))
+        results: list[FileResourceCreateResult] = []
+        for req in create_requests:
+            self._ensure_not_cancelled(cancel_checker)
+            results.append(
+                self._create_from_remote_url(
+                    req,
+                    progress_callback=progress_callback,
+                    cancel_checker=cancel_checker,
+                )
+            )
+        return results
+
     # ── 北向能力：资源访问 ─────────────────────────────────────
 
     def get_resources(
@@ -146,6 +177,15 @@ class FileResourceService:
 
         self._assert_valid_batch_size(len(resource_ids))
         return [self._get_single_resource(rid) for rid in resource_ids]
+
+    def get_resources_by_object_storage_urls(
+        self,
+        object_storage_urls: list[str],
+    ) -> list[FileResourceAccessResult | None]:
+        """按对象存储访问 URL 批量获取资源访问结果。"""
+
+        self._assert_valid_batch_size(len(object_storage_urls))
+        return [self._get_single_resource_by_object_storage_url(url) for url in object_storage_urls]
 
     # ── 北向能力：资源删除 ─────────────────────────────────────
 
@@ -202,6 +242,36 @@ class FileResourceService:
         archive = self._ingest_content(
             content,
             request.resource_mime_type,
+            progress_callback=progress_callback,
+            cancel_checker=cancel_checker,
+        )
+        return self._to_create_result(archive)
+
+    def _create_from_remote_url(
+        self,
+        request: RemoteUrlCreateRequest,
+        *,
+        progress_callback: FileResourceProgressCallback | None = None,
+        cancel_checker: FileResourceCancelChecker | None = None,
+    ) -> FileResourceCreateResult:
+        """处理单个远程 URL 资源接入请求。"""
+
+        remote_url = _normalize_remote_resource_url(request.resource_url)
+        existing = self._archive_repository.get_archive_by_object_storage_url(remote_url)
+        if existing is not None:
+            self._emit_progress(progress_callback, "completed", "URL 已命中现有资源，复用已有档案。", 100)
+            return self._to_create_result(existing)
+        self._ensure_not_cancelled(cancel_checker)
+        self._emit_progress(progress_callback, "downloading", "正在下载远程文件内容。", 5)
+        content, mime_type = _download_remote_resource(
+            remote_url,
+            declared_mime_type=request.resource_mime_type,
+            max_bytes=request.max_bytes,
+        )
+        self._ensure_not_cancelled(cancel_checker)
+        archive = self._ingest_content(
+            content,
+            mime_type,
             progress_callback=progress_callback,
             cancel_checker=cancel_checker,
         )
@@ -334,6 +404,12 @@ class FileResourceService:
             resource_metadata=archive.resource_metadata,
         )
 
+    def _get_single_resource_by_object_storage_url(self, object_storage_url: str) -> FileResourceAccessResult | None:
+        archive = self._archive_repository.get_archive_by_object_storage_url(object_storage_url)
+        if archive is None:
+            return None
+        return self._get_single_resource(archive.resource_id)
+
     # ── 内部：资源删除 ─────────────────────────────────────────
 
     def _delete_single_resource(self, resource_id: str) -> None:
@@ -411,3 +487,83 @@ class FileResourceService:
     ) -> None:
         if progress_callback is not None:
             progress_callback(phase, message, progress_percent, uploaded_bytes, total_bytes)
+
+
+def _normalize_remote_resource_url(resource_url: str) -> str:
+    url = (resource_url or "").strip()
+    if not url:
+        raise ValueError("远程文件 URL 不能为空。")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("远程文件 URL 仅支持 http 或 https。")
+    if not parsed.netloc:
+        raise ValueError("远程文件 URL 缺少主机名。")
+    return url
+
+
+def _download_remote_resource(
+    resource_url: str,
+    *,
+    declared_mime_type: str | None,
+    max_bytes: int | None,
+) -> tuple[bytes, str]:
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError("远程文件下载大小上限必须大于 0。")
+    request = urllib.request.Request(
+        resource_url,
+        headers={"User-Agent": "AgentRuntimeFileResource/1.0"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            mime_type = _resolve_remote_mime_type(
+                declared_mime_type,
+                response.headers.get("Content-Type"),
+                resource_url,
+            )
+            if mime_type not in {"image/jpeg", "image/png", "image/webp", "application/pdf"}:
+                raise ValueError(f"不支持的远程文件 MIME 类型: {mime_type}")
+            length_header = response.headers.get("Content-Length")
+            if max_bytes is not None and length_header:
+                try:
+                    content_length = int(length_header)
+                except ValueError:
+                    content_length = 0
+                if content_length > max_bytes:
+                    raise ValueError(
+                        f"远程文件大小 {content_length} bytes 超过上限 {max_bytes} bytes。"
+                    )
+            chunks: list[bytes] = []
+            downloaded = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if max_bytes is not None and downloaded > max_bytes:
+                    raise ValueError(
+                        f"远程文件大小超过上限 {max_bytes} bytes，已停止下载。"
+                    )
+                chunks.append(chunk)
+    except urllib.error.URLError as exc:
+        raise ValueError(f"远程文件下载失败: {exc}") from exc
+    content = b"".join(chunks)
+    if not content:
+        raise ValueError("远程文件内容为空。")
+    return content, mime_type
+
+
+def _resolve_remote_mime_type(
+    declared_mime_type: str | None,
+    response_content_type: str | None,
+    resource_url: str,
+) -> str:
+    candidates = [
+        declared_mime_type,
+        (response_content_type or "").split(";", 1)[0].strip() or None,
+        mimetypes.guess_type(urllib.parse.urlparse(resource_url).path)[0],
+    ]
+    for candidate in candidates:
+        if candidate:
+            return str(candidate).strip().lower()
+    raise ValueError("无法确定远程文件 MIME 类型。")

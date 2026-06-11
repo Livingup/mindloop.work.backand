@@ -20,6 +20,11 @@ from agent_runtime.agent.agent_execution_engine import (
     AgentMessageSubmissionResult,
 )
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
+from agent_runtime.agent.file_input_policy import (
+    collect_next_request_file_input_stats,
+    file_input_limits_payload,
+    file_input_stats_payload,
+)
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import (
     AgentRuntimeGateway,
     AttachSceneRequest,
@@ -43,15 +48,8 @@ from agent_runtime.chat_bubble.chat_bubble_message import (
     ChatBubbleTextFormat,
 )
 from agent_runtime.chat_bubble.chat_bubble_service import ChatBubbleService
-from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 from agent_runtime.scene.scene_session_registry import SceneSessionRegistry
-
-MAX_IMAGE_INPUTS_PER_LLM_REQUEST = 1500
-MAX_TOTAL_IMAGE_BYTES_PER_LLM_REQUEST = 512 * 1024 * 1024
-MAX_SINGLE_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
-MAX_TOTAL_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
-
 
 class CreateRootAgentInstanceBody(BaseModel):
     thread_id: str
@@ -975,12 +973,7 @@ def _relation_response(relation: AgentParentChildRelation) -> AgentParentChildRe
 
 
 def _file_input_limits_response() -> FileInputLimitsResponse:
-    return FileInputLimitsResponse(
-        max_image_inputs_per_request=MAX_IMAGE_INPUTS_PER_LLM_REQUEST,
-        max_total_image_bytes_per_request=MAX_TOTAL_IMAGE_BYTES_PER_LLM_REQUEST,
-        max_single_input_file_bytes=MAX_SINGLE_INPUT_FILE_BYTES_PER_LLM_REQUEST,
-        max_total_input_file_bytes_per_request=MAX_TOTAL_INPUT_FILE_BYTES_PER_LLM_REQUEST,
-    )
+    return FileInputLimitsResponse(**file_input_limits_payload())
 
 
 async def _next_request_file_stats(
@@ -988,110 +981,12 @@ async def _next_request_file_stats(
     conversation_repository: ConversationRepository | None,
     file_resource_service: Any | None,
 ) -> FileInputStatsResponse:
-    stats = _empty_file_input_stats()
-    if conversation_repository is not None and instance.conversation_id:
-        conversation = await conversation_repository.get(instance.conversation_id)
-        _add_resource_reference_stats(
-            stats,
-            list(_iter_file_resource_references(conversation.messages)),
-            file_resource_service,
-        )
-    for message in instance.pending_user_messages:
-        for attachment in message.attachments:
-            _add_file_input_stats(
-                stats,
-                attachment.kind,
-                attachment.size_in_bytes or 0,
-                attachment.page_count or 0,
-            )
-    return FileInputStatsResponse(**stats)
-
-
-def _empty_file_input_stats() -> dict[str, int]:
-    return {
-        "file_count": 0,
-        "total_file_bytes": 0,
-        "pdf_file_count": 0,
-        "image_file_count": 0,
-        "total_pdf_pages": 0,
-        "total_image_bytes": 0,
-        "total_input_file_bytes": 0,
-    }
-
-
-def _iter_file_resource_references(messages: list[Any]):
-    for message in messages:
-        yield from _iter_file_resource_references_from_parts(getattr(message, "content", []))
-
-
-def _iter_file_resource_references_from_parts(parts: list[Any]):
-    for part in parts:
-        kind = getattr(part, "kind", None)
-        if kind in {INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF}:
-            resource_id = getattr(part, "resource_id", None)
-            if resource_id:
-                yield kind, str(resource_id)
-        elif kind == "tool_result":
-            output = getattr(part, "output", None)
-            if isinstance(output, list):
-                yield from _iter_file_resource_references_from_parts(output)
-
-
-def _add_resource_reference_stats(
-    stats: dict[str, int],
-    references: list[tuple[str, str]],
-    file_resource_service: Any | None,
-) -> None:
-    if not references:
-        return
-    if file_resource_service is None:
-        raise RuntimeError("文件资源服务未启用，无法统计历史文件输入。")
-    resources = file_resource_service.get_resources([resource_id for _, resource_id in references])
-    for index, (kind, _resource_id) in enumerate(references):
-        resource = resources[index] if index < len(resources) else None
-        if resource is None:
-            raise RuntimeError("历史文件资源不存在，无法统计文件输入限制。")
-        metadata = getattr(resource, "resource_metadata", None)
-        category = getattr(metadata, "resource_category", None)
-        actual_kind = (
-            INPUT_MODALITY_PDF
-            if category == INPUT_MODALITY_PDF
-            else INPUT_MODALITY_IMAGE
-            if category == INPUT_MODALITY_IMAGE
-            else kind
-        )
-        _add_file_input_stats(
-            stats,
-            actual_kind,
-            _resource_size(resource),
-            getattr(metadata, "pdf_page_count", 0) if actual_kind == INPUT_MODALITY_PDF else 0,
-        )
-
-
-def _resource_size(resource: Any) -> int:
-    try:
-        return max(0, int(getattr(resource, "resource_size_in_bytes", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _add_file_input_stats(
-    stats: dict[str, int],
-    kind: str,
-    size_in_bytes: int,
-    page_count: int,
-) -> None:
-    safe_size = max(0, size_in_bytes)
-    stats["file_count"] += 1
-    stats["total_file_bytes"] += safe_size
-    if kind == INPUT_MODALITY_PDF:
-        stats["pdf_file_count"] += 1
-        stats["total_pdf_pages"] += max(0, page_count)
-        stats["total_input_file_bytes"] += safe_size
-        return
-    if kind == INPUT_MODALITY_IMAGE:
-        stats["image_file_count"] += 1
-        stats["total_image_bytes"] += safe_size
+    stats = await collect_next_request_file_input_stats(
+        instance,
+        conversation_repository,
+        file_resource_service,
+    )
+    return FileInputStatsResponse(**file_input_stats_payload(stats))
 
 
 async def _instance_response(

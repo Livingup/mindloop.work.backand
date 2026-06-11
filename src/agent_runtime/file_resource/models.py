@@ -155,6 +155,9 @@ class FileResourceArchiveRepository(Protocol):
     ) -> FileResourceArchive | None:
         """根据内容哈希获取档案（用于去重判断）。"""
 
+    def get_archive_by_object_storage_url(self, object_storage_url: str) -> FileResourceArchive | None:
+        """根据资源对象存储访问 URL 获取档案。"""
+
     def save_archive(self, archive: FileResourceArchive) -> None:
         """保存档案。"""
 
@@ -171,6 +174,7 @@ class InMemoryFileResourceArchiveRepository:
     def __init__(self) -> None:
         self._archive_by_id: dict[str, FileResourceArchive] = {}
         self._resource_id_by_hash: dict[str, str] = {}
+        self._resource_id_by_object_storage_url: dict[str, str] = {}
 
     def get_archive_by_id(self, resource_id: str) -> FileResourceArchive | None:
         """根据资源标识获取档案。"""
@@ -188,11 +192,23 @@ class InMemoryFileResourceArchiveRepository:
             return None
         return self._archive_by_id.get(resource_id)
 
-    def save_archive(self, archive: FileResourceArchive) -> None:
-        """保存档案并同步维护内容哈希索引。"""
+    def get_archive_by_object_storage_url(self, object_storage_url: str) -> FileResourceArchive | None:
+        """根据对象存储访问 URL 获取档案。"""
 
+        resource_id = self._resource_id_by_object_storage_url.get(object_storage_url)
+        if resource_id is None:
+            return None
+        return self._archive_by_id.get(resource_id)
+
+    def save_archive(self, archive: FileResourceArchive) -> None:
+        """保存档案并同步维护内容哈希与对象存储 URL 索引。"""
+
+        previous = self._archive_by_id.get(archive.resource_id)
+        if previous is not None and previous.object_storage_url != archive.object_storage_url:
+            self._resource_id_by_object_storage_url.pop(previous.object_storage_url, None)
         self._archive_by_id[archive.resource_id] = archive
         self._resource_id_by_hash[archive.resource_content_hash] = archive.resource_id
+        self._resource_id_by_object_storage_url[archive.object_storage_url] = archive.resource_id
 
     def delete_archive(self, resource_id: str) -> None:
         """删除档案并移除对应内容哈希索引。"""
@@ -200,3 +216,4 @@ class InMemoryFileResourceArchiveRepository:
         archive = self._archive_by_id.pop(resource_id, None)
         if archive is not None:
             self._resource_id_by_hash.pop(archive.resource_content_hash, None)
+            self._resource_id_by_object_storage_url.pop(archive.object_storage_url, None)

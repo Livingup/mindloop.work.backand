@@ -43,6 +43,10 @@ from agent_runtime.conversation_message.message.models import (
     UniPart,
 )
 from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_claude_content
+from agent_runtime.conversation_message.message.multimodal_url_markers import (
+    multimodal_file_close_marker,
+    multimodal_file_open_marker,
+)
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -233,6 +237,9 @@ async def _build_claude_user(
             content.append({"type": "text", "text": p.text})
         elif p.kind == "image":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if marker is not None:
+                content.append({"type": "text", "text": marker})
             if resource.object_storage_url:
                 source = {"type": "url", "url": resource.object_storage_url}
             else:
@@ -246,8 +253,13 @@ async def _build_claude_user(
                 "type": "image",
                 "source": source,
             })
+            if marker is not None:
+                content.append({"type": "text", "text": multimodal_file_close_marker()})
         elif p.kind == "pdf":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if marker is not None:
+                content.append({"type": "text", "text": marker})
             if resource.object_storage_url:
                 source = {"type": "url", "url": resource.object_storage_url}
             else:
@@ -261,6 +273,8 @@ async def _build_claude_user(
                 "type": "document",
                 "source": source,
             })
+            if marker is not None:
+                content.append({"type": "text", "text": multimodal_file_close_marker()})
 
     return {"role": "user", "content": content}
 

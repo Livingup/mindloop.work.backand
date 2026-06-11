@@ -2,14 +2,23 @@
 """本地子 Agent 协作运行时门面。"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
+from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING, PendingUserMessageAttachment
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
+from agent_runtime.agent.file_input_policy import (
+    FileInputCandidate,
+    default_file_input_limits,
+    validate_file_input_candidates,
+)
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import CreateChildAgentInstanceRequest
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
+from agent_runtime.file_resource.shared_service import get_file_resource_service
+from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 
 if TYPE_CHECKING:
     from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
@@ -51,6 +60,7 @@ class SubagentRuntime:
         agent_definition_id: str,
         llm_policy_group_id: str | None = None,
         initial_message: str | None = None,
+        initial_message_attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         parent = self._runtime_gateway.get_agent_instance(parent_instance_id)
         task = self._runtime_gateway.get_task(parent.task_id)
@@ -64,6 +74,9 @@ class SubagentRuntime:
         child_definition = self._agent_definition_gateway.get_agent_definition(agent_definition_id)
         if child_definition.disabled:
             raise ValueError(f"子 Agent 定义已禁用: {agent_definition_id}")
+        initial_attachments = await self._resolve_url_attachments(initial_message_attachments or [])
+        if initial_attachments:
+            validate_file_input_candidates(_file_input_candidates(initial_attachments))
         selection = self._resolve_child_llm_selection(
             parent_llm_provider_id=parent.llm_provider_id,
             parent_llm_model_binding_id=parent.llm_model_binding_id,
@@ -90,11 +103,12 @@ class SubagentRuntime:
             child_instance_id=child.instance_id,
             relation=relation,
         )
-        if initial_message and initial_message.strip():
-            await self.send_agent_message(
+        if (initial_message and initial_message.strip()) or initial_attachments:
+            await self._send_agent_message(
                 from_instance_id=parent.instance_id,
                 to_instance_id=child.instance_id,
-                content=initial_message,
+                content=initial_message or "",
+                attachments=initial_attachments,
             )
         return {
             "status": "created",
@@ -115,10 +129,27 @@ class SubagentRuntime:
         from_instance_id: str,
         to_instance_id: str,
         content: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        resolved_attachments = await self._resolve_url_attachments(attachments or [])
+        return await self._send_agent_message(
+            from_instance_id=from_instance_id,
+            to_instance_id=to_instance_id,
+            content=content,
+            attachments=resolved_attachments,
+        )
+
+    async def _send_agent_message(
+        self,
+        *,
+        from_instance_id: str,
+        to_instance_id: str,
+        content: str,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
     ) -> dict[str, Any]:
         content = content.strip()
-        if not content:
-            raise ValueError("content 不能为空。")
+        if not content and not attachments:
+            raise ValueError("content 和 attachments 必须至少提供一个。")
         source = self._runtime_gateway.get_agent_instance(from_instance_id)
         target = self._runtime_gateway.get_agent_instance(to_instance_id)
         task = self._runtime_gateway.get_task(source.task_id)
@@ -136,6 +167,8 @@ class SubagentRuntime:
             "transport": "subagent",
             "channel": "subagent",
             "display_text": content,
+            "text_format": "markdown",
+            "attachments": _attachments_metadata(attachments),
             "local_agent": {
                 "name": source_name,
                 "agent_definition_id": source.agent_definition_id,
@@ -150,6 +183,7 @@ class SubagentRuntime:
         result = await self._execution_engine.submit_agent_instance_message(
             agent_instance_id=target.instance_id,
             user_text=user_text,
+            attachments=attachments,
             message_metadata=metadata,
         )
         return {
@@ -160,6 +194,55 @@ class SubagentRuntime:
             "queued_for_later": result.queued_for_later,
             "delivery": "accepted",
         }
+
+    async def _resolve_url_attachments(
+        self,
+        attachments: list[dict[str, Any]],
+    ) -> tuple[PendingUserMessageAttachment, ...]:
+        if not attachments:
+            return ()
+        requests: list[RemoteUrlCreateRequest] = []
+        expected_kinds: list[str] = []
+        names: list[str | None] = []
+        for index, attachment in enumerate(attachments):
+            kind = _normalize_attachment_kind(attachment.get("kind"), index)
+            url = _normalize_attachment_url(attachment.get("url"), index)
+            mime_type = _normalize_attachment_mime_type(attachment.get("mime_type"))
+            requests.append(
+                RemoteUrlCreateRequest(
+                    resource_url=url,
+                    resource_mime_type=mime_type,
+                    max_bytes=_attachment_download_limit(kind),
+                )
+            )
+            expected_kinds.append(kind)
+            names.append(_normalize_optional_text(attachment.get("name")))
+        service = get_file_resource_service()
+        created = await asyncio.to_thread(service.create_resources_from_remote_urls, requests)
+        resources = await asyncio.to_thread(service.get_resources, [item.resource_id for item in created])
+        resolved: list[PendingUserMessageAttachment] = []
+        for index, resource in enumerate(resources):
+            if resource is None:
+                raise ValueError("URL 文件资源创建后无法读取资源详情。")
+            metadata = resource.resource_metadata
+            actual_kind = metadata.resource_category
+            if actual_kind != expected_kinds[index]:
+                raise ValueError(
+                    f"附件类型与 URL 文件实际类型不一致: expected={expected_kinds[index]}, actual={actual_kind}"
+                )
+            resolved.append(
+                PendingUserMessageAttachment(
+                    kind=actual_kind,
+                    resource_id=resource.resource_id,
+                    name=names[index],
+                    mime_type=resource.resource_mime_type,
+                    size_in_bytes=resource.resource_size_in_bytes,
+                    width=getattr(metadata, "image_width", None),
+                    height=getattr(metadata, "image_height", None),
+                    page_count=getattr(metadata, "pdf_page_count", None),
+                )
+            )
+        return tuple(resolved)
 
     def get_agent_status(self, requester_instance_id: str, target_instance_id: str) -> dict[str, Any]:
         requester = self._runtime_gateway.get_agent_instance(requester_instance_id)
@@ -425,6 +508,73 @@ def get_subagent_runtime() -> SubagentRuntime:
     if _runtime is None:
         raise RuntimeError("Subagent runtime has not been configured.")
     return _runtime
+
+
+def _attachments_metadata(
+    attachments: tuple[PendingUserMessageAttachment, ...],
+) -> list[dict[str, object | None]]:
+    return [
+        {
+            "kind": attachment.kind,
+            "resource_id": attachment.resource_id,
+            "name": attachment.name,
+            "mime_type": attachment.mime_type,
+            "size_in_bytes": attachment.size_in_bytes,
+            "width": attachment.width,
+            "height": attachment.height,
+            "page_count": attachment.page_count,
+        }
+        for attachment in attachments
+    ]
+
+
+def _file_input_candidates(
+    attachments: tuple[PendingUserMessageAttachment, ...],
+) -> tuple[FileInputCandidate, ...]:
+    return tuple(
+        FileInputCandidate(
+            kind=attachment.kind,
+            size_in_bytes=attachment.size_in_bytes or 0,
+            page_count=attachment.page_count or 0,
+            name=attachment.name,
+        )
+        for attachment in attachments
+    )
+
+
+def _normalize_attachment_kind(value: Any, index: int) -> str:
+    kind = str(value or "").strip().lower()
+    if kind not in {INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF}:
+        raise ValueError(f"attachments[{index}].kind 必须是 image 或 pdf。")
+    return kind
+
+
+def _normalize_attachment_url(value: Any, index: int) -> str:
+    url = str(value or "").strip()
+    if not url:
+        raise ValueError(f"attachments[{index}].url 不能为空。")
+    return url
+
+
+def _normalize_attachment_mime_type(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _normalize_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _attachment_download_limit(kind: str) -> int:
+    limits = default_file_input_limits()
+    if kind == INPUT_MODALITY_PDF:
+        return limits.max_single_input_file_bytes - 1
+    return limits.max_total_image_bytes_per_request
 
 
 def _default_stream_id_for_task(scene_id: str | None, task_id: str) -> str:

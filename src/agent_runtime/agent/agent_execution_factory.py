@@ -193,6 +193,7 @@ class AgentExecutionFactory:
             event_publisher=event_publisher,
             context_compression_service=context_compression_service,
             execution_loop_logger=execution_loop_logger,
+            file_resource_service_getter=get_file_resource_service,
         )
         LacpFactory.create_bridge(
             runtime_gateway=runtime_gateway,

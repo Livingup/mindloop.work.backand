@@ -2,11 +2,23 @@
 """本地子 Agent 协作工具。"""
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
 from agent_runtime.subagent.subagent_runtime import get_subagent_runtime
+
+
+class SubagentMessageAttachmentRequest(BaseModel):
+    """LLM 可见的本地 Agent 协作附件。
+
+    这里只暴露模型能理解和转发的 URL，不暴露 Runtime 内部 resource_id。
+    """
+
+    kind: str = Field(description="附件类型，仅支持 image 或 pdf。")
+    url: str = Field(description="图片或 PDF 的 http/https 文件 URL。Runtime 会自动反查或接入为内部文件资源。")
+    name: str | None = Field(default=None, description="可选文件名，用于接收方 UI 展示。")
+    mime_type: str | None = Field(default=None, description="可选 MIME 类型，例如 image/png 或 application/pdf；为空时由 URL 响应或后缀推断。")
 
 
 class CreateSubagentRequest(BaseToolRequest):
@@ -15,13 +27,15 @@ class CreateSubagentRequest(BaseToolRequest):
     agent_definition_id: str = Field(description="要创建的子 AgentDefinition ID，必须包含在当前 AgentDefinition.available_sub_agent_ids 中。")
     llm_policy_group_id: str | None = Field(default=None, description="可选 LLM 执行策略组 ID；不填时使用子 Agent 默认策略或继承当前 Agent 策略。")
     initial_message: str | None = Field(default=None, description="可选初始任务消息；提供后会在创建成功后异步投递给子 Agent。")
+    initial_message_attachments: list[SubagentMessageAttachmentRequest] = Field(default_factory=list, description="可选初始消息附件 URL 列表，支持图片或 PDF。")
 
 
 class SendAgentMessageRequest(BaseToolRequest):
     """向直接父/子 Agent 发送消息。"""
 
     to_agent_instance_id: str = Field(description="目标 Agent 实例 ID，必须是未释放的直接父 Agent 或直接子 Agent。")
-    content: str = Field(description="要发送给目标 Agent 的任务协作消息正文。发送立即返回，仅表示已接受/入队。")
+    content: str = Field(default="", description="要发送给目标 Agent 的任务协作消息正文。发送立即返回，仅表示已接受/入队。")
+    attachments: list[SubagentMessageAttachmentRequest] = Field(default_factory=list, description="可选协作附件 URL 列表，支持图片或 PDF。")
 
 
 class GetAgentStatusRequest(BaseToolRequest):
@@ -56,6 +70,7 @@ async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContex
         agent_definition_id=request.agent_definition_id,
         llm_policy_group_id=request.llm_policy_group_id,
         initial_message=request.initial_message,
+        initial_message_attachments=[item.model_dump() for item in request.initial_message_attachments],
     )
     return BaseToolResult(output=output, metadata={"subagent_action": "create_subagent"})
 
@@ -77,6 +92,7 @@ async def send_agent_message(request: SendAgentMessageRequest, ctx: ToolRuntimeC
         from_instance_id=ctx.agent_instance_id,
         to_instance_id=request.to_agent_instance_id,
         content=request.content,
+        attachments=[item.model_dump() for item in request.attachments],
     )
     return BaseToolResult(output=output, metadata={"subagent_action": "send_agent_message"})
 

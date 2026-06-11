@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from agent_runtime.config import ConfigRegistry
 from agent_runtime.file_resource.models import ImageResourceMetadata, PdfResourceMetadata
-from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest, RemoteUrlCreateRequest
 from agent_runtime.file_resource.settings_repository import (
     DEFAULT_OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS,
     ObjectStorageSettingsRepository,
@@ -35,6 +35,17 @@ class CreateFileResourceItem(BaseModel):
 
 class CreateFileResourcesBody(BaseModel):
     resources: list[CreateFileResourceItem] = Field(default_factory=list)
+
+
+class CreateFileResourceUrlItem(BaseModel):
+    name: str | None = None
+    url: str
+    mime_type: str | None = None
+    max_bytes: int | None = None
+
+
+class CreateFileResourcesFromUrlsBody(BaseModel):
+    resources: list[CreateFileResourceUrlItem] = Field(default_factory=list)
 
 
 class FileResourceResponse(BaseModel):
@@ -135,6 +146,30 @@ def create_file_resource_router() -> APIRouter:
                 [item.mime_type for item in body.resources],
             )
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        responses: list[FileResourceResponse] = []
+        for index, resource in enumerate(resolved):
+            if resource is None:
+                continue
+            responses.append(_resource_response(resource, name=body.resources[index].name))
+        return CreateFileResourcesResponse(resources=responses)
+
+    @router.post("/from-urls", response_model=CreateFileResourcesResponse)
+    def create_resources_from_urls(body: CreateFileResourcesFromUrlsBody) -> CreateFileResourcesResponse:
+        if not body.resources:
+            raise HTTPException(status_code=400, detail="resources 不能为空。")
+        try:
+            service = get_file_resource_service()
+            created = service.create_resources_from_remote_urls([
+                RemoteUrlCreateRequest(
+                    resource_url=item.url,
+                    resource_mime_type=item.mime_type,
+                    max_bytes=item.max_bytes,
+                )
+                for item in body.resources
+            ])
+            resolved = service.get_resources([item.resource_id for item in created])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         responses: list[FileResourceResponse] = []
         for index, resource in enumerate(resolved):
             if resource is None:

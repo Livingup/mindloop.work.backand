@@ -22,6 +22,7 @@ from agent_runtime.agent.agent_instance import (
 )
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
+from agent_runtime.agent.file_input_policy import validate_agent_instance_file_input_allowed
 from agent_runtime.agent.execution_loop_logger import (
     AgentExecutionLoopLogger,
     NoopAgentExecutionLoopLogger,
@@ -305,6 +306,7 @@ class AgentExecutionEngine:
         event_publisher: RuntimeEventPublisher | None = None,
         context_compression_service: ContextCompressionService | None = None,
         execution_loop_logger: AgentExecutionLoopLogger | NoopAgentExecutionLoopLogger | None = None,
+        file_resource_service_getter: Callable[[], Any] | None = None,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -331,6 +333,7 @@ class AgentExecutionEngine:
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
         self._context_compression_service = context_compression_service
         self._execution_loop_logger = execution_loop_logger or NoopAgentExecutionLoopLogger()
+        self._file_resource_service_getter = file_resource_service_getter
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
@@ -390,6 +393,25 @@ class AgentExecutionEngine:
     def _clear_execution_progress(self, instance_id: str) -> None:
         self._execution_progress.pop(instance_id, None)
 
+    async def _validate_file_input_before_enqueue(
+        self,
+        instance: AgentInstance,
+        attachments: tuple[PendingUserMessageAttachment, ...],
+    ) -> None:
+        if not attachments:
+            return
+        file_resource_service = (
+            self._file_resource_service_getter()
+            if self._file_resource_service_getter is not None
+            else None
+        )
+        await validate_agent_instance_file_input_allowed(
+            instance=instance,
+            new_attachments=attachments,
+            conversation_repository=self._conversation_repository,
+            file_resource_service=file_resource_service,
+        )
+
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
         task, instance = self._runtime_gateway.create_task_with_root_agent_instance(
@@ -404,10 +426,12 @@ class AgentExecutionEngine:
                 conversation_id=request.conversation_id,
             )
         )
+        attachments = _request_user_attachments(request)
+        await self._validate_file_input_before_enqueue(instance, attachments)
         self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=_request_user_text(request),
-            attachments=_request_user_attachments(request),
+            attachments=attachments,
             client_message_id=request.client_message_id,
         )
         instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
@@ -431,6 +455,7 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
+        await self._validate_file_input_before_enqueue(instance, attachments)
         instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
@@ -472,6 +497,7 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
+        await self._validate_file_input_before_enqueue(instance, attachments)
         instance, pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,

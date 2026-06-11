@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS file_resource_archives (
 );
 CREATE INDEX IF NOT EXISTS idx_file_resource_archives_content_hash
     ON file_resource_archives(resource_content_hash);
+CREATE INDEX IF NOT EXISTS idx_file_resource_archives_object_storage_url
+    ON file_resource_archives(object_storage_url);
 """
 
 
@@ -89,6 +91,26 @@ class SqliteFileResourceArchiveRepository:
                 WHERE resource_content_hash = ?
                 """,
                 (content_hash,),
+            ).fetchone()
+        return _row_to_archive(row) if row is not None else None
+
+    def get_archive_by_object_storage_url(self, object_storage_url: str) -> FileResourceArchive | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT resource_id,
+                       resource_content_hash,
+                       resource_category,
+                       resource_mime_type,
+                       resource_size_in_bytes,
+                       local_storage_path,
+                       object_storage_url,
+                       resource_metadata_json,
+                       resource_created_at_iso8601
+                FROM file_resource_archives
+                WHERE object_storage_url = ?
+                """,
+                (object_storage_url,),
             ).fetchone()
         return _row_to_archive(row) if row is not None else None
 

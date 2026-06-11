@@ -44,6 +44,10 @@ from agent_runtime.conversation_message.message.tool_result_output import (
     prefix_tool_result_error_output,
     tool_result_output_to_openai_responses_output,
 )
+from agent_runtime.conversation_message.message.multimodal_url_markers import (
+    multimodal_file_close_marker,
+    multimodal_file_open_marker,
+)
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     resolve_resource_access,
@@ -249,6 +253,9 @@ async def _build_openai_user(
             content.append({"type": "input_text", "text": p.text})
         elif p.kind == "image":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if marker is not None:
+                content.append({"type": "input_text", "text": marker})
             image_url = resource.object_storage_url
             if not image_url:
                 data = _require_base64(resource.base64_content, p.resource_id)
@@ -257,8 +264,13 @@ async def _build_openai_user(
                 "type": "input_image",
                 "image_url": image_url,
             })
+            if marker is not None:
+                content.append({"type": "input_text", "text": multimodal_file_close_marker()})
         elif p.kind == "pdf":
             resource = await resolve_resource_access(resolver, p.resource_id)
+            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if marker is not None:
+                content.append({"type": "input_text", "text": marker})
             if resource.object_storage_url:
                 content.append({
                     "type": "input_file",
@@ -270,6 +282,8 @@ async def _build_openai_user(
                     "type": "input_file",
                     "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
                 })
+            if marker is not None:
+                content.append({"type": "input_text", "text": multimodal_file_close_marker()})
 
     return {"type": "message", "role": "user", "content": content}
 
