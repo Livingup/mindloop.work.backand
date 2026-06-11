@@ -12,12 +12,19 @@ ChatBubbleStatus: TypeAlias = str
 ChatBubbleTextFormat: TypeAlias = str
 
 CHAT_BUBBLE_ROLE_USER: Final[str] = "user"
-CHAT_BUBBLE_ROLE_ASSISTANT: Final[str] = "assistant"
+CHAT_BUBBLE_ROLE_AGENT: Final[str] = "agent"
+CHAT_BUBBLE_ROLE_LOCAL_AGENT: Final[str] = "local_agent"
+CHAT_BUBBLE_ROLE_REMOTE_AGENT: Final[str] = "remote_agent"
 CHAT_BUBBLE_ROLE_SYSTEM: Final[str] = "system"
+# 兼容历史已持久化的 assistant 气泡；新 UI 气泡统一使用 agent。
+CHAT_BUBBLE_ROLE_ASSISTANT: Final[str] = "assistant"
 CHAT_BUBBLE_ROLES: Final[frozenset[str]] = frozenset({
     CHAT_BUBBLE_ROLE_USER,
-    CHAT_BUBBLE_ROLE_ASSISTANT,
+    CHAT_BUBBLE_ROLE_AGENT,
+    CHAT_BUBBLE_ROLE_LOCAL_AGENT,
+    CHAT_BUBBLE_ROLE_REMOTE_AGENT,
     CHAT_BUBBLE_ROLE_SYSTEM,
+    CHAT_BUBBLE_ROLE_ASSISTANT,
 })
 
 CHAT_BUBBLE_STATUS_SENDING: Final[str] = "sending"
@@ -205,8 +212,8 @@ class ChatBubbleMessage:
                 raise ValueError("interaction_options 必须由 ChatBubbleInteractionOption 组成。")
         if self.interaction_state not in CHAT_BUBBLE_INTERACTION_STATES:
             raise ValueError(f"未知 Chat 气泡交互状态: {self.interaction_state}")
-        if self.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING and self.role != CHAT_BUBBLE_ROLE_ASSISTANT:
-            raise ValueError("只有 assistant 气泡可以处于 pending 交互状态。")
+        if self.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING and self.role not in {CHAT_BUBBLE_ROLE_AGENT, CHAT_BUBBLE_ROLE_ASSISTANT}:
+            raise ValueError("只有 agent 气泡可以处于 pending 交互状态。")
         if self.selected_option_id is not None:
             _require_non_blank(self.selected_option_id, "selected_option_id")
             if self.interaction_state == CHAT_BUBBLE_INTERACTION_STATE_PENDING:
