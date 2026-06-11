@@ -122,6 +122,9 @@ class AgentExecutionFactory:
         )
         local_tool_gateway = LocalToolFactory.create()
         mcp_gateway = mcp_client_gateway or McpClientFactory.create()
+        from agent_runtime.mcp.mcp_meta_tools import mcp_meta_tools
+
+        mcp_meta_tools.configure(mcp_gateway)
         runtime_gateway = AgentRuntimeFactory.create()
         resource_resolver = _LazyFileResourceResolver()
         llm_request_service = LlmClientFactory.create(

@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
 from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import SqliteAgentRuntimeRepository
-from agent_runtime.agent_definition.agent_definition import AgentDefinition, SystemPromptSegment
+from agent_runtime.agent_definition.agent_definition import AgentDefinition, McpToolBinding, SystemPromptSegment
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
+from agent_runtime.agent.tool_dispatch.tool_dispatcher import AgentToolDispatcher
+from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_CHAT_COMPLETIONS
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 from agent_runtime.subagent.subagent_runtime import SubagentRuntime
 from agent_runtime.subagent.subagent_tool import EndSubagentRequest
@@ -20,6 +22,20 @@ class _LocalToolGateway:
     def list_tools(self, *, public_only: bool = False, group_by: bool = False):
         return self._tools
 
+    def get_tool(self, tool_name: str):
+        return SimpleNamespace(
+            schemas={
+                API_FORMAT_OPENAI_CHAT_COMPLETIONS: {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": f"{tool_name} desc",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            },
+        )
+
 
 class _AgentDefinitionGateway:
     def __init__(self, definitions):
@@ -27,6 +43,28 @@ class _AgentDefinitionGateway:
 
     def get_agent_definition(self, agent_id: str) -> AgentDefinition:
         return self._definitions[agent_id]
+
+
+class _McpGateway:
+    def list_services(self):
+        return [
+            SimpleNamespace(
+                service_id="remote-search",
+                description="远端搜索 MCP 服务",
+            ),
+        ]
+
+    async def list_tools(self, service_id: str):
+        self.list_tools_service_id = service_id
+        return [
+            SimpleNamespace(
+                name="search",
+                description="执行远端搜索",
+            ),
+        ]
+
+    async def get_tool_detail(self, service_id: str, tool_names: list[str]):
+        raise AssertionError("执行循环不应把远端 MCP 工具详情展开为 LLM tools")
 
 
 class _SubagentTask:
@@ -122,6 +160,12 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         prompt_text = prompt or ""
         self.assertTrue(prompt_text.startswith("# 沟通环境与身份"))
         self.assertIn("当前 Agent 实例 ID：`agent-instance-self`", prompt_text)
+        self.assertIn("MCP 支持说明", prompt_text)
+        self.assertIn("当前你所处的agent系统支持通过 MCP 服务接入外部工具和资源", prompt_text)
+        self.assertIn("远端 MCP 服务的工具不会直接设置到你的 `tools` 中", prompt_text)
+        self.assertIn("mcp_get_service_detail", prompt_text)
+        self.assertIn("mcp_get_tool_detail", prompt_text)
+        self.assertIn("mcp_call_tool", prompt_text)
         self.assertIn("使用 `lacp` MCP 服务提供的 `lacp_send_message` 工具", prompt_text)
         self.assertIn("`【@本地Agent <agent_name_or_id> <agent_instance_id>】`", prompt_text)
         self.assertIn("使用本地 subagent 工具", prompt_text)
@@ -297,6 +341,50 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertNotIn("图片生成请使用generate_image工具", notice)
         self.assertNotIn("网络搜索请使用web_search，read_url_context工具", notice)
         self.assertNotIn("禁止并发调用", notice)
+
+    def test_mcp_bindings_are_described_in_prompt_but_not_exposed_as_direct_llm_tools(self) -> None:
+        mcp_gateway = _McpGateway()
+        dispatcher = AgentToolDispatcher(
+            local_tool_gateway=_LocalToolGateway((
+                _local_tool("mcp_get_service_detail"),
+                _local_tool("mcp_get_tool_detail"),
+                _local_tool("mcp_call_tool"),
+            )),
+            mcp_client_gateway=mcp_gateway,
+        )
+        definition = AgentDefinition(
+            agent_id="mcp-agent",
+            group="default",
+            mcp_tools=(McpToolBinding(service_id="remote-search", tool_ids=("search",)),),
+        )
+
+        llm_tools = asyncio.run(dispatcher.build_llm_tools(
+            agent_definition=definition,
+            api_format=API_FORMAT_OPENAI_CHAT_COMPLETIONS,
+        ))
+
+        self.assertEqual([tool.name for tool in llm_tools], [
+            "mcp_get_service_detail",
+            "mcp_get_tool_detail",
+            "mcp_call_tool",
+        ])
+        self.assertTrue(all(tool.source == "local" for tool in llm_tools))
+        self.assertFalse(any(tool.name.startswith("mcp__") for tool in llm_tools))
+
+        engine = self._engine_with_local_tools(
+            _local_tool("mcp_get_service_detail"),
+            _local_tool("mcp_get_tool_detail"),
+            _local_tool("mcp_call_tool"),
+        )
+        engine._mcp_client_gateway = mcp_gateway
+        prompt = asyncio.run(engine._load_mcp_services_prompt(definition))
+
+        self.assertIn("# 可用的 MCP 服务列表", prompt)
+        self.assertIn("`remote-search`：远端搜索 MCP 服务", prompt)
+        self.assertIn("`search`：执行远端搜索", prompt)
+        self.assertIn("远端 MCP 服务工具不会直接设置到本轮 LLM 请求 tools 中", prompt)
+        self.assertIn("`mcp_get_tool_detail` 获取参数 schema", prompt)
+        self.assertIn("`mcp_call_tool` 执行", prompt)
 
     def test_system_prompt_injects_available_subagent_ids_and_descriptions(self) -> None:
         engine = self._engine_with_local_tools(

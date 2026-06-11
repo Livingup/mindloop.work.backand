@@ -52,6 +52,7 @@ class LocalToolFactory:
         import agent_runtime.file_tools.file_edit_tools  # noqa: F401
         import agent_runtime.frontend_debug.frontend_debug_tool  # noqa: F401
         import agent_runtime.image_generation.image_generation_tool  # noqa: F401
+        import agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools  # noqa: F401
         import agent_runtime.subagent.subagent_tool  # noqa: F401
         import agent_runtime.terminal.terminal_tool  # noqa: F401
         import agent_runtime.web_tools.web_tools  # noqa: F401

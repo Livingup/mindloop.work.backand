@@ -65,9 +65,9 @@ class ToolDispatchResult:
 class AgentToolDispatcher:
     """Agent 内部工具调度器。
 
-    调度器只暴露当前 AgentDefinition 明确允许的本地工具和 MCP 工具。LLM 请求前，
-    build_llm_tools() 生成可传给对应 SDK 平台的工具 schema；LLM 返回工具调用后，
-    dispatch_tool_call() 再次执行 allowlist 校验并调用本地工具或 MCP 工具。
+    调度器只暴露当前 AgentDefinition 明确允许的本地工具和 always-enabled 本地工具。
+    AgentDefinition.mcp_tools 只用于系统提示词中的 MCP 服务摘要，不会被展开为 LLM tools；
+    远端 MCP 服务通过 mcp_get_tool_detail / mcp_call_tool 等本地代理工具访问。
     """
 
     def __init__(
@@ -101,35 +101,10 @@ class AgentToolDispatcher:
                 raise ValueError(f"本地工具 {tool_name} 缺少 {api_format} 协议格式 schema。")
             tools.append(LlmToolDefinition(name=tool_name, schema=schema, source="local"))
 
-        if agent_definition.mcp_tools:
-            if self._mcp_client_gateway is None:
-                raise RuntimeError("当前 Agent 定义了 MCP 工具，但执行器未配置 McpClientGateway。")
-            for binding in agent_definition.mcp_tools:
-                details = await self._mcp_client_gateway.get_tool_detail(
-                    binding.service_id,
-                    list(binding.tool_ids),
-                )
-                detail_map = {detail.name: detail for detail in details}
-                for tool_name in binding.tool_ids:
-                    detail = detail_map.get(tool_name)
-                    if detail is None:
-                        raise KeyError(f"MCP 工具不存在: {binding.service_id}/{tool_name}")
-                    exposed_name = build_mcp_exposed_tool_name(binding.service_id, tool_name)
-                    schema = _build_mcp_tool_schema(
-                        api_format=api_format,
-                        exposed_name=exposed_name,
-                        description=detail.description,
-                        input_schema=detail.input_schema,
-                    )
-                    tools.append(
-                        LlmToolDefinition(
-                            name=exposed_name,
-                            schema=schema,
-                            source="mcp",
-                            mcp_service_id=binding.service_id,
-                            mcp_tool_name=tool_name,
-                        )
-                    )
+        # AgentDefinition.mcp_tools 只用于系统提示词中的 MCP 服务/工具摘要。
+        # 为防止 LLM 请求参数 tools 膨胀，远端 MCP 工具不再直接展开为 LlmToolDefinition；
+        # Agent 调用 MCP 服务时应使用本地 MCP 代理工具 mcp_get_service_detail /
+        # mcp_get_tool_detail / mcp_call_tool 等。
         return tuple(tools)
 
     async def dispatch_tool_call(

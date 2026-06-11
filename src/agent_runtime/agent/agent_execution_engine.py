@@ -1478,12 +1478,14 @@ class AgentExecutionEngine:
                 agent_definition=agent_definition,
                 api_format=resolved_model.api_format,
             )
+            mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
             system_prompt = self._render_system_prompt(
                 agent_definition,
                 instance.instance_id,
                 instance.current_working_directory,
                 render_options,
                 tools,
+                mcp_services_prompt=mcp_services_prompt,
             )
             try:
                 if self._context_compression_service is not None:
@@ -1686,6 +1688,8 @@ class AgentExecutionEngine:
         current_working_directory: str,
         render_options: dict[str, Any],
         llm_tools: tuple[LlmToolDefinition, ...],
+        *,
+        mcp_services_prompt: str | None = None,
     ) -> str | None:
         """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。"""
         segments: list[str] = []
@@ -1697,7 +1701,7 @@ class AgentExecutionEngine:
                 segments.append(snippet.text)
         text = "\n\n".join(item for item in segments if item.strip())
         runtime_context_prompt = _build_runtime_context_prompt(agent_instance_id, current_working_directory)
-        mcp_services_prompt = self._build_mcp_services_prompt(definition, llm_tools)
+        rendered_mcp_services_prompt = mcp_services_prompt or self._build_mcp_services_prompt(definition)
         skills_prompt = self._build_skills_prompt(definition)
         available_subagents_prompt = self._build_available_subagents_prompt(definition)
         lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
@@ -1707,7 +1711,7 @@ class AgentExecutionEngine:
             for item in (
                 runtime_context_prompt,
                 text,
-                mcp_services_prompt,
+                rendered_mcp_services_prompt,
                 skills_prompt,
                 available_subagents_prompt,
                 lifecycle_prompt,
@@ -1716,17 +1720,11 @@ class AgentExecutionEngine:
             if item.strip()
         ) or None
 
-    def _build_mcp_services_prompt(
-        self,
-        definition: AgentDefinition,
-        llm_tools: tuple[LlmToolDefinition, ...],
-    ) -> str:
+    async def _load_mcp_services_prompt(self, definition: AgentDefinition) -> str:
+        """按 AgentDefinition 的 MCP 绑定加载服务与工具摘要提示词。"""
         if not definition.mcp_tools or self._mcp_client_gateway is None:
             return ""
-        service_ids = []
-        for binding in definition.mcp_tools:
-            if binding.service_id not in service_ids:
-                service_ids.append(binding.service_id)
+        service_ids = _mcp_service_ids(definition)
         services = {
             item.service_id: item
             for item in self._mcp_client_gateway.list_services()
@@ -1735,14 +1733,48 @@ class AgentExecutionEngine:
         if not available_services:
             return ""
 
-        tools_by_service: dict[str, list[LlmToolDefinition]] = {sid: [] for sid in service_ids}
-        for tool in llm_tools:
-            if tool.source != "mcp" or not tool.mcp_service_id or not tool.mcp_tool_name:
+        tools_by_service: dict[str, list[tuple[str, str | None]]] = {sid: [] for sid in service_ids}
+        for binding in definition.mcp_tools:
+            try:
+                tool_summaries = await self._mcp_client_gateway.list_tools(binding.service_id)
+            except Exception as exc:  # noqa: BLE001 - MCP 摘要不可用不应阻断 Agent 执行
+                logger.warning(
+                    "MCP 服务工具摘要加载失败，已退化为 AgentDefinition 工具 ID: service_id=%s, error_type=%s, error=%s",
+                    binding.service_id,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                tools_by_service[binding.service_id].extend((tool_id, None) for tool_id in binding.tool_ids)
                 continue
-            if tool.mcp_service_id in tools_by_service:
-                tools_by_service[tool.mcp_service_id].append(tool)
+            summary_map = {item.name: item for item in tool_summaries}
+            for tool_id in binding.tool_ids:
+                summary = summary_map.get(tool_id)
+                tools_by_service[binding.service_id].append((
+                    tool_id,
+                    summary.description if summary is not None else None,
+                ))
+        return self._build_mcp_services_prompt(definition, tools_by_service=tools_by_service)
 
-        # system prompt 仅注入 MCP 服务与可用工具摘要；参数 schema 仍通过正式 tool schema 暴露给模型。
+    def _build_mcp_services_prompt(
+        self,
+        definition: AgentDefinition,
+        *,
+        tools_by_service: dict[str, list[tuple[str, str | None]]] | None = None,
+    ) -> str:
+        if not definition.mcp_tools or self._mcp_client_gateway is None:
+            return ""
+        service_ids = _mcp_service_ids(definition)
+        services = {
+            item.service_id: item
+            for item in self._mcp_client_gateway.list_services()
+        }
+        available_services = [services[sid] for sid in service_ids if sid in services]
+        if not available_services:
+            return ""
+
+        if tools_by_service is None:
+            tools_by_service = {binding.service_id: [(tool_id, None) for tool_id in binding.tool_ids] for binding in definition.mcp_tools}
+
         lines = ["# 可用的 MCP 服务列表"]
         for service in available_services:
             description = service.description or ""
@@ -1754,17 +1786,20 @@ class AgentExecutionEngine:
             if not service_tools:
                 continue
             lines.append("  - 可用工具：")
-            for tool in service_tools:
-                tool_name = tool.mcp_tool_name or tool.name
-                tool_description = self._tool_schema_description(tool.schema)
+            for tool_name, tool_description in service_tools:
                 if tool_description:
                     lines.append(f"    - `{tool_name}`：{tool_description}")
                 else:
                     lines.append(f"    - `{tool_name}`")
         lines.append("## 使用方式")
         lines.append(
-            "上方只列出 MCP 服务和可用工具摘要；工具参数 schema 不写入系统提示词，"
-            "以本轮工具定义中对应 MCP tool 的参数 schema 为准。"
+            "上方只列出 MCP 服务和可用工具摘要；为防止 LLM 请求参数中的 tools 膨胀，"
+            "这些远端 MCP 服务工具不会直接设置到本轮 LLM 请求 tools 中。"
+        )
+        lines.append(
+            "调用 MCP 工具时必须使用本地 MCP 代理工具：先用 `mcp_get_service_detail` 了解服务能力和使用指南，"
+            "必要时用 `mcp_list_resources` / `mcp_read_resource` 读取资源；调用具体工具前必须先用 "
+            "`mcp_get_tool_detail` 获取参数 schema，再用 `mcp_call_tool` 执行。"
         )
         return "\n".join(lines)
 
@@ -2449,6 +2484,14 @@ def _message_text(message: UniMessage) -> str:
     return "\n\n".join(texts)
 
 
+def _mcp_service_ids(definition: AgentDefinition) -> list[str]:
+    service_ids: list[str] = []
+    for binding in definition.mcp_tools:
+        if binding.service_id not in service_ids:
+            service_ids.append(binding.service_id)
+    return service_ids
+
+
 def _build_runtime_context_prompt(agent_instance_id: str, current_working_directory: str) -> str:
     working_directory = Path(current_working_directory).expanduser()
     resolved_working_directory = working_directory.resolve(strict=False)
@@ -2457,6 +2500,10 @@ def _build_runtime_context_prompt(agent_instance_id: str, current_working_direct
         "",
         f"当前 Agent 实例 ID：`{agent_instance_id}`",
         f"当前工作目录：`{resolved_working_directory}`",
+        "",
+        "MCP 支持说明：",
+        "- 当前你所处的agent系统支持通过 MCP 服务接入外部工具和资源。远端 MCP 服务的工具不会直接设置到你的 `tools` 中。",
+        "- MCP 工具必须通过本地 MCP 代理工具使用：`mcp_get_service_detail` ， `mcp_get_tool_detail`，`mcp_call_tool`...等实现MCP工具调用。",
         "",
         "你处在多角色沟通环境中：所有 user message 都会进入同一消息流，但来源可能是本地用户、远程 Agent 或本地父/子 Agent。",
         "",
