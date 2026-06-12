@@ -1091,6 +1091,11 @@ class AgentExecutionEngine:
                     phase="drain_user_messages",
                     loop_index=loop_index,
                 )
+                pending_user_message_count = len(instance.pending_user_messages)
+                if pending_user_message_count:
+                    communication_context = communication_context.with_metadata(
+                        conversation_history_copy_message_count=len(conversation.messages),
+                    )
                 drained_count = await self._drain_pending_user_messages_to_conversation(
                     instance_id=instance.instance_id,
                     conversation=conversation,

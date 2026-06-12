@@ -71,6 +71,8 @@ async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContex
         llm_policy_group_id=request.llm_policy_group_id,
         initial_message=request.initial_message,
         initial_message_attachments=[item.model_dump() for item in request.initial_message_attachments],
+        parent_conversation_id=ctx.conversation_id,
+        conversation_history_copy_message_count=ctx.conversation_history_copy_message_count,
     )
     return BaseToolResult(output=output, metadata={"subagent_action": "create_subagent"})
 

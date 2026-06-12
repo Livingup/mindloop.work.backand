@@ -311,6 +311,7 @@ class AgentToolDispatcher:
                 task_id=metadata.get("task_id"),
                 agent_instance_id=metadata.get("agent_instance_id"),
                 conversation_id=metadata.get("conversation_id"),
+                conversation_history_copy_message_count=metadata.get("conversation_history_copy_message_count"),
                 trace_id=communication_context.trace_id if communication_context is not None else None,
                 communication_stream_id=(
                     communication_context.stream_id if communication_context is not None else None

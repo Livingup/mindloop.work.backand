@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from agent_runtime.agent.file_input_policy import (
 )
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import CreateChildAgentInstanceRequest
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
+from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import AgentRuntimeGateway
     from agent_runtime.agent_definition.north_gateway.agent_definition_contracts import AgentDefinitionNorthGateway
+    from agent_runtime.conversation_message.conversation_repository import ConversationRepository
     from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
     from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
 
@@ -46,12 +49,14 @@ class SubagentRuntime:
         llm_registry_gateway: "LlmModelRegistryGateway",
         execution_engine: "AgentExecutionEngine",
         event_publisher: "RuntimeEventPublisher",
+        conversation_repository: "ConversationRepository",
     ) -> None:
         self._runtime_gateway = runtime_gateway
         self._agent_definition_gateway = agent_definition_gateway
         self._llm_registry_gateway = llm_registry_gateway
         self._execution_engine = execution_engine
         self._event_publisher = event_publisher
+        self._conversation_repository = conversation_repository
 
     async def create_subagent(
         self,
@@ -61,6 +66,8 @@ class SubagentRuntime:
         llm_policy_group_id: str | None = None,
         initial_message: str | None = None,
         initial_message_attachments: list[dict[str, Any]] | None = None,
+        parent_conversation_id: str | None = None,
+        conversation_history_copy_message_count: int | None = None,
     ) -> dict[str, Any]:
         parent = self._runtime_gateway.get_agent_instance(parent_instance_id)
         task = self._runtime_gateway.get_task(parent.task_id)
@@ -86,18 +93,38 @@ class SubagentRuntime:
             default_policy_group_id=child_definition.default_llm_policy_group_id,
             allowed_policy_group_ids=child_definition.allowed_llm_policy_group_ids,
         )
-        _updated_task, child, relation = self._runtime_gateway.create_child_agent_instance(
-            CreateChildAgentInstanceRequest(
-                task_id=task.task_id,
-                parent_instance_id=parent.instance_id,
-                thread_id=f"thread-{uuid4().hex}",
-                current_working_directory=parent.current_working_directory,
-                agent_definition_id=agent_definition_id,
-                llm_provider_id=selection["llm_provider_id"],
-                llm_model_binding_id=selection["llm_model_binding_id"],
-                llm_policy_group_id=selection.get("llm_policy_group_id"),
-            )
+        child_thread_id = f"thread-{uuid4().hex}"
+        child_instance_id = f"agent-instance-{uuid4().hex}"
+        seeded_conversation_id = await self._seed_child_conversation_from_parent_prefix(
+            parent=parent,
+            child_instance_id=child_instance_id,
+            child_thread_id=child_thread_id,
+            child_agent_definition_id=agent_definition_id,
+            parent_conversation_id=parent_conversation_id,
+            conversation_history_copy_message_count=conversation_history_copy_message_count,
         )
+        try:
+            _updated_task, child, relation = self._runtime_gateway.create_child_agent_instance(
+                CreateChildAgentInstanceRequest(
+                    task_id=task.task_id,
+                    parent_instance_id=parent.instance_id,
+                    thread_id=child_thread_id,
+                    current_working_directory=parent.current_working_directory,
+                    agent_definition_id=agent_definition_id,
+                    llm_provider_id=selection["llm_provider_id"],
+                    llm_model_binding_id=selection["llm_model_binding_id"],
+                    llm_policy_group_id=selection.get("llm_policy_group_id"),
+                    child_instance_id=child_instance_id,
+                    conversation_id=seeded_conversation_id,
+                )
+            )
+        except Exception:
+            if seeded_conversation_id is not None:
+                try:
+                    await self._conversation_repository.delete(seeded_conversation_id)
+                except Exception:  # noqa: BLE001 - creation failure cleanup must not hide root cause
+                    logger.exception("清理子 Agent 预创建会话失败: conversation_id=%s", seeded_conversation_id)
+            raise
         await self._publish_subagent_created(
             parent_instance_id=parent.instance_id,
             child_instance_id=child.instance_id,
@@ -341,6 +368,66 @@ class SubagentRuntime:
             "reason": reason,
         }
 
+    async def _seed_child_conversation_from_parent_prefix(
+        self,
+        *,
+        parent: Any,
+        child_instance_id: str,
+        child_thread_id: str,
+        child_agent_definition_id: str,
+        parent_conversation_id: str | None,
+        conversation_history_copy_message_count: int | None,
+    ) -> str | None:
+        if parent_conversation_id is None or conversation_history_copy_message_count is None:
+            logger.info(
+                "创建子 Agent 未继承父会话历史: parent_instance_id=%s parent_conversation_id=%s copy_count=%s",
+                parent.instance_id,
+                parent_conversation_id,
+                conversation_history_copy_message_count,
+            )
+            return None
+        if parent.conversation_id != parent_conversation_id:
+            raise PermissionError(
+                "父 Agent 会话归属校验失败，不能为子 Agent 复制历史: "
+                f"parent_instance_id={parent.instance_id} "
+                f"runtime_conversation_id={parent.conversation_id} "
+                f"context_conversation_id={parent_conversation_id}"
+            )
+        if conversation_history_copy_message_count < 0:
+            raise ValueError("conversation_history_copy_message_count 不能小于 0。")
+        try:
+            parent_conversation = await self._conversation_repository.get(parent_conversation_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"读取父 Agent 会话失败，不能为子 Agent 复制历史: conversation_id={parent_conversation_id}"
+            ) from exc
+        parent_message_count = len(parent_conversation.messages)
+        if conversation_history_copy_message_count > parent_message_count:
+            raise ValueError(
+                "conversation_history_copy_message_count 超出父会话消息数量，不能复制完整父会话: "
+                f"copy_count={conversation_history_copy_message_count} parent_message_count={parent_message_count}"
+            )
+        child_conversation = create_conversation()
+        for message in parent_conversation.messages[:conversation_history_copy_message_count]:
+            child_conversation.append_message(deepcopy(message))
+        await self._conversation_repository.create(
+            child_conversation,
+            task_id=parent.task_id,
+            thread_id=child_thread_id,
+            agent_id=child_agent_definition_id,
+            agent_instance_id=child_instance_id,
+        )
+        logger.info(
+            "已为子 Agent 创建父会话历史副本: parent_instance_id=%s child_instance_id=%s "
+            "parent_conversation_id=%s child_conversation_id=%s copy_count=%s",
+            parent.instance_id,
+            child_instance_id,
+            parent_conversation_id,
+            child_conversation.id,
+            conversation_history_copy_message_count,
+        )
+        return child_conversation.id
+
     def _resolve_child_llm_selection(
         self,
         *,
@@ -492,6 +579,7 @@ def configure_subagent_runtime(
     llm_registry_gateway: "LlmModelRegistryGateway",
     execution_engine: "AgentExecutionEngine",
     event_publisher: "RuntimeEventPublisher",
+    conversation_repository: "ConversationRepository",
 ) -> SubagentRuntime:
     global _runtime
     _runtime = SubagentRuntime(
@@ -500,6 +588,7 @@ def configure_subagent_runtime(
         llm_registry_gateway=llm_registry_gateway,
         execution_engine=execution_engine,
         event_publisher=event_publisher,
+        conversation_repository=conversation_repository,
     )
     return _runtime
 

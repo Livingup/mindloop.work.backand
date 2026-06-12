@@ -229,6 +229,7 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
             llm_registry_gateway=SimpleNamespace(),
             execution_engine=execution_engine,
             event_publisher=SimpleNamespace(),
+            conversation_repository=SimpleNamespace(),
         )
 
         result = asyncio.run(runtime.send_agent_message(

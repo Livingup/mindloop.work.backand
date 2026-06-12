@@ -208,5 +208,6 @@ class AgentExecutionFactory:
             llm_registry_gateway=llm_registry_gateway,
             execution_engine=engine,
             event_publisher=event_publisher,
+            conversation_repository=conversation_repository,
         )
         return engine
