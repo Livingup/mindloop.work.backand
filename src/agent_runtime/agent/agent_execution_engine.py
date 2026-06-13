@@ -259,6 +259,7 @@ class _PromptWithConversationResult:
     response: LlmPromptResponse
     conversation: Any
     instance: AgentInstance
+    conversation_history_copy_message_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1215,7 +1216,10 @@ class AgentExecutionEngine:
                 llm_response = prompt_result.response
                 conversation = prompt_result.conversation
                 instance = prompt_result.instance
-                communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+                communication_context = communication_context.with_metadata(
+                    conversation_id=conversation.id,
+                    conversation_history_copy_message_count=prompt_result.conversation_history_copy_message_count,
+                )
                 assistant_message = llm_response.assistant_message
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
@@ -2367,6 +2371,11 @@ class AgentExecutionEngine:
                         "model_alias": resolved_model.model_alias,
                     },
                 )
+                conversation_history_copy_message_count = len(conversation.messages)
+                communication_context = communication_context.with_metadata(
+                    conversation_id=conversation.id,
+                    conversation_history_copy_message_count=conversation_history_copy_message_count,
+                )
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     stage="llm.candidate.request.start",
@@ -2381,6 +2390,7 @@ class AgentExecutionEngine:
                         "model_id": resolved_model.model_id,
                         "model_alias": resolved_model.model_alias,
                         "llm_call_id": llm_call_id,
+                        "conversation_history_copy_message_count": conversation_history_copy_message_count,
                         "has_next_candidate": candidate_index < len(resolved_candidates) - 1,
                     },
                     expected_next="llm.candidate.response",
@@ -2427,6 +2437,7 @@ class AgentExecutionEngine:
                     response=response,
                     conversation=conversation,
                     instance=instance,
+                    conversation_history_copy_message_count=conversation_history_copy_message_count,
                 )
             except LlmRequestCancelled:
                 raise

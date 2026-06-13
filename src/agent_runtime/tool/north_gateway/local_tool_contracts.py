@@ -125,7 +125,7 @@ class ToolExecuteRequest(BaseToolRequest):
     conversation_id: str | None = PydanticField(default=None, description="所属 Conversation 标识。")
     conversation_history_copy_message_count: int | None = PydanticField(
         default=None,
-        description="当前请求开始前 Conversation 中可被子 Agent 继承的历史消息数量。",
+        description="触发工具调用的当前 LLM 请求开始前，Conversation 中可被子 Agent 继承的历史消息数量。",
     )
     trace_id: str | None = PydanticField(default=None, description="执行链路追踪标识。")
     communication_stream_id: str | None = PydanticField(default=None, description="所属通信流标识。")
