@@ -54,6 +54,15 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 该命令生成 `build-resources/backend/spread-ai-runtime.exe`，随后由前端仓库的 Windows 打包脚本作为 `extraResources/backend` 打入正式桌面 exe。
 
 ---
+
+## 运维资源环境
+
+- 云端 PostgreSQL 资源：轻量云实例 `liuliangMtI5Khg8gfjU`（`#server-19413`），公网 `103.236.88.224`；实例必须保持运行，暂停会导致 SSH 与数据库不可用。
+- SSH：`ssh -i ~/.ssh/lacp_registry_deploy_ed25519 -p 44524 root@103.236.88.224`（本机已配置公钥）。
+- PostgreSQL：项目访问 `db.mindloop.chat:25432`，数据库 `agent_runtime`，用户 `agent_runtime_client`；密码只从本机 `~/.spread-ai/cloud-user-config/cloud_user_config_bootstrap.db` 读取，不写入仓库。
+- 服务端：Docker 容器 `agent-runtime-postgres`（PostgreSQL 16），容器监听 `5432`；排查优先看 `docker ps`、`docker logs agent-runtime-postgres` 和外部 psycopg 连通性。
+
+---
 ## 已完成模块
 
 ### 统一文件资源服务（file_resource）
