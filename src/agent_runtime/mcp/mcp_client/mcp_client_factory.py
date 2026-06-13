@@ -6,12 +6,21 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent_runtime.mcp.mcp_client.mcp_client_service import McpClientService
 from agent_runtime.mcp.mcp_client.infrastructure.mcp_session_manager import (
     McpSessionManager,
 )
 from agent_runtime.mcp.mcp_client.infrastructure.yaml_mcp_service_repository import (
     YamlMcpServiceRepository,
+)
+from agent_runtime.mcp.mcp_client.mcp_metadata_cache import (
+    JsonMcpMetadataSnapshotRepository,
+    global_mcp_metadata_registry,
+)
+from agent_runtime.mcp.mcp_client.mcp_metadata_refresh_manager import (
+    McpMetadataRefreshManager,
 )
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_gateway_impl import (
     McpClientGatewayImpl,
@@ -55,8 +64,27 @@ class McpClientFactory:
         else:
             repository = local_repository
 
+        metadata_repository = JsonMcpMetadataSnapshotRepository(
+            cache_dir_accessor=lambda: str(
+                Path(ConfigRegistry.instance().mcp_client.config_dir).expanduser() / "metadata-cache"
+            ),
+        )
+        metadata_registry = global_mcp_metadata_registry()
+        metadata_registry.hydrate(metadata_repository.load_all())
+
         session_manager = McpSessionManager()
         service = McpClientService(repository, session_manager)
-        gateway = McpClientGatewayImpl(service, session_manager)
+        metadata_refresh_manager = McpMetadataRefreshManager(
+            service=service,
+            registry=metadata_registry,
+            snapshot_repository=metadata_repository,
+        )
+        gateway = McpClientGatewayImpl(
+            service,
+            session_manager,
+            metadata_registry=metadata_registry,
+            snapshot_repository=metadata_repository,
+            metadata_refresh_manager=metadata_refresh_manager,
+        )
 
         return gateway

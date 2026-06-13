@@ -19,6 +19,13 @@ from agent_runtime.mcp.mcp_client.mcp_transport_config import (
 from agent_runtime.mcp.mcp_client.infrastructure.mcp_session_manager import (
     McpSessionManager,
 )
+from agent_runtime.mcp.mcp_client.mcp_metadata_cache import (
+    JsonMcpMetadataSnapshotRepository,
+    McpMetadataRegistry,
+)
+from agent_runtime.mcp.mcp_client.mcp_metadata_refresh_manager import (
+    McpMetadataRefreshManager,
+)
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
     McpResourceContentDTO,
     McpResourceInfoDTO,
@@ -44,9 +51,16 @@ class McpClientGatewayImpl:
         self,
         service: McpClientService,
         session_manager: McpSessionManager,
+        *,
+        metadata_registry: McpMetadataRegistry,
+        snapshot_repository: JsonMcpMetadataSnapshotRepository,
+        metadata_refresh_manager: McpMetadataRefreshManager,
     ) -> None:
         self._service = service
         self._session_manager = session_manager
+        self._metadata_registry = metadata_registry
+        self._snapshot_repository = snapshot_repository
+        self._metadata_refresh_manager = metadata_refresh_manager
 
     # ══════════════════════════════════════════
     # 配置管理
@@ -122,6 +136,7 @@ class McpClientGatewayImpl:
         if update.usage_guide is not None:
             kwargs["usage_guide"] = update.usage_guide
         self._service.update_service(service_id, **kwargs)
+        self._remove_metadata_snapshot(service_id)
 
     @staticmethod
     def _build_transport_config(transport_dict: dict) -> TransportConfig:
@@ -134,9 +149,15 @@ class McpClientGatewayImpl:
         else:
             raise ValueError(f"不支持的传输方式: {transport_type}")
 
+    def _remove_metadata_snapshot(self, service_id: str) -> None:
+        """清理本地缓存中的指定服务元数据快照。"""
+        self._metadata_registry.remove(service_id)
+        self._snapshot_repository.delete(service_id)
+
     async def remove_service(self, service_id: str) -> None:
         """删除 MCP 服务配置并断开连接。"""
         await self._service.remove_service(service_id)
+        self._remove_metadata_snapshot(service_id)
 
     def enable_service(self, service_id: str) -> None:
         """启用 MCP 服务。"""
@@ -145,6 +166,7 @@ class McpClientGatewayImpl:
     def disable_service(self, service_id: str) -> None:
         """禁用 MCP 服务。"""
         self._service.disable_service(service_id)
+        self._remove_metadata_snapshot(service_id)
 
     async def test_connection(self, service_id: str) -> McpTestResult:
         """测试连接。"""
@@ -192,24 +214,50 @@ class McpClientGatewayImpl:
         """
         await self._service.reconcile_if_config_changed()
 
+    async def load_cached_metadata(self) -> None:
+        """从本地持久化缓存加载 MCP 元数据到内存。"""
+        await self._metadata_refresh_manager.load_persisted_metadata()
+
+    def start_metadata_refresh(self) -> None:
+        """启动 MCP 元数据后台刷新轮询。"""
+        self._metadata_refresh_manager.start()
+
+    async def stop_metadata_refresh(self) -> None:
+        """停止 MCP 元数据后台刷新轮询。"""
+        await self._metadata_refresh_manager.stop()
+
+    async def refresh_metadata_once(self) -> None:
+        """立即执行一轮 MCP 元数据刷新。"""
+        await self._metadata_refresh_manager.refresh_once()
+
     async def ensure_connected(self, service_id: str) -> None:
         """确保与指定 MCP 服务的连接已建立。"""
         await self._service.ensure_connected(service_id)
 
     async def get_service_detail(self, service_id: str) -> McpServiceDetailResult:
-        """获取服务能力和 instructions。"""
-        detail = await self._service.get_service_detail(service_id)
+        """从内存缓存获取服务能力和 instructions。"""
+        definition = self._service.get_service(service_id)
+        snapshot = self._metadata_registry.get_snapshot(service_id)
+        if snapshot is None:
+            return McpServiceDetailResult(
+                supports_tools=False,
+                supports_resources=False,
+                server_name="",
+                server_version="",
+                instructions=definition.usage_guide,
+            )
         return McpServiceDetailResult(
-            supports_tools=detail["supports_tools"],
-            supports_resources=detail["supports_resources"],
-            server_name=detail["server_name"],
-            server_version=detail["server_version"],
-            instructions=detail["instructions"],
+            supports_tools=snapshot.supports_tools,
+            supports_resources=snapshot.supports_resources,
+            server_name=snapshot.server_name,
+            server_version=snapshot.server_version,
+            instructions=snapshot.instructions if snapshot.instructions is not None else definition.usage_guide,
         )
 
     async def list_tools(self, service_id: str) -> list[McpToolSummaryDTO]:
-        """列出指定服务的所有工具。"""
-        tools = await self._service.list_tools(service_id)
+        """从内存缓存列出指定服务的所有工具。"""
+        self._service.get_service(service_id)
+        tools = self._metadata_registry.get_tool_summaries(service_id)
         return [
             McpToolSummaryDTO(name=t.name, description=t.description) for t in tools
         ]
@@ -217,8 +265,9 @@ class McpClientGatewayImpl:
     async def get_tool_detail(
         self, service_id: str, tool_names: list[str]
     ) -> list[McpToolInfoDTO]:
-        """批量获取工具的 inputSchema。"""
-        tools = await self._service.get_tool_detail(service_id, tool_names)
+        """从内存缓存批量获取工具的 inputSchema。"""
+        self._service.get_service(service_id)
+        tools = self._metadata_registry.get_tool_details(service_id, tool_names)
         return [
             McpToolInfoDTO(
                 name=t.name,
@@ -241,8 +290,9 @@ class McpClientGatewayImpl:
         )
 
     async def list_resources(self, service_id: str) -> list[McpResourceInfoDTO]:
-        """列出指定服务的资源。"""
-        resources = await self._service.list_resources(service_id)
+        """从内存缓存列出指定服务的资源。"""
+        self._service.get_service(service_id)
+        resources = self._metadata_registry.get_resources(service_id)
         return [
             McpResourceInfoDTO(
                 uri=r.uri,
@@ -266,5 +316,6 @@ class McpClientGatewayImpl:
     # ── 生命周期 ──
 
     async def shutdown(self) -> None:
-        """断开所有 MCP 连接。"""
+        """停止元数据刷新并断开所有 MCP 连接。"""
+        await self.stop_metadata_refresh()
         await self._session_manager.disconnect_all()

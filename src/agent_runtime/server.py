@@ -275,6 +275,8 @@ def create_app(
     runtime_loop: asyncio.AbstractEventLoop | None = None
     detach_tasks: set[asyncio.Task[None]] = set()
     auto_connect_task: asyncio.Task | None = None
+    mcp_metadata_start_task: asyncio.Task | None = None
+    mcp_metadata_management_started = False
     lacp_start_task: asyncio.Task | None = None
     config_cache_poll_task: asyncio.Task | None = None
     codex_provider_task: asyncio.Task | None = None
@@ -291,6 +293,20 @@ def create_app(
         except (Exception, asyncio.CancelledError) as e:
             logger.exception("MCP 服务后台连接调度发生未预期错误，REST API 服务将继续启动：%s", e)
 
+    async def start_mcp_metadata_management() -> None:
+        """先加载本地元数据缓存，再启动 MCP 元数据后台轮询。"""
+        nonlocal mcp_metadata_management_started
+        if mcp_metadata_management_started:
+            return
+        try:
+            await mcp_gateway.load_cached_metadata()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("MCP 元数据本地缓存加载失败，将以空缓存启动后台刷新：%s", e, exc_info=True)
+        mcp_gateway.start_metadata_refresh()
+        mcp_metadata_management_started = True
+
     async def ensure_codex_builtin_provider() -> None:
         try:
             await asyncio.to_thread(codex_oauth_service.ensure_builtin_provider)
@@ -298,7 +314,7 @@ def create_app(
             logger.warning("内置 Codex Provider 后台同步失败，Runtime 将继续运行：%s", e, exc_info=True)
 
     def _rebuild_full_mode_components() -> None:
-        nonlocal lacp_client
+        nonlocal lacp_client, mcp_metadata_management_started
 
         reset_file_resource_services_for_runtime_mode_change()
         LacpFactory.reset_for_runtime_mode_change()
@@ -345,6 +361,7 @@ def create_app(
             )
         )
         lacp_settings_repository.set_target(LacpFactory.create_settings_repository())
+        mcp_metadata_management_started = False
 
     def _activate_runtime_full_mode_if_ready() -> bool:
         nonlocal runtime_full_mode_active
@@ -374,9 +391,17 @@ def create_app(
             logger.exception("Runtime 完整模式后台服务调度失败。")
 
     def _start_full_mode_background_services_on_loop() -> None:
-        nonlocal auto_connect_task, lacp_start_task, config_cache_poll_task
+        nonlocal auto_connect_task, mcp_metadata_start_task, lacp_start_task, config_cache_poll_task
         nonlocal codex_provider_task, codex_oauth_callback_server_started
 
+        if (
+            not mcp_metadata_management_started
+            and (mcp_metadata_start_task is None or mcp_metadata_start_task.done())
+        ):
+            mcp_metadata_start_task = asyncio.create_task(
+                start_mcp_metadata_management(),
+                name="mcp-metadata-management-start",
+            )
         if config_cache_poll_task is None or config_cache_poll_task.done():
             config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
                 lambda: ConfigRegistry.instance().cloud_user_config_database,
@@ -513,6 +538,7 @@ def create_app(
         runtime_network_monitor.start()
         scene_session_registry.start()
         if runtime_full_mode_active:
+            await start_mcp_metadata_management()
             _start_full_mode_background_services_on_loop()
         else:
             logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接、LACP 启动与 Codex OAuth 回调服务。")
@@ -526,6 +552,12 @@ def create_app(
                 with suppress(Exception, asyncio.CancelledError):
                     await task
             detach_tasks.clear()
+            if mcp_metadata_start_task is not None and not mcp_metadata_start_task.done():
+                mcp_metadata_start_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await mcp_metadata_start_task
+            with suppress(Exception, asyncio.CancelledError):
+                await mcp_gateway.stop_metadata_refresh()
             if auto_connect_task is not None and not auto_connect_task.done():
                 auto_connect_task.cancel()
                 with suppress(Exception, asyncio.CancelledError):

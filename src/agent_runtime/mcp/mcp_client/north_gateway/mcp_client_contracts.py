@@ -227,6 +227,24 @@ class McpClientGateway(Protocol):
         """若配置目录 mtime 变化，则 reconcile 连接运行态。"""
         ...
 
+    # ── 元数据缓存生命周期 ──
+
+    async def load_cached_metadata(self) -> None:
+        """启动后台刷新前，先从本地持久化缓存加载 MCP 元数据到内存。"""
+        ...
+
+    def start_metadata_refresh(self) -> None:
+        """启动 MCP 元数据后台刷新轮询。"""
+        ...
+
+    async def stop_metadata_refresh(self) -> None:
+        """停止 MCP 元数据后台刷新轮询。"""
+        ...
+
+    async def refresh_metadata_once(self) -> None:
+        """立即执行一轮 MCP 元数据刷新。"""
+        ...
+
     # ── 协议操作 ──
 
     async def ensure_connected(self, service_id: str) -> None:
