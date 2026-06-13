@@ -17,6 +17,7 @@ from agent_runtime.agent.file_input_policy import (
 )
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import CreateChildAgentInstanceRequest
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
+from agent_runtime.conversation_message.message.models import ROLE_USER, TextPart, TextPartMeta, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
@@ -95,8 +96,10 @@ class SubagentRuntime:
         )
         child_thread_id = f"thread-{uuid4().hex}"
         child_instance_id = f"agent-instance-{uuid4().hex}"
+        parent_name = parent_definition.name or parent_definition.agent_id
         seeded_conversation_id = await self._seed_child_conversation_from_parent_prefix(
             parent=parent,
+            parent_agent_name=parent_name,
             child_instance_id=child_instance_id,
             child_thread_id=child_thread_id,
             child_agent_definition_id=agent_definition_id,
@@ -372,6 +375,7 @@ class SubagentRuntime:
         self,
         *,
         parent: Any,
+        parent_agent_name: str,
         child_instance_id: str,
         child_thread_id: str,
         child_agent_definition_id: str,
@@ -410,6 +414,13 @@ class SubagentRuntime:
         child_conversation = create_conversation()
         for message in parent_conversation.messages[:conversation_history_copy_message_count]:
             child_conversation.append_message(deepcopy(message))
+        child_conversation.append_message(
+            _build_parent_history_boundary_message(
+                parent_agent_name=parent_agent_name,
+                parent_instance_id=parent.instance_id,
+            ),
+            [TextPartMeta()],
+        )
         await self._conversation_repository.create(
             child_conversation,
             task_id=parent.task_id,
@@ -418,13 +429,15 @@ class SubagentRuntime:
             agent_instance_id=child_instance_id,
         )
         logger.info(
-            "已为子 Agent 创建父会话历史副本: parent_instance_id=%s child_instance_id=%s "
-            "parent_conversation_id=%s child_conversation_id=%s copy_count=%s",
+            "已为子 Agent 创建父会话历史副本并静默追加范围边界消息: "
+            "parent_instance_id=%s child_instance_id=%s parent_conversation_id=%s "
+            "child_conversation_id=%s copied_parent_message_count=%s child_message_count=%s",
             parent.instance_id,
             child_instance_id,
             parent_conversation_id,
             child_conversation.id,
             conversation_history_copy_message_count,
+            len(child_conversation.messages),
         )
         return child_conversation.id
 
@@ -597,6 +610,19 @@ def get_subagent_runtime() -> SubagentRuntime:
     if _runtime is None:
         raise RuntimeError("Subagent runtime has not been configured.")
     return _runtime
+
+
+def _build_parent_history_boundary_message(
+    *,
+    parent_agent_name: str,
+    parent_instance_id: str,
+) -> UniMessage:
+    text = (
+        f"【@本地Agent {parent_agent_name} {parent_instance_id}】"
+        f"上面的历史消息是我{parent_agent_name}的历史对话消息，"
+        "作为你的任务背景认知上下文，只需要你帮我完成下面的任务"
+    )
+    return UniMessage(role=ROLE_USER, content=[TextPart(text)])
 
 
 def _attachments_metadata(

@@ -183,6 +183,7 @@ def test_seed_child_conversation_copies_parent_prefix_into_independent_conversat
                 task_id="task-parent",
                 conversation_id=parent_conversation.id,
             ),
+            parent_agent_name="父Agent",
             child_instance_id="agent-child",
             child_thread_id="thread-child",
             child_agent_definition_id="assistant",
@@ -194,15 +195,69 @@ def test_seed_child_conversation_copies_parent_prefix_into_independent_conversat
         child_conversation = repository.created_conversation
         assert child_conversation_id == child_conversation.id
         assert child_conversation.id != parent_conversation.id
-        assert len(child_conversation.messages) == 3
+        assert len(child_conversation.messages) == 4
         assert repository.create_kwargs == {
             "task_id": "task-parent",
             "thread_id": "thread-child",
             "agent_id": "assistant",
             "agent_instance_id": "agent-child",
         }
+        boundary_message = child_conversation.messages[-1]
+        assert boundary_message.role == ROLE_USER
+        assert boundary_message.content[0].text == (
+            "【@本地Agent 父Agent agent-parent】"
+            "上面的历史消息是我父Agent的历史对话消息，"
+            "作为你的任务背景认知上下文，只需要你帮我完成下面的任务"
+        )
         assert child_conversation.messages[0] is not parent_conversation.messages[0]
         child_conversation.messages[0].content[0].text = "子会话独立修改"
         assert parent_conversation.messages[0].content[0].text == "父会话消息 0"
+
+    asyncio.run(run_case())
+
+
+def test_seed_child_conversation_boundary_message_closes_conversation_state() -> None:
+    async def run_case() -> None:
+        parent_conversation = Conversation(id="parent-conversation")
+
+        class _ConversationRepository:
+            def __init__(self) -> None:
+                self.created_conversation: Conversation | None = None
+
+            async def get(self, conversation_id: str) -> Conversation:
+                assert conversation_id == parent_conversation.id
+                return parent_conversation
+
+            async def create(self, conversation: Conversation, **_kwargs):
+                self.created_conversation = conversation
+
+        repository = _ConversationRepository()
+        runtime = SubagentRuntime(
+            runtime_gateway=object(),
+            agent_definition_gateway=object(),
+            llm_registry_gateway=object(),
+            execution_engine=object(),
+            event_publisher=object(),
+            conversation_repository=repository,
+        )
+        await runtime._seed_child_conversation_from_parent_prefix(
+            parent=SimpleNamespace(
+                instance_id="agent-parent",
+                task_id="task-parent",
+                conversation_id=parent_conversation.id,
+            ),
+            parent_agent_name="父Agent",
+            child_instance_id="agent-child",
+            child_thread_id="thread-child",
+            child_agent_definition_id="assistant",
+            parent_conversation_id=parent_conversation.id,
+            conversation_history_copy_message_count=0,
+        )
+
+        assert repository.created_conversation is not None
+        child_conversation = repository.created_conversation
+        assert len(child_conversation.messages) == 1
+        assert child_conversation.messages[0].role == ROLE_USER
+        assert child_conversation.state.modalities == [INPUT_MODALITY_TEXT]
 
     asyncio.run(run_case())
