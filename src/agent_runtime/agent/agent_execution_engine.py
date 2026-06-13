@@ -3665,6 +3665,7 @@ def _build_runtime_context_prompt(agent_instance_id: str, current_working_direct
         "本地父/子 Agent 协作规则：",
         "- 本地父/子 Agent 通信只用于同一任务内的分工、结果回传、状态查询或释放子 Agent。",
         "- 父 Agent 负责管理子 Agent 的生命周期；当你确定后面一定不需要使用某个子 Agent 时，请主动结束该子 Agent。",
+        "- 创建子 Agent 时，内部系统会自动基于父 Agent 之前的对话历史提取上下文并作为子 Agent 的历史对话；因此调用 `create_subagent` 时只需要描述希望子 Agent 接下来完成的任务，不需要再次总结或提取已有上下文附加到任务中。",
         "- 本地子 Agent 与远程 LACP Agent 是不同机制；不要用 `lacp_send_message` 联系本地子 Agent，也不要用 subagent 工具联系远程 Agent。",
         "- 对仅表达收到、感谢、客套且不需要动作的本地父/子 Agent 消息，默认不回复，避免本地 Agent 间空转。",
         "",
