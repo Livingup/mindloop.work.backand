@@ -26,7 +26,7 @@ class CreateSubagentRequest(BaseToolRequest):
 
     agent_definition_id: str = Field(description="要创建的子 AgentDefinition ID，必须包含在当前 AgentDefinition.available_sub_agent_ids 中。")
     llm_policy_group_id: str | None = Field(default=None, description="可选 LLM 执行策略组 ID；不填时使用子 Agent 默认策略或继承当前 Agent 策略。")
-    initial_message: str | None = Field(default=None, description="可选初始任务消息；提供后会在创建成功后异步投递给子 Agent。内部系统会自动基于父 Agent 之前的对话历史提取上下文并作为子 Agent 的历史对话；这里只需要描述希望子 Agent 接下来完成的任务，不需要再次总结或提取已有上下文。")
+    initial_message: str | None = Field(default=None, description="可选初始任务消息；提供后会在创建成功后异步投递给子 Agent。")
     initial_message_attachments: list[SubagentMessageAttachmentRequest] = Field(default_factory=list, description="可选初始消息附件 URL 列表，支持图片或 PDF。")
 
 
