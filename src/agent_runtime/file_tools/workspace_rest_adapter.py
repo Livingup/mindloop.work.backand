@@ -30,16 +30,27 @@ class WorkspaceTreeResponse(BaseModel):
 
 
 class WorkspaceGitStatusRequest(BaseModel):
-    workspace_path: str = Field(description="要检查 Git 状态的工作区根目录路径。")
+    workspace_path: str = Field(description="要扫描 Git 状态的工作区根目录路径。")
+
+
+class WorkspaceGitRepositoryStatusResponse(BaseModel):
+    repository_path: str = Field(description="Git 仓库根目录绝对路径。")
+    relative_path: str = Field(description="仓库根目录相对工作区根目录的规范路径；工作区根仓库为 .。")
+    branch: str | None = Field(default=None, description="当前检出的 Git 分支；detached HEAD 或不可读取时为空。")
+    dirty: bool = Field(default=False, description="工作区是否存在未提交变更。")
+    display_text: str | None = Field(default=None, description="状态栏可直接展示的仓库状态文本，例如 main* 或 HEAD@abc1234。")
+    reason: str | None = Field(default=None, description="仓库状态存在降级或不可读取时的机器可读原因。")
 
 
 class WorkspaceGitStatusResponse(BaseModel):
     workspace_path: str
-    is_git_repository_root: bool = Field(description="该目录本身是否为 Git 仓库根目录。")
-    branch: str | None = Field(default=None, description="当前检出的 Git 分支；detached HEAD 或不可读取时为空。")
-    dirty: bool = Field(default=False, description="工作区是否存在未提交变更。")
-    display_text: str | None = Field(default=None, description="状态栏可直接展示的分支文本，例如 main*。")
-    reason: str | None = Field(default=None, description="不可展示分支时的机器可读原因。")
+    repositories: list[WorkspaceGitRepositoryStatusResponse] = Field(default_factory=list, description="工作区下按层级顺序排列的 Git 仓库状态列表。")
+    is_git_repository_root: bool = Field(default=False, description="兼容字段：工作区根目录本身是否为 Git 仓库根目录。")
+    branch: str | None = Field(default=None, description="兼容字段：工作区根仓库当前检出的 Git 分支。")
+    dirty: bool = Field(default=False, description="兼容字段：工作区根仓库是否存在未提交变更。")
+    display_text: str | None = Field(default=None, description="兼容字段：工作区根仓库可直接展示的分支文本，例如 main*。")
+    reason: str | None = Field(default=None, description="兼容字段或扫描降级原因。")
+    scan_truncated: bool = Field(default=False, description="扫描目录或仓库数量达到边界时为 true，表示结果可能被截断。")
 
 
 _EXCLUDED_NAMES = {
@@ -85,54 +96,193 @@ def create_workspace_router() -> APIRouter:
             raise HTTPException(status_code=404, detail=f"工作目录不存在: {root}")
         if not root.is_dir():
             raise HTTPException(status_code=400, detail=f"工作目录不是文件夹: {root}")
-        return _read_git_status(root)
+        return _read_workspace_git_status(root)
 
     return router
 
 
 _GIT_COMMAND_TIMEOUT_SECONDS = 3.0
+_GIT_REPOSITORY_SCAN_MAX_DIRECTORIES = 5_000
+_GIT_REPOSITORY_SCAN_MAX_REPOSITORIES = 100
+_GIT_SCAN_EXCLUDED_NAMES = {
+    name.casefold()
+    for name in _EXCLUDED_NAMES
+    | {
+        ".next",
+        ".turbo",
+        ".vite",
+        "coverage",
+        "out",
+        "release",
+        "target",
+    }
+}
 
 
-def _read_git_status(root: Path) -> WorkspaceGitStatusResponse:
-    """读取工作区 Git 状态；只有目录本身是 Git 仓库根目录时才返回可展示文本。"""
-    if not (root / ".git").exists():
-        return _git_status_response(root, is_git_repository_root=False, reason="missing_git_metadata")
+def _read_workspace_git_status(root: Path) -> WorkspaceGitStatusResponse:
+    """扫描工作区下的 Git 仓库，并返回按层级顺序排列的仓库状态汇总。"""
+    repository_paths, scan_truncated = _discover_git_repositories(root)
+    repositories = [
+        _read_git_repository_status(root, repository_path)
+        for repository_path in _sort_repository_paths(root, repository_paths)
+    ]
+    root_repository = next((repository for repository in repositories if repository.relative_path == "."), None)
 
-    top_level_ok, top_level = _run_git(root, "rev-parse", "--show-toplevel")
-    if not top_level_ok or not top_level:
-        return _git_status_response(root, is_git_repository_root=False, reason="git_root_unavailable")
+    if scan_truncated:
+        reason = "scan_truncated"
+    elif root_repository is not None:
+        reason = root_repository.reason
+    elif repositories:
+        reason = "workspace_root_not_git_repository"
+    else:
+        reason = "no_git_repositories"
 
-    top_level_path = Path(top_level).expanduser().resolve()
-    if not _is_same_path(root, top_level_path):
-        return _git_status_response(root, is_git_repository_root=False, reason="not_git_repository_root")
-
-    branch_ok, branch_output = _run_git(root, "branch", "--show-current")
-    branch = branch_output if branch_ok and branch_output else None
-    dirty_ok, dirty_output = _run_git(root, "status", "--porcelain")
-    dirty = bool(dirty_output) if dirty_ok else False
-    display_text = f"{branch}{'*' if dirty else ''}" if branch else None
-    return _git_status_response(
-        root,
-        is_git_repository_root=True,
-        branch=branch,
-        dirty=dirty,
-        display_text=display_text,
-        reason=None if display_text else "branch_unavailable",
+    return WorkspaceGitStatusResponse(
+        workspace_path=str(root),
+        repositories=repositories,
+        is_git_repository_root=root_repository is not None,
+        branch=root_repository.branch if root_repository is not None else None,
+        dirty=root_repository.dirty if root_repository is not None else False,
+        display_text=root_repository.display_text if root_repository is not None else None,
+        reason=reason,
+        scan_truncated=scan_truncated,
     )
 
 
-def _git_status_response(
-    root: Path,
+def _discover_git_repositories(root: Path) -> tuple[list[Path], bool]:
+    repositories: list[Path] = []
+    stack: list[Path] = [root]
+    scanned_directories = 0
+
+    while stack:
+        directory = stack.pop()
+        scanned_directories += 1
+        if scanned_directories > _GIT_REPOSITORY_SCAN_MAX_DIRECTORIES:
+            return repositories, True
+
+        if _has_git_metadata_marker(directory):
+            repositories.append(directory)
+            if len(repositories) >= _GIT_REPOSITORY_SCAN_MAX_REPOSITORIES:
+                return repositories, True
+
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name.casefold())
+        except OSError:
+            continue
+
+        child_directories: list[Path] = []
+        for entry in entries:
+            if entry.name.casefold() in _GIT_SCAN_EXCLUDED_NAMES:
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            child_directories.append(entry)
+        stack.extend(reversed(child_directories))
+
+    return repositories, False
+
+
+def _has_git_metadata_marker(directory: Path) -> bool:
+    try:
+        git_metadata = directory / ".git"
+        return git_metadata.is_dir() or git_metadata.is_file()
+    except OSError:
+        return False
+
+
+def _sort_repository_paths(workspace_root: Path, repository_paths: list[Path]) -> list[Path]:
+    unique_repository_paths = {_normalise_path_for_compare(repository_path): repository_path for repository_path in repository_paths}
+    return sorted(
+        unique_repository_paths.values(),
+        key=lambda repository_path: _repository_sort_key(workspace_root, repository_path),
+    )
+
+
+def _relative_path_for_workspace(workspace_root: Path, repository_path: Path) -> str:
+    try:
+        relative_path = repository_path.relative_to(workspace_root).as_posix()
+    except ValueError:
+        relative_path = repository_path.name or str(repository_path)
+    relative_path = relative_path.replace("\\", "/").rstrip("/")
+    return relative_path or "."
+
+
+def _normalise_relative_path_for_sort(relative_path: str) -> str:
+    if relative_path == ".":
+        return ""
+    return relative_path.replace("\\", "/").rstrip("/").casefold()
+
+
+def _repository_sort_key(workspace_root: Path, repository_path: Path) -> tuple[int, str]:
+    relative_path = _relative_path_for_workspace(workspace_root, repository_path)
+    depth = 0 if relative_path == "." else len([segment for segment in relative_path.split("/") if segment])
+    return depth, _normalise_relative_path_for_sort(relative_path)
+
+
+def _read_git_repository_status(workspace_root: Path, repository_root: Path) -> WorkspaceGitRepositoryStatusResponse:
+    relative_path = _relative_path_for_workspace(workspace_root, repository_root)
+    top_level_ok, top_level = _run_git(repository_root, "rev-parse", "--show-toplevel")
+    if not top_level_ok or not top_level:
+        return _git_repository_status_response(
+            repository_root,
+            relative_path=relative_path,
+            display_text="unknown",
+            reason="git_root_unavailable",
+        )
+
+    top_level_path = Path(top_level).expanduser().resolve()
+    if not _is_same_path(repository_root, top_level_path):
+        return _git_repository_status_response(
+            repository_root,
+            relative_path=relative_path,
+            display_text="unknown",
+            reason="not_git_repository_root",
+        )
+
+    branch_ok, branch_output = _run_git(repository_root, "branch", "--show-current")
+    branch = branch_output if branch_ok and branch_output else None
+    display_ref = branch
+    reason = None
+    if not display_ref:
+        commit_ok, commit_output = _run_git(repository_root, "rev-parse", "--short", "HEAD")
+        if commit_ok and commit_output:
+            display_ref = f"HEAD@{commit_output}"
+            reason = "detached_head"
+        else:
+            display_ref = "HEAD"
+            reason = "branch_unavailable"
+
+    dirty_ok, dirty_output = _run_git(repository_root, "status", "--porcelain")
+    dirty = bool(dirty_output) if dirty_ok else False
+    if not dirty_ok and reason is None:
+        reason = "dirty_status_unavailable"
+    display_text = f"{display_ref}{'*' if dirty else ''}"
+
+    return _git_repository_status_response(
+        repository_root,
+        relative_path=relative_path,
+        branch=branch,
+        dirty=dirty,
+        display_text=display_text,
+        reason=reason,
+    )
+
+
+def _git_repository_status_response(
+    repository_root: Path,
     *,
-    is_git_repository_root: bool,
+    relative_path: str,
     branch: str | None = None,
     dirty: bool = False,
     display_text: str | None = None,
     reason: str | None = None,
-) -> WorkspaceGitStatusResponse:
-    return WorkspaceGitStatusResponse(
-        workspace_path=str(root),
-        is_git_repository_root=is_git_repository_root,
+) -> WorkspaceGitRepositoryStatusResponse:
+    return WorkspaceGitRepositoryStatusResponse(
+        repository_path=str(repository_root),
+        relative_path=relative_path,
         branch=branch,
         dirty=dirty,
         display_text=display_text,
