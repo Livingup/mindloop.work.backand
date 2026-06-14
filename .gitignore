@@ -4,6 +4,7 @@
 .env
 .env.*
 !.env.example
+!config/.env.dev
 
 # =============================================
 # Python 构建与运行产物

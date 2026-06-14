@@ -35,7 +35,7 @@ dev 后端在本仓库独立启动，推荐使用项目内配置目录：
 spread-ai serve --config-file config/agent_runtime.yaml --env-file config/.env.dev
 ```
 
-dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`。`config/.env.dev` 只能保存 dev 启动元数据覆盖，且必须通过 `--env-file config/.env.dev` 显式传入；`config/.env` 与 `config/.env.prod` 不再作为 OSS、云端 PostgreSQL 密码或其他用户业务密钥来源。
+dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`；dev 数据根由 `SPREAD_AI_DATA_ROOT` 提供，默认固定为 `~/.spread-ai-dev`，用于源码自测沙箱，避免写入正式安装版默认使用的 `~/.spread-ai` 用户数据。`config/.env.dev` 只能保存 dev 启动元数据覆盖，且必须通过 `--env-file config/.env.dev` 显式传入；`config/.env` 与 `config/.env.prod` 不再作为 OSS、云端 PostgreSQL 密码或其他用户业务密钥来源。
 
 正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式 release 后端监听地址和端口由 `agent_runtime.yaml` 的 `agent_runtime_service.service_host/service_port` 决定，Electron packaged 主进程正常只传 `--config-file`，不再用 `--host` / `--port` 覆盖 release 配置；如果 YAML 配置端口被占用，应由 Electron 启动前检查并清晰失败，不得静默切换随机端口。正式 sidecar 可额外接收 `--frontend-dist-dir` 挂载同一份 Vite production `dist/`：`/api/*` 仍是 Runtime API，非 `/api` 路径服务 release SPA，供 PC/手机浏览器按页面自身 HTTP origin 访问同一个 Runtime。
 
@@ -43,7 +43,7 @@ dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐�
 
 正式 release 监听地址是安全边界。任何非 loopback / LAN 暴露默认值调整前，必须保持无账号首次初始化只能由本机来源完成；未创建 Runtime 本地账号时，除健康检查和账号初始化入口外，普通 `/api/*` 不得因为“无账号”而向 LAN 客户端免认证开放。
 
-正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`，该 YAML 是 packaged release 程序启动元数据权威，承载服务 host/port、本机数据根和 bootstrap/cloud 默认元数据等信息；它不能写入用户资源密钥、Runtime 本地登录凭据或共享云配置的长期本地权威缓存。正式 release 不扫描外部 `.env`，也不把目标机器 `SPREAD_AI_*` / `VITE_*` 环境变量作为启动或业务配置来源；dev/诊断可通过显式 `--env-file` 或 CLI 参数覆盖。Electron packaged 主进程只负责传入配置文件，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：未显式配置时，dev 与正式版默认使用同一套 `~/.spread-ai` 用户业务数据；dev/prod/release 是运行环境，不是同一台机器上的用户数据隔离边界。
+正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`，该 YAML 是 packaged release 程序启动元数据权威，承载服务 host/port、本机数据根和 bootstrap/cloud 默认元数据等信息；它不能写入用户资源密钥、Runtime 本地登录凭据或共享云配置的长期本地权威缓存。正式 release 不扫描外部 `.env`，也不把目标机器 `SPREAD_AI_*` / `VITE_*` 环境变量作为启动或业务配置来源；dev/诊断可通过显式 `--env-file` 或 CLI 参数覆盖。Electron packaged 主进程只负责传入配置文件，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：正式安装版未显式配置时默认使用 `~/.spread-ai` 用户业务数据；源码 dev 自测必须通过 `config/.env.dev` 显式设置 `SPREAD_AI_DATA_ROOT=~/.spread-ai-dev`，作为可重置的沙箱数据根。除非明确做迁移或兼容性验证，不要让 dev 临时服务直接读写 release 用户数据根。
 
 构建正式版后端 sidecar：
 
