@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -104,6 +107,8 @@ def create_workspace_router() -> APIRouter:
 _GIT_COMMAND_TIMEOUT_SECONDS = 3.0
 _GIT_REPOSITORY_SCAN_MAX_DIRECTORIES = 5_000
 _GIT_REPOSITORY_SCAN_MAX_REPOSITORIES = 100
+_GIT_REPOSITORY_DISCOVERY_CACHE_TTL_SECONDS = 45.0
+_GIT_REPOSITORY_DISCOVERY_CACHE_MAX_ENTRIES = 32
 _GIT_SCAN_EXCLUDED_NAMES = {
     name.casefold()
     for name in _EXCLUDED_NAMES
@@ -117,11 +122,14 @@ _GIT_SCAN_EXCLUDED_NAMES = {
         "target",
     }
 }
+_GitRepositoryDiscoveryCacheEntry = tuple[float, tuple[str, ...], bool]
+_git_repository_discovery_cache: dict[str, _GitRepositoryDiscoveryCacheEntry] = {}
+_git_repository_discovery_cache_lock = threading.Lock()
 
 
 def _read_workspace_git_status(root: Path) -> WorkspaceGitStatusResponse:
     """扫描工作区下的 Git 仓库，并返回按层级顺序排列的仓库状态汇总。"""
-    repository_paths, scan_truncated = _discover_git_repositories(root)
+    repository_paths, scan_truncated = _get_cached_git_repositories(root)
     repositories = [
         _read_git_repository_status(root, repository_path)
         for repository_path in _sort_repository_paths(root, repository_paths)
@@ -149,52 +157,84 @@ def _read_workspace_git_status(root: Path) -> WorkspaceGitStatusResponse:
     )
 
 
+def _get_cached_git_repositories(root: Path) -> tuple[list[Path], bool]:
+    cache_key = _normalise_path_for_compare(root)
+    now = time.monotonic()
+    with _git_repository_discovery_cache_lock:
+        cached = _git_repository_discovery_cache.get(cache_key)
+        if cached is not None:
+            cached_at, repository_path_texts, scan_truncated = cached
+            if now - cached_at <= _GIT_REPOSITORY_DISCOVERY_CACHE_TTL_SECONDS:
+                repositories = [Path(repository_path_text) for repository_path_text in repository_path_texts]
+                return repositories, scan_truncated
+            _git_repository_discovery_cache.pop(cache_key, None)
+
+    repositories, scan_truncated = _discover_git_repositories(root)
+    with _git_repository_discovery_cache_lock:
+        _remember_git_repository_discovery(cache_key, repositories, scan_truncated, time.monotonic())
+    return repositories, scan_truncated
+
+
+def _remember_git_repository_discovery(
+    cache_key: str,
+    repositories: list[Path],
+    scan_truncated: bool,
+    cached_at: float,
+) -> None:
+    cache_full = len(_git_repository_discovery_cache) >= _GIT_REPOSITORY_DISCOVERY_CACHE_MAX_ENTRIES
+    if cache_key not in _git_repository_discovery_cache and cache_full:
+        oldest_cache_key = min(_git_repository_discovery_cache, key=lambda key: _git_repository_discovery_cache[key][0])
+        _git_repository_discovery_cache.pop(oldest_cache_key, None)
+    _git_repository_discovery_cache[cache_key] = (
+        cached_at,
+        tuple(str(repository) for repository in repositories),
+        scan_truncated,
+    )
+
+
 def _discover_git_repositories(root: Path) -> tuple[list[Path], bool]:
-    repositories: list[Path] = []
-    stack: list[Path] = [root]
+    repositories: list[str] = []
+    stack: list[str] = [str(root)]
     scanned_directories = 0
 
     while stack:
-        directory = stack.pop()
+        directory_path = stack.pop()
         scanned_directories += 1
         if scanned_directories > _GIT_REPOSITORY_SCAN_MAX_DIRECTORIES:
-            return repositories, True
+            return [Path(repository_path) for repository_path in repositories], True
 
-        if _has_git_metadata_marker(directory):
-            repositories.append(directory)
+        if _has_git_metadata_marker(directory_path):
+            repositories.append(directory_path)
             if len(repositories) >= _GIT_REPOSITORY_SCAN_MAX_REPOSITORIES:
-                return repositories, True
+                return [Path(repository_path) for repository_path in repositories], True
 
         try:
-            entries = sorted(directory.iterdir(), key=lambda entry: entry.name.casefold())
+            with os.scandir(directory_path) as entries:
+                for entry in entries:
+                    if entry.name.casefold() in _GIT_SCAN_EXCLUDED_NAMES:
+                        continue
+                    try:
+                        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    stack.append(entry.path)
         except OSError:
             continue
 
-        child_directories: list[Path] = []
-        for entry in entries:
-            if entry.name.casefold() in _GIT_SCAN_EXCLUDED_NAMES:
-                continue
-            try:
-                if entry.is_symlink() or not entry.is_dir():
-                    continue
-            except OSError:
-                continue
-            child_directories.append(entry)
-        stack.extend(reversed(child_directories))
-
-    return repositories, False
+    return [Path(repository_path) for repository_path in repositories], False
 
 
-def _has_git_metadata_marker(directory: Path) -> bool:
-    try:
-        git_metadata = directory / ".git"
-        return git_metadata.is_dir() or git_metadata.is_file()
-    except OSError:
-        return False
+def _has_git_metadata_marker(directory_path: str) -> bool:
+    git_metadata_path = os.path.join(directory_path, ".git")
+    return os.path.isdir(git_metadata_path) or os.path.isfile(git_metadata_path)
 
 
 def _sort_repository_paths(workspace_root: Path, repository_paths: list[Path]) -> list[Path]:
-    unique_repository_paths = {_normalise_path_for_compare(repository_path): repository_path for repository_path in repository_paths}
+    unique_repository_paths = {
+        _normalise_path_for_compare(repository_path): repository_path
+        for repository_path in repository_paths
+    }
     return sorted(
         unique_repository_paths.values(),
         key=lambda repository_path: _repository_sort_key(workspace_root, repository_path),
