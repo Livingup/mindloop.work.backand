@@ -373,14 +373,26 @@ def test_logs_workspace_rest_contracts_preserve_trace_lookup_and_cleanup_flow(tm
     }
     preview_job = client.post("/api/logs/cleanup/jobs", json={"mode": "preview", **request})
     assert preview_job.status_code == 202
+    preview_jobs = client.get("/api/logs/cleanup/jobs?active_only=true")
+    assert preview_jobs.status_code == 200
+    assert preview_jobs.json()["items"] == []
     preview = _wait_for_cleanup_job(client, preview_job.json()["job_id"])
     assert preview["status"] == "succeeded"
     assert preview["result"]["total_matched_count"] == 4
     execute_job = client.post("/api/logs/cleanup/jobs", json={"mode": "execute", **request})
     assert execute_job.status_code == 202
+    execute_jobs = client.get("/api/logs/cleanup/jobs?active_only=true")
+    assert execute_jobs.status_code == 200
+    assert execute_jobs.json()["active_count"] == 1
+    assert execute_jobs.json()["items"][0]["job_id"] == execute_job.json()["job_id"]
+    assert execute_jobs.json()["items"][0]["mode"] == "execute"
     execute = _wait_for_cleanup_job(client, execute_job.json()["job_id"])
     assert execute["status"] == "succeeded"
     assert execute["result"]["total_deleted_count"] == preview["result"]["total_matched_count"]
+    completed_execute_jobs = client.get("/api/logs/cleanup/jobs?active_only=true")
+    assert completed_execute_jobs.status_code == 200
+    assert completed_execute_jobs.json()["items"] == []
+    assert "未完成" in completed_execute_jobs.json()["retention_note"]
     with _connect(paths.llm_http_trace_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT llm_request_id FROM llm_http_traces").fetchall()}
         assert "trace-contract" in remaining

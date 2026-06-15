@@ -152,6 +152,28 @@ class LogsManagementService:
             job = self._jobs.get(job_id)
             return job.to_dict() if job is not None else None
 
+    def list_cleanup_jobs(
+        self,
+        *,
+        limit: int = 10,
+        active_only: bool = False,
+    ) -> dict[str, Any]:
+        normalized_limit = max(1, min(int(limit), 50))
+        active_statuses = {CLEANUP_JOB_STATUS_QUEUED, CLEANUP_JOB_STATUS_RUNNING}
+        with self._jobs_lock:
+            jobs = [
+                job
+                for job in self._jobs.values()
+                if job.mode == CLEANUP_MODE_EXECUTE and job.status in active_statuses
+            ]
+        jobs.sort(key=lambda job: job.created_at, reverse=True)
+        return {
+            "items": [job.to_dict() for job in jobs[:normalized_limit]],
+            "active_count": len(jobs),
+            "volatile": True,
+            "retention_note": "只返回当前后端进程内未完成的 execute 删除任务；预览任务和已完成删除任务不会出现在恢复列表中，后端重启后未完成任务状态不会保留。",
+        }
+
     def _run_cleanup_job(self, job_id: str) -> None:
         with self._cleanup_lock:
             self._update_job(job_id, status=CLEANUP_JOB_STATUS_RUNNING, started_at=_utc_now())

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from agent_runtime.logs_management.service import LogsManagementService
@@ -64,6 +64,13 @@ class LogsCleanupJobResponse(BaseModel):
     error_message: str | None = None
 
 
+class LogsCleanupJobsResponse(BaseModel):
+    items: list[LogsCleanupJobResponse] = Field(default_factory=list)
+    active_count: int
+    volatile: bool = True
+    retention_note: str
+
+
 def create_logs_management_router(service: LogsManagementService) -> APIRouter:
     router = APIRouter()
 
@@ -81,6 +88,13 @@ def create_logs_management_router(service: LogsManagementService) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/cleanup/jobs", response_model=LogsCleanupJobsResponse)
+    def list_logs_cleanup_jobs(
+        limit: int = Query(default=10, ge=1, le=50),
+        active_only: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        return service.list_cleanup_jobs(limit=limit, active_only=active_only)
 
     @router.get("/cleanup/jobs/{job_id}", response_model=LogsCleanupJobResponse)
     def get_logs_cleanup_job(job_id: str) -> dict[str, Any]:
