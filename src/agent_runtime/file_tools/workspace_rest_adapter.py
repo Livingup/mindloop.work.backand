@@ -24,6 +24,7 @@ class WorkspaceTreeNodeResponse(BaseModel):
     path: str
     type: Literal["folder", "file"] = Field(description="节点类型；可选值仅限 folder、file。")
     children: list["WorkspaceTreeNodeResponse"] = Field(default_factory=list)
+    children_loaded: bool = Field(default=True, description="目录子项是否已经随当前响应加载；为 false 时前端可按需再次请求该目录。")
 
 
 class WorkspaceTreeResponse(BaseModel):
@@ -377,6 +378,7 @@ def _read_children(
     nodes: list[WorkspaceTreeNodeResponse] = []
     for entry in entries:
         if entry.is_dir():
+            should_load_children = depth < max_depth
             nodes.append(
                 WorkspaceTreeNodeResponse(
                     name=entry.name,
@@ -387,7 +389,8 @@ def _read_children(
                         depth=depth + 1,
                         max_depth=max_depth,
                         max_entries_per_directory=max_entries_per_directory,
-                    ),
+                    ) if should_load_children else [],
+                    children_loaded=should_load_children,
                 ),
             )
         elif entry.is_file():
