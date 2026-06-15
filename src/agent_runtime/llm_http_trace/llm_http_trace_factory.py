@@ -11,13 +11,13 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 class LlmHttpTraceFactory:
     _lock = RLock()
     _service: LlmHttpTraceService | None = None
-    _config_signature: tuple[bool, str, int] | None = None
+    _config_signature: tuple[bool, str] | None = None
 
     @classmethod
     def create(cls) -> LlmHttpTraceService:
         with cls._lock:
             config = cls._read_config()
-            signature = (config.enabled, config.data_dir, config.max_body_bytes)
+            signature = (config.enabled, config.data_dir)
             if cls._service is None or cls._config_signature != signature:
                 repository = SqliteLlmHttpTraceRepository(
                     data_dir_accessor=cls._build_data_dir_accessor(config),

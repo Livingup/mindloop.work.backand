@@ -50,7 +50,7 @@ class Scene:
       新业务规则下 conversation_id 按 task 创建和清理，不再作为 Scene 跨 task 上下文复用依据。
     - LLM 策略不与 scene 绑定，只属于 agent 实例（见 AgentInstance.llm_*）。Scene 长期 root instance
       会保留运行中切换后的 LLM 策略，后续 task 复用同一 root instance 时继续沿用该策略。
-    - 状态流转：active <-> archived 可双向切换；不允许直接删除（删除是仓储级硬删除）。
+    - 状态流转：active -> archived 单向流转；归档是业务删除语义，不允许恢复 active。
     """
 
     # 场景唯一标识。
@@ -125,14 +125,11 @@ class Scene:
         )
 
     def activate(self, *, at: datetime | None = None) -> "Scene":
-        """重新激活场景，返回新副本。"""
+        """保持兼容的激活入口；归档场景是业务终态，不允许恢复 active。"""
+        del at
         if self.status == SCENE_STATUS_ACTIVE:
             return self
-        return replace(
-            self,
-            status=SCENE_STATUS_ACTIVE,
-            last_active_at=at or _utc_now(),
-        )
+        raise ValueError("已归档 Scene 不允许恢复为 active。")
 
     def update_metadata(
         self,

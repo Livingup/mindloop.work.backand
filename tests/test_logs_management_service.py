@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -145,6 +146,18 @@ def _service(paths: LogsStorePaths) -> LogsManagementService:
     return LogsManagementService(paths_accessor=lambda: paths)
 
 
+def _wait_for_cleanup_job(client: TestClient, job_id: str) -> dict:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/logs/cleanup/jobs/{job_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] not in {"queued", "running"}:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError(f"日志清理任务未在预期时间内完成: {job_id}")
+
+
 def test_manual_cleanup_deletes_only_selected_lifecycle_and_categories(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _seed_lifecycle(paths)
@@ -223,7 +236,7 @@ def test_archived_scene_cleanup_matches_scene_scope_and_derives_scene_tasks(tmp_
         assert "trace-unlinked" in remaining
 
 
-def test_cleanup_with_multiple_lifecycle_filters_uses_lifecycle_intersection(tmp_path: Path) -> None:
+def test_cleanup_with_multiple_lifecycle_filters_uses_lifecycle_union(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _seed_lifecycle(paths)
     _seed_logs(paths)
@@ -260,33 +273,25 @@ def test_cleanup_with_multiple_lifecycle_filters_uses_lifecycle_intersection(tmp
         categories=[CATEGORY_COMMUNICATION_MESSAGES, CATEGORY_CHAT_BUBBLES, CATEGORY_LLM_HTTP_TRACE, CATEGORY_TERMINAL_HISTORY],
     )
 
-    assert result["scope"] == {"task_count": 1, "scene_count": 0}
+    assert result["scope"] == {"task_count": 4, "scene_count": 1}
     assert {item["category"]: item["deleted_count"] for item in result["category_results"]} == {
-        CATEGORY_COMMUNICATION_MESSAGES: 1,
-        CATEGORY_CHAT_BUBBLES: 1,
-        CATEGORY_LLM_HTTP_TRACE: 1,
-        CATEGORY_TERMINAL_HISTORY: 1,
+        CATEGORY_COMMUNICATION_MESSAGES: 4,
+        CATEGORY_CHAT_BUBBLES: 4,
+        CATEGORY_LLM_HTTP_TRACE: 4,
+        CATEGORY_TERMINAL_HISTORY: 3,
     }
     with _connect(paths.communication_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT message_id FROM communication_messages").fetchall()}
-        assert "message-ended-archived-scene" not in remaining
-        assert "message-ended" in remaining
-        assert "message-archived-scene" in remaining
+        assert remaining == {"message-active"}
     with _connect(paths.chat_bubbles_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT bubble_id FROM chat_bubble_messages").fetchall()}
-        assert "bubble-ended-archived-scene" not in remaining
-        assert "bubble-ended" in remaining
-        assert "bubble-archived-scene" in remaining
+        assert remaining == {"bubble-active"}
     with _connect(paths.llm_http_trace_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT llm_request_id FROM llm_http_traces").fetchall()}
-        assert "trace-ended-archived-scene" not in remaining
-        assert "trace-ended" in remaining
-        assert "trace-archived-scene" in remaining
+        assert remaining == {"trace-active", "trace-unlinked"}
     with _connect(paths.terminal_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT terminal_id FROM terminals").fetchall()}
-        assert "terminal-ended-archived-scene" not in remaining
-        assert "terminal-ended" in remaining
-        assert "terminal-archived-scene" in remaining
+        assert remaining == {"terminal-active"}
 
 
 def test_logs_workspace_rest_contracts_preserve_trace_lookup_and_cleanup_flow(tmp_path: Path) -> None:
@@ -347,7 +352,7 @@ def test_logs_workspace_rest_contracts_preserve_trace_lookup_and_cleanup_flow(tm
         create_llm_http_trace_router(
             LlmHttpTraceService(
                 SqliteLlmHttpTraceRepository(lambda: str(paths.llm_http_trace_db.parent)),
-                LlmHttpTraceConfig(enabled=True, data_dir=str(paths.llm_http_trace_db.parent), max_body_bytes=1024),
+                LlmHttpTraceConfig(enabled=True, data_dir=str(paths.llm_http_trace_db.parent)),
             )
         ),
         prefix="/api/llm-http-traces",
@@ -366,12 +371,16 @@ def test_logs_workspace_rest_contracts_preserve_trace_lookup_and_cleanup_flow(tm
         "lifecycle_filters": [LIFECYCLE_ENDED_TASKS],
         "categories": [CATEGORY_COMMUNICATION_MESSAGES, CATEGORY_CHAT_BUBBLES],
     }
-    preview = client.post("/api/logs/cleanup/preview", json=request)
-    assert preview.status_code == 200
-    assert preview.json()["total_matched_count"] == 4
-    execute = client.post("/api/logs/cleanup/execute", json=request)
-    assert execute.status_code == 200
-    assert execute.json()["total_deleted_count"] == preview.json()["total_matched_count"]
+    preview_job = client.post("/api/logs/cleanup/jobs", json={"mode": "preview", **request})
+    assert preview_job.status_code == 202
+    preview = _wait_for_cleanup_job(client, preview_job.json()["job_id"])
+    assert preview["status"] == "succeeded"
+    assert preview["result"]["total_matched_count"] == 4
+    execute_job = client.post("/api/logs/cleanup/jobs", json={"mode": "execute", **request})
+    assert execute_job.status_code == 202
+    execute = _wait_for_cleanup_job(client, execute_job.json()["job_id"])
+    assert execute["status"] == "succeeded"
+    assert execute["result"]["total_deleted_count"] == preview["result"]["total_matched_count"]
     with _connect(paths.llm_http_trace_db) as conn:
         remaining = {row[0] for row in conn.execute("SELECT llm_request_id FROM llm_http_traces").fetchall()}
         assert "trace-contract" in remaining

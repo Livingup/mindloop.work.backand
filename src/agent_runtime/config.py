@@ -707,7 +707,6 @@ def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
     return LlmHttpTraceConfig(
         enabled=bool(data.get("enabled", True)),
         data_dir=str(data.get("data_dir", "~/.spread-ai/llm-http-traces")),
-        max_body_bytes=int(data.get("max_body_bytes", 20 * 1024 * 1024)),
     )
 
 

@@ -42,10 +42,6 @@ class LlmHttpTraceService:
     def enabled(self) -> bool:
         return self._config.enabled
 
-    @property
-    def max_body_bytes(self) -> int:
-        return self._config.max_body_bytes
-
     def get(self, llm_request_id: str) -> LlmHttpTraceRecord | None:
         return self._repository.get(llm_request_id)
 
@@ -64,7 +60,8 @@ class LlmHttpTraceService:
         try:
             sanitized_url = sanitize_url(url)
             sanitized_headers = sanitize_headers(request_headers)
-            request_body_text, request_body_truncated = decode_and_truncate(request_body_bytes, self.max_body_bytes)
+            request_body_text = decode_body(request_body_bytes)
+            request_body_truncated = False
             raw_request_text = build_raw_request_text(
                 method=method,
                 url=sanitized_url,
@@ -108,7 +105,8 @@ class LlmHttpTraceService:
             if base is None:
                 return
             sanitized_headers = sanitize_headers(response_headers)
-            response_body_text, response_body_truncated = decode_and_truncate(response_body_bytes, self.max_body_bytes)
+            response_body_text = decode_body(response_body_bytes)
+            response_body_truncated = False
             raw_response_text = build_raw_response_text(
                 status_code=status_code,
                 headers=sanitized_headers,
@@ -155,7 +153,8 @@ class LlmHttpTraceService:
                 return
             sanitized_headers = sanitize_headers(response_headers or {})
             body = response_body_bytes or b""
-            response_body_text, response_body_truncated = decode_and_truncate(body, self.max_body_bytes)
+            response_body_text = decode_body(body)
+            response_body_truncated = False
             raw_response_text = None
             if status_code is not None or sanitized_headers or response_body_text:
                 raw_response_text = build_raw_response_text(
@@ -219,13 +218,8 @@ def mask_secret(value: str) -> str:
     return f"{stripped[:3]}****{stripped[-4:]}"
 
 
-def decode_and_truncate(data: bytes, max_bytes: int) -> tuple[str, bool]:
-    truncated = len(data) > max_bytes
-    sample = data[:max_bytes] if truncated else data
-    text = sample.decode("utf-8", errors="replace")
-    if truncated:
-        text = f"{text}\n...[truncated {len(data) - max_bytes} bytes]"
-    return text, truncated
+def decode_body(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace")
 
 
 def build_raw_request_text(

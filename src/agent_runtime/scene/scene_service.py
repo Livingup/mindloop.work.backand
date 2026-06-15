@@ -265,14 +265,16 @@ class SceneService:
 
         ``bound_agent_definition_id`` 永久绑定不可变；如需更换 Agent 请新建 scene。
         ``bound_root_conversation_id`` 是历史兼容字段，不在普通更新接口中修改。
-        ``status`` 可传 ``'active' / 'archived'`` 触发激活/归档；其他字段为 None 表示不变。
+        ``status`` 只允许 active -> archived 单向归档；archived 是业务删除终态，不允许恢复 active。
         """
         scene = self.get_scene(workspace_path, scene_id)
         if status is not None:
             if status not in SCENE_STATUSES:
                 raise ValueError(f"未知 scene 状态: {status}")
             if status != scene.status:
-                scene = scene.archive() if status == "archived" else scene.activate()
+                if status != "archived":
+                    raise ValueError("已归档 Scene 不允许恢复为 active。")
+                scene = scene.archive()
         scene = scene.update_metadata(
             name=name,
             description=description,
@@ -302,7 +304,7 @@ class SceneService:
         return self._scene_repo.save_scene(updated)
 
     def delete_scene(self, workspace_path: str, scene_id: str) -> bool:
-        """删除场景。全局数据库下必须先验证场景属于该 workspace 对应项目才能删除。"""
+        """归档场景。DELETE API 保持兼容，但业务语义不再硬删除 scene 行。"""
         project = self.get_project_by_workspace_path(workspace_path)
         scene = self._scene_repo.get_scene(scene_id)
         if scene is None:
@@ -313,7 +315,8 @@ class SceneService:
                 f"scene.project_id={scene.project_id} "
                 f"workspace_project_id={project.project_id}"
             )
-        return self._scene_repo.delete_scene(scene_id)
+        self._scene_repo.save_scene(scene.archive())
+        return True
 
     # ── 内部辅助 ────────────────────────────────────────────────────
 

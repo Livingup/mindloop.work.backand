@@ -106,7 +106,6 @@ codex_oauth:
 llm_http_trace:
   enabled: true
   data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-http-traces"
-  max_body_bytes: 20971520
 
 context_compression:
   enabled: true

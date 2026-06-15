@@ -22,7 +22,8 @@ class LogsOverviewResponse(BaseModel):
     total_size_bytes: int
 
 
-class LogsCleanupRequest(BaseModel):
+class LogsCleanupJobCreateRequest(BaseModel):
+    mode: str
     lifecycle_filters: list[str] = Field(default_factory=list)
     categories: list[str] = Field(default_factory=list)
 
@@ -49,6 +50,20 @@ class LogsCleanupResponse(BaseModel):
     total_deleted_count: int
 
 
+class LogsCleanupJobResponse(BaseModel):
+    job_id: str
+    mode: str
+    status: str
+    lifecycle_filters: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    result: LogsCleanupResponse | None = None
+    error_message: str | None = None
+
+
 def create_logs_management_router(service: LogsManagementService) -> APIRouter:
     router = APIRouter()
 
@@ -56,24 +71,22 @@ def create_logs_management_router(service: LogsManagementService) -> APIRouter:
     def get_logs_overview() -> dict[str, Any]:
         return service.get_overview()
 
-    @router.post("/cleanup/preview", response_model=LogsCleanupResponse)
-    def preview_logs_cleanup(body: LogsCleanupRequest) -> dict[str, Any]:
+    @router.post("/cleanup/jobs", response_model=LogsCleanupJobResponse, status_code=202)
+    def create_logs_cleanup_job(body: LogsCleanupJobCreateRequest) -> dict[str, Any]:
         try:
-            return service.preview_cleanup(
+            return service.create_cleanup_job(
+                mode=body.mode,
                 lifecycle_filters=body.lifecycle_filters,
                 categories=body.categories,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @router.post("/cleanup/execute", response_model=LogsCleanupResponse)
-    def execute_logs_cleanup(body: LogsCleanupRequest) -> dict[str, Any]:
-        try:
-            return service.execute_cleanup(
-                lifecycle_filters=body.lifecycle_filters,
-                categories=body.categories,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    @router.get("/cleanup/jobs/{job_id}", response_model=LogsCleanupJobResponse)
+    def get_logs_cleanup_job(job_id: str) -> dict[str, Any]:
+        job = service.get_cleanup_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="日志清理任务不存在。")
+        return job
 
     return router
