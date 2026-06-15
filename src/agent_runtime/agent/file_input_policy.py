@@ -18,6 +18,7 @@ MAX_IMAGE_INPUTS_PER_LLM_REQUEST = 1500
 MAX_TOTAL_IMAGE_BYTES_PER_LLM_REQUEST = 512 * 1024 * 1024
 MAX_SINGLE_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
 MAX_TOTAL_INPUT_FILE_BYTES_PER_LLM_REQUEST = 50 * 1024 * 1024
+FILE_RESOURCE_SERVICE_DEFAULT_BATCH_SIZE = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +200,10 @@ def _attachment_candidates(
     attachments: tuple[PendingUserMessageAttachment, ...],
     file_resource_service: Any,
 ) -> tuple[FileInputCandidate, ...]:
-    resources = file_resource_service.get_resources([attachment.resource_id for attachment in attachments])
+    resources = _get_resources_in_batches(
+        file_resource_service,
+        [attachment.resource_id for attachment in attachments],
+    )
     candidates: list[FileInputCandidate] = []
     for index, attachment in enumerate(attachments):
         resource = resources[index] if index < len(resources) else None
@@ -249,13 +253,43 @@ def _add_resource_reference_stats(
         return
     if file_resource_service is None:
         raise FileInputLimitError("文件资源服务未启用，无法统计历史文件输入。")
-    resources = file_resource_service.get_resources([resource_id for _, resource_id in references])
+    resources = _get_resources_in_batches(
+        file_resource_service,
+        [resource_id for _, resource_id in references],
+    )
     for index, (kind, resource_id) in enumerate(references):
         resource = resources[index] if index < len(resources) else None
         if resource is None:
             raise FileInputLimitError(f"历史文件资源不存在，无法统计文件输入限制: {resource_id}")
         candidate = _resource_candidate(resource, fallback_kind=kind, fallback_name=None)
         add_file_input_stats(stats, candidate.kind, candidate.size_in_bytes, candidate.page_count)
+
+
+def _get_resources_in_batches(file_resource_service: Any, resource_ids: list[str]) -> list[Any]:
+    """按文件资源服务单次批量上限分批读取资源，并保持输入顺序。"""
+
+    if not resource_ids:
+        return []
+    batch_size = _file_resource_service_batch_size(file_resource_service)
+    resources: list[Any] = []
+    for start in range(0, len(resource_ids), batch_size):
+        resources.extend(file_resource_service.get_resources(resource_ids[start:start + batch_size]))
+    return resources
+
+
+def _file_resource_service_batch_size(file_resource_service: Any) -> int:
+    try:
+        batch_size = int(
+            getattr(
+                file_resource_service,
+                "_batch_limit",
+                FILE_RESOURCE_SERVICE_DEFAULT_BATCH_SIZE,
+            )
+            or FILE_RESOURCE_SERVICE_DEFAULT_BATCH_SIZE
+        )
+    except (TypeError, ValueError):
+        return FILE_RESOURCE_SERVICE_DEFAULT_BATCH_SIZE
+    return max(1, batch_size)
 
 
 def _resource_candidate(resource: Any, *, fallback_kind: str, fallback_name: str | None) -> FileInputCandidate:

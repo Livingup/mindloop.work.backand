@@ -90,6 +90,7 @@ Desktop.ini
 !/tests/test_subagent_conversation_history.py
 !/tests/test_sqlite_threaded_repositories.py
 !/tests/test_lacp_inbound_attachments.py
+!/tests/test_file_input_policy.py
 !/tests/test_release_windows_subprocess_visibility.py
 !/tests/test_workspace_tree_lazy_loading.py
 !/tests/test_context_compression_worker_contents.py
