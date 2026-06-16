@@ -620,7 +620,9 @@ def _build_parent_history_boundary_message(
     text = (
         f"【@本地Agent {parent_agent_name} {parent_instance_id}】"
         f"上面的历史消息是我{parent_agent_name}的历史对话消息，"
-        "作为你的任务背景认知上下文，只需要你帮我完成下面的任务"
+        "作为你的任务背景认知上下文，只需要你帮我完成下面的任务。"
+        "任务完成后请向父 Agent 汇报任务结果；"
+        "如果任务执行过程中遇到问题无法确定或解决时，也要向父 Agent 汇报。"
     )
     return UniMessage(role=ROLE_USER, content=[TextPart(text)])
 
