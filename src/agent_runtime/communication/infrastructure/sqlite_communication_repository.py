@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -11,6 +13,64 @@ from typing import Any, Callable
 
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_stream import CommunicationStream
+
+logger = logging.getLogger(__name__)
+_SQLITE_COMMUNICATION_SLOW_PHASE_SECONDS = 1.0
+
+
+def _duration_ms_since(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _message_trace_id(message: CommunicationMessage) -> str | None:
+    value = message.metadata.get("trace_id")
+    return str(value) if value is not None else None
+
+
+def _log_sqlite_append_diagnostic(
+    level: int,
+    message_text: str,
+    *,
+    message: CommunicationMessage,
+    phase: str,
+    duration_ms: int | None = None,
+    seq: int | None = None,
+    db_path: Path | None = None,
+    timeout_seconds: float | None = None,
+    rollback_duration_ms: int | None = None,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s "
+        "duration_ms=%s timeout_seconds=%s message_id=%s seq=%s correlation_id=%s "
+        "db_path=%s rollback_duration_ms=%s error_type=%s error=%s",
+        message_text,
+        _message_trace_id(message),
+        message.stream_id,
+        message.type,
+        None,
+        "communication.sqlite.append_message",
+        phase,
+        None,
+        duration_ms,
+        timeout_seconds,
+        message.message_id,
+        seq if seq is not None else message.seq,
+        message.correlation_id,
+        str(db_path) if db_path is not None else None,
+        rollback_duration_ms,
+        error_type,
+        error,
+    )
+
+
+def _slow_or_debug(duration_ms: int) -> int:
+    return logging.WARNING if duration_ms >= int(_SQLITE_COMMUNICATION_SLOW_PHASE_SECONDS * 1000) else logging.DEBUG
+
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS communication_streams (
@@ -128,10 +188,42 @@ class SqliteCommunicationRepository:
 
     def append_message(self, message: CommunicationMessage) -> CommunicationMessage:
         """追加通信消息，并在事务内分配流内递增 seq。"""
-        with self._lock:
+        append_started_at = time.perf_counter()
+        lock_wait_started_at = time.perf_counter()
+        self._lock.acquire()
+        lock_wait_ms = _duration_ms_since(lock_wait_started_at)
+        _log_sqlite_append_diagnostic(
+            _slow_or_debug(lock_wait_ms),
+            "SQLite communication append lock acquired",
+            message=message,
+            phase="sqlite.rlock.acquired",
+            duration_ms=lock_wait_ms,
+            db_path=self._db_path,
+        )
+        try:
+            connection_started_at = time.perf_counter()
             conn = self._connection()
+            connection_duration_ms = _duration_ms_since(connection_started_at)
+            _log_sqlite_append_diagnostic(
+                _slow_or_debug(connection_duration_ms),
+                "SQLite communication connection ready",
+                message=message,
+                phase="sqlite.connection.ready",
+                duration_ms=connection_duration_ms,
+                db_path=self._db_path,
+            )
             try:
+                begin_started_at = time.perf_counter()
                 conn.execute("BEGIN IMMEDIATE")
+                begin_duration_ms = _duration_ms_since(begin_started_at)
+                _log_sqlite_append_diagnostic(
+                    _slow_or_debug(begin_duration_ms),
+                    "SQLite communication BEGIN IMMEDIATE completed",
+                    message=message,
+                    phase="sqlite.begin_immediate.completed",
+                    duration_ms=begin_duration_ms,
+                    db_path=self._db_path,
+                )
                 row = conn.execute(
                     """
                     SELECT MAX(
@@ -179,11 +271,70 @@ class SqliteCommunicationRepository:
                     """,
                     _message_to_row(saved),
                 )
+                commit_started_at = time.perf_counter()
                 conn.commit()
+                commit_duration_ms = _duration_ms_since(commit_started_at)
+                _log_sqlite_append_diagnostic(
+                    _slow_or_debug(commit_duration_ms),
+                    "SQLite communication commit completed",
+                    message=saved,
+                    phase="sqlite.commit.completed",
+                    duration_ms=commit_duration_ms,
+                    seq=saved.seq,
+                    db_path=self._db_path,
+                )
+                transaction_duration_ms = _duration_ms_since(begin_started_at)
+                _log_sqlite_append_diagnostic(
+                    _slow_or_debug(transaction_duration_ms),
+                    "SQLite communication transaction completed",
+                    message=saved,
+                    phase="sqlite.transaction.completed",
+                    duration_ms=transaction_duration_ms,
+                    seq=saved.seq,
+                    db_path=self._db_path,
+                )
+                total_duration_ms = _duration_ms_since(append_started_at)
+                _log_sqlite_append_diagnostic(
+                    _slow_or_debug(total_duration_ms),
+                    "SQLite communication append completed",
+                    message=saved,
+                    phase="sqlite.append.completed",
+                    duration_ms=total_duration_ms,
+                    seq=saved.seq,
+                    db_path=self._db_path,
+                )
                 return saved
-            except Exception:
-                conn.rollback()
+            except Exception as exc:
+                rollback_started_at = time.perf_counter()
+                try:
+                    conn.rollback()
+                finally:
+                    rollback_duration_ms = _duration_ms_since(rollback_started_at)
+                logger.exception(
+                    "SQLite communication append failed: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s "
+                    "phase=%s task_name=%s duration_ms=%s timeout_seconds=%s message_id=%s correlation_id=%s db_path=%s "
+                    "rollback_duration_ms=%s error_type=%s error=%s",
+                    _message_trace_id(message),
+                    message.stream_id,
+                    message.type,
+                    None,
+                    "communication.sqlite.append_message",
+                    "sqlite.transaction.exception",
+                    None,
+                    _duration_ms_since(append_started_at),
+                    None,
+                    message.message_id,
+                    message.correlation_id,
+                    str(self._db_path) if self._db_path is not None else None,
+                    rollback_duration_ms,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 raise
+        except Exception:
+            raise
+        finally:
+            self._lock.release()
 
     def advance_stream_cursor(self, stream_id: str, *, seq: int) -> None:
         if seq <= 0:

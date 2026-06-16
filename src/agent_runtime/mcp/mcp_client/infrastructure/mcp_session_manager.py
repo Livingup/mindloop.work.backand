@@ -40,6 +40,65 @@ logger = logging.getLogger(__name__)
 _MCP_CONNECT_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_BASE_DELAY_SECONDS = 2.0
 _MCP_RECONNECT_MAX_DELAY_SECONDS = 60.0
+_MCP_DIAGNOSTIC_SLOW_PHASE_SECONDS = 1.0
+_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS = 5.0
+
+
+def _duration_ms_since(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _current_task_name() -> str | None:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
+def _slow_or_debug(duration_ms: int) -> int:
+    return logging.WARNING if duration_ms >= int(_MCP_DIAGNOSTIC_SLOW_PHASE_SECONDS * 1000) else logging.DEBUG
+
+
+def _transport_type_name(definition: McpServiceDefinition) -> str:
+    return type(definition.transport).__name__
+
+
+def _log_mcp_phase(
+    level: int,
+    message: str,
+    *,
+    service_id: str,
+    operation: str,
+    phase: str,
+    task_name: str | None,
+    duration_ms: int | None = None,
+    timeout_seconds: float | None = None,
+    status: str | None = None,
+    transport_type: str | None = None,
+    owner_task_name: str | None = None,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
+        "status=%s transport_type=%s owner_task_name=%s error_type=%s error=%s",
+        message,
+        None,
+        None,
+        None,
+        service_id,
+        operation,
+        phase,
+        task_name,
+        duration_ms,
+        timeout_seconds,
+        status,
+        transport_type,
+        owner_task_name,
+        error_type,
+        error,
+    )
 
 
 def _dump_mcp_content_block(content: Any) -> dict[str, Any]:
@@ -359,12 +418,56 @@ class McpSessionManager:
         status: str,
     ) -> McpServiceCapabilities:
         service_id = definition.service_id
+        operation = "mcp.connect"
+        task_name = _current_task_name()
+        transport_type = _transport_type_name(definition)
+        connect_started_at = time.perf_counter()
         state = self._state(service_id)
-        async with state.lock:
+        lock_wait_started_at = time.perf_counter()
+        try:
+            await state.lock.acquire()
+        except asyncio.CancelledError:
+            _log_mcp_phase(
+                logging.WARNING,
+                "MCP connect state lock wait cancelled",
+                service_id=service_id,
+                operation=operation,
+                phase="state.lock.cancelled",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(lock_wait_started_at),
+                status=status,
+                transport_type=transport_type,
+                error_type="CancelledError",
+            )
+            raise
+        lock_wait_ms = _duration_ms_since(lock_wait_started_at)
+        _log_mcp_phase(
+            _slow_or_debug(lock_wait_ms),
+            "MCP connect state lock acquired",
+            service_id=service_id,
+            operation=operation,
+            phase="state.lock.acquired",
+            task_name=task_name,
+            duration_ms=lock_wait_ms,
+            status=status,
+            transport_type=transport_type,
+        )
+        try:
             if service_id in self._connections:
                 state.status = MCP_CONNECTION_STATUS_CONNECTED
                 state.last_error = None
                 state.next_retry_at = None
+                _log_mcp_phase(
+                    logging.DEBUG,
+                    "MCP connect reused existing connection",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="connection.reused",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(connect_started_at),
+                    status=state.status,
+                    transport_type=transport_type,
+                )
                 return self._connections[service_id].capabilities
 
             state.status = status
@@ -374,14 +477,49 @@ class McpSessionManager:
             ready_future: asyncio.Future[tuple[ClientSession, McpServiceCapabilities]] = (
                 asyncio.get_running_loop().create_future()
             )
+            owner_task_created_at = time.perf_counter()
             owner_task = asyncio.create_task(
-                self._connection_owner(definition, close_event, ready_future)
+                self._connection_owner(
+                    definition,
+                    close_event,
+                    ready_future,
+                    owner_task_created_at=owner_task_created_at,
+                ),
+                name=f"mcp-connection-owner-{service_id}",
+            )
+            _log_mcp_phase(
+                logging.DEBUG,
+                "MCP connect owner task created",
+                service_id=service_id,
+                operation=operation,
+                phase="owner_task.created",
+                task_name=task_name,
+                duration_ms=0,
+                timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                status=state.status,
+                transport_type=transport_type,
+                owner_task_name=owner_task.get_name(),
             )
 
             try:
+                ready_wait_started_at = time.perf_counter()
                 session, capabilities = await asyncio.wait_for(
                     asyncio.shield(ready_future),
                     timeout=_MCP_CONNECT_TIMEOUT_SECONDS,
+                )
+                ready_wait_ms = _duration_ms_since(ready_wait_started_at)
+                _log_mcp_phase(
+                    _slow_or_debug(ready_wait_ms),
+                    "MCP connect ready future completed",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="ready_future.completed",
+                    task_name=task_name,
+                    duration_ms=ready_wait_ms,
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
                 )
                 self._connections[service_id] = _ManagedConnection(
                     session=session,
@@ -394,6 +532,19 @@ class McpSessionManager:
                 state.retry_attempt = 0
                 state.next_retry_at = None
                 state.last_connected_at = time.time()
+                _log_mcp_phase(
+                    logging.INFO,
+                    "MCP service connected",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="connection.connected",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(connect_started_at),
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
+                )
                 logger.info(
                     "已连接 MCP 服务: %s (%s v%s)",
                     service_id,
@@ -402,14 +553,69 @@ class McpSessionManager:
                 )
                 return capabilities
             except TimeoutError as e:
+                ready_wait_ms = _duration_ms_since(ready_wait_started_at)
+                _log_mcp_phase(
+                    logging.ERROR,
+                    "MCP connect ready future timed out",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="ready_future.timeout",
+                    task_name=task_name,
+                    duration_ms=ready_wait_ms,
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
+                    error_type="TimeoutError",
+                    error=f"ready_future did not complete within {_MCP_CONNECT_TIMEOUT_SECONDS}s",
+                )
                 ready_future.cancel()
-                await self._stop_owner_task(owner_task, close_event)
+                cleanup_started_at = time.perf_counter()
+                await self._stop_owner_task(
+                    owner_task,
+                    close_event,
+                    service_id=service_id,
+                    operation="mcp.connect.timeout_cleanup",
+                )
+                cleanup_ms = _duration_ms_since(cleanup_started_at)
+                _log_mcp_phase(
+                    _slow_or_debug(cleanup_ms),
+                    "MCP connect timeout cleanup completed",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="timeout_cleanup.completed",
+                    task_name=task_name,
+                    duration_ms=cleanup_ms,
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
+                )
                 error = f"连接 MCP 服务 '{service_id}' 超时"
                 self._record_failure(state, error)
                 raise ConnectionError(error) from e
             except asyncio.CancelledError as e:
+                _log_mcp_phase(
+                    logging.WARNING,
+                    "MCP connect cancelled while waiting for readiness",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="ready_future.cancelled",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(connect_started_at),
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
+                    error_type="CancelledError",
+                )
                 ready_future.cancel()
-                await self._stop_owner_task(owner_task, close_event)
+                await self._stop_owner_task(
+                    owner_task,
+                    close_event,
+                    service_id=service_id,
+                    operation="mcp.connect.cancel_cleanup",
+                )
                 current_task = asyncio.current_task()
                 if current_task is not None and current_task.cancelling():
                     raise
@@ -417,16 +623,43 @@ class McpSessionManager:
                 self._record_failure(state, error)
                 raise ConnectionError(error) from e
             except Exception as e:
-                await self._stop_owner_task(owner_task, close_event)
+                _log_mcp_phase(
+                    logging.ERROR,
+                    "MCP connect failed before readiness",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="ready_future.exception",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(connect_started_at),
+                    timeout_seconds=_MCP_CONNECT_TIMEOUT_SECONDS,
+                    status=state.status,
+                    transport_type=transport_type,
+                    owner_task_name=owner_task.get_name(),
+                    error_type=e.__class__.__name__,
+                    error=str(e),
+                )
+                await self._stop_owner_task(
+                    owner_task,
+                    close_event,
+                    service_id=service_id,
+                    operation="mcp.connect.exception_cleanup",
+                )
                 error = f"连接 MCP 服务 '{service_id}' 失败: {e}"
                 self._record_failure(state, error)
                 raise ConnectionError(error) from e
+        finally:
+            state.lock.release()
 
     async def _close_connection(self, service_id: str) -> None:
         conn = self._connections.pop(service_id, None)
         if conn is None:
             return
-        await self._stop_owner_task(conn.owner_task, conn.close_event)
+        await self._stop_owner_task(
+            conn.owner_task,
+            conn.close_event,
+            service_id=service_id,
+            operation="mcp.disconnect",
+        )
         logger.info("已断开 MCP 服务: %s", service_id)
 
     async def _connection_owner(
@@ -434,28 +667,143 @@ class McpSessionManager:
         definition: McpServiceDefinition,
         close_event: asyncio.Event,
         ready_future: asyncio.Future[tuple[ClientSession, McpServiceCapabilities]],
+        *,
+        owner_task_created_at: float,
     ) -> None:
         service_id = definition.service_id
+        operation = "mcp.connection_owner"
+        task_name = _current_task_name()
+        transport_type = _transport_type_name(definition)
+        owner_started_at = time.perf_counter()
+        start_delay_ms = int((owner_started_at - owner_task_created_at) * 1000)
+        _log_mcp_phase(
+            _slow_or_debug(start_delay_ms),
+            "MCP connection owner task started",
+            service_id=service_id,
+            operation=operation,
+            phase="owner_task.started",
+            task_name=task_name,
+            duration_ms=start_delay_ms,
+            transport_type=transport_type,
+            owner_task_name=task_name,
+        )
         exit_stack = AsyncExitStack()
         try:
+            exit_stack_entered_at = time.perf_counter()
             await exit_stack.__aenter__()
+            _log_mcp_phase(
+                _slow_or_debug(_duration_ms_since(exit_stack_entered_at)),
+                "MCP connection owner exit stack entered",
+                service_id=service_id,
+                operation=operation,
+                phase="exit_stack.entered",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(exit_stack_entered_at),
+                transport_type=transport_type,
+                owner_task_name=task_name,
+            )
+            create_session_started_at = time.perf_counter()
             session = await self._create_session(definition, exit_stack)
+            create_session_ms = _duration_ms_since(create_session_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(create_session_ms),
+                "MCP connection owner create session completed",
+                service_id=service_id,
+                operation=operation,
+                phase="create_session.completed",
+                task_name=task_name,
+                duration_ms=create_session_ms,
+                transport_type=transport_type,
+                owner_task_name=task_name,
+            )
+            initialize_started_at = time.perf_counter()
+            _log_mcp_phase(
+                logging.DEBUG,
+                "MCP session initialize started",
+                service_id=service_id,
+                operation=operation,
+                phase="session.initialize.started",
+                task_name=task_name,
+                duration_ms=0,
+                transport_type=transport_type,
+                owner_task_name=task_name,
+            )
             init_result = await session.initialize()
+            initialize_ms = _duration_ms_since(initialize_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(initialize_ms),
+                "MCP session initialize completed",
+                service_id=service_id,
+                operation=operation,
+                phase="session.initialize.completed",
+                task_name=task_name,
+                duration_ms=initialize_ms,
+                transport_type=transport_type,
+                owner_task_name=task_name,
+            )
             capabilities = self._extract_capabilities(init_result)
             if not ready_future.done():
                 ready_future.set_result((session, capabilities))
+                _log_mcp_phase(
+                    logging.DEBUG,
+                    "MCP ready future set result",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="ready_future.set_result",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(owner_started_at),
+                    transport_type=transport_type,
+                    owner_task_name=task_name,
+                )
+            close_wait_started_at = time.perf_counter()
             await close_event.wait()
+            _log_mcp_phase(
+                _slow_or_debug(_duration_ms_since(close_wait_started_at)),
+                "MCP connection owner close event received",
+                service_id=service_id,
+                operation=operation,
+                phase="close_event.received",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(close_wait_started_at),
+                transport_type=transport_type,
+                owner_task_name=task_name,
+            )
         except asyncio.CancelledError as e:
+            _log_mcp_phase(
+                logging.WARNING,
+                "MCP connection owner cancelled",
+                service_id=service_id,
+                operation=operation,
+                phase="owner_task.cancelled",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(owner_started_at),
+                transport_type=transport_type,
+                owner_task_name=task_name,
+                error_type="CancelledError",
+            )
             if not ready_future.done():
                 ready_future.set_exception(ConnectionError(f"连接 MCP 服务 '{service_id}' 初始化被取消"))
             raise
         except Exception as e:
+            _log_mcp_phase(
+                logging.WARNING,
+                "MCP connection owner failed",
+                service_id=service_id,
+                operation=operation,
+                phase="owner_task.exception",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(owner_started_at),
+                transport_type=transport_type,
+                owner_task_name=task_name,
+                error_type=e.__class__.__name__,
+                error=str(e),
+            )
             if not ready_future.done():
                 ready_future.set_exception(e)
             else:
                 logger.warning("MCP 服务连接 owner 异常退出: %s — %s", service_id, e)
         finally:
-            await self._close_exit_stack(exit_stack)
+            await self._close_exit_stack(exit_stack, service_id=service_id, operation=operation)
             current_task = asyncio.current_task()
             conn = self._connections.get(service_id)
             if conn is not None and conn.owner_task is current_task:
@@ -465,24 +813,178 @@ class McpSessionManager:
         self,
         owner_task: asyncio.Task,
         close_event: asyncio.Event,
+        *,
+        service_id: str | None = None,
+        operation: str = "mcp.stop_owner_task",
     ) -> None:
+        actual_service_id = service_id or "unknown"
+        task_name = _current_task_name()
+        stop_started_at = time.perf_counter()
         close_event.set()
+        _log_mcp_phase(
+            logging.DEBUG,
+            "MCP owner task stop requested",
+            service_id=actual_service_id,
+            operation=operation,
+            phase="owner_task.close_event_set",
+            task_name=task_name,
+            duration_ms=0,
+            timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+            owner_task_name=owner_task.get_name(),
+        )
         if owner_task is asyncio.current_task():
+            _log_mcp_phase(
+                logging.DEBUG,
+                "MCP owner task stop skipped for current task",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="owner_task.current_task_skip",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(stop_started_at),
+                timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                owner_task_name=owner_task.get_name(),
+            )
             return
+        first_wait_started_at = time.perf_counter()
         try:
-            await asyncio.wait_for(asyncio.shield(owner_task), timeout=5.0)
+            await asyncio.wait_for(
+                asyncio.shield(owner_task),
+                timeout=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+            )
+            first_wait_ms = _duration_ms_since(first_wait_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(first_wait_ms),
+                "MCP owner task stopped after close event",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="owner_task.first_wait.completed",
+                task_name=task_name,
+                duration_ms=first_wait_ms,
+                timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                owner_task_name=owner_task.get_name(),
+            )
         except TimeoutError:
+            first_wait_ms = _duration_ms_since(first_wait_started_at)
+            _log_mcp_phase(
+                logging.WARNING,
+                "MCP owner task did not stop after close event, cancelling",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="owner_task.first_wait.timeout",
+                task_name=task_name,
+                duration_ms=first_wait_ms,
+                timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                owner_task_name=owner_task.get_name(),
+                error_type="TimeoutError",
+            )
             owner_task.cancel()
-            with suppress(Exception, asyncio.CancelledError, TimeoutError):
-                await asyncio.wait_for(asyncio.shield(owner_task), timeout=5.0)
-        except (Exception, asyncio.CancelledError):
-            pass
+            cancel_wait_started_at = time.perf_counter()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(owner_task),
+                    timeout=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                )
+                cancel_wait_ms = _duration_ms_since(cancel_wait_started_at)
+                _log_mcp_phase(
+                    _slow_or_debug(cancel_wait_ms),
+                    "MCP owner task cancel wait completed",
+                    service_id=actual_service_id,
+                    operation=operation,
+                    phase="owner_task.cancel_wait.completed",
+                    task_name=task_name,
+                    duration_ms=cancel_wait_ms,
+                    timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                    owner_task_name=owner_task.get_name(),
+                )
+            except TimeoutError:
+                _log_mcp_phase(
+                    logging.ERROR,
+                    "MCP owner task cancel wait timed out",
+                    service_id=actual_service_id,
+                    operation=operation,
+                    phase="owner_task.cancel_wait.timeout",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(cancel_wait_started_at),
+                    timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                    owner_task_name=owner_task.get_name(),
+                    error_type="TimeoutError",
+                )
+            except (Exception, asyncio.CancelledError) as exc:
+                _log_mcp_phase(
+                    logging.DEBUG,
+                    "MCP owner task cancel wait ended with exception",
+                    service_id=actual_service_id,
+                    operation=operation,
+                    phase="owner_task.cancel_wait.exception",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(cancel_wait_started_at),
+                    timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                    owner_task_name=owner_task.get_name(),
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                )
+        except (Exception, asyncio.CancelledError) as exc:
+            _log_mcp_phase(
+                logging.DEBUG,
+                "MCP owner task first wait ended with exception",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="owner_task.first_wait.exception",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(first_wait_started_at),
+                timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                owner_task_name=owner_task.get_name(),
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
+        finally:
+            total_ms = _duration_ms_since(stop_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(total_ms),
+                "MCP owner task stop sequence completed",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="owner_task.stop_sequence.completed",
+                task_name=task_name,
+                duration_ms=total_ms,
+                timeout_seconds=_MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                owner_task_name=owner_task.get_name(),
+            )
 
-    async def _close_exit_stack(self, exit_stack: AsyncExitStack) -> None:
+    async def _close_exit_stack(
+        self,
+        exit_stack: AsyncExitStack,
+        *,
+        service_id: str | None = None,
+        operation: str = "mcp.connection_owner",
+    ) -> None:
+        actual_service_id = service_id or "unknown"
+        task_name = _current_task_name()
+        close_started_at = time.perf_counter()
         try:
             await exit_stack.__aexit__(None, None, None)
+            close_ms = _duration_ms_since(close_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(close_ms),
+                "MCP exit stack close completed",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="exit_stack.close.completed",
+                task_name=task_name,
+                duration_ms=close_ms,
+            )
         except (Exception, asyncio.CancelledError) as e:
-            logger.debug("关闭 MCP 连接资源时出错: %s", e)
+            _log_mcp_phase(
+                logging.WARNING,
+                "MCP exit stack close failed",
+                service_id=actual_service_id,
+                operation=operation,
+                phase="exit_stack.close.exception",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(close_started_at),
+                error_type=e.__class__.__name__,
+                error=str(e),
+            )
 
     def _record_failure(self, state: _ConnectionRuntimeState, error: str) -> None:
         state.status = MCP_CONNECTION_STATUS_FAILED
@@ -531,36 +1033,110 @@ class McpSessionManager:
             StreamableHttpTransportConfig,
         )
 
+        service_id = definition.service_id
+        operation = "mcp.create_session"
+        task_name = _current_task_name()
+        transport_type = _transport_type_name(definition)
+        create_started_at = time.perf_counter()
         tc = definition.transport
 
-        if isinstance(tc, StdioTransportConfig):
-            params = StdioServerParameters(
-                command=tc.command,
-                args=tc.args,
-                env=tc.env if tc.env else None,
-            )
-            read_stream, write_stream = await exit_stack.enter_async_context(
-                stdio_client(params)
-            )
-        elif isinstance(tc, StreamableHttpTransportConfig):
-            # streamable_http_client 不直接接受 headers，需通过 httpx.AsyncClient 传入
-            http_client = None
-            if tc.headers:
-                import httpx
-                http_client = httpx.AsyncClient(headers=tc.headers)
-            read_stream, write_stream, _ = await exit_stack.enter_async_context(
-                streamable_http_client(
-                    tc.url,
-                    http_client=http_client,
-                )
-            )
-        else:
-            raise ValueError(f"不支持的传输配置类型: {type(tc).__name__}")
-
-        session = await exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
+        _log_mcp_phase(
+            logging.DEBUG,
+            "MCP create session started",
+            service_id=service_id,
+            operation=operation,
+            phase="create_session.started",
+            task_name=task_name,
+            duration_ms=0,
+            transport_type=transport_type,
         )
-        return session
+        try:
+            transport_started_at = time.perf_counter()
+            _log_mcp_phase(
+                logging.DEBUG,
+                "MCP transport context enter started",
+                service_id=service_id,
+                operation=operation,
+                phase="transport.enter.started",
+                task_name=task_name,
+                duration_ms=0,
+                transport_type=transport_type,
+            )
+            if isinstance(tc, StdioTransportConfig):
+                params = StdioServerParameters(
+                    command=tc.command,
+                    args=tc.args,
+                    env=tc.env if tc.env else None,
+                )
+                read_stream, write_stream = await exit_stack.enter_async_context(
+                    stdio_client(params)
+                )
+            elif isinstance(tc, StreamableHttpTransportConfig):
+                # streamable_http_client 不直接接受 headers，需通过 httpx.AsyncClient 传入
+                http_client = None
+                if tc.headers:
+                    import httpx
+                    http_client = httpx.AsyncClient(headers=tc.headers)
+                read_stream, write_stream, _ = await exit_stack.enter_async_context(
+                    streamable_http_client(
+                        tc.url,
+                        http_client=http_client,
+                    )
+                )
+            else:
+                raise ValueError(f"不支持的传输配置类型: {type(tc).__name__}")
+            transport_ms = _duration_ms_since(transport_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(transport_ms),
+                "MCP transport context entered",
+                service_id=service_id,
+                operation=operation,
+                phase="transport.enter.completed",
+                task_name=task_name,
+                duration_ms=transport_ms,
+                transport_type=transport_type,
+            )
+
+            session_started_at = time.perf_counter()
+            session = await exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
+            session_ms = _duration_ms_since(session_started_at)
+            _log_mcp_phase(
+                _slow_or_debug(session_ms),
+                "MCP client session context entered",
+                service_id=service_id,
+                operation=operation,
+                phase="client_session.enter.completed",
+                task_name=task_name,
+                duration_ms=session_ms,
+                transport_type=transport_type,
+            )
+            _log_mcp_phase(
+                _slow_or_debug(_duration_ms_since(create_started_at)),
+                "MCP create session completed",
+                service_id=service_id,
+                operation=operation,
+                phase="create_session.completed",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(create_started_at),
+                transport_type=transport_type,
+            )
+            return session
+        except Exception as exc:
+            _log_mcp_phase(
+                logging.ERROR,
+                "MCP create session failed",
+                service_id=service_id,
+                operation=operation,
+                phase="create_session.exception",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(create_started_at),
+                transport_type=transport_type,
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
+            raise
 
     @staticmethod
     def _extract_capabilities(init_result: types.InitializeResult) -> McpServiceCapabilities:

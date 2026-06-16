@@ -19,6 +19,52 @@ _RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS = 5.0
 _RUNTIME_EVENT_PUBLISH_SLOW_LOG_SECONDS = 1.0
 
 
+def _duration_ms_since(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _current_task_name() -> str | None:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
+def _log_runtime_publish_diagnostic(
+    level: int,
+    message: str,
+    *,
+    trace_id: str | None,
+    stream_id: str,
+    event_type: str,
+    phase: str,
+    task_name: str | None,
+    duration_ms: int | None = None,
+    timeout_seconds: float | None = None,
+    timeout_overrun_ms: int | None = None,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s "
+        "duration_ms=%s timeout_seconds=%s timeout_overrun_ms=%s error_type=%s error=%s",
+        message,
+        trace_id,
+        stream_id,
+        event_type,
+        None,
+        "communication.runtime_event.publish",
+        phase,
+        task_name,
+        duration_ms,
+        timeout_seconds,
+        timeout_overrun_ms,
+        error_type,
+        error,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeCommunicationContext:
     """运行过程中的通信关联上下文。
@@ -117,6 +163,19 @@ class CommunicationRuntimeEventPublisher:
         if metadata:
             merged_metadata.update(metadata)
         started_at = time.perf_counter()
+        task_name = _current_task_name()
+        trace_id = str(context.trace_id or merged_metadata.get("trace_id") or "") or None
+        _log_runtime_publish_diagnostic(
+            logging.DEBUG,
+            "Runtime communication event publish started",
+            trace_id=trace_id,
+            stream_id=context.stream_id,
+            event_type=event_type,
+            phase="publisher_wait_for.started",
+            task_name=task_name,
+            duration_ms=0,
+            timeout_seconds=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+        )
         try:
             await asyncio.wait_for(
                 self._communication_gateway.publish_message(
@@ -133,23 +192,70 @@ class CommunicationRuntimeEventPublisher:
                 ),
                 timeout=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
             )
-            duration_seconds = time.perf_counter() - started_at
-            if duration_seconds >= _RUNTIME_EVENT_PUBLISH_SLOW_LOG_SECONDS:
-                logger.warning(
-                    "发布运行时通信事件较慢: stream_id=%s event_type=%s duration_ms=%s",
-                    context.stream_id,
-                    event_type,
-                    int(duration_seconds * 1000),
-                )
+            duration_ms = _duration_ms_since(started_at)
+            level = (
+                logging.WARNING
+                if duration_ms >= int(_RUNTIME_EVENT_PUBLISH_SLOW_LOG_SECONDS * 1000)
+                else logging.DEBUG
+            )
+            _log_runtime_publish_diagnostic(
+                level,
+                "Runtime communication event publish completed",
+                trace_id=trace_id,
+                stream_id=context.stream_id,
+                event_type=event_type,
+                phase="publisher_wait_for.completed",
+                task_name=task_name,
+                duration_ms=duration_ms,
+                timeout_seconds=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+            )
         except asyncio.TimeoutError:
-            logger.error(
-                "发布运行时通信事件超时，已跳过以避免阻塞 Agent 主流程: stream_id=%s event_type=%s timeout_seconds=%s",
+            duration_ms = _duration_ms_since(started_at)
+            timeout_ms = int(_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS * 1000)
+            _log_runtime_publish_diagnostic(
+                logging.ERROR,
+                "Runtime communication event publish timed out",
+                trace_id=trace_id,
+                stream_id=context.stream_id,
+                event_type=event_type,
+                phase="publisher_wait_for.timeout",
+                task_name=task_name,
+                duration_ms=duration_ms,
+                timeout_seconds=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+                timeout_overrun_ms=max(0, duration_ms - timeout_ms),
+                error_type="TimeoutError",
+                error=f"wait_for exceeded {timeout_ms}ms",
+            )
+        except asyncio.CancelledError:
+            _log_runtime_publish_diagnostic(
+                logging.WARNING,
+                "Runtime communication event publish cancelled",
+                trace_id=trace_id,
+                stream_id=context.stream_id,
+                event_type=event_type,
+                phase="publisher_wait_for.cancelled",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(started_at),
+                timeout_seconds=_RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+                error_type="CancelledError",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - 实时通知失败不能反向拖垮 Agent 执行
+            logger.exception(
+                "Runtime communication event publish failed: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s error_type=%s error=%s",
+                trace_id,
                 context.stream_id,
                 event_type,
+                None,
+                "communication.runtime_event.publish",
+                "publisher_wait_for.exception",
+                task_name,
+                _duration_ms_since(started_at),
                 _RUNTIME_EVENT_PUBLISH_TIMEOUT_SECONDS,
+                exc.__class__.__name__,
+                exc,
             )
-        except Exception:  # noqa: BLE001 - 实时通知失败不能反向拖垮 Agent 执行
-            logger.exception("发布运行时通信事件失败: stream_id=%s event_type=%s", context.stream_id, event_type)
 
 
 class NoopRuntimeEventPublisher:

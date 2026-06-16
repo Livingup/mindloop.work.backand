@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import threading
 from contextlib import suppress
 from threading import RLock
 from typing import Any, AsyncIterator
@@ -17,6 +18,7 @@ from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
 
 logger = logging.getLogger(__name__)
 _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS = 1.0
+_COMMUNICATION_TO_THREAD_QUEUE_SLOW_LOG_SECONDS = 1.0
 
 
 def _new_id(prefix: str) -> str:
@@ -30,6 +32,69 @@ def _require_non_blank(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} 不能为空。")
     if value != value.strip():
         raise ValueError(f"{field_name} 不能包含首尾空白字符。")
+
+
+def _duration_ms_since(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _current_task_name() -> str | None:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
+def _trace_id_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+    if not metadata:
+        return None
+    value = metadata.get("trace_id")
+    return str(value) if value is not None else None
+
+
+def _log_publish_diagnostic(
+    level: int,
+    message: str,
+    *,
+    trace_id: str | None,
+    stream_id: str,
+    event_type: str,
+    operation: str,
+    phase: str,
+    task_name: str | None,
+    duration_ms: int | None = None,
+    timeout_seconds: float | None = None,
+    correlation_id: str | None = None,
+    message_id: str | None = None,
+    seq: int | None = None,
+    executor_queue_delay_ms: int | None = None,
+    worker_thread_name: str | None = None,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s "
+        "duration_ms=%s timeout_seconds=%s correlation_id=%s message_id=%s seq=%s "
+        "executor_queue_delay_ms=%s worker_thread_name=%s error_type=%s error=%s",
+        message,
+        trace_id,
+        stream_id,
+        event_type,
+        None,
+        operation,
+        phase,
+        task_name,
+        duration_ms,
+        timeout_seconds,
+        correlation_id,
+        message_id,
+        seq,
+        executor_queue_delay_ms,
+        worker_thread_name,
+        error_type,
+        error,
+    )
 
 
 class CommunicationService:
@@ -115,39 +180,187 @@ class CommunicationService:
     ) -> CommunicationMessage:
         """发布一条通信消息，并实时推送给当前进程内订阅者。"""
         started_at = time.perf_counter()
-        logger.debug(
-            "通信消息发布开始: stream_id=%s, message_type=%s, source=%s, correlation_id=%s",
-            stream_id,
-            message_type,
-            source,
-            correlation_id,
+        task_name = _current_task_name()
+        trace_id = _trace_id_from_metadata(metadata) or correlation_id
+        operation = "communication.publish_message"
+        _log_publish_diagnostic(
+            logging.DEBUG,
+            "Communication message publish started",
+            trace_id=trace_id,
+            stream_id=stream_id,
+            event_type=message_type,
+            operation=operation,
+            phase="publish_message.started",
+            task_name=task_name,
+            duration_ms=0,
+            correlation_id=correlation_id,
+            message_id=message_id,
         )
         _require_non_blank(stream_id, "stream_id")
         _require_non_blank(message_type, "message_type")
-        saved = await asyncio.to_thread(
-            self._append_message_sync,
-            stream_id=stream_id,
-            message_type=message_type,
-            payload=payload,
-            topic=topic,
-            source=source,
-            actor_id=actor_id,
-            correlation_id=correlation_id,
-            parent_message_id=parent_message_id,
-            metadata=metadata,
-            message_id=message_id,
-        )
-        await self._event_hub.publish(saved)
-        duration_seconds = time.perf_counter() - started_at
-        if duration_seconds >= _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS:
-            logger.warning(
-                "通信消息发布较慢: stream_id=%s, message_type=%s, seq=%s, duration_ms=%s",
+        try:
+            to_thread_submitted_at = time.perf_counter()
+            saved = await asyncio.to_thread(
+                self._append_message_sync_with_diagnostics,
+                stream_id=stream_id,
+                message_type=message_type,
+                payload=payload,
+                topic=topic,
+                source=source,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                parent_message_id=parent_message_id,
+                metadata=metadata,
+                message_id=message_id,
+                diagnostics_trace_id=trace_id,
+                diagnostics_task_name=task_name,
+                diagnostics_submitted_at=to_thread_submitted_at,
+            )
+            to_thread_duration_ms = _duration_ms_since(to_thread_submitted_at)
+            _log_publish_diagnostic(
+                logging.DEBUG,
+                "Communication message append thread await completed",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="to_thread.await_completed",
+                task_name=task_name,
+                duration_ms=to_thread_duration_ms,
+                correlation_id=correlation_id,
+                message_id=saved.message_id,
+                seq=saved.seq,
+            )
+
+            hub_started_at = time.perf_counter()
+            _log_publish_diagnostic(
+                logging.DEBUG,
+                "Communication event hub publish started",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="event_hub.publish.started",
+                task_name=task_name,
+                duration_ms=0,
+                correlation_id=correlation_id,
+                message_id=saved.message_id,
+                seq=saved.seq,
+            )
+            try:
+                await self._event_hub.publish(saved)
+            except asyncio.CancelledError:
+                _log_publish_diagnostic(
+                    logging.WARNING,
+                    "Communication event hub publish cancelled",
+                    trace_id=trace_id,
+                    stream_id=stream_id,
+                    event_type=message_type,
+                    operation=operation,
+                    phase="event_hub.publish.cancelled",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(hub_started_at),
+                    correlation_id=correlation_id,
+                    message_id=saved.message_id,
+                    seq=saved.seq,
+                    error_type="CancelledError",
+                )
+                raise
+            except Exception as exc:
+                _log_publish_diagnostic(
+                    logging.ERROR,
+                    "Communication event hub publish failed",
+                    trace_id=trace_id,
+                    stream_id=stream_id,
+                    event_type=message_type,
+                    operation=operation,
+                    phase="event_hub.publish.exception",
+                    task_name=task_name,
+                    duration_ms=_duration_ms_since(hub_started_at),
+                    correlation_id=correlation_id,
+                    message_id=saved.message_id,
+                    seq=saved.seq,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                )
+                raise
+            hub_duration_ms = _duration_ms_since(hub_started_at)
+            hub_level = (
+                logging.WARNING
+                if hub_duration_ms >= int(_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS * 1000)
+                else logging.DEBUG
+            )
+            _log_publish_diagnostic(
+                hub_level,
+                "Communication event hub publish completed",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="event_hub.publish.completed",
+                task_name=task_name,
+                duration_ms=hub_duration_ms,
+                correlation_id=correlation_id,
+                message_id=saved.message_id,
+                seq=saved.seq,
+            )
+
+            duration_ms = _duration_ms_since(started_at)
+            level = (
+                logging.WARNING
+                if duration_ms >= int(_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS * 1000)
+                else logging.DEBUG
+            )
+            _log_publish_diagnostic(
+                level,
+                "Communication message publish completed",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="publish_message.completed",
+                task_name=task_name,
+                duration_ms=duration_ms,
+                correlation_id=correlation_id,
+                message_id=saved.message_id,
+                seq=saved.seq,
+            )
+            return saved
+        except asyncio.CancelledError:
+            _log_publish_diagnostic(
+                logging.WARNING,
+                "Communication message publish cancelled",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="publish_message.cancelled",
+                task_name=task_name,
+                duration_ms=_duration_ms_since(started_at),
+                correlation_id=correlation_id,
+                message_id=message_id,
+                error_type="CancelledError",
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Communication message publish failed: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s "
+                "phase=%s task_name=%s duration_ms=%s timeout_seconds=%s correlation_id=%s message_id=%s error_type=%s error=%s",
+                trace_id,
                 stream_id,
                 message_type,
-                saved.seq,
-                int(duration_seconds * 1000),
+                None,
+                operation,
+                "publish_message.exception",
+                task_name,
+                _duration_ms_since(started_at),
+                None,
+                correlation_id,
+                message_id,
+                exc.__class__.__name__,
+                exc,
             )
-        return saved
+            raise
 
     def list_messages(
         self,
@@ -261,6 +474,102 @@ class CommunicationService:
             with suppress(asyncio.CancelledError):
                 await next_live_message
             await subscription.aclose()
+
+    def _append_message_sync_with_diagnostics(
+        self,
+        *,
+        stream_id: str,
+        message_type: str,
+        payload: dict[str, Any] | None,
+        topic: str | None,
+        source: str | None,
+        actor_id: str | None,
+        correlation_id: str | None,
+        parent_message_id: str | None,
+        metadata: dict[str, Any] | None,
+        message_id: str | None,
+        diagnostics_trace_id: str | None,
+        diagnostics_task_name: str | None,
+        diagnostics_submitted_at: float,
+    ) -> CommunicationMessage:
+        operation = "communication.publish_message"
+        worker_started_at = time.perf_counter()
+        queue_delay_ms = int((worker_started_at - diagnostics_submitted_at) * 1000)
+        worker_thread_name = threading.current_thread().name
+        queue_level = (
+            logging.WARNING
+            if queue_delay_ms >= int(_COMMUNICATION_TO_THREAD_QUEUE_SLOW_LOG_SECONDS * 1000)
+            else logging.DEBUG
+        )
+        _log_publish_diagnostic(
+            queue_level,
+            "Communication append worker started",
+            trace_id=diagnostics_trace_id,
+            stream_id=stream_id,
+            event_type=message_type,
+            operation=operation,
+            phase="to_thread.worker_started",
+            task_name=diagnostics_task_name,
+            duration_ms=queue_delay_ms,
+            correlation_id=correlation_id,
+            message_id=message_id,
+            executor_queue_delay_ms=queue_delay_ms,
+            worker_thread_name=worker_thread_name,
+        )
+        append_started_at = time.perf_counter()
+        try:
+            saved = self._append_message_sync(
+                stream_id=stream_id,
+                message_type=message_type,
+                payload=payload,
+                topic=topic,
+                source=source,
+                actor_id=actor_id,
+                correlation_id=correlation_id,
+                parent_message_id=parent_message_id,
+                metadata=metadata,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            _log_publish_diagnostic(
+                logging.ERROR,
+                "Communication append worker failed",
+                trace_id=diagnostics_trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="append_message_sync.exception",
+                task_name=diagnostics_task_name,
+                duration_ms=_duration_ms_since(append_started_at),
+                correlation_id=correlation_id,
+                message_id=message_id,
+                worker_thread_name=worker_thread_name,
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
+            raise
+        append_duration_ms = _duration_ms_since(append_started_at)
+        append_level = (
+            logging.WARNING
+            if append_duration_ms >= int(_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS * 1000)
+            else logging.DEBUG
+        )
+        _log_publish_diagnostic(
+            append_level,
+            "Communication append worker completed",
+            trace_id=diagnostics_trace_id,
+            stream_id=stream_id,
+            event_type=message_type,
+            operation=operation,
+            phase="append_message_sync.completed",
+            task_name=diagnostics_task_name,
+            duration_ms=append_duration_ms,
+            correlation_id=correlation_id,
+            message_id=saved.message_id,
+            seq=saved.seq,
+            worker_thread_name=worker_thread_name,
+        )
+        return saved
 
     def _append_message_sync(
         self,

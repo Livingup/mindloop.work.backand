@@ -27,6 +27,53 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_METADATA_POLL_INTERVAL_SECONDS = 30.0
 _DEFAULT_METADATA_OPERATION_TIMEOUT_SECONDS = 10.0
+_METADATA_DIAGNOSTIC_SLOW_PHASE_SECONDS = 1.0
+
+
+def _duration_ms_since(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def _current_task_name() -> str | None:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
+def _slow_or_debug(duration_ms: int) -> int:
+    return logging.WARNING if duration_ms >= int(_METADATA_DIAGNOSTIC_SLOW_PHASE_SECONDS * 1000) else logging.DEBUG
+
+
+def _log_metadata_diagnostic(
+    level: int,
+    message: str,
+    *,
+    service_id: str,
+    operation: str,
+    phase: str,
+    task_name: str | None,
+    duration_ms: int | None = None,
+    timeout_seconds: float | None = None,
+    error_type: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not logger.isEnabledFor(level):
+        return
+    logger.log(
+        level,
+        "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s error_type=%s error=%s",
+        message,
+        None,
+        None,
+        None,
+        service_id,
+        operation,
+        phase,
+        task_name,
+        duration_ms,
+        timeout_seconds,
+        error_type,
+        error,
+    )
 
 
 class McpMetadataRefreshManager:
@@ -193,24 +240,196 @@ class McpMetadataRefreshManager:
         service_id: str,
         operation: str,
     ) -> Any:
+        task_name = f"mcp-metadata-refresh-{service_id}-{operation}"
+        create_started_at = time.perf_counter()
+
+        async def _run_operation() -> Any:
+            operation_task_name = _current_task_name()
+            start_delay_ms = int((time.perf_counter() - create_started_at) * 1000)
+            _log_metadata_diagnostic(
+                _slow_or_debug(start_delay_ms),
+                "MCP metadata operation task started",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_task.started",
+                task_name=operation_task_name,
+                duration_ms=start_delay_ms,
+                timeout_seconds=self._operation_timeout_seconds,
+            )
+            operation_started_at = time.perf_counter()
+            try:
+                result = await awaitable
+            except asyncio.CancelledError:
+                _log_metadata_diagnostic(
+                    logging.WARNING,
+                    "MCP metadata operation task cancelled",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="operation_task.cancelled",
+                    task_name=operation_task_name,
+                    duration_ms=_duration_ms_since(operation_started_at),
+                    timeout_seconds=self._operation_timeout_seconds,
+                    error_type="CancelledError",
+                )
+                raise
+            except Exception as exc:
+                _log_metadata_diagnostic(
+                    logging.WARNING,
+                    "MCP metadata operation task failed",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="operation_task.exception",
+                    task_name=operation_task_name,
+                    duration_ms=_duration_ms_since(operation_started_at),
+                    timeout_seconds=self._operation_timeout_seconds,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                )
+                raise
+            _log_metadata_diagnostic(
+                _slow_or_debug(_duration_ms_since(operation_started_at)),
+                "MCP metadata operation task completed",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_task.completed",
+                task_name=operation_task_name,
+                duration_ms=_duration_ms_since(operation_started_at),
+                timeout_seconds=self._operation_timeout_seconds,
+            )
+            return result
+
         task = asyncio.create_task(
-            awaitable,
-            name=f"mcp-metadata-refresh-{service_id}-{operation}",
+            _run_operation(),
+            name=task_name,
         )
+        _log_metadata_diagnostic(
+            logging.DEBUG,
+            "MCP metadata operation task created",
+            service_id=service_id,
+            operation=operation,
+            phase="operation_task.created",
+            task_name=_current_task_name(),
+            duration_ms=_duration_ms_since(create_started_at),
+            timeout_seconds=self._operation_timeout_seconds,
+        )
+        wait_started_at = time.perf_counter()
         done, _pending = await asyncio.wait({task}, timeout=self._operation_timeout_seconds)
         if task in done:
-            return task.result()
+            wait_ms = _duration_ms_since(wait_started_at)
+            try:
+                result = task.result()
+            except Exception as exc:
+                _log_metadata_diagnostic(
+                    logging.WARNING,
+                    "MCP metadata operation wait completed with exception",
+                    service_id=service_id,
+                    operation=operation,
+                    phase="operation_wait.exception",
+                    task_name=_current_task_name(),
+                    duration_ms=wait_ms,
+                    timeout_seconds=self._operation_timeout_seconds,
+                    error_type=exc.__class__.__name__,
+                    error=str(exc),
+                )
+                raise
+            _log_metadata_diagnostic(
+                _slow_or_debug(wait_ms),
+                "MCP metadata operation wait completed",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_wait.completed",
+                task_name=_current_task_name(),
+                duration_ms=wait_ms,
+                timeout_seconds=self._operation_timeout_seconds,
+            )
+            return result
 
+        wait_ms = _duration_ms_since(wait_started_at)
+        timeout_started_at = time.perf_counter()
+        _log_metadata_diagnostic(
+            logging.WARNING,
+            "MCP metadata operation wait timed out",
+            service_id=service_id,
+            operation=operation,
+            phase="operation_wait.timeout",
+            task_name=_current_task_name(),
+            duration_ms=wait_ms,
+            timeout_seconds=self._operation_timeout_seconds,
+            error_type="TimeoutError",
+            error=f"operation did not complete within {self._operation_timeout_seconds}s",
+        )
         task.cancel()
-        task.add_done_callback(self._consume_timed_out_operation)
+        _log_metadata_diagnostic(
+            logging.DEBUG,
+            "MCP metadata operation cancel requested after timeout",
+            service_id=service_id,
+            operation=operation,
+            phase="operation_task.cancel_requested",
+            task_name=_current_task_name(),
+            duration_ms=0,
+            timeout_seconds=self._operation_timeout_seconds,
+        )
+        task.add_done_callback(
+            lambda done_task: self._consume_timed_out_operation(
+                done_task,
+                service_id=service_id,
+                operation=operation,
+                timeout_started_at=timeout_started_at,
+                timeout_seconds=self._operation_timeout_seconds,
+            )
+        )
         raise TimeoutError(
             f"MCP 服务 '{service_id}' 元数据刷新操作超时: {operation}"
         )
 
     @staticmethod
-    def _consume_timed_out_operation(task: asyncio.Task[Any]) -> None:
-        with suppress(Exception, asyncio.CancelledError):
+    def _consume_timed_out_operation(
+        task: asyncio.Task[Any],
+        *,
+        service_id: str,
+        operation: str,
+        timeout_started_at: float,
+        timeout_seconds: float,
+    ) -> None:
+        recovery_ms = _duration_ms_since(timeout_started_at)
+        try:
             task.result()
+        except asyncio.CancelledError:
+            _log_metadata_diagnostic(
+                _slow_or_debug(recovery_ms),
+                "MCP metadata timed-out operation cancellation recovered",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_task.cancel_recovered",
+                task_name=None,
+                duration_ms=recovery_ms,
+                timeout_seconds=timeout_seconds,
+                error_type="CancelledError",
+            )
+        except Exception as exc:
+            _log_metadata_diagnostic(
+                logging.WARNING,
+                "MCP metadata timed-out operation completed with exception after timeout",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_task.exception_after_timeout",
+                task_name=None,
+                duration_ms=recovery_ms,
+                timeout_seconds=timeout_seconds,
+                error_type=exc.__class__.__name__,
+                error=str(exc),
+            )
+        else:
+            _log_metadata_diagnostic(
+                logging.WARNING,
+                "MCP metadata timed-out operation completed after timeout",
+                service_id=service_id,
+                operation=operation,
+                phase="operation_task.completed_after_timeout",
+                task_name=None,
+                duration_ms=recovery_ms,
+                timeout_seconds=timeout_seconds,
+            )
 
     async def _poll_loop(self) -> None:
         stop_event = self._stop_event

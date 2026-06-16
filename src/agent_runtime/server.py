@@ -28,6 +28,11 @@ logger = logging.getLogger("agent_runtime.serve")
 SCENE_VACANT_IDLE_EXPIRATION_SECONDS: float = 30 * 60
 
 
+def _current_task_name() -> str | None:
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else None
+
+
 class _SwitchableRuntimeComponent:
     """线程安全的运行时组件代理。
 
@@ -533,6 +538,20 @@ def create_app(
         nonlocal runtime_loop
 
         runtime_loop = asyncio.get_running_loop()
+        lifespan_started_at = time.perf_counter()
+        logger.info(
+            "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+            "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s",
+            None,
+            None,
+            "runtime.lifespan",
+            None,
+            "runtime.lifespan",
+            "startup.started",
+            _current_task_name(),
+            0,
+            None,
+        )
         execution_loop_logger.start()
         event_loop_monitor.start()
         runtime_network_monitor.start()
@@ -542,9 +561,38 @@ def create_app(
             _start_full_mode_background_services_on_loop()
         else:
             logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接、LACP 启动与 Codex OAuth 回调服务。")
+        logger.info(
+            "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+            "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
+            None,
+            None,
+            "runtime.lifespan",
+            None,
+            "runtime.lifespan",
+            "startup.completed",
+            _current_task_name(),
+            int((time.perf_counter() - lifespan_started_at) * 1000),
+            None,
+            event_loop_monitor.snapshot().get("status"),
+        )
         try:
             yield
         finally:
+            shutdown_started_at = time.perf_counter()
+            logger.info(
+                "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
+                None,
+                None,
+                "runtime.lifespan",
+                None,
+                "runtime.lifespan",
+                "shutdown.started",
+                _current_task_name(),
+                0,
+                None,
+                event_loop_monitor.snapshot().get("status"),
+            )
             scene_session_registry.stop()
             for task in tuple(detach_tasks):
                 task.cancel()
@@ -582,6 +630,20 @@ def create_app(
             runtime_network_monitor.stop()
             with suppress(Exception, asyncio.CancelledError):
                 await execution_loop_logger.stop()
+            logger.info(
+                "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
+                None,
+                None,
+                "runtime.lifespan",
+                None,
+                "runtime.lifespan",
+                "shutdown.completed",
+                _current_task_name(),
+                int((time.perf_counter() - shutdown_started_at) * 1000),
+                None,
+                event_loop_monitor.snapshot().get("status"),
+            )
             runtime_loop = None
 
     effective_runtime_bind_host = runtime_bind_host or ConfigRegistry.instance().agent_runtime_service.service_host
@@ -689,21 +751,48 @@ def create_app(
             response = await call_next(request)
         except Exception as exc:
             active_after = runtime_network_monitor.end_http_request()
+            duration_ms = round((time.perf_counter() - started_at) * 1000)
+            event_loop_snapshot = event_loop_monitor.snapshot()
             runtime_network_monitor.record({
                 "layer": "backend",
                 "type": "http.request.error",
                 "trace_id": trace_id,
                 "method": request.method,
                 "path": path,
-                "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                "duration_ms": duration_ms,
                 "active_http_requests": active_after,
-                "event_loop": event_loop_monitor.snapshot(),
+                "event_loop": event_loop_snapshot,
                 "error_type": exc.__class__.__name__,
                 "error_message": str(exc),
             })
+            logger.exception(
+                "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
+                "method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
+                "event_loop_max_lag_ms=%s event_loop_blocked_tick_count=%s error_type=%s error=%s",
+                trace_id,
+                None,
+                "http.request",
+                None,
+                "http.request",
+                "response.exception",
+                _current_task_name(),
+                duration_ms,
+                None,
+                request.method,
+                path,
+                active_after,
+                event_loop_snapshot.get("status"),
+                event_loop_snapshot.get("last_lag_ms"),
+                event_loop_snapshot.get("max_lag_ms"),
+                event_loop_snapshot.get("blocked_tick_count"),
+                exc.__class__.__name__,
+                exc,
+            )
             raise
         active_after = runtime_network_monitor.end_http_request()
         duration_ms = round((time.perf_counter() - started_at) * 1000)
+        event_loop_snapshot = event_loop_monitor.snapshot()
         if should_record_start or duration_ms >= 1000 or response.status_code >= 400:
             runtime_network_monitor.record({
                 "layer": "backend",
@@ -714,9 +803,34 @@ def create_app(
                 "status": response.status_code,
                 "duration_ms": duration_ms,
                 "active_http_requests": active_after,
-                "event_loop": event_loop_monitor.snapshot(),
+                "event_loop": event_loop_snapshot,
                 **runtime_network_monitor.snapshot(),
             })
+            log_level = logging.WARNING if duration_ms >= 1000 or response.status_code >= 400 else logging.DEBUG
+            logger.log(
+                log_level,
+                "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
+                "status=%s method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
+                "event_loop_max_lag_ms=%s event_loop_blocked_tick_count=%s",
+                trace_id,
+                None,
+                "http.request",
+                None,
+                "http.request",
+                "response.completed",
+                _current_task_name(),
+                duration_ms,
+                None,
+                response.status_code,
+                request.method,
+                path,
+                active_after,
+                event_loop_snapshot.get("status"),
+                event_loop_snapshot.get("last_lag_ms"),
+                event_loop_snapshot.get("max_lag_ms"),
+                event_loop_snapshot.get("blocked_tick_count"),
+            )
         response.headers["x-network-trace-id"] = trace_id
         return response
 
