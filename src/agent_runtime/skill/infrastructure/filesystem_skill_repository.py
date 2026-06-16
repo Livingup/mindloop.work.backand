@@ -50,6 +50,7 @@ class FilesystemSkillRepository:
         3. 解析 SKILL.md 的 YAML frontmatter
         4. 构建 SkillDefinition 并校验
         5. 校验失败的 Skill 跳过并记录警告
+        6. 若多个目录声明同一 frontmatter name/skill_id，保留排序最靠前目录并跳过后续重复项
         """
         if not self._skills_dir.exists():
             logger.warning("Skill 仓库目录不存在: %s", self._skills_dir)
@@ -62,6 +63,7 @@ class FilesystemSkillRepository:
             return
 
         discovered: list[SkillDefinition] = []
+        discovered_by_id: dict[str, SkillDefinition] = {}
         for entry in sorted(self._skills_dir.iterdir()):
             if not entry.is_dir():
                 continue
@@ -74,6 +76,16 @@ class FilesystemSkillRepository:
             try:
                 skill = _parse_skill_md(skill_md, entry)
                 skill.validate()
+                existing = discovered_by_id.get(skill.skill_id)
+                if existing is not None:
+                    logger.warning(
+                        "发现重复 Skill ID '%s'：保留目录 %s，跳过目录 %s",
+                        skill.skill_id,
+                        existing.directory_path,
+                        skill.directory_path,
+                    )
+                    continue
+                discovered_by_id[skill.skill_id] = skill
                 discovered.append(skill)
             except Exception:
                 logger.warning("解析 Skill '%s' 失败，已跳过", entry.name, exc_info=True)
@@ -115,12 +127,6 @@ def _parse_skill_md(skill_md: Path, skill_dir: Path) -> SkillDefinition:
     description = data.get("description")
     if not description:
         raise ValueError(f"{skill_md} 缺少必填字段 description")
-
-    dir_name = skill_dir.name
-    if name != dir_name:
-        raise ValueError(
-            f"{skill_md} 中 name '{name}' 与目录名 '{dir_name}' 不一致"
-        )
 
     # 解析可选字段。
     metadata = data.get("metadata") or {}

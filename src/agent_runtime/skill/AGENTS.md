@@ -35,14 +35,14 @@ skill-name/
 
 | 字段 | 必填 | 类型 | 说明 |
 |---|---|---|---|
-| `name` | ✅ | string | Skill 唯一标识，必须与目录名一致 |
+| `name` | ✅ | string | 稳定 Skill ID，来自 frontmatter；物理目录名只是承载路径，不要求完全一致 |
 | `description` | ✅ | string | 做什么、何时使用 |
 | `license` | | string | 许可证 |
 | `compatibility` | | string | 环境/依赖要求 |
-| `metadata` | | map | 字符串到字符串映射 |
+| `metadata` | | map | 字符串到字符串映射；友好展示名可放 `metadata.display-name` |
 | `allowed-tools` | | string | 空格分隔的工具列表（实验性） |
 
-`name` 格式要求：a-z / 0-9 / `-`，1~64 字符，不能以 `-` 开头或结尾，不能包含连续 `--`。
+`name` 只保留必要安全边界：必须非空，不能包含前后空白、空白字符、路径分隔符或控制字符；不强制小写 kebab-case。重复 `name` 在同一仓库内按扫描顺序保留首个有效 Skill 并跳过后续重复项。
 
 ---
 
@@ -82,8 +82,8 @@ src/agent_runtime/skill/
 class SkillDefinition:
     """Skill 定义实体（聚合根）。"""
 
-    skill_id: str                           # 唯一标识（= name = 目录名）
-    name: str                               # Skill 名称
+    skill_id: str                           # 唯一标识（= frontmatter name）
+    name: str                               # Skill 名称（与 skill_id 一致，不要求等于目录名）
     description: str                        # Skill 描述
     directory_path: str                     # 目录绝对路径
     license: str | None = None              # 许可证

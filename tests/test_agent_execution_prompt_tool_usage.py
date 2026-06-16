@@ -55,6 +55,17 @@ class _AgentDefinitionGateway:
         return self._definitions[agent_id]
 
 
+class _SkillGateway:
+    def __init__(self, skills_dir: str = "G:\\project\\agent\\skills") -> None:
+        self._skills_dir = skills_dir
+
+    def get_settings(self):
+        return SimpleNamespace(skills_dir=self._skills_dir)
+
+    def list_skills(self):
+        return []
+
+
 class _McpGateway:
     def __init__(self):
         self.get_tool_detail_called = False
@@ -176,6 +187,7 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         engine = object.__new__(AgentExecutionEngine)
         engine._local_tool_gateway = _LocalToolGateway(tools)
         engine._agent_definition_gateway = _AgentDefinitionGateway(agent_definitions)
+        engine._skill_gateway = _SkillGateway()
         return engine
 
     def test_system_prompt_starts_with_communication_context_and_instance_id(self) -> None:
@@ -199,13 +211,29 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIsNotNone(prompt)
         prompt_text = prompt or ""
         self.assertTrue(prompt_text.startswith("# 沟通环境与身份"))
+        self.assertIn("当前 Agent 定义 ID：`agent-c`", prompt_text)
         self.assertIn("当前 Agent 实例 ID：`agent-instance-self`", prompt_text)
+        self.assertIn("当前 Agent 专属 Skill 文件：`G:\\project\\agent\\skills\\agent-c\\SKILL.md`", prompt_text)
+        self.assertIn("当前 Agent 项目记忆文件：`G:\\project\\agent\\.spread-ai\\memory\\agent-c\\memory.md`", prompt_text)
         self.assertIn("MCP 支持说明", prompt_text)
-        self.assertIn("当前你所处的agent系统支持通过 MCP 服务接入外部工具和资源", prompt_text)
+        self.assertIn("当前你所处的 Agent 系统支持通过 MCP 服务接入外部工具和资源", prompt_text)
         self.assertIn("远端 MCP 服务的工具不会直接设置到你的 `tools` 中", prompt_text)
         self.assertIn("mcp_get_service_detail", prompt_text)
         self.assertIn("mcp_get_tool_detail", prompt_text)
         self.assertIn("mcp_call_tool", prompt_text)
+        self.assertIn("# Agent 专属 Skill 使用协议", prompt_text)
+        self.assertIn("# 项目记忆使用协议", prompt_text)
+        self.assertIn("# 自学习进化协议", prompt_text)
+        self.assertIn("`name` 必填，是稳定 Skill ID", prompt_text)
+        self.assertIn("后端以 frontmatter `name` 作为 skill_id，而不是以物理目录名推导", prompt_text)
+        self.assertIn("Skill 物理目录名只作为承载路径", prompt_text)
+        self.assertIn("不强制大小写或内容完全一致", prompt_text)
+        self.assertIn("前后不能有空白，不能包含空白字符、路径分隔符或控制字符", prompt_text)
+        self.assertIn("metadata.display-name", prompt_text)
+        self.assertNotIn("`name` 必须使用小写 kebab-case", prompt_text)
+        self.assertNotIn("不要用大写 `name` 承载展示名", prompt_text)
+        self.assertIn("`G:\\project\\agent\\skills\\agent-c\\SKILL.md`", prompt_text)
+        self.assertIn("`G:\\project\\agent\\.spread-ai\\memory\\agent-c\\memory.md`", prompt_text)
         self.assertIn("使用 `lacp` MCP 服务提供的 `lacp_send_message` 工具", prompt_text)
         self.assertIn("`【@本地Agent <agent_name_or_id> <agent_instance_id>】`", prompt_text)
         self.assertIn("使用本地 subagent 工具", prompt_text)

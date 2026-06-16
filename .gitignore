@@ -88,6 +88,7 @@ Desktop.ini
 !/tests/test_tool_schema_sanitizer.py
 !/tests/test_execution_loop_logger.py
 !/tests/test_subagent_conversation_history.py
+!/tests/test_filesystem_skill_repository.py
 !/tests/test_sqlite_threaded_repositories.py
 !/tests/test_lacp_inbound_attachments.py
 !/tests/test_file_input_policy.py
