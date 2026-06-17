@@ -35,14 +35,14 @@ skill-name/
 
 | 字段 | 必填 | 类型 | 说明 |
 |---|---|---|---|
-| `name` | ✅ | string | 稳定 Skill ID，来自 frontmatter；物理目录名只是承载路径，不要求完全一致 |
+| `name` | ✅ | string | 稳定 Skill ID，来自 frontmatter；字符规则与文件目录名一致，物理目录名只是承载路径，不要求完全一致 |
 | `description` | ✅ | string | 做什么、何时使用 |
 | `license` | | string | 许可证 |
 | `compatibility` | | string | 环境/依赖要求 |
 | `metadata` | | map | 字符串到字符串映射；友好展示名可放 `metadata.display-name` |
 | `allowed-tools` | | string | 空格分隔的工具列表（实验性） |
 
-`name` 只保留必要安全边界：必须非空，不能包含前后空白、空白字符、路径分隔符或控制字符；不强制小写 kebab-case。重复 `name` 在同一仓库内按扫描顺序保留首个有效 Skill 并跳过后续重复项。
+`name` 的校验规则与文件目录名一致：允许大小写、空格和 Unicode；但不能是空白、`.` 或 `..`，不能包含路径分隔符、Windows 非法文件名字符、控制字符，不能以空格或点号结尾，也不能使用 Windows 保留设备名。重复 `name` 在同一仓库内按扫描顺序保留首个有效 Skill 并跳过后续重复项。
 
 ---
 

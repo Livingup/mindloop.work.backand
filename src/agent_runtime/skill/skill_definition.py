@@ -5,8 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-# Skill ID 只保留必要安全边界：非空、无空白、无路径分隔符、无控制字符。
-_PATH_SEPARATORS = ("/", "\\")
+# Skill name / skill_id 采用“文件目录名可接受字符”规则：
+# 允许大小写、空格和 Unicode，但禁止路径分隔符、Windows 文件名保留字符、
+# 控制字符、仅由空白组成的名称、"." / ".."，以及 Windows 保留设备名。
+_WINDOWS_INVALID_FILE_NAME_CHARS = set('<>:"/\\|?*')
+_WINDOWS_RESERVED_FILE_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 @dataclass
@@ -20,7 +27,7 @@ class SkillDefinition:
     # Skill 唯一标识（= frontmatter name）。
     skill_id: str
 
-    # Skill 名称（必须与 skill_id 一致，可使用大小写；不要求与物理目录名一致）。
+    # Skill 名称（必须与 skill_id 一致，校验规则与文件目录名一致；不要求与物理目录名一致）。
     name: str
 
     # Skill 描述（做什么、何时使用）。
@@ -48,7 +55,9 @@ class SkillDefinition:
 
         校验规则：
         - name 必须是稳定 Skill ID，且必须与 skill_id 一致
-        - name 只做必要安全校验：非空、无前后空白、无空白字符、无路径分隔符、无控制字符
+        - name 的可接受字符规则与文件目录名一致：允许大小写、空格和 Unicode，
+          但不能是空白、"." / ".."，不能包含路径分隔符、Windows 非法文件名字符、
+          控制字符，不能以空格或点号结尾，也不能使用 Windows 保留设备名
         - description 不能为空
 
         Raises:
@@ -66,16 +75,24 @@ class SkillDefinition:
             )
 
         if not self.name or not self.name.strip():
-            raise ValueError("skill name 不能为空")
+            raise ValueError("skill name 不能为空白字符串")
 
-        if self.name != self.name.strip() or any(ch.isspace() for ch in self.name):
-            raise ValueError("skill name 不能包含空白字符或前后空白")
+        if self.name in {".", ".."}:
+            raise ValueError("skill name 不能是 '.' 或 '..'")
 
-        if any(separator in self.name for separator in _PATH_SEPARATORS):
-            raise ValueError("skill name 不能包含路径分隔符 / 或 \\")
+        if any(ch in _WINDOWS_INVALID_FILE_NAME_CHARS for ch in self.name):
+            raise ValueError(
+                "skill name 不能包含 Windows 非法文件名字符 <>:\"/\\|?* 或路径分隔符"
+            )
 
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.name):
             raise ValueError("skill name 不能包含控制字符")
+
+        if self.name.endswith((" ", ".")):
+            raise ValueError("skill name 不能以空格或点号结尾")
+
+        if self.name.upper() in _WINDOWS_RESERVED_FILE_NAMES:
+            raise ValueError(f"skill name 不能使用 Windows 保留设备名: {self.name}")
 
         if not self.description or not self.description.strip():
             raise ValueError("skill description 不能为空")

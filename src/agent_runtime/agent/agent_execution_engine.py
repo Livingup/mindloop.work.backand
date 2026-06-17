@@ -3802,7 +3802,7 @@ def _build_runtime_context_prompt(
             "frontmatter 规则：",
             "- `name` 必填，是稳定 Skill ID；后端以 frontmatter `name` 作为 skill_id，而不是以物理目录名推导。",
             "- Skill 物理目录名只作为承载路径；建议新建 Skill 时为了人工定位与 `name` 保持一致，但不强制大小写或内容完全一致。",
-            "- `name` 只做必要的安全与稳定性约束：必须是非空字符串，前后不能有空白，不能包含空白字符、路径分隔符或控制字符；不要为了格式化强制改成小写 kebab-case。",
+            "- `name` 的校验规则应与文件目录名一致：允许大小写、空格和 Unicode；不能是空白、`.` 或 `..`，不能包含路径分隔符、Windows 非法文件名字符或控制字符，不能以空格或点号结尾，也不能使用 Windows 保留设备名。",
             "- 如果需要与稳定 ID 不同的友好展示名称，可写入 `metadata.display-name`（例如 `metadata: {display-name: \"Software Engineering\"}`）。",
             "- `description` 必填。",
             "- `description` 必须说明该 Skill 是什么，以及在什么场景下使用。",

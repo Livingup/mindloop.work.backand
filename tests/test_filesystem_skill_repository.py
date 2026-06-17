@@ -21,23 +21,33 @@ def _write_skill(skill_dir: Path, *, name: str, description: str = "测试 Skill
 
 
 class SkillDefinitionValidationTests(unittest.TestCase):
-    def test_accepts_non_lowercase_safe_skill_name(self) -> None:
+    def test_accepts_directory_name_safe_skill_name(self) -> None:
         definition = SkillDefinition(
-            skill_id="Software-Engineering",
-            name="Software-Engineering",
+            skill_id="Software Engineering",
+            name="Software Engineering",
             description="用于软件工程任务。",
-            directory_path="C:/skills/Software-Engineering",
+            directory_path="C:/skills/Software Engineering",
         )
 
         definition.validate()
 
-    def test_rejects_unsafe_skill_name_characters(self) -> None:
+    def test_rejects_directory_name_unsafe_skill_name_characters(self) -> None:
         unsafe_names = (
-            " has-leading-space",
+            ".",
+            "..",
             "has trailing-space ",
-            "contains space",
+            "ends-with-dot.",
             "contains/slash",
             "contains\\backslash",
+            "contains:colon",
+            "contains*star",
+            'contains"quote',
+            "contains<less",
+            "contains>greater",
+            "contains|pipe",
+            "contains?question",
+            "NUL",
+            "COM1",
             "contains\ncontrol",
         )
 
@@ -59,7 +69,7 @@ class FilesystemSkillRepositoryTests(unittest.TestCase):
             skills_dir = Path(tmp)
             _write_skill(
                 skills_dir / "Display-Style-Directory",
-                name="DevOps",
+                name="DevOps Skill",
                 description="用于 DevOps 任务。",
             )
 
@@ -68,8 +78,8 @@ class FilesystemSkillRepositoryTests(unittest.TestCase):
 
         self.assertEqual(len(skills), 1)
         skill = skills[0]
-        self.assertEqual(skill.skill_id, "DevOps")
-        self.assertEqual(skill.name, "DevOps")
+        self.assertEqual(skill.skill_id, "DevOps Skill")
+        self.assertEqual(skill.name, "DevOps Skill")
         self.assertTrue(skill.directory_path.endswith("Display-Style-Directory"))
 
     def test_scan_skips_later_duplicate_frontmatter_names_deterministically(self) -> None:
@@ -93,13 +103,13 @@ class FilesystemSkillRepositoryTests(unittest.TestCase):
     def test_parse_allows_frontmatter_name_that_differs_from_physical_directory_name(self) -> None:
         with TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "Physical-Container"
-            _write_skill(skill_dir, name="RuntimeSkill", description="用于运行时任务。")
+            _write_skill(skill_dir, name="Runtime Skill", description="用于运行时任务。")
 
             skill = _parse_skill_md(skill_dir / "SKILL.md", skill_dir)
             skill.validate()
 
-        self.assertEqual(skill.skill_id, "RuntimeSkill")
-        self.assertEqual(skill.name, "RuntimeSkill")
+        self.assertEqual(skill.skill_id, "Runtime Skill")
+        self.assertEqual(skill.name, "Runtime Skill")
         self.assertTrue(skill.directory_path.endswith("Physical-Container"))
 
 
