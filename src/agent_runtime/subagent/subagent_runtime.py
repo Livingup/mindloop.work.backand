@@ -21,6 +21,7 @@ from agent_runtime.conversation_message.message.models import ROLE_USER, TextPar
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 
 if TYPE_CHECKING:
@@ -248,8 +249,28 @@ class SubagentRuntime:
             expected_kinds.append(kind)
             names.append(_normalize_optional_text(attachment.get("name")))
         service = get_file_resource_service()
-        created = await asyncio.to_thread(service.create_resources_from_remote_urls, requests)
-        resources = await asyncio.to_thread(service.get_resources, [item.resource_id for item in created])
+        created = await monitored_to_thread(
+            service.create_resources_from_remote_urls,
+            requests,
+            operation="subagent.resolve_url_attachments.create_resources",
+            caller="SubagentRuntime._resolve_url_attachments",
+            log=logger,
+            diagnostic_context={
+                "attachment_count": len(attachments),
+                "request_count": len(requests),
+            },
+        )
+        resources = await monitored_to_thread(
+            service.get_resources,
+            [item.resource_id for item in created],
+            operation="subagent.resolve_url_attachments.get_resources",
+            caller="SubagentRuntime._resolve_url_attachments",
+            log=logger,
+            diagnostic_context={
+                "attachment_count": len(attachments),
+                "resource_count": len(created),
+            },
+        )
         resolved: list[PendingUserMessageAttachment] = []
         for index, resource in enumerate(resources):
             if resource is None:

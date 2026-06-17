@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from uuid import uuid4
 
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.models import (
     LacpClientStatus,
@@ -268,7 +269,19 @@ class LacpClient:
         parsed = urlparse(configured)
         if parsed.scheme in {"ws", "wss"}:
             return configured if parsed.path else f"{configured}/ws"
-        metadata = await asyncio.to_thread(self._fetch_metadata, configured, config.connect_timeout_seconds)
+        metadata = await monitored_to_thread(
+            self._fetch_metadata,
+            configured,
+            config.connect_timeout_seconds,
+            operation="lacp.resolve_ws_endpoint.fetch_metadata",
+            caller="LacpClient._resolve_ws_endpoint",
+            log=logger,
+            slow_execution_seconds=max(config.connect_timeout_seconds, 1.0),
+            diagnostic_context={
+                "registry_url": configured,
+                "connect_timeout_seconds": config.connect_timeout_seconds,
+            },
+        )
         ws_path = "/ws"
         if isinstance(metadata, dict):
             endpoints = metadata.get("endpoints")

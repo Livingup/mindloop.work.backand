@@ -13,6 +13,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+
 from agent_runtime.auth.runtime_access_policy import (
     LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
     NO_ACCOUNT_API_RESTRICTED_DETAIL,
@@ -318,7 +320,15 @@ def create_app(
 
     async def ensure_codex_builtin_provider() -> None:
         try:
-            await asyncio.to_thread(codex_oauth_service.ensure_builtin_provider)
+            await monitored_to_thread(
+                codex_oauth_service.ensure_builtin_provider,
+                operation="server.ensure_codex_builtin_provider",
+                caller="create_app.ensure_codex_builtin_provider",
+                log=logger,
+                diagnostic_context={
+                    "component": "codex_oauth_service",
+                },
+            )
         except (Exception, asyncio.CancelledError) as e:
             logger.warning("内置 Codex Provider 后台同步失败，Runtime 将继续运行：%s", e, exc_info=True)
 
@@ -497,10 +507,17 @@ def create_app(
 
     async def _detach_expired_scene(session) -> None:
         try:
-            await asyncio.to_thread(
+            await monitored_to_thread(
                 agent_runtime_gateway.detach_scene,
                 session.scene_id,
                 DetachSceneRequest(workspace_path=session.workspace_path),
+                operation="server.scene.detach_expired",
+                caller="create_app._detach_expired_scene",
+                log=logger,
+                diagnostic_context={
+                    "scene_id": session.scene_id,
+                    "workspace_path": session.workspace_path,
+                },
             )
         except Exception:
             logger.exception(

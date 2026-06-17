@@ -8,6 +8,7 @@ from agent_runtime.agent.agent_instance import PendingUserMessageAttachment
 from agent_runtime.agent.file_input_policy import default_file_input_limits
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.lacp.client import LacpClient
 from agent_runtime.lacp.models import (
@@ -150,8 +151,28 @@ class AgentRuntimeLacpBridge:
             expected_kinds.append(kind)
             names.append(_normalize_optional_text(attachment.name))
         service = get_file_resource_service()
-        created = await asyncio.to_thread(service.create_resources_from_remote_urls, requests)
-        resources = await asyncio.to_thread(service.get_resources, [item.resource_id for item in created])
+        created = await monitored_to_thread(
+            service.create_resources_from_remote_urls,
+            requests,
+            operation="lacp.resolve_url_attachments.create_resources",
+            caller="AgentRuntimeLacpBridge._resolve_url_attachments",
+            log=logger,
+            diagnostic_context={
+                "attachment_count": len(attachments),
+                "request_count": len(requests),
+            },
+        )
+        resources = await monitored_to_thread(
+            service.get_resources,
+            [item.resource_id for item in created],
+            operation="lacp.resolve_url_attachments.get_resources",
+            caller="AgentRuntimeLacpBridge._resolve_url_attachments",
+            log=logger,
+            diagnostic_context={
+                "attachment_count": len(attachments),
+                "resource_count": len(created),
+            },
+        )
         resolved: list[PendingUserMessageAttachment] = []
         for index, resource in enumerate(resources):
             if resource is None:

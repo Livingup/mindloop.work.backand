@@ -12,6 +12,7 @@ import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.mcp.mcp_client.mcp_metadata_cache import (
     JsonMcpMetadataSnapshotRepository,
     McpCachedResource,
@@ -111,7 +112,13 @@ class McpMetadataRefreshManager:
 
         该方法必须在 start() 之前执行，保证后台刷新开始前所有消费者已有非网络基线。
         """
-        snapshots = await asyncio.to_thread(self._snapshot_repository.load_all)
+        snapshots = await monitored_to_thread(
+            self._snapshot_repository.load_all,
+            operation="mcp.metadata_cache.load_all",
+            caller="McpMetadataRefreshManager.load_persisted_metadata",
+            log=logger,
+            diagnostic_context={"cache_operation": "load_all"},
+        )
         self._registry.hydrate(snapshots)
         logger.info("已加载 MCP 元数据本地缓存：%d 个服务快照", len(snapshots))
 
@@ -450,7 +457,14 @@ class McpMetadataRefreshManager:
 
     def _schedule_save(self, snapshot: McpServiceMetadataSnapshot) -> None:
         task = asyncio.create_task(
-            asyncio.to_thread(self._snapshot_repository.save, snapshot),
+            monitored_to_thread(
+                self._snapshot_repository.save,
+                snapshot,
+                operation="mcp.metadata_cache.save",
+                caller="McpMetadataRefreshManager._schedule_save",
+                log=logger,
+                diagnostic_context={"service_id": snapshot.service_id, "cache_operation": "save"},
+            ),
             name=f"mcp-metadata-cache-save-{snapshot.service_id}",
         )
         self._persist_tasks.add(task)
@@ -458,7 +472,14 @@ class McpMetadataRefreshManager:
 
     def _schedule_delete(self, service_id: str) -> None:
         task = asyncio.create_task(
-            asyncio.to_thread(self._snapshot_repository.delete, service_id),
+            monitored_to_thread(
+                self._snapshot_repository.delete,
+                service_id,
+                operation="mcp.metadata_cache.delete",
+                caller="McpMetadataRefreshManager._schedule_delete",
+                log=logger,
+                diagnostic_context={"service_id": service_id, "cache_operation": "delete"},
+            ),
             name=f"mcp-metadata-cache-delete-{service_id}",
         )
         self._persist_tasks.add(task)

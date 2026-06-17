@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import codecs
 import locale
+import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.terminal.terminal_process import (
     TerminalExitHandler,
     TerminalOutputHandler,
@@ -17,6 +20,7 @@ from agent_runtime.terminal.terminal_process import (
     TerminalSessionStartRequest,
 )
 
+logger = logging.getLogger(__name__)
 _PTY_READ_CHUNK_SIZE = 4096
 
 
@@ -54,19 +58,55 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         *,
         on_exit: TerminalExitHandler,
     ) -> bool:
+        started_at = time.perf_counter()
+        logger.info(
+            "PTY terminal runtime start requested: terminal_id=%s shell=%s cwd=%s runtime_token=%s platform=%s",
+            request.terminal_id,
+            request.shell,
+            request.cwd,
+            request.runtime_token,
+            sys.platform,
+        )
         async with self._lock:
             existing = self._sessions.get(request.terminal_id)
             if existing is not None and _session_alive(existing):
+                logger.info(
+                    "PTY terminal runtime start skipped because live session already exists: terminal_id=%s runtime_token=%s active_command_id=%s",
+                    request.terminal_id,
+                    existing.runtime_token,
+                    _active_command_id(existing),
+                )
                 return False
             if existing is not None:
+                logger.info(
+                    "PTY terminal runtime replacing stale session: terminal_id=%s old_runtime_token=%s active_command_id=%s",
+                    request.terminal_id,
+                    existing.runtime_token,
+                    _active_command_id(existing),
+                )
                 self._sessions.pop(request.terminal_id, None)
             if sys.platform.startswith("win"):
                 session = await _start_windows_terminal(request, on_exit=on_exit)
-                session.task = asyncio.create_task(self._watch_windows_terminal(session))
+                session.task = asyncio.create_task(
+                    self._watch_windows_terminal(session),
+                    name=f"terminal-winpty-watch-{request.terminal_id}",
+                )
             else:
                 session = await _start_unix_terminal(request, on_exit=on_exit)
-                session.task = asyncio.create_task(self._watch_unix_terminal(session))
+                session.task = asyncio.create_task(
+                    self._watch_unix_terminal(session),
+                    name=f"terminal-pty-watch-{request.terminal_id}",
+                )
             self._sessions[request.terminal_id] = session
+            logger.info(
+                "PTY terminal runtime started: terminal_id=%s shell=%s cwd=%s runtime_token=%s watcher_task=%s duration_ms=%s",
+                request.terminal_id,
+                request.shell,
+                request.cwd,
+                request.runtime_token,
+                session.task.get_name() if session.task is not None else None,
+                int((time.perf_counter() - started_at) * 1000),
+            )
             return True
 
     async def start_command(
@@ -76,10 +116,26 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         on_output: TerminalOutputHandler,
         on_exit: TerminalExitHandler,
     ) -> None:
+        started_at = time.perf_counter()
+        logger.info(
+            "PTY command start requested: terminal_id=%s command_id=%s cwd=%s shell=%s timeout_ms=%s command_chars=%s",
+            request.terminal_id,
+            request.command_id,
+            request.cwd,
+            request.shell,
+            request.timeout_ms,
+            len(request.command_line),
+        )
         session = self._require_session(request.terminal_id)
         async with session.lock:
             if session.active_command is not None:
                 previous = session.active_command
+                logger.warning(
+                    "PTY command replacing previous active command: terminal_id=%s previous_command_id=%s new_command_id=%s",
+                    request.terminal_id,
+                    previous.command_id,
+                    request.command_id,
+                )
                 if previous.timeout_task is not None:
                     previous.timeout_task.cancel()
             active = _ActiveCommand(
@@ -89,42 +145,112 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             )
             session.active_command = active
             if request.timeout_ms is not None and request.timeout_ms > 0:
-                active.timeout_task = asyncio.create_task(self._enforce_timeout(session, request.command_id, request.timeout_ms))
+                active.timeout_task = asyncio.create_task(
+                    self._enforce_timeout(session, request.command_id, request.timeout_ms),
+                    name=f"terminal-timeout-{request.terminal_id}-{request.command_id}",
+                )
             try:
-                await _write_terminal(session, _command_input_text(request.command_line))
+                await _write_terminal(session, _command_input_text(request.command_line), operation="terminal.command.write")
             except asyncio.CancelledError:
+                logger.warning(
+                    "PTY command start cancelled while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
+                    request.terminal_id,
+                    request.command_id,
+                    int((time.perf_counter() - started_at) * 1000),
+                )
                 raise
             except BaseException:
                 session.active_command = None
                 if active.timeout_task is not None:
                     active.timeout_task.cancel()
+                logger.exception(
+                    "PTY command start failed while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
+                    request.terminal_id,
+                    request.command_id,
+                    int((time.perf_counter() - started_at) * 1000),
+                )
                 raise
+            logger.info(
+                "PTY command start accepted: terminal_id=%s command_id=%s duration_ms=%s",
+                request.terminal_id,
+                request.command_id,
+                int((time.perf_counter() - started_at) * 1000),
+            )
 
     async def write_input(self, terminal_id: str, text: str) -> int:
+        started_at = time.perf_counter()
         session = self._require_session(terminal_id)
         payload = _normalize_terminal_input(text)
-        await _write_terminal(session, payload)
-        return len(payload.encode("utf-8", errors="replace"))
+        logger.info(
+            "PTY terminal input write requested: terminal_id=%s active_command_id=%s input_chars=%s payload_bytes=%s",
+            terminal_id,
+            _active_command_id(session),
+            len(text),
+            len(payload.encode("utf-8", errors="replace")),
+        )
+        await _write_terminal(session, payload, operation="terminal.input.write")
+        bytes_written = len(payload.encode("utf-8", errors="replace"))
+        logger.info(
+            "PTY terminal input write completed: terminal_id=%s active_command_id=%s bytes_written=%s duration_ms=%s",
+            terminal_id,
+            _active_command_id(session),
+            bytes_written,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return bytes_written
 
     async def interrupt_terminal(self, terminal_id: str) -> None:
+        started_at = time.perf_counter()
         session = self._require_session(terminal_id)
-        await _write_terminal(session, "\x03")
+        logger.info(
+            "PTY terminal interrupt requested: terminal_id=%s active_command_id=%s",
+            terminal_id,
+            _active_command_id(session),
+        )
+        await _write_terminal(session, "\x03", operation="terminal.interrupt.write")
+        logger.info(
+            "PTY terminal interrupt completed: terminal_id=%s active_command_id=%s duration_ms=%s",
+            terminal_id,
+            _active_command_id(session),
+            int((time.perf_counter() - started_at) * 1000),
+        )
 
     async def terminate_terminal(self, terminal_id: str) -> None:
+        started_at = time.perf_counter()
         session = self._sessions.get(terminal_id)
         if session is None:
+            logger.info("PTY terminal terminate skipped because session is missing: terminal_id=%s", terminal_id)
             return
+        logger.info(
+            "PTY terminal terminate requested: terminal_id=%s runtime_token=%s active_command_id=%s closing=%s watcher_task=%s",
+            terminal_id,
+            session.runtime_token,
+            _active_command_id(session),
+            session.closing,
+            session.task.get_name() if session.task is not None else None,
+        )
         await _close_terminal_session(session)
         if session.task is not None:
             try:
                 await asyncio.wait_for(session.task, timeout=3)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "PTY terminal watcher did not stop after close; cancelling: terminal_id=%s watcher_task=%s",
+                    terminal_id,
+                    session.task.get_name(),
+                )
                 session.task.cancel()
                 try:
                     await session.task
                 except asyncio.CancelledError:
                     pass
         self._discard_session_if_current(session)
+        logger.info(
+            "PTY terminal terminate completed: terminal_id=%s runtime_token=%s duration_ms=%s",
+            terminal_id,
+            session.runtime_token,
+            int((time.perf_counter() - started_at) * 1000),
+        )
 
     async def shutdown(self) -> None:
         for terminal_id in list(self._sessions.keys()):
@@ -180,20 +306,67 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         try:
             if session.winpty is None:
                 raise RuntimeError("Windows ConPTY 终端未初始化。")
+            logger.info(
+                "Windows PTY watcher started: terminal_id=%s runtime_token=%s active_command_id=%s",
+                session.terminal_id,
+                session.runtime_token,
+                _active_command_id(session),
+            )
             while _session_alive(session):
-                text = await asyncio.to_thread(_read_windows_pty, session.winpty)
+                text = await monitored_to_thread(
+                    _read_windows_pty,
+                    session.winpty,
+                    operation="terminal.windows_pty.read",
+                    caller="PtyTerminalProcessManager._watch_windows_terminal",
+                    log=logger,
+                    diagnostic_context={
+                        "terminal_id": session.terminal_id,
+                        "runtime_token": session.runtime_token,
+                        "active_command_id": _active_command_id(session),
+                    },
+                )
                 if text:
+                    logger.debug(
+                        "Windows PTY watcher received output: terminal_id=%s active_command_id=%s text_chars=%s",
+                        session.terminal_id,
+                        _active_command_id(session),
+                        len(text),
+                    )
                     await self._handle_terminal_output(session, text)
                 else:
                     await asyncio.sleep(0.05)
             exit_code = _windows_exit_status(session.winpty)
         except asyncio.CancelledError:
+            logger.warning(
+                "Windows PTY watcher cancelled: terminal_id=%s runtime_token=%s active_command_id=%s",
+                session.terminal_id,
+                session.runtime_token,
+                _active_command_id(session),
+            )
             raise
         except BaseException as exc:
             if _is_process_control_exception(exc):
                 raise
             error_message = None if session.closing else str(exc)
+            logger.warning(
+                "Windows PTY watcher failed: terminal_id=%s runtime_token=%s active_command_id=%s closing=%s error_type=%s error=%s",
+                session.terminal_id,
+                session.runtime_token,
+                _active_command_id(session),
+                session.closing,
+                exc.__class__.__name__,
+                str(exc),
+            )
         finally:
+            logger.info(
+                "Windows PTY watcher finalizing: terminal_id=%s runtime_token=%s active_command_id=%s exit_code=%s error_message=%s closing=%s",
+                session.terminal_id,
+                session.runtime_token,
+                _active_command_id(session),
+                exit_code,
+                error_message,
+                session.closing,
+            )
             self._discard_session_if_current(session)
             await self._fail_active_command(session, error_message or "终端运行时已退出。")
             await session.on_exit(exit_code, error_message)
@@ -235,7 +408,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             active = session.active_command
             if active is None or active.command_id != command_id:
                 return
-            await _write_terminal(session, "\x03")
+            await _write_terminal(session, "\x03", operation="terminal.timeout.interrupt.write")
             await asyncio.sleep(3)
             active = session.active_command
             if active is not None and active.command_id == command_id:
@@ -245,7 +418,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     exit_code=None,
                     error_message=f"命令执行超时: {timeout_ms}ms",
                 )
-                await _close_terminal_session(session)
+                await _close_terminal_session(session, reason="command_timeout")
         except asyncio.CancelledError:
             raise
 
@@ -434,13 +607,40 @@ def _read_windows_pty(winpty: Any) -> str:
         raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
 
 
-async def _write_terminal(session: _TerminalSession, text: str) -> None:
+async def _write_terminal(session: _TerminalSession, text: str, *, operation: str = "terminal.write") -> None:
+    payload_bytes = len(text.encode("utf-8", errors="replace"))
     if session.master_fd is not None:
+        logger.debug(
+            "Unix PTY write started: terminal_id=%s active_command_id=%s operation=%s payload_bytes=%s",
+            session.terminal_id,
+            _active_command_id(session),
+            operation,
+            payload_bytes,
+        )
         os.write(session.master_fd, text.encode("utf-8", errors="replace"))
+        logger.debug(
+            "Unix PTY write completed: terminal_id=%s active_command_id=%s operation=%s payload_bytes=%s",
+            session.terminal_id,
+            _active_command_id(session),
+            operation,
+            payload_bytes,
+        )
         return
     if session.winpty is not None:
         try:
-            await asyncio.to_thread(session.winpty.write, text)
+            await monitored_to_thread(
+                session.winpty.write,
+                text,
+                operation=operation,
+                caller="_write_terminal",
+                log=logger,
+                diagnostic_context={
+                    "terminal_id": session.terminal_id,
+                    "runtime_token": session.runtime_token,
+                    "active_command_id": _active_command_id(session),
+                    "payload_bytes": payload_bytes,
+                },
+            )
         except BaseException as exc:
             if _is_process_control_exception(exc):
                 raise
@@ -449,8 +649,18 @@ async def _write_terminal(session: _TerminalSession, text: str) -> None:
     raise KeyError(f"终端运行时不可写: {session.terminal_id}")
 
 
-async def _close_terminal_session(session: _TerminalSession) -> None:
+async def _close_terminal_session(session: _TerminalSession, *, reason: str = "close") -> None:
+    close_started_at = time.perf_counter()
     session.closing = True
+    logger.info(
+        "PTY terminal close started: terminal_id=%s runtime_token=%s active_command_id=%s reason=%s has_process=%s has_winpty=%s",
+        session.terminal_id,
+        session.runtime_token,
+        _active_command_id(session),
+        reason,
+        session.process is not None,
+        session.winpty is not None,
+    )
     if session.process is not None and session.process.returncode is None:
         try:
             os.killpg(session.process.pid, signal.SIGTERM)
@@ -470,28 +680,96 @@ async def _close_terminal_session(session: _TerminalSession) -> None:
             await session.process.wait()
     if session.winpty is not None:
         try:
-            await asyncio.to_thread(session.winpty.close, True)
+            await monitored_to_thread(
+                session.winpty.close,
+                True,
+                operation="terminal.windows_pty.close",
+                caller="_close_terminal_session",
+                log=logger,
+                diagnostic_context={
+                    "terminal_id": session.terminal_id,
+                    "runtime_token": session.runtime_token,
+                    "active_command_id": _active_command_id(session),
+                    "reason": reason,
+                    "close_signature": "close_true",
+                },
+            )
         except TypeError:
             try:
-                await asyncio.to_thread(session.winpty.close)
+                await monitored_to_thread(
+                    session.winpty.close,
+                    operation="terminal.windows_pty.close",
+                    caller="_close_terminal_session",
+                    log=logger,
+                    diagnostic_context={
+                        "terminal_id": session.terminal_id,
+                        "runtime_token": session.runtime_token,
+                        "active_command_id": _active_command_id(session),
+                        "reason": reason,
+                        "close_signature": "close_no_args",
+                    },
+                )
             except BaseException as exc:
                 if _is_process_control_exception(exc):
                     raise
                 try:
-                    await asyncio.to_thread(session.winpty.kill)
+                    await monitored_to_thread(
+                        session.winpty.kill,
+                        operation="terminal.windows_pty.kill",
+                        caller="_close_terminal_session",
+                        log=logger,
+                        diagnostic_context={
+                            "terminal_id": session.terminal_id,
+                            "runtime_token": session.runtime_token,
+                            "active_command_id": _active_command_id(session),
+                            "reason": reason,
+                            "after_close_error_type": exc.__class__.__name__,
+                        },
+                    )
                 except BaseException as kill_exc:
                     if _is_process_control_exception(kill_exc):
                         raise
-                    pass
+                    logger.warning(
+                        "Windows PTY kill after close TypeError fallback failed: terminal_id=%s reason=%s error_type=%s error=%s",
+                        session.terminal_id,
+                        reason,
+                        kill_exc.__class__.__name__,
+                        str(kill_exc),
+                    )
         except BaseException as exc:
             if _is_process_control_exception(exc):
                 raise
             try:
-                await asyncio.to_thread(session.winpty.kill)
+                await monitored_to_thread(
+                    session.winpty.kill,
+                    operation="terminal.windows_pty.kill",
+                    caller="_close_terminal_session",
+                    log=logger,
+                    diagnostic_context={
+                        "terminal_id": session.terminal_id,
+                        "runtime_token": session.runtime_token,
+                        "active_command_id": _active_command_id(session),
+                        "reason": reason,
+                        "after_close_error_type": exc.__class__.__name__,
+                    },
+                )
             except BaseException as kill_exc:
                 if _is_process_control_exception(kill_exc):
                     raise
-                pass
+                logger.warning(
+                    "Windows PTY kill after close failure failed: terminal_id=%s reason=%s error_type=%s error=%s",
+                    session.terminal_id,
+                    reason,
+                    kill_exc.__class__.__name__,
+                    str(kill_exc),
+                )
+    logger.info(
+        "PTY terminal close completed: terminal_id=%s runtime_token=%s reason=%s duration_ms=%s",
+        session.terminal_id,
+        session.runtime_token,
+        reason,
+        int((time.perf_counter() - close_started_at) * 1000),
+    )
 
 
 def _session_alive(session: _TerminalSession) -> bool:
@@ -518,6 +796,11 @@ def _windows_exit_status(winpty: Any) -> int | None:
 
 def _is_process_control_exception(exc: BaseException) -> bool:
     return isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit))
+
+
+def _active_command_id(session: _TerminalSession) -> str | None:
+    active = session.active_command
+    return active.command_id if active is not None else None
 
 
 def _normalize_terminal_input(text: str) -> str:

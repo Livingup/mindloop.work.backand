@@ -15,6 +15,7 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
     PublishCommunicationMessageRequest,
 )
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
@@ -210,6 +211,18 @@ class TerminalService:
         shell: str | None = None,
         terminal_id: str | None = None,
     ) -> TerminalInstance:
+        started_at = time.perf_counter()
+        logger.info(
+            "Terminal create requested: owner_type=%s owner_id=%s requested_terminal_id=%s requested_cwd=%s requested_shell=%s task_id=%s agent_instance_id=%s trace_id=%s",
+            scope.owner_type,
+            scope.owner_id,
+            terminal_id,
+            cwd,
+            shell,
+            scope.task_id,
+            scope.agent_instance_id,
+            scope.trace_id,
+        )
         if terminal_id:
             existing = self._repo.get_terminal(terminal_id)
             if existing is not None and existing.status == TERMINAL_STATUS_DELETED:
@@ -243,6 +256,16 @@ class TerminalService:
             },
             correlation_id=scope.tool_call_id,
         )
+        logger.info(
+            "Terminal create completed: terminal_id=%s cwd=%s shell=%s status=%s task_id=%s agent_instance_id=%s duration_ms=%s",
+            terminal.terminal_id,
+            terminal.cwd,
+            terminal.shell,
+            terminal.status,
+            scope.task_id,
+            scope.agent_instance_id,
+            int((time.perf_counter() - started_at) * 1000),
+        )
         return terminal
 
     def list_terminals(self, scope: TerminalRuntimeScope) -> list[TerminalInstance]:
@@ -262,6 +285,20 @@ class TerminalService:
         shell: str | None = None,
         timeout_ms: int | None = None,
     ) -> ExecuteCommandAccepted:
+        started_at = time.perf_counter()
+        logger.info(
+            "Terminal execute requested: owner_type=%s owner_id=%s requested_terminal_id=%s requested_cwd=%s requested_shell=%s timeout_ms=%s command_chars=%s task_id=%s agent_instance_id=%s trace_id=%s",
+            scope.owner_type,
+            scope.owner_id,
+            terminal_id,
+            cwd,
+            shell,
+            timeout_ms,
+            len(command_line),
+            scope.task_id,
+            scope.agent_instance_id,
+            scope.trace_id,
+        )
         lock_key = f"{scope.owner_type}:{scope.owner_id}"
         async with self._lock_for(lock_key):
             terminal = await self._select_terminal(scope, terminal_id=terminal_id, cwd=cwd, shell=shell)
@@ -319,6 +356,17 @@ class TerminalService:
             )
             terminal = terminal.mark_idle()
             self._repo.save_terminal(terminal)
+            logger.info(
+                "Terminal execute accepted: terminal_id=%s command_id=%s actual_cwd=%s shell=%s timeout_ms=%s task_id=%s agent_instance_id=%s duration_ms=%s",
+                terminal.terminal_id,
+                command.command_id,
+                command.actual_cwd,
+                command.shell,
+                timeout_ms,
+                scope.task_id,
+                scope.agent_instance_id,
+                int((time.perf_counter() - started_at) * 1000),
+            )
         except Exception as exc:
             failed = command.fail(str(exc))
             self._repo.save_command(failed)
@@ -339,6 +387,16 @@ class TerminalService:
                     "completed_at": failed.completed_at.isoformat() if failed.completed_at else None,
                 },
                 correlation_id=scope.tool_call_id,
+            )
+            logger.warning(
+                "Terminal execute failed: terminal_id=%s command_id=%s error_type=%s error=%s task_id=%s agent_instance_id=%s duration_ms=%s",
+                terminal.terminal_id,
+                command.command_id,
+                exc.__class__.__name__,
+                str(exc),
+                scope.task_id,
+                scope.agent_instance_id,
+                int((time.perf_counter() - started_at) * 1000),
             )
             raise
         return ExecuteCommandAccepted(accepted=True, terminal=terminal, command=command)
@@ -410,7 +468,20 @@ class TerminalService:
                 if command_id is not None
                 else terminal_chunks
             )
-            rendered = await asyncio.to_thread(render_terminal_chunks, [chunk.chunk for chunk in terminal_chunks])
+            rendered = await monitored_to_thread(
+                render_terminal_chunks,
+                [chunk.chunk for chunk in terminal_chunks],
+                operation="terminal.read_output.render_tail",
+                caller="TerminalService.read_output",
+                log=logger,
+                diagnostic_context={
+                    "terminal_id": terminal_id,
+                    "command_id": command_id,
+                    "mode": mode,
+                    "chunk_count": len(terminal_chunks),
+                    "tail_lines": tail_lines,
+                },
+            )
             lines = rendered.text.splitlines(keepends=True)
             tail_text = "".join(lines[-max(1, tail_lines):])
             result = _build_read_result(
@@ -436,7 +507,20 @@ class TerminalService:
                 int((time.perf_counter() - started_at) * 1000),
             )
             return result
-        rendered = await asyncio.to_thread(render_terminal_chunks, [chunk.chunk for chunk in chunks])
+        rendered = await monitored_to_thread(
+            render_terminal_chunks,
+            [chunk.chunk for chunk in chunks],
+            operation="terminal.read_output.render",
+            caller="TerminalService.read_output",
+            log=logger,
+            diagnostic_context={
+                "terminal_id": terminal_id,
+                "command_id": command_id,
+                "mode": mode,
+                "chunk_count": len(chunks),
+                "limit_lines": limit_lines,
+            },
+        )
         result = _build_read_result(
             terminal_id=terminal_id,
             command_id=command_id,

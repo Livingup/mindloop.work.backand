@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 from agent_runtime.file_resource.models import ImageResourceMetadata, PdfResourceMetadata
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest, RemoteUrlCreateRequest
 from agent_runtime.file_resource.settings_repository import (
@@ -232,7 +233,21 @@ def create_file_resource_router() -> APIRouter:
                     return
                 if await request.is_disconnected():
                     return
-                has_event = await asyncio.to_thread(task_service.wait_for_event, task, cursor, 15)
+                has_event = await monitored_to_thread(
+                    task_service.wait_for_event,
+                    task,
+                    cursor,
+                    15,
+                    operation="file_resource.upload_task.wait_for_event",
+                    caller="stream_upload_task_events.event_generator",
+                    log=logger,
+                    slow_execution_seconds=5.0,
+                    diagnostic_context={
+                        "task_id": task_id,
+                        "cursor": cursor,
+                        "wait_timeout_seconds": 15,
+                    },
+                )
                 if await request.is_disconnected():
                     return
                 if not has_event:

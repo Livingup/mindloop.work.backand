@@ -13,6 +13,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RETAINED_FRAME_COUNT = 3
@@ -489,7 +491,18 @@ class AgentExecutionLoopLogger:
                     return
                 snapshot = self._snapshot_locked(state)
             path = self.log_file_path_for_instance(instance_id)
-            await asyncio.to_thread(_write_snapshot_file, path, snapshot)
+            await monitored_to_thread(
+                _write_snapshot_file,
+                path,
+                snapshot,
+                operation="agent.execution_loop_logger.write_snapshot",
+                caller="AgentExecutionLoopLogger._write_instance_snapshot",
+                log=logger,
+                diagnostic_context={
+                    "instance_id": instance_id,
+                    "path": str(path),
+                },
+            )
         except Exception as exc:  # noqa: BLE001 - 日志写失败不能影响业务执行
             with self._lock:
                 state = self._states.get(instance_id)

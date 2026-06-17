@@ -15,6 +15,7 @@ from agent_runtime.communication.communication_message import CommunicationMessa
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
 from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
+from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
 
 logger = logging.getLogger(__name__)
 _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS = 1.0
@@ -200,8 +201,18 @@ class CommunicationService:
         _require_non_blank(message_type, "message_type")
         try:
             to_thread_submitted_at = time.perf_counter()
-            saved = await asyncio.to_thread(
+            saved = await monitored_to_thread(
                 self._append_message_sync_with_diagnostics,
+                operation="communication.publish_message.append",
+                caller="CommunicationService.publish_message",
+                log=logger,
+                diagnostic_context={
+                    "trace_id": trace_id,
+                    "stream_id": stream_id,
+                    "event_type": message_type,
+                    "correlation_id": correlation_id,
+                    "message_id": message_id,
+                },
                 stream_id=stream_id,
                 message_type=message_type,
                 payload=payload,
@@ -424,16 +435,27 @@ class CommunicationService:
     ) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
-        await asyncio.to_thread(self.get_stream, stream_id)
+        await monitored_to_thread(
+            self.get_stream,
+            stream_id,
+            operation="communication.subscribe.get_stream",
+            caller="CommunicationService.subscribe_messages",
+            log=logger,
+            diagnostic_context={"stream_id": stream_id, "after_seq": after_seq},
+        )
         cursor = max(after_seq, 0)
         subscription = self._event_hub.subscribe(stream_id, after_seq=cursor)
         next_live_message = asyncio.create_task(anext(subscription))
         await asyncio.sleep(0)
         try:
             while True:
-                replay_messages = await asyncio.to_thread(
+                replay_messages = await monitored_to_thread(
                     self._repository.list_messages,
                     stream_id,
+                    operation="communication.subscribe.replay_messages",
+                    caller="CommunicationService.subscribe_messages",
+                    log=logger,
+                    diagnostic_context={"stream_id": stream_id, "cursor": cursor, "limit": 5000},
                     after_seq=cursor,
                     limit=5000,
                 )
@@ -452,9 +474,13 @@ class CommunicationService:
                 if message.seq <= cursor:
                     continue
                 if message.seq > cursor + 1:
-                    gap_messages = await asyncio.to_thread(
+                    gap_messages = await monitored_to_thread(
                         self._repository.list_messages,
                         stream_id,
+                        operation="communication.subscribe.gap_messages",
+                        caller="CommunicationService.subscribe_messages",
+                        log=logger,
+                        diagnostic_context={"stream_id": stream_id, "cursor": cursor, "live_seq": message.seq, "limit": 5000},
                         after_seq=cursor,
                         limit=5000,
                     )
