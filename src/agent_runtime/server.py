@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -23,6 +24,9 @@ from agent_runtime.config import ConfigRegistry
 from agent_runtime.frontend_static import mount_frontend_static
 
 logger = logging.getLogger("agent_runtime.serve")
+_DEFAULT_RUNTIME_LOG_LEVEL = "DEBUG"
+_RUNTIME_LOG_LEVEL_ENV = "AGENT_RUNTIME_LOG_LEVEL"
+
 
 # 所有前端离开后，只有连续 30 分钟没有新的任务/执行活动，才允许自动释放 scene。
 SCENE_VACANT_IDLE_EXPIRATION_SECONDS: float = 30 * 60
@@ -1106,6 +1110,25 @@ def _runtime_auth_query_token_allowed(request) -> bool:
     return False
 
 
+def _runtime_log_level() -> int:
+    """Return the backend stderr logging threshold.
+
+    Runtime diagnostics are emitted through normal Python logging handlers. If the root
+    logger stays at INFO, DEBUG diagnostic records never reach backend-stderr.log.
+    """
+    configured_level = os.getenv(_RUNTIME_LOG_LEVEL_ENV, _DEFAULT_RUNTIME_LOG_LEVEL).strip().upper()
+    level = logging.getLevelName(configured_level)
+    if isinstance(level, int):
+        return level
+    logging.getLogger(__name__).warning(
+        "Invalid %s=%r; falling back to %s",
+        _RUNTIME_LOG_LEVEL_ENV,
+        configured_level,
+        _DEFAULT_RUNTIME_LOG_LEVEL,
+    )
+    return logging.DEBUG
+
+
 def run_server(
     *,
     config_file_path: str | Path,
@@ -1115,11 +1138,17 @@ def run_server(
     watch: bool = True,
     frontend_dist_dir: str | Path | None = None,
 ) -> None:
+    log_level = _runtime_log_level()
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
+        force=True,
     )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    for handler in root_logger.handlers:
+        handler.setLevel(log_level)
     load_runtime_config(config_file_path, env_file_path, watch=watch)
     runtime_cfg = ConfigRegistry.instance().agent_runtime_service
     effective_host = host or runtime_cfg.service_host
