@@ -16,7 +16,11 @@ from agent_runtime.mcp.mcp_client.mcp_value_objects import (
     MCP_CONNECTION_STATUS_DISCONNECTED,
     McpServiceCapabilities,
 )
-from agent_runtime.runtime_health import runtime_concurrency_health_snapshot, runtime_task_health_summary
+from agent_runtime.runtime_health import (
+    runtime_concurrency_health_snapshot,
+    runtime_concurrency_limit,
+    runtime_task_health_summary,
+)
 
 
 def test_runtime_task_registry_tracks_cancel_stop_health_and_redaction() -> None:
@@ -317,22 +321,127 @@ def test_runtime_concurrency_health_snapshot_is_bounded_sanitized_and_diagnostic
         top_limit=1,
     )
 
+    assert set(snapshot) == {
+        "status",
+        "diagnostic_scope",
+        "diagnostic_only",
+        "signals",
+        "event_loop",
+        "blocking_scheduler",
+        "runtime_tasks",
+        "network",
+        "limits",
+    }
     assert snapshot["status"] == "degraded"
+    assert snapshot["diagnostic_scope"] == "runtime_concurrency_observability"
     assert snapshot["diagnostic_only"] is True
+    assert snapshot["limits"] == {
+        "top_limit": 1,
+        "operation_limit": 0,
+        "include_blocking_operations": False,
+    }
     assert snapshot["signals"]["event_loop"]["lagging"] is True
     assert snapshot["signals"]["runtime_tasks"]["stale_progress"] is True
     assert snapshot["signals"]["network"]["event_hub_queue_pressure"] is True
-    assert snapshot["blocking_scheduler"]["totals"]["pending"] == 2
-    assert snapshot["blocking_scheduler"]["totals"]["executor_work_queue_size"] == 2
-    assert len(snapshot["blocking_scheduler"]["top_active_pools"]) == 1
+    blocking = snapshot["blocking_scheduler"]
+    assert {
+        "pool_count",
+        "executor_count",
+        "physical_executor_count",
+        "operation_count",
+        "totals",
+        "logical_totals",
+        "physical_executor_totals",
+        "top_active_pools",
+        "top_pending_pools",
+        "top_failed_pools",
+        "top_queued_executors",
+        "unavailable_executors",
+        "top_physical_executors",
+        "unavailable_physical_executors",
+        "executor_view",
+    }.issubset(blocking)
+    assert blocking["totals"]["pending"] == 2
+    assert blocking["totals"]["executor_work_queue_size"] == 2
+    assert len(blocking["top_active_pools"]) == 1
+    assert len(blocking["top_pending_pools"]) == 1
+    assert len(blocking["top_failed_pools"]) == 1
+    assert len(blocking["top_queued_executors"]) == 1
+    assert len(blocking["top_physical_executors"]) == 1
     assert len(snapshot["runtime_tasks"]["top_active_owners"]) == 1
-    assert "top_operations" not in snapshot["blocking_scheduler"]
+    assert "top_operations" not in blocking
     payload_text = str(snapshot).lower()
     assert "diagnostic_context" not in payload_text
     assert "should-not-appear" not in payload_text
     assert "authorization" not in payload_text
     assert "password" not in payload_text
     assert "token" not in payload_text
+    assert "header" not in payload_text
+    assert "payload" not in payload_text
+    assert "body" not in payload_text
+    assert "content" not in payload_text
+    assert "base64" not in payload_text
+    assert "0x" not in payload_text
+
+
+
+def test_runtime_concurrency_limit_keeps_public_default_and_maximum_contract() -> None:
+    assert runtime_concurrency_limit(None) == 20
+    assert runtime_concurrency_limit(0) == 20
+    assert runtime_concurrency_limit("not-a-number") == 20
+    assert runtime_concurrency_limit(7) == 7
+    assert runtime_concurrency_limit(101) == 100
+
+
+def test_runtime_concurrency_health_snapshot_empty_executor_view_is_explicit_and_stable() -> None:
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={"status": "ok", "monitor_running": True},
+        network_snapshot={},
+        runtime_task_summary=_empty_runtime_task_summary(),
+        blocking_scheduler_snapshot={
+            "pools": {},
+            "executors": {
+                "default": {
+                    "max_workers": 8,
+                    "isolated": False,
+                    "executor_pool": "default",
+                    "created": False,
+                    "runtime": {},
+                }
+            },
+        },
+    )
+
+    blocking = snapshot["blocking_scheduler"]
+    assert snapshot["status"] == "ok"
+    assert snapshot["diagnostic_only"] is True
+    assert snapshot["limits"] == {
+        "top_limit": 20,
+        "operation_limit": 0,
+        "include_blocking_operations": False,
+    }
+    assert blocking["executor_count"] == 1
+    assert blocking["physical_executor_count"] == 0
+    assert blocking["physical_executor_totals"] == {
+        "executor_work_queue_size": 0,
+        "executor_thread_count": 0,
+        "executor_alive_thread_count": 0,
+        "executor_max_workers": 0,
+        "executor_shutdown_count": 0,
+        "executor_broken_count": 0,
+    }
+    assert blocking["executor_view"] == {
+        "logical_executor_count": 1,
+        "physical_executor_count": 0,
+        "shared_executor_count": 0,
+        "dedupe_identity_source": "none",
+        "dedupe_confident": True,
+        "physical_totals_deduped": True,
+    }
+    assert snapshot["signals"]["blocking_scheduler"]["physical_executor_count"] == 0
+    assert snapshot["signals"]["blocking_scheduler"]["logical_executor_count"] == 1
+    assert snapshot["signals"]["blocking_scheduler"]["shared_executors_detected"] is False
+    assert "top_operations" not in blocking
 
 
 def test_runtime_concurrency_health_snapshot_detail_is_bounded_and_keeps_operation_counters_only() -> None:

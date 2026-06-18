@@ -169,6 +169,11 @@ def runtime_concurrency_health_snapshot(
     Stage-3/4 runtime task registry health, and a compact network summary. It
     is a diagnostic triage view only: the status is not a business-health
     verdict and does not prove a root cause for any incident.
+
+    The returned shape is intentionally stable for ``/api/health.concurrency``
+    and ``/api/runtime-diagnostics/concurrency``: top lists are bounded and
+    sanitized, ``diagnostic_only`` remains true, and expensive per-operation
+    details are emitted only when explicitly requested.
     """
     top_limit = runtime_concurrency_limit(top_limit)
     operation_limit = runtime_concurrency_limit(operation_limit)
@@ -411,13 +416,19 @@ def _executor_view_summary(
     physical_executor_items: list[dict[str, Any]],
 ) -> dict[str, Any]:
     identity_sources = {str(item.get("dedupe_identity_source") or "unknown") for item in physical_executor_items}
+    if not physical_executor_items:
+        dedupe_identity_source = "none"
+    elif len(identity_sources) == 1:
+        dedupe_identity_source = next(iter(identity_sources))
+    else:
+        dedupe_identity_source = "mixed"
     return {
         "logical_executor_count": logical_executor_count,
         "physical_executor_count": len(physical_executor_items),
         "shared_executor_count": sum(
             1 for item in physical_executor_items if _int_value(item.get("logical_pool_count")) > 1
         ),
-        "dedupe_identity_source": next(iter(identity_sources)) if len(identity_sources) == 1 else "mixed",
+        "dedupe_identity_source": dedupe_identity_source,
         "dedupe_confident": all(bool(item.get("dedupe_confident")) for item in physical_executor_items),
         "physical_totals_deduped": True,
     }
