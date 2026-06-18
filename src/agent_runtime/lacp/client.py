@@ -11,6 +11,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 from uuid import uuid4
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.models import (
     LacpClientStatus,
@@ -24,6 +25,19 @@ from agent_runtime.lacp.registration_registry import LacpRegistrationRegistry
 logger = logging.getLogger(__name__)
 
 InboundMessageHandler = Callable[[LacpInboundMessage], Awaitable[bool]]
+
+
+def _safe_ws_owner_id(ws_endpoint: str | None) -> str:
+    if not ws_endpoint:
+        return "unknown"
+    parsed = urlparse(ws_endpoint)
+    host = parsed.hostname or "unknown"
+    if parsed.port is not None:
+        host = f"{host}-{parsed.port}"
+    path = parsed.path.strip("/").replace("/", "-")
+    raw = f"{host}-{path}" if path else host
+    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
+    return (safe.strip("-._") or "unknown")[:80]
 
 
 class LacpClient:
@@ -74,7 +88,14 @@ class LacpClient:
         if self._task is not None and not self._task.done():
             return
         self._running = True
-        self._task = asyncio.create_task(self._run_loop())
+        self._task = get_runtime_task_registry().create_task(
+            self._run_loop(),
+            task_name="lacp-client-run-loop",
+            owner_type="lacp_client",
+            owner_id="global",
+            task_class="client_run_loop",
+            diagnostic_context={"enabled": True, "phase": "start"},
+        )
 
     async def reload_from_config(self) -> None:
         await self.shutdown()
@@ -90,7 +111,11 @@ class LacpClient:
             with contextlib_suppress(Exception):
                 await ws.close()
         if task is not None and not task.done():
-            task.cancel()
+            get_runtime_task_registry().cancel(
+                task,
+                message="lacp client stopped",
+                diagnostic_context={"phase": "shutdown"},
+            )
             with contextlib_suppress(Exception, asyncio.CancelledError):
                 await task
         self._fail_pending(RuntimeError("LACP client stopped."))
@@ -128,20 +153,38 @@ class LacpClient:
 
     async def _run_loop(self) -> None:
         retry_count = 0
+        registry = get_runtime_task_registry()
         while self._running:
             config = self._config_accessor()
             if not config.enabled:
+                registry.mark_progress(
+                    asyncio.current_task() or "lacp-client-run-loop",
+                    diagnostic_context={"phase": "config.disabled", "enabled": False},
+                )
                 await asyncio.sleep(1)
                 continue
             config_error = self._connection_config_error(config)
             if config_error is not None:
                 self._last_error = config_error
+                registry.mark_progress(
+                    asyncio.current_task() or "lacp-client-run-loop",
+                    diagnostic_context={"phase": "config.error", "enabled": True, "error_type": "ConfigError"},
+                )
                 await asyncio.sleep(1)
                 continue
             try:
+                registry.mark_progress(
+                    asyncio.current_task() or "lacp-client-run-loop",
+                    diagnostic_context={"phase": "resolve_ws_endpoint", "reconnect_attempt": retry_count},
+                )
                 ws_endpoint = await self._resolve_ws_endpoint(config)
                 self._last_ws_endpoint = ws_endpoint
+                endpoint_owner_id = _safe_ws_owner_id(ws_endpoint)
                 headers = self._auth_headers(config)
+                registry.mark_progress(
+                    asyncio.current_task() or "lacp-client-run-loop",
+                    diagnostic_context={"phase": "websocket.connecting", "endpoint_owner_id": endpoint_owner_id},
+                )
                 import websockets
 
                 connect_kwargs: dict[str, Any] = {
@@ -159,9 +202,30 @@ class LacpClient:
                     self._last_connected_at = utc_now_iso()
                     retry_count = 0
                     self._reconnect_attempt = 0
-                    reader_task = asyncio.create_task(self._reader_loop(ws))
-                    await self._register_desired_instances()
-                    await reader_task
+                    registry.mark_progress(
+                        asyncio.current_task() or "lacp-client-run-loop",
+                        diagnostic_context={"phase": "websocket.connected", "endpoint_owner_id": endpoint_owner_id},
+                    )
+                    reader_task = registry.create_task(
+                        self._reader_loop(ws, endpoint_owner_id=endpoint_owner_id),
+                        task_name=f"lacp-websocket-reader-{endpoint_owner_id}",
+                        owner_type="lacp_client",
+                        owner_id=endpoint_owner_id,
+                        task_class="websocket_reader",
+                        diagnostic_context={"phase": "reader.started", "endpoint_owner_id": endpoint_owner_id},
+                    )
+                    try:
+                        await self._register_desired_instances()
+                        await reader_task
+                    finally:
+                        if not reader_task.done():
+                            registry.cancel(
+                                reader_task,
+                                message="lacp websocket connection closing",
+                                diagnostic_context={"phase": "reader.connection_closing", "endpoint_owner_id": endpoint_owner_id},
+                            )
+                            with contextlib_suppress(Exception, asyncio.CancelledError):
+                                await reader_task
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -172,16 +236,33 @@ class LacpClient:
                 self._last_disconnected_at = utc_now_iso()
                 self._registration_registry.mark_disconnected()
                 self._fail_pending(RuntimeError("LACP WebSocket disconnected."))
+                registry.mark_progress(
+                    asyncio.current_task() or "lacp-client-run-loop",
+                    diagnostic_context={"phase": "websocket.disconnected"},
+                )
             delay = min(
                 config.reconnect_initial_delay_seconds * (2 ** retry_count),
                 config.reconnect_max_delay_seconds,
             )
             retry_count += 1
             self._reconnect_attempt = retry_count
+            registry.mark_progress(
+                asyncio.current_task() or "lacp-client-run-loop",
+                diagnostic_context={"phase": "reconnect.sleeping", "reconnect_attempt": retry_count, "delay_seconds": delay},
+            )
             await asyncio.sleep(delay)
 
-    async def _reader_loop(self, ws: Any) -> None:
+    async def _reader_loop(self, ws: Any, *, endpoint_owner_id: str) -> None:
+        registry = get_runtime_task_registry()
+        registry.mark_progress(
+            asyncio.current_task() or f"lacp-websocket-reader-{endpoint_owner_id}",
+            diagnostic_context={"phase": "reader.waiting", "endpoint_owner_id": endpoint_owner_id},
+        )
         async for raw_message in ws:
+            registry.mark_progress(
+                asyncio.current_task() or f"lacp-websocket-reader-{endpoint_owner_id}",
+                diagnostic_context={"phase": "reader.frame_received", "endpoint_owner_id": endpoint_owner_id},
+            )
             try:
                 frame = json.loads(raw_message)
             except json.JSONDecodeError:
@@ -193,8 +274,16 @@ class LacpClient:
                 future = self._pending_requests.pop(request_id)
                 if not future.done():
                     future.set_result(frame)
+                registry.mark_progress(
+                    asyncio.current_task() or f"lacp-websocket-reader-{endpoint_owner_id}",
+                    diagnostic_context={"phase": "reader.pending_response", "endpoint_owner_id": endpoint_owner_id},
+                )
                 continue
             if frame.get("type") == "message":
+                registry.mark_progress(
+                    asyncio.current_task() or f"lacp-websocket-reader-{endpoint_owner_id}",
+                    diagnostic_context={"phase": "reader.message_frame", "endpoint_owner_id": endpoint_owner_id},
+                )
                 await self._handle_message_frame(frame)
 
     async def _handle_message_frame(self, frame: dict[str, Any]) -> None:

@@ -193,7 +193,7 @@ def create_app(
     from agent_runtime.logs_management.north_gateway.logs_management_rest_adapter import (
         create_logs_management_router,
     )
-    from agent_runtime.runtime_health import EventLoopLagMonitor
+    from agent_runtime.runtime_health import EventLoopLagMonitor, runtime_task_health_summary
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
         runtime_network_monitor,
@@ -940,6 +940,7 @@ def create_app(
             "status": "ok",
             "event_loop": event_loop_monitor.snapshot(),
             "network": runtime_network_monitor.snapshot(),
+            "runtime_tasks": runtime_task_health_summary(),
         }
 
     app.include_router(

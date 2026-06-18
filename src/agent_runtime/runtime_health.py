@@ -11,10 +11,94 @@ from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_
 
 logger = logging.getLogger(__name__)
 
+RUNTIME_TASK_STALE_PROGRESS_SECONDS = 300.0
+RUNTIME_TASK_STALE_SUMMARY_LIMIT = 20
+RUNTIME_TASK_CANCELLING_SUMMARY_LIMIT = 20
+RUNTIME_TASK_RECENT_TERMINAL_SUMMARY_LIMIT = 10
+
 
 def _current_task_name() -> str | None:
     task = asyncio.current_task()
     return task.get_name() if task is not None else None
+
+
+def runtime_task_health_summary(
+    *,
+    stale_progress_seconds: float = RUNTIME_TASK_STALE_PROGRESS_SECONDS,
+    stale_limit: int = RUNTIME_TASK_STALE_SUMMARY_LIMIT,
+    cancelling_limit: int = RUNTIME_TASK_CANCELLING_SUMMARY_LIMIT,
+    recent_terminal_limit: int = RUNTIME_TASK_RECENT_TERMINAL_SUMMARY_LIMIT,
+) -> dict[str, Any]:
+    """Return a compact, sanitized RuntimeTaskRegistry diagnostic summary.
+
+    The health endpoint must stay backwards-compatible and bounded, so this helper
+    exposes aggregate counts and selected task identifiers/status fields only. It
+    intentionally does not include raw diagnostic_context or raw error text.
+    Stale-progress entries are diagnostic signals, not automatic health failures.
+    """
+    registry_snapshot = get_runtime_task_registry().snapshot(include_completed=True)
+    tasks = list(registry_snapshot.get("tasks") or [])
+    active_tasks = [task for task in tasks if not bool((task.get("health_snapshot") or {}).get("terminal"))]
+    stale_tasks = [
+        task
+        for task in active_tasks
+        if _seconds_since_progress(task) is not None
+        and _seconds_since_progress(task) >= stale_progress_seconds
+    ]
+    cancelling_tasks = [task for task in active_tasks if task.get("status") == "cancelling"]
+    terminal_tasks = [task for task in tasks if bool((task.get("health_snapshot") or {}).get("terminal"))]
+
+    return {
+        "total_count": int(registry_snapshot.get("total_count") or 0),
+        "active_count": int(registry_snapshot.get("active_count") or 0),
+        "by_status": dict(registry_snapshot.get("by_status") or {}),
+        "active_by_owner": dict(registry_snapshot.get("active_by_owner") or {}),
+        "active_by_class": dict(registry_snapshot.get("active_by_class") or {}),
+        "stale_progress_seconds": stale_progress_seconds,
+        "stale_progress_count": len(stale_tasks),
+        "stale_progress_tasks": [
+            _runtime_task_summary_item(task)
+            for task in sorted(stale_tasks, key=lambda item: _seconds_since_progress(item) or 0, reverse=True)[:stale_limit]
+        ],
+        "cancelling_count": len(cancelling_tasks),
+        "cancelling_tasks": [
+            _runtime_task_summary_item(task)
+            for task in sorted(cancelling_tasks, key=lambda item: item.get("cancel_requested_at") or "")[:cancelling_limit]
+        ],
+        "recent_terminal_tasks": [
+            _runtime_task_summary_item(task)
+            for task in sorted(terminal_tasks, key=lambda item: item.get("completed_at") or "", reverse=True)[:recent_terminal_limit]
+        ],
+    }
+
+
+def _seconds_since_progress(task: dict[str, Any]) -> float | None:
+    health_snapshot = task.get("health_snapshot")
+    if not isinstance(health_snapshot, dict):
+        return None
+    value = health_snapshot.get("seconds_since_progress")
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _runtime_task_summary_item(task: dict[str, Any]) -> dict[str, Any]:
+    health_snapshot = task.get("health_snapshot") if isinstance(task.get("health_snapshot"), dict) else {}
+    return {
+        "task_id": task.get("task_id"),
+        "task_name": task.get("task_name"),
+        "owner_type": task.get("owner_type"),
+        "owner_id": task.get("owner_id"),
+        "task_class": task.get("task_class"),
+        "status": task.get("status"),
+        "started_at": task.get("started_at"),
+        "last_progress_at": task.get("last_progress_at"),
+        "completed_at": task.get("completed_at"),
+        "cancel_requested_at": task.get("cancel_requested_at"),
+        "stop_requested_at": task.get("stop_requested_at"),
+        "runtime_seconds": health_snapshot.get("runtime_seconds"),
+        "seconds_since_progress": health_snapshot.get("seconds_since_progress"),
+        "last_error_type": task.get("last_error_type"),
+        "done_callback_error_type": task.get("done_callback_error_type"),
+    }
 
 
 @dataclass(slots=True)

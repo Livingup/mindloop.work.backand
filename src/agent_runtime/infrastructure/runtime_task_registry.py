@@ -20,6 +20,31 @@ logger = logging.getLogger(__name__)
 _MAX_CONTEXT_VALUE_LENGTH = 500
 _DEFAULT_COMPLETED_TASK_RETENTION = 256
 
+RUNTIME_TASK_REGISTRY_REQUIRED_TASK_CATEGORIES = (
+    "long_lived_background_worker",
+    "reconnect_or_subscription_owner",
+    "cross_request_or_cross_session_task",
+    "shutdown_critical_task",
+    "health_relevant_task",
+)
+RUNTIME_TASK_REGISTRY_DIRECT_CREATE_TASK_EXCEPTIONS = (
+    "request_local_helper",
+    "request_local_anext_subscription_driver",
+    "short_lived_fan_out_helper",
+    "higher_level_lifecycle_bound_task",
+)
+RUNTIME_TASK_REGISTRY_EXCEPTION_MINIMUM_REQUIREMENTS = (
+    "owner coroutine/request is explicit",
+    "lifecycle cannot outlive the owner coroutine/request",
+    "cancellation and cleanup happen in the same owner boundary",
+    "nearby code or admission policy explains why registry ownership would change semantics",
+)
+RUNTIME_TASK_REGISTRY_OWNER_NAMING_RULES = {
+    "owner_type": "stable subsystem label such as mcp_session_manager, lacp_client, communication_sse, agent_execution_engine",
+    "owner_id": "sanitized resource identity such as service_id, global, scene_id, task_id, terminal_id, or a non-secret connection id",
+    "task_class": "semantic lifecycle role such as reconnect_loop, connection_owner, client_run_loop, websocket_reader, poller, watcher",
+}
+
 
 class RuntimeTaskStatus(str, Enum):
     RUNNING = "running"
@@ -214,8 +239,31 @@ def _sanitize_error_text(error: str | None) -> str | None:
     return text
 
 
+def runtime_task_registry_admission_policy() -> dict[str, Any]:
+    """Return the Stage-4 admission rules for Runtime-managed asyncio tasks.
+
+    Required registry enrollment covers long-lived, reconnect/subscription-owner,
+    cross-request/session, shutdown-critical, and health-relevant background tasks.
+    Direct ``asyncio.create_task`` remains acceptable only for request-local helper
+    tasks whose owner coroutine also owns cancellation and cleanup; communication
+    SSE ``anext(subscription)`` drivers are the canonical Stage-4 exception.
+    """
+    return {
+        "required_registry_categories": list(RUNTIME_TASK_REGISTRY_REQUIRED_TASK_CATEGORIES),
+        "direct_create_task_exceptions": list(RUNTIME_TASK_REGISTRY_DIRECT_CREATE_TASK_EXCEPTIONS),
+        "exception_minimum_requirements": list(RUNTIME_TASK_REGISTRY_EXCEPTION_MINIMUM_REQUIREMENTS),
+        "owner_naming_rules": dict(RUNTIME_TASK_REGISTRY_OWNER_NAMING_RULES),
+    }
+
+
 class RuntimeTaskRegistry:
-    """Low-intrusion lifecycle registry for Runtime background asyncio tasks."""
+    """Low-intrusion lifecycle registry for Runtime background asyncio tasks.
+
+    New Runtime background tasks must be checked against
+    :func:`runtime_task_registry_admission_policy` before using raw
+    ``asyncio.create_task``. Registry-managed tasks must provide stable
+    ``owner_type``, sanitized ``owner_id``, and semantic ``task_class`` values.
+    """
 
     def __init__(self, *, completed_task_retention: int = _DEFAULT_COMPLETED_TASK_RETENTION) -> None:
         self._records: dict[str, _RuntimeTaskRecord] = {}
