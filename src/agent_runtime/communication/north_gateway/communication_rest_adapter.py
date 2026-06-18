@@ -28,6 +28,7 @@ from agent_runtime.runtime_network_monitor import (
 
 COMMUNICATION_SSE_EVENT_TYPE = "communication.message"
 COMMUNICATION_SSE_PING_EVENT_TYPE = "communication.ping"
+COMMUNICATION_SSE_KEEPALIVE_SECONDS = 15
 
 
 class CommunicationStreamCreateBody(BaseModel):
@@ -180,7 +181,7 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
             gateway.get_stream(stream_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"通信流不存在: {stream_id}")
-        effective_after_seq = max(after_seq, _last_event_id_to_seq(request.headers.get("last-event-id")))
+        effective_after_seq = _effective_after_seq(after_seq, request.headers.get("last-event-id"))
 
         async def event_generator() -> AsyncIterator[str]:
             active_sse = runtime_network_monitor.begin_sse_connection()
@@ -194,6 +195,8 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                 **runtime_network_monitor.snapshot(),
             })
             subscription = gateway.subscribe_messages(stream_id, after_seq=effective_after_seq)
+            # Request-local helper task: the SSE generator owns cancellation and cleanup so keepalive
+            # timeouts, disconnects, and subscription.aclose() stay in the same request boundary.
             next_message = asyncio.create_task(anext(subscription))
             sent_count = 0
             keepalive_count = 0
@@ -203,7 +206,7 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                 while True:
                     done, _pending = await asyncio.wait(
                         {next_message},
-                        timeout=15,
+                        timeout=COMMUNICATION_SSE_KEEPALIVE_SECONDS,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if await request.is_disconnected():
@@ -321,6 +324,11 @@ def _format_sse_ping(*, stream_id: str, sent_count: int, keepalive_count: int) -
         separators=(",", ":"),
     )
     return f"event: {COMMUNICATION_SSE_PING_EVENT_TYPE}\ndata: {payload}\n\n"
+
+
+def _effective_after_seq(after_seq: int, last_event_id: str | None) -> int:
+    """计算 SSE 断线恢复游标：query after_seq 与 Last-Event-ID 取较大有效 seq。"""
+    return max(after_seq, _last_event_id_to_seq(last_event_id), 0)
 
 
 def _last_event_id_to_seq(value: str | None) -> int:

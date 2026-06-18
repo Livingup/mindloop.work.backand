@@ -447,6 +447,8 @@ class CommunicationService:
         )
         cursor = max(after_seq, 0)
         subscription = self._event_hub.subscribe(stream_id, after_seq=cursor)
+        # Request-local helper task: subscribe_messages owns cancellation/aclose so replay, gap-fill,
+        # and disconnect cleanup remain ordered inside the consuming SSE/request coroutine.
         next_live_message = asyncio.create_task(anext(subscription))
         await asyncio.sleep(0)
         try:
