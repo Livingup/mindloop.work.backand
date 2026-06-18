@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
@@ -59,6 +61,7 @@ from agent_runtime.conversation_message.message.models import Conversation, Imag
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
@@ -75,6 +78,71 @@ class _SectionWorkerRun:
     worker_name: str
     section: str
     system_prompt: str
+
+
+def _mark_context_compression_task_progress(
+    job: CompressionJob,
+    *,
+    phase: str,
+    worker: _SectionWorkerRun | None = None,
+    worker_count: int | None = None,
+    pending_worker_count: int | None = None,
+    completed_worker_count: int | None = None,
+    cancelled_worker_count: int | None = None,
+    reason: str | None = None,
+    error_type: str | None = None,
+    duration_ms: int | None = None,
+    input_mode: str | None = None,
+) -> None:
+    """Best-effort Registry progress for the owner task running a compression job.
+
+    The section workers themselves remain job-local structured-concurrency helper
+    tasks.  When the caller is already Registry-managed, this records bounded
+    job-level phases on that owner task; otherwise mark_progress is a no-op.
+    """
+    task = asyncio.current_task()
+    if task is None:
+        return
+    worker_id = (
+        context_compression_worker_id(worker.worker_name, "section_worker", worker.section)
+        if worker is not None
+        else None
+    )
+    diagnostic_context: dict[str, Any] = {
+        "phase": phase,
+        "job_id": job.job_id,
+        "agent_task_id": job.task_id,
+        "agent_instance_id": job.agent_instance_id,
+        "root_conversation_id": job.root_conversation_id,
+        "source_conversation_id": job.source_conversation_id,
+        "compression_index": job.compression_index,
+        "input_mode": input_mode or job.input_mode,
+    }
+    if worker_count is not None:
+        diagnostic_context["worker_count"] = worker_count
+    if pending_worker_count is not None:
+        diagnostic_context["pending_worker_count"] = pending_worker_count
+    if completed_worker_count is not None:
+        diagnostic_context["completed_worker_count"] = completed_worker_count
+    if cancelled_worker_count is not None:
+        diagnostic_context["cancelled_worker_count"] = cancelled_worker_count
+    if worker is not None:
+        diagnostic_context.update(
+            {
+                "worker_id": worker_id,
+                "worker_name": worker.worker_name,
+                "worker_role": "section_worker",
+                "output_section": worker.section,
+            }
+        )
+    if reason is not None:
+        diagnostic_context["reason"] = reason
+    if error_type is not None:
+        diagnostic_context["error_type"] = error_type
+    if duration_ms is not None:
+        diagnostic_context["duration_ms"] = duration_ms
+    with suppress(Exception):
+        get_runtime_task_registry().mark_progress(task, diagnostic_context=diagnostic_context)
 
 
 class ContextCompressionService:
@@ -296,6 +364,15 @@ class ContextCompressionService:
             )
             for worker_name, section in SECTION_WORKERS
         )
+        _mark_context_compression_task_progress(
+            job,
+            phase="section_workers.queued",
+            worker_count=len(workers),
+            pending_worker_count=len(workers),
+            completed_worker_count=0,
+            cancelled_worker_count=0,
+            input_mode=input_mode,
+        )
         for worker in workers:
             await self._publish_section_worker_lifecycle_event(
                 communication_context,
@@ -305,6 +382,13 @@ class ContextCompressionService:
                 input_mode=input_mode,
                 reason="waiting_for_concurrent_start",
             )
+        # Stage 8/P1.2 protected direct-task exception: these section workers are
+        # short-lived, job-local structured-concurrency helpers.  This owner
+        # coroutine creates every worker, waits with FIRST_EXCEPTION, cancels
+        # siblings before cleanup, and gathers remaining tasks before returning.
+        # Do not mechanically migrate per-worker tasks into RuntimeTaskRegistry;
+        # job-level Registry progress above/below is only best-effort observation.
+        started_at = time.perf_counter()
         tasks = {
             asyncio.create_task(
                 self._run_one_section_worker(
@@ -317,19 +401,53 @@ class ContextCompressionService:
                     communication_context=communication_context,
                     interrupt_checker=interrupt_checker,
                     request_canceller_observer=request_canceller_observer,
-                )
+                ),
+                name=f"context-compression-section-worker-{context_compression_worker_id(worker.worker_name, 'section_worker', worker.section)}",
             ): worker
             for worker in workers
         }
         pending = set(tasks)
+        completed_worker_count = 0
+        cancelled_worker_count = 0
+        _mark_context_compression_task_progress(
+            job,
+            phase="section_workers.started",
+            worker_count=len(workers),
+            pending_worker_count=len(pending),
+            completed_worker_count=completed_worker_count,
+            cancelled_worker_count=cancelled_worker_count,
+            input_mode=input_mode,
+        )
         try:
             while pending:
+                _mark_context_compression_task_progress(
+                    job,
+                    phase="section_workers.waiting",
+                    worker_count=len(workers),
+                    pending_worker_count=len(pending),
+                    completed_worker_count=completed_worker_count,
+                    cancelled_worker_count=cancelled_worker_count,
+                    input_mode=input_mode,
+                )
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_EXCEPTION)
                 failure_error: BaseException | None = None
                 cancellation_error: BaseException | None = None
                 for task in done:
+                    worker = tasks[task]
                     try:
                         await task
+                        completed_worker_count += 1
+                        _mark_context_compression_task_progress(
+                            job,
+                            phase="section_workers.worker_completed",
+                            worker=worker,
+                            worker_count=len(workers),
+                            pending_worker_count=len(pending),
+                            completed_worker_count=completed_worker_count,
+                            cancelled_worker_count=cancelled_worker_count,
+                            duration_ms=int((time.perf_counter() - started_at) * 1000),
+                            input_mode=input_mode,
+                        )
                     except LlmRequestCancelled as exc:
                         cancellation_error = cancellation_error or exc
                     except asyncio.CancelledError as exc:
@@ -339,13 +457,39 @@ class ContextCompressionService:
                 first_error = failure_error or cancellation_error
                 if first_error is not None:
                     self._job_store.update_status(job.job_id, "failed" if failure_error is not None else "cancelled")
+                    reason = "sibling_worker_failed" if job.status == "failed" else "context_compression_cancelled"
+                    _mark_context_compression_task_progress(
+                        job,
+                        phase="section_workers.first_exception",
+                        worker_count=len(workers),
+                        pending_worker_count=len(pending),
+                        completed_worker_count=completed_worker_count,
+                        cancelled_worker_count=cancelled_worker_count,
+                        reason=reason,
+                        error_type=first_error.__class__.__name__,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        input_mode=input_mode,
+                    )
+                    cancelled_worker_count += len(pending)
                     await self._cancel_pending_section_workers(
                         job=job,
                         pending_tasks=pending,
                         task_workers=tasks,
                         input_mode=input_mode,
                         communication_context=communication_context,
-                        reason="sibling_worker_failed" if job.status == "failed" else "context_compression_cancelled",
+                        reason=reason,
+                    )
+                    _mark_context_compression_task_progress(
+                        job,
+                        phase="section_workers.sibling_cancelled",
+                        worker_count=len(workers),
+                        pending_worker_count=0,
+                        completed_worker_count=completed_worker_count,
+                        cancelled_worker_count=cancelled_worker_count,
+                        reason=reason,
+                        error_type=first_error.__class__.__name__,
+                        duration_ms=int((time.perf_counter() - started_at) * 1000),
+                        input_mode=input_mode,
                     )
                     pending = set()
                     if failure_error is None and isinstance(first_error, asyncio.CancelledError):
@@ -353,6 +497,19 @@ class ContextCompressionService:
                     raise first_error
         except asyncio.CancelledError:
             self._job_store.update_status(job.job_id, "cancelled")
+            cancelled_worker_count += len(pending)
+            _mark_context_compression_task_progress(
+                job,
+                phase="section_workers.cancelled",
+                worker_count=len(workers),
+                pending_worker_count=len(pending),
+                completed_worker_count=completed_worker_count,
+                cancelled_worker_count=cancelled_worker_count,
+                reason="context_compression_cancelled",
+                error_type="CancelledError",
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                input_mode=input_mode,
+            )
             await self._cancel_pending_section_workers(
                 job=job,
                 pending_tasks=pending,
@@ -364,10 +521,21 @@ class ContextCompressionService:
             raise
         finally:
             remaining = [task for task in tasks if not task.done()]
+            cancelled_worker_count += len(remaining)
             if remaining:
                 for task in remaining:
                     task.cancel()
                 await asyncio.gather(*remaining, return_exceptions=True)
+            _mark_context_compression_task_progress(
+                job,
+                phase="section_workers.cleanup_completed",
+                worker_count=len(workers),
+                pending_worker_count=0,
+                completed_worker_count=completed_worker_count,
+                cancelled_worker_count=cancelled_worker_count,
+                duration_ms=int((time.perf_counter() - started_at) * 1000),
+                input_mode=input_mode,
+            )
 
     async def _run_one_section_worker(
         self,
