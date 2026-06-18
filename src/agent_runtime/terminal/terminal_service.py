@@ -15,7 +15,7 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
     PublishCommunicationMessageRequest,
 )
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
@@ -473,6 +473,7 @@ class TerminalService:
                 [chunk.chunk for chunk in terminal_chunks],
                 operation="terminal.read_output.render_tail",
                 caller="TerminalService.read_output",
+                pool=BlockingPool.TERMINAL_RENDER,
                 log=logger,
                 diagnostic_context={
                     "terminal_id": terminal_id,
@@ -512,6 +513,7 @@ class TerminalService:
             [chunk.chunk for chunk in chunks],
             operation="terminal.read_output.render",
             caller="TerminalService.read_output",
+            pool=BlockingPool.TERMINAL_RENDER,
             log=logger,
             diagnostic_context={
                 "terminal_id": terminal_id,

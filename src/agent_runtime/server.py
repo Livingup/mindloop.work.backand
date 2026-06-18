@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread, shutdown_blocking_executors
 
 from agent_runtime.auth.runtime_access_policy import (
     LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
@@ -324,6 +324,7 @@ def create_app(
                 codex_oauth_service.ensure_builtin_provider,
                 operation="server.ensure_codex_builtin_provider",
                 caller="create_app.ensure_codex_builtin_provider",
+                pool=BlockingPool.MAINTENANCE,
                 log=logger,
                 diagnostic_context={
                     "component": "codex_oauth_service",
@@ -513,6 +514,7 @@ def create_app(
                 DetachSceneRequest(workspace_path=session.workspace_path),
                 operation="server.scene.detach_expired",
                 caller="create_app._detach_expired_scene",
+                pool=BlockingPool.MAINTENANCE,
                 log=logger,
                 diagnostic_context={
                     "scene_id": session.scene_id,
@@ -651,6 +653,7 @@ def create_app(
             runtime_network_monitor.stop()
             with suppress(Exception, asyncio.CancelledError):
                 await execution_loop_logger.stop()
+            shutdown_blocking_executors(wait=False, cancel_futures=False)
             logger.info(
                 "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
                 "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",

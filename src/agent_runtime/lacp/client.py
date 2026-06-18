@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from uuid import uuid4
 
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.lacp.config import LacpConfig
 from agent_runtime.lacp.models import (
     LacpClientStatus,
@@ -275,6 +275,7 @@ class LacpClient:
             config.connect_timeout_seconds,
             operation="lacp.resolve_ws_endpoint.fetch_metadata",
             caller="LacpClient._resolve_ws_endpoint",
+            pool=BlockingPool.NETWORK,
             log=logger,
             slow_execution_seconds=max(config.connect_timeout_seconds, 1.0),
             diagnostic_context={

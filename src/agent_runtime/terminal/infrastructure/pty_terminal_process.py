@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.terminal.terminal_process import (
     TerminalExitHandler,
     TerminalOutputHandler,
@@ -318,6 +318,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     session.winpty,
                     operation="terminal.windows_pty.read",
                     caller="PtyTerminalProcessManager._watch_windows_terminal",
+                    pool=BlockingPool.TERMINAL,
                     log=logger,
                     diagnostic_context={
                         "terminal_id": session.terminal_id,
@@ -633,6 +634,7 @@ async def _write_terminal(session: _TerminalSession, text: str, *, operation: st
                 text,
                 operation=operation,
                 caller="_write_terminal",
+                pool=BlockingPool.TERMINAL,
                 log=logger,
                 diagnostic_context={
                     "terminal_id": session.terminal_id,
@@ -685,6 +687,7 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
                 True,
                 operation="terminal.windows_pty.close",
                 caller="_close_terminal_session",
+                pool=BlockingPool.TERMINAL,
                 log=logger,
                 diagnostic_context={
                     "terminal_id": session.terminal_id,
@@ -700,6 +703,7 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
                     session.winpty.close,
                     operation="terminal.windows_pty.close",
                     caller="_close_terminal_session",
+                    pool=BlockingPool.TERMINAL,
                     log=logger,
                     diagnostic_context={
                         "terminal_id": session.terminal_id,
@@ -717,6 +721,7 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
                         session.winpty.kill,
                         operation="terminal.windows_pty.kill",
                         caller="_close_terminal_session",
+                        pool=BlockingPool.TERMINAL,
                         log=logger,
                         diagnostic_context={
                             "terminal_id": session.terminal_id,
@@ -744,6 +749,7 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
                     session.winpty.kill,
                     operation="terminal.windows_pty.kill",
                     caller="_close_terminal_session",
+                    pool=BlockingPool.TERMINAL,
                     log=logger,
                     diagnostic_context={
                         "terminal_id": session.terminal_id,

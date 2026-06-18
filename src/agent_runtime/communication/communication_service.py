@@ -15,7 +15,7 @@ from agent_runtime.communication.communication_message import CommunicationMessa
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
 from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 
 logger = logging.getLogger(__name__)
 _COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS = 1.0
@@ -205,6 +205,7 @@ class CommunicationService:
                 self._append_message_sync_with_diagnostics,
                 operation="communication.publish_message.append",
                 caller="CommunicationService.publish_message",
+                pool=BlockingPool.COMMUNICATION,
                 log=logger,
                 diagnostic_context={
                     "trace_id": trace_id,
@@ -440,6 +441,7 @@ class CommunicationService:
             stream_id,
             operation="communication.subscribe.get_stream",
             caller="CommunicationService.subscribe_messages",
+            pool=BlockingPool.COMMUNICATION,
             log=logger,
             diagnostic_context={"stream_id": stream_id, "after_seq": after_seq},
         )
@@ -454,6 +456,7 @@ class CommunicationService:
                     stream_id,
                     operation="communication.subscribe.replay_messages",
                     caller="CommunicationService.subscribe_messages",
+                    pool=BlockingPool.COMMUNICATION,
                     log=logger,
                     diagnostic_context={"stream_id": stream_id, "cursor": cursor, "limit": 5000},
                     after_seq=cursor,
@@ -479,6 +482,7 @@ class CommunicationService:
                         stream_id,
                         operation="communication.subscribe.gap_messages",
                         caller="CommunicationService.subscribe_messages",
+                        pool=BlockingPool.COMMUNICATION,
                         log=logger,
                         diagnostic_context={"stream_id": stream_id, "cursor": cursor, "live_seq": message.seq, "limit": 5000},
                         after_seq=cursor,

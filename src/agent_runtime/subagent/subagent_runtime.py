@@ -21,7 +21,7 @@ from agent_runtime.conversation_message.message.models import ROLE_USER, TextPar
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 
 if TYPE_CHECKING:
@@ -254,6 +254,7 @@ class SubagentRuntime:
             requests,
             operation="subagent.resolve_url_attachments.create_resources",
             caller="SubagentRuntime._resolve_url_attachments",
+            pool=BlockingPool.FILE_RESOURCE,
             log=logger,
             diagnostic_context={
                 "attachment_count": len(attachments),
@@ -265,6 +266,7 @@ class SubagentRuntime:
             [item.resource_id for item in created],
             operation="subagent.resolve_url_attachments.get_resources",
             caller="SubagentRuntime._resolve_url_attachments",
+            pool=BlockingPool.FILE_RESOURCE,
             log=logger,
             diagnostic_context={
                 "attachment_count": len(attachments),

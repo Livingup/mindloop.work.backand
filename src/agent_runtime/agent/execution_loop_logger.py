@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -497,6 +497,7 @@ class AgentExecutionLoopLogger:
                 snapshot,
                 operation="agent.execution_loop_logger.write_snapshot",
                 caller="AgentExecutionLoopLogger._write_instance_snapshot",
+                pool=BlockingPool.DIAGNOSTIC,
                 log=logger,
                 diagnostic_context={
                     "instance_id": instance_id,

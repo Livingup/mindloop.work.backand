@@ -15,7 +15,7 @@ from psycopg.types.json import Jsonb
 
 from agent_runtime.cloud_user_config.config import CloudUserConfigDatabaseConfig
 from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 
 logger = logging.getLogger("agent_runtime.cloud_user_config.postgres_store")
 
@@ -364,6 +364,7 @@ class PostgresUserConfigStore:
                 self.reload_cache_from_database,
                 operation="cloud_user_config.postgres.reload_cache_from_database",
                 caller="PostgresCloudUserConfigStore._poll_database_revision",
+                pool=BlockingPool.DB_BLOCKING,
                 log=logger,
                 diagnostic_context={"poll_interval_seconds": interval_seconds, "poll_phase": "startup_reload"},
             )
@@ -376,6 +377,7 @@ class PostgresUserConfigStore:
                     self.refresh_cache_if_revision_changed,
                     operation="cloud_user_config.postgres.refresh_cache_if_revision_changed",
                     caller="PostgresCloudUserConfigStore._poll_database_revision",
+                    pool=BlockingPool.DB_BLOCKING,
                     log=logger,
                     diagnostic_context={"poll_interval_seconds": interval_seconds, "poll_phase": "revision_poll"},
                 )

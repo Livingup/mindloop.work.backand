@@ -12,7 +12,7 @@ import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
-from agent_runtime.infrastructure.asyncio_diagnostics import monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.mcp.mcp_client.mcp_metadata_cache import (
     JsonMcpMetadataSnapshotRepository,
     McpCachedResource,
@@ -116,6 +116,7 @@ class McpMetadataRefreshManager:
             self._snapshot_repository.load_all,
             operation="mcp.metadata_cache.load_all",
             caller="McpMetadataRefreshManager.load_persisted_metadata",
+            pool=BlockingPool.DIAGNOSTIC,
             log=logger,
             diagnostic_context={"cache_operation": "load_all"},
         )
@@ -462,6 +463,7 @@ class McpMetadataRefreshManager:
                 snapshot,
                 operation="mcp.metadata_cache.save",
                 caller="McpMetadataRefreshManager._schedule_save",
+                pool=BlockingPool.DIAGNOSTIC,
                 log=logger,
                 diagnostic_context={"service_id": snapshot.service_id, "cache_operation": "save"},
             ),
@@ -477,6 +479,7 @@ class McpMetadataRefreshManager:
                 service_id,
                 operation="mcp.metadata_cache.delete",
                 caller="McpMetadataRefreshManager._schedule_delete",
+                pool=BlockingPool.DIAGNOSTIC,
                 log=logger,
                 diagnostic_context={"service_id": service_id, "cache_operation": "delete"},
             ),
