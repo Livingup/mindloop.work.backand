@@ -395,6 +395,286 @@ def test_runtime_concurrency_health_snapshot_detail_is_bounded_and_keeps_operati
     assert set(operation) == {"pool", "operation", "submitted", "pending", "active", "completed", "failed", "cancelled"}
 
 
+
+def _empty_runtime_task_summary() -> dict[str, object]:
+    return {
+        "total_count": 0,
+        "active_count": 0,
+        "by_status": {},
+        "active_by_owner": {},
+        "active_by_class": {},
+        "stale_progress_seconds": 300.0,
+        "stale_progress_count": 0,
+        "stale_progress_tasks": [],
+        "cancelling_count": 0,
+        "cancelling_tasks": [],
+        "recent_terminal_tasks": [],
+    }
+
+
+def test_runtime_concurrency_health_snapshot_separates_logical_and_deduped_physical_executor_totals() -> None:
+    blocking_scheduler = {
+        "pools": {
+            "file_resource": {
+                "submitted": 10,
+                "pending": 2,
+                "active": 5,
+                "completed": 3,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {},
+            },
+            "conversation": {
+                "submitted": 8,
+                "pending": 4,
+                "active": 3,
+                "completed": 1,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {},
+            },
+            "communication": {
+                "submitted": 2,
+                "pending": 0,
+                "active": 1,
+                "completed": 1,
+                "failed": 1,
+                "cancelled": 0,
+                "operations": {},
+            },
+        },
+        "executors": {
+            "file_resource": {
+                "max_workers": 8,
+                "isolated": False,
+                "executor_pool": "default",
+                "created": True,
+                "runtime": {
+                    "executor_id": "0xabc123",
+                    "max_workers": 8,
+                    "work_queue_size": 5,
+                    "thread_count": 8,
+                    "alive_thread_count": 7,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            },
+            "conversation": {
+                "max_workers": 8,
+                "isolated": False,
+                "executor_pool": "default",
+                "created": True,
+                "runtime": {
+                    "executor_id": "0xabc123",
+                    "max_workers": 8,
+                    "work_queue_size": 5,
+                    "thread_count": 8,
+                    "alive_thread_count": 7,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            },
+            "communication": {
+                "max_workers": 2,
+                "isolated": True,
+                "executor_pool": "communication",
+                "created": True,
+                "runtime": {
+                    "executor_id": "0xdef456",
+                    "max_workers": 2,
+                    "work_queue_size": 1,
+                    "thread_count": 2,
+                    "alive_thread_count": 2,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            },
+        },
+    }
+
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={"status": "ok", "monitor_running": True},
+        network_snapshot={},
+        runtime_task_summary=_empty_runtime_task_summary(),
+        blocking_scheduler_snapshot=blocking_scheduler,
+        top_limit=10,
+    )
+
+    blocking = snapshot["blocking_scheduler"]
+    assert blocking["executor_count"] == 3
+    assert blocking["physical_executor_count"] == 2
+    assert blocking["logical_totals"]["active"] == 9
+    assert blocking["logical_totals"]["pending"] == 6
+    assert blocking["physical_executor_totals"]["executor_max_workers"] == 10
+    assert blocking["physical_executor_totals"]["executor_work_queue_size"] == 6
+    assert blocking["totals"]["active"] == 9
+    assert blocking["totals"]["pending"] == 6
+    assert blocking["totals"]["executor_max_workers"] == 10
+    assert blocking["totals"]["executor_work_queue_size"] == 6
+    assert snapshot["signals"]["blocking_scheduler"]["active_operations"] == 9
+    assert snapshot["signals"]["blocking_scheduler"]["pending_operations"] == 6
+    assert snapshot["signals"]["blocking_scheduler"]["executor_queue_size"] == 6
+    assert snapshot["signals"]["blocking_scheduler"]["executor_runtime_totals_deduped"] is True
+    assert snapshot["signals"]["blocking_scheduler"]["shared_executors_detected"] is True
+    assert snapshot["signals"]["blocking_scheduler"]["physical_executor_count"] == 2
+    assert snapshot["signals"]["blocking_scheduler"]["logical_executor_count"] == 3
+
+    executor_view = blocking["executor_view"]
+    assert executor_view["logical_executor_count"] == 3
+    assert executor_view["physical_executor_count"] == 2
+    assert executor_view["shared_executor_count"] == 1
+    assert executor_view["physical_totals_deduped"] is True
+
+    default_executor = next(
+        item for item in blocking["top_physical_executors"] if item["physical_executor_id"] == "default"
+    )
+    assert default_executor["executor"] == "default"
+    assert default_executor["executor_pool"] == "default"
+    assert default_executor["executor_role"] == "default_shared"
+    assert default_executor["logical_pool_count"] == 2
+    assert default_executor["logical_pools"] == ["file_resource", "conversation"]
+    assert default_executor["dedupe_identity_source"] == "executor_pool"
+    assert default_executor["dedupe_confident"] is True
+    assert default_executor["max_workers"] == 8
+    assert default_executor["work_queue_size"] == 5
+    assert "0xabc123" not in str(snapshot)
+
+
+def test_runtime_concurrency_health_snapshot_keeps_isolated_executors_separate_and_bounded() -> None:
+    blocking_scheduler = {
+        "pools": {
+            f"pool-{index}": {
+                "submitted": 1,
+                "pending": 0,
+                "active": 1,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {},
+            }
+            for index in range(5)
+        },
+        "executors": {
+            f"pool-{index}": {
+                "max_workers": 1,
+                "isolated": True,
+                "executor_pool": f"pool-{index}",
+                "created": True,
+                "runtime": {
+                    "executor_id": f"0x{index + 1:04x}",
+                    "max_workers": 1,
+                    "work_queue_size": index,
+                    "thread_count": 1,
+                    "alive_thread_count": 1,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            }
+            for index in range(5)
+        },
+    }
+
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={"status": "ok", "monitor_running": True},
+        network_snapshot={},
+        runtime_task_summary=_empty_runtime_task_summary(),
+        blocking_scheduler_snapshot=blocking_scheduler,
+        top_limit=2,
+    )
+
+    blocking = snapshot["blocking_scheduler"]
+    assert blocking["executor_count"] == 5
+    assert blocking["physical_executor_count"] == 5
+    assert blocking["physical_executor_totals"]["executor_max_workers"] == 5
+    assert blocking["physical_executor_totals"]["executor_work_queue_size"] == 10
+    assert blocking["executor_view"]["shared_executor_count"] == 0
+    assert snapshot["signals"]["blocking_scheduler"]["shared_executors_detected"] is False
+    assert len(blocking["top_physical_executors"]) == 2
+    assert len(blocking["top_queued_executors"]) == 2
+    assert all(item["logical_pool_count"] == 1 for item in blocking["top_physical_executors"])
+    assert all(item["executor_role"] == "isolated_pool" for item in blocking["top_physical_executors"])
+    assert "0x0005" not in str(snapshot)
+    assert "0x0004" not in str(snapshot)
+
+
+def test_runtime_concurrency_health_snapshot_marks_inconsistent_shared_executor_runtime_values() -> None:
+    blocking_scheduler = {
+        "pools": {
+            "alpha": {
+                "submitted": 1,
+                "pending": 0,
+                "active": 1,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {},
+            },
+            "beta": {
+                "submitted": 1,
+                "pending": 0,
+                "active": 1,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {},
+            },
+        },
+        "executors": {
+            "alpha": {
+                "max_workers": 4,
+                "isolated": False,
+                "executor_pool": "default",
+                "created": True,
+                "runtime": {
+                    "max_workers": 4,
+                    "work_queue_size": 1,
+                    "thread_count": 3,
+                    "alive_thread_count": 2,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            },
+            "beta": {
+                "max_workers": 4,
+                "isolated": False,
+                "executor_pool": "default",
+                "created": True,
+                "runtime": {
+                    "max_workers": 4,
+                    "work_queue_size": 3,
+                    "thread_count": 4,
+                    "alive_thread_count": 4,
+                    "shutdown": True,
+                    "broken": "executor broken marker",
+                },
+            },
+        },
+    }
+
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={"status": "ok", "monitor_running": True},
+        network_snapshot={},
+        runtime_task_summary=_empty_runtime_task_summary(),
+        blocking_scheduler_snapshot=blocking_scheduler,
+        top_limit=5,
+    )
+
+    blocking = snapshot["blocking_scheduler"]
+    assert blocking["physical_executor_count"] == 1
+    assert blocking["physical_executor_totals"]["executor_work_queue_size"] == 3
+    assert blocking["physical_executor_totals"]["executor_thread_count"] == 4
+    assert blocking["physical_executor_totals"]["executor_alive_thread_count"] == 4
+    assert blocking["physical_executor_totals"]["executor_shutdown_count"] == 1
+    assert blocking["physical_executor_totals"]["executor_broken_count"] == 1
+    assert snapshot["signals"]["blocking_scheduler"]["executor_unavailable"] is True
+    assert snapshot["signals"]["blocking_scheduler"]["physical_executor_unavailable"] is True
+    assert snapshot["status"] == "degraded"
+    physical_executor = blocking["top_physical_executors"][0]
+    assert physical_executor["inconsistent_runtime_values"] is True
+    assert physical_executor["logical_pools"] == ["alpha", "beta"]
+    assert "executor broken marker" not in str(snapshot)
+
+
 class _LacpRegistrationRegistryLifecycleStub:
     def __init__(self) -> None:
         self.disconnected = False

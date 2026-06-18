@@ -22,6 +22,15 @@ RUNTIME_CONCURRENCY_DETAIL_MAX_LIMIT = 100
 RUNTIME_CONCURRENCY_RECENT_SECONDS = 300.0
 
 _BLOCKING_COUNTER_KEYS = ("submitted", "pending", "active", "completed", "failed", "cancelled")
+_PHYSICAL_EXECUTOR_TOTAL_KEYS = (
+    "executor_work_queue_size",
+    "executor_thread_count",
+    "executor_alive_thread_count",
+    "executor_max_workers",
+    "executor_shutdown_count",
+    "executor_broken_count",
+)
+_PHYSICAL_EXECUTOR_LOGICAL_POOL_LIMIT = 20
 _SENSITIVE_KEY_FRAGMENTS = (
     "authorization",
     "credential",
@@ -234,37 +243,44 @@ def _blocking_scheduler_concurrency_summary(
     pools = snapshot.get("pools") if isinstance(snapshot.get("pools"), dict) else {}
     executors = snapshot.get("executors") if isinstance(snapshot.get("executors"), dict) else {}
     pool_items = [_blocking_pool_summary(name, value) for name, value in pools.items() if isinstance(value, dict)]
-    executor_items = [
+    logical_executor_items = [
         _blocking_executor_summary(name, value) for name, value in executors.items() if isinstance(value, dict)
     ]
-    totals = {key: sum(_int_value(item.get(key)) for item in pool_items) for key in _BLOCKING_COUNTER_KEYS}
-    totals.update(
-        {
-            "executor_work_queue_size": sum(_int_value(item.get("work_queue_size")) for item in executor_items),
-            "executor_thread_count": sum(_int_value(item.get("thread_count")) for item in executor_items),
-            "executor_alive_thread_count": sum(_int_value(item.get("alive_thread_count")) for item in executor_items),
-            "executor_max_workers": sum(_int_value(item.get("max_workers")) for item in executor_items),
-            "executor_shutdown_count": sum(1 for item in executor_items if bool(item.get("shutdown"))),
-            "executor_broken_count": sum(1 for item in executor_items if bool(item.get("broken"))),
-        }
-    )
+    physical_executor_items = _physical_executor_summaries(executors, top_limit=top_limit)
+    logical_totals = {key: sum(_int_value(item.get(key)) for item in pool_items) for key in _BLOCKING_COUNTER_KEYS}
+    physical_executor_totals = _physical_executor_totals(physical_executor_items)
+    totals = {**logical_totals, **physical_executor_totals}
     operation_count = sum(
         len(value.get("operations") or {}) for value in pools.values() if isinstance(value, dict)
     )
+    unavailable_physical_executors = [
+        item for item in physical_executor_items if bool(item.get("shutdown")) or bool(item.get("broken"))
+    ][:top_limit]
     summary: dict[str, Any] = {
         "pool_count": len(pool_items),
-        "executor_count": len(executor_items),
+        "executor_count": len(logical_executor_items),
+        "physical_executor_count": len(physical_executor_items),
         "operation_count": operation_count,
         "totals": totals,
+        "logical_totals": logical_totals,
+        "physical_executor_totals": physical_executor_totals,
         "top_active_pools": _top_nonzero(pool_items, key_names=("active", "pending", "submitted"), limit=top_limit),
         "top_pending_pools": _top_nonzero(pool_items, key_names=("pending", "active", "submitted"), limit=top_limit),
         "top_failed_pools": _top_nonzero(pool_items, key_names=("failed", "cancelled", "submitted"), limit=top_limit),
         "top_queued_executors": _top_nonzero(
-            executor_items, key_names=("work_queue_size", "alive_thread_count", "thread_count"), limit=top_limit
+            physical_executor_items, key_names=("work_queue_size", "alive_thread_count", "thread_count"), limit=top_limit
         ),
-        "unavailable_executors": [
-            item for item in executor_items if bool(item.get("shutdown")) or bool(item.get("broken"))
-        ][:top_limit],
+        "unavailable_executors": unavailable_physical_executors,
+        "top_physical_executors": _top_items(
+            physical_executor_items,
+            key_names=("work_queue_size", "alive_thread_count", "thread_count", "max_workers"),
+            limit=top_limit,
+        ),
+        "unavailable_physical_executors": unavailable_physical_executors,
+        "executor_view": _executor_view_summary(
+            logical_executor_count=len(logical_executor_items),
+            physical_executor_items=physical_executor_items,
+        ),
     }
     if include_operations:
         summary["top_operations"] = _blocking_operation_summaries(
@@ -282,17 +298,188 @@ def _blocking_pool_summary(pool_name: str, value: dict[str, Any]) -> dict[str, A
 
 def _blocking_executor_summary(executor_name: str, value: dict[str, Any]) -> dict[str, Any]:
     runtime = value.get("runtime") if isinstance(value.get("runtime"), dict) else {}
+    identity = _physical_executor_identity(executor_name, value)
     return {
         "executor": _safe_label(executor_name),
+        "physical_executor_id": identity["public_id"],
         "executor_pool": _safe_label(value.get("executor_pool")),
+        "executor_role": _executor_role(executor_name, value),
         "isolated": bool(value.get("isolated")),
-        "max_workers": _int_value(value.get("max_workers")),
+        "max_workers": _runtime_int_value(runtime, "max_workers", fallback=value.get("max_workers")),
+        "work_queue_size": _int_value(runtime.get("work_queue_size")),
+        "thread_count": _int_value(runtime.get("thread_count")),
+        "alive_thread_count": _int_value(runtime.get("alive_thread_count")),
+        "shutdown": bool(runtime.get("shutdown")),
+        "broken": bool(runtime.get("broken")),
+        "dedupe_identity_source": identity["source"],
+        "dedupe_confident": bool(identity["confident"]),
+    }
+
+
+def _physical_executor_summaries(
+    executors: dict[str, Any],
+    *,
+    top_limit: int,
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    logical_pool_limit = min(top_limit, _PHYSICAL_EXECUTOR_LOGICAL_POOL_LIMIT)
+    for executor_name, value in executors.items():
+        if not isinstance(value, dict):
+            continue
+        runtime = value.get("runtime") if isinstance(value.get("runtime"), dict) else {}
+        if not _executor_runtime_created(value, runtime):
+            continue
+        identity = _physical_executor_identity(str(executor_name), value)
+        group = groups.get(identity["key"])
+        logical_pool_label = _safe_label(executor_name)
+        if group is None:
+            group = {
+                "executor": identity["public_id"],
+                "physical_executor_id": identity["public_id"],
+                "executor_pool": _safe_label(value.get("executor_pool")),
+                "executor_role": _executor_role(str(executor_name), value),
+                "isolated": bool(value.get("isolated")),
+                "logical_pool_count": 0,
+                "logical_pools": [],
+                "max_workers": 0,
+                "work_queue_size": 0,
+                "thread_count": 0,
+                "alive_thread_count": 0,
+                "shutdown": False,
+                "broken": False,
+                "dedupe_identity_source": identity["source"],
+                "dedupe_confident": bool(identity["confident"]),
+                "inconsistent_runtime_values": False,
+                "_has_runtime_values": False,
+            }
+            groups[identity["key"]] = group
+        group["logical_pool_count"] = _int_value(group.get("logical_pool_count")) + 1
+        if len(group["logical_pools"]) < logical_pool_limit:
+            group["logical_pools"].append(logical_pool_label)
+        if group.get("dedupe_identity_source") != identity["source"]:
+            group["dedupe_identity_source"] = "mixed"
+        group["dedupe_confident"] = bool(group.get("dedupe_confident")) and bool(identity["confident"])
+        if group.get("executor_role") != _executor_role(str(executor_name), value):
+            group["executor_role"] = "mixed"
+        if bool(group.get("isolated")) != bool(value.get("isolated")):
+            group["isolated"] = False
+        _merge_physical_executor_runtime(group, value, runtime)
+    summaries = []
+    for group in groups.values():
+        group.pop("_has_runtime_values", None)
+        summaries.append(group)
+    return summaries
+
+
+def _merge_physical_executor_runtime(group: dict[str, Any], value: dict[str, Any], runtime: dict[str, Any]) -> None:
+    candidate = {
+        "max_workers": _runtime_int_value(runtime, "max_workers", fallback=value.get("max_workers")),
         "work_queue_size": _int_value(runtime.get("work_queue_size")),
         "thread_count": _int_value(runtime.get("thread_count")),
         "alive_thread_count": _int_value(runtime.get("alive_thread_count")),
         "shutdown": bool(runtime.get("shutdown")),
         "broken": bool(runtime.get("broken")),
     }
+    has_runtime_values = bool(group.get("_has_runtime_values"))
+    for key in ("max_workers", "work_queue_size", "thread_count", "alive_thread_count"):
+        if has_runtime_values and _int_value(group.get(key)) != candidate[key]:
+            group["inconsistent_runtime_values"] = True
+        group[key] = max(_int_value(group.get(key)), candidate[key])
+    for key in ("shutdown", "broken"):
+        if has_runtime_values and bool(group.get(key)) != candidate[key]:
+            group["inconsistent_runtime_values"] = True
+        group[key] = bool(group.get(key)) or candidate[key]
+    group["_has_runtime_values"] = True
+
+
+def _physical_executor_totals(physical_executor_items: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "executor_work_queue_size": sum(_int_value(item.get("work_queue_size")) for item in physical_executor_items),
+        "executor_thread_count": sum(_int_value(item.get("thread_count")) for item in physical_executor_items),
+        "executor_alive_thread_count": sum(
+            _int_value(item.get("alive_thread_count")) for item in physical_executor_items
+        ),
+        "executor_max_workers": sum(_int_value(item.get("max_workers")) for item in physical_executor_items),
+        "executor_shutdown_count": sum(1 for item in physical_executor_items if bool(item.get("shutdown"))),
+        "executor_broken_count": sum(1 for item in physical_executor_items if bool(item.get("broken"))),
+    }
+
+
+def _executor_view_summary(
+    *,
+    logical_executor_count: int,
+    physical_executor_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    identity_sources = {str(item.get("dedupe_identity_source") or "unknown") for item in physical_executor_items}
+    return {
+        "logical_executor_count": logical_executor_count,
+        "physical_executor_count": len(physical_executor_items),
+        "shared_executor_count": sum(
+            1 for item in physical_executor_items if _int_value(item.get("logical_pool_count")) > 1
+        ),
+        "dedupe_identity_source": next(iter(identity_sources)) if len(identity_sources) == 1 else "mixed",
+        "dedupe_confident": all(bool(item.get("dedupe_confident")) for item in physical_executor_items),
+        "physical_totals_deduped": True,
+    }
+
+
+def _physical_executor_identity(executor_name: str, value: dict[str, Any]) -> dict[str, Any]:
+    for source in ("executor_id", "runtime_identity"):
+        raw_value = value.get(source)
+        if raw_value is not None and not _looks_like_raw_memory_identity(str(raw_value)):
+            return {
+                "key": f"{source}:{raw_value}",
+                "public_id": _safe_label(raw_value),
+                "source": source,
+                "confident": True,
+            }
+    executor_pool = value.get("executor_pool")
+    if executor_pool is not None:
+        return {
+            "key": f"executor_pool:{executor_pool}",
+            "public_id": _safe_label(executor_pool),
+            "source": "executor_pool",
+            "confident": True,
+        }
+    return {
+        "key": f"logical_executor_name_fallback:{executor_name}",
+        "public_id": _safe_label(executor_name),
+        "source": "logical_executor_name_fallback",
+        "confident": False,
+    }
+
+
+def _executor_role(executor_name: str, value: dict[str, Any]) -> str:
+    if bool(value.get("isolated")):
+        return "isolated_pool"
+    executor_pool = str(value.get("executor_pool") or "")
+    if executor_pool == "default":
+        return "default_shared"
+    if executor_pool and executor_pool != executor_name:
+        return "shared_pool"
+    return "unknown"
+
+
+def _executor_runtime_created(value: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    if value.get("created") is False:
+        return False
+    return any(
+        runtime.get(key) is not None
+        for key in ("executor_id", "max_workers", "work_queue_size", "thread_count", "alive_thread_count", "shutdown", "broken")
+    )
+
+
+def _runtime_int_value(runtime: dict[str, Any], key: str, *, fallback: Any = None) -> int:
+    value = runtime.get(key)
+    if value is None:
+        value = fallback
+    return _int_value(value)
+
+
+def _looks_like_raw_memory_identity(text: str) -> bool:
+    if not text.startswith("0x"):
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in text[2:])
 
 
 def _blocking_operation_summaries(pools: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
@@ -360,6 +547,13 @@ def _runtime_concurrency_signals(
     network: dict[str, Any],
 ) -> dict[str, Any]:
     blocking_totals = blocking_scheduler.get("totals") if isinstance(blocking_scheduler.get("totals"), dict) else {}
+    logical_totals = blocking_scheduler.get("logical_totals") if isinstance(blocking_scheduler.get("logical_totals"), dict) else blocking_totals
+    physical_totals = (
+        blocking_scheduler.get("physical_executor_totals")
+        if isinstance(blocking_scheduler.get("physical_executor_totals"), dict)
+        else blocking_totals
+    )
+    executor_view = blocking_scheduler.get("executor_view") if isinstance(blocking_scheduler.get("executor_view"), dict) else {}
     event_loop_status = str(event_loop.get("status") or "unknown")
     blocked_recently = event_loop_status == "blocked_recently" or _timestamp_recent(
         event_loop.get("last_blocked_tick_at")
@@ -367,10 +561,12 @@ def _runtime_concurrency_signals(
     slow_recently = event_loop_status in {"slow_recently", "blocked_recently"} or _timestamp_recent(
         event_loop.get("last_slow_tick_at")
     )
-    blocking_active = _int_value(blocking_totals.get("active"))
-    blocking_pending = _int_value(blocking_totals.get("pending"))
-    executor_queue_size = _int_value(blocking_totals.get("executor_work_queue_size"))
-    executor_max_workers = _int_value(blocking_totals.get("executor_max_workers"))
+    blocking_active = _int_value(logical_totals.get("active"))
+    blocking_pending = _int_value(logical_totals.get("pending"))
+    executor_queue_size = _int_value(physical_totals.get("executor_work_queue_size"))
+    executor_max_workers = _int_value(physical_totals.get("executor_max_workers"))
+    executor_shutdown_count = _int_value(physical_totals.get("executor_shutdown_count"))
+    executor_broken_count = _int_value(physical_totals.get("executor_broken_count"))
     return {
         "event_loop": {
             "monitor_running": bool(event_loop.get("monitor_running")),
@@ -381,13 +577,17 @@ def _runtime_concurrency_signals(
             "active_operations": blocking_active,
             "pending_operations": blocking_pending,
             "executor_queue_size": executor_queue_size,
-            "executor_unavailable": _int_value(blocking_totals.get("executor_shutdown_count")) > 0
-            or _int_value(blocking_totals.get("executor_broken_count")) > 0,
+            "executor_unavailable": executor_shutdown_count > 0 or executor_broken_count > 0,
             "saturated": executor_max_workers > 0
             and blocking_active >= executor_max_workers
             and (blocking_pending > 0 or executor_queue_size > 0),
-            "recent_failures_or_cancellations": _int_value(blocking_totals.get("failed")) > 0
-            or _int_value(blocking_totals.get("cancelled")) > 0,
+            "recent_failures_or_cancellations": _int_value(logical_totals.get("failed")) > 0
+            or _int_value(logical_totals.get("cancelled")) > 0,
+            "executor_runtime_totals_deduped": bool(executor_view.get("physical_totals_deduped", False)),
+            "shared_executors_detected": _int_value(executor_view.get("shared_executor_count")) > 0,
+            "physical_executor_unavailable": executor_shutdown_count > 0 or executor_broken_count > 0,
+            "physical_executor_count": _int_value(executor_view.get("physical_executor_count")),
+            "logical_executor_count": _int_value(executor_view.get("logical_executor_count")),
         },
         "runtime_tasks": {
             "active_tasks": _int_value(runtime_tasks.get("active_count")),
@@ -460,8 +660,17 @@ def _top_nonzero(
     limit: int,
 ) -> list[dict[str, Any]]:
     nonzero_items = [item for item in items if any(_int_value(item.get(key)) > 0 for key in key_names)]
+    return _top_items(nonzero_items, key_names=key_names, limit=limit)
+
+
+def _top_items(
+    items: list[dict[str, Any]],
+    *,
+    key_names: tuple[str, ...],
+    limit: int,
+) -> list[dict[str, Any]]:
     return sorted(
-        nonzero_items,
+        items,
         key=lambda item: tuple(_int_value(item.get(key)) for key in key_names),
         reverse=True,
     )[:limit]
