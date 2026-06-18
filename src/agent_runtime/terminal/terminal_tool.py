@@ -53,7 +53,7 @@ class TerminalWriteInputToolRequest(BaseToolRequest):
 
 @tool(
     name="terminal_create",
-    description="打开一个可交互的真实终端，返回 terminal_id，供后续发送命令、读取输出或写入交互输入。你必须显式提供初始 cwd；cwd 只表示 shell 启动目录，之后如果在终端内切换目录，需要你自己记住。一次对话结束后，这些终端会自动清理。",
+    description="打开一个可交互的真实终端，返回 terminal_id，供后续发送命令、读取输出或写入交互输入。创建的终端是持久终端，尽量复用可用的终端，不要随意创建新终端，导致资源浪费和内存泄露。你必须显式提供初始 cwd；cwd 只表示 shell 启动目录，之后如果在终端内切换目录，需要你自己记住。一次对话结束后，这些终端会自动清理。",
     group="terminal",
     category="business",
 )
