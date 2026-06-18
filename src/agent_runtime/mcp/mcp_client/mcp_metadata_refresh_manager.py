@@ -13,6 +13,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.mcp.mcp_client.mcp_metadata_cache import (
     JsonMcpMetadataSnapshotRepository,
     McpCachedResource,
@@ -128,9 +129,16 @@ class McpMetadataRefreshManager:
         if self.running:
             return
         self._stop_event = asyncio.Event()
-        self._poll_task = asyncio.create_task(
+        self._poll_task = get_runtime_task_registry().create_task(
             self._poll_loop(),
-            name="mcp-metadata-refresh-poller",
+            task_name="mcp-metadata-refresh-poller",
+            owner_type="mcp_metadata_refresh_manager",
+            owner_id="global",
+            task_class="poller",
+            diagnostic_context={
+                "poll_interval_seconds": self._poll_interval_seconds,
+                "operation_timeout_seconds": self._operation_timeout_seconds,
+            },
         )
 
     async def stop(self) -> None:
@@ -140,7 +148,11 @@ class McpMetadataRefreshManager:
             stop_event.set()
         task = self._poll_task
         if task is not None and not task.done():
-            task.cancel()
+            get_runtime_task_registry().cancel(
+                task,
+                message="mcp metadata refresh manager stop",
+                diagnostic_context={"component": "mcp_metadata_refresh_manager"},
+            )
             with suppress(Exception, asyncio.CancelledError):
                 await task
         self._poll_task = None
@@ -306,9 +318,17 @@ class McpMetadataRefreshManager:
             )
             return result
 
-        task = asyncio.create_task(
+        task = get_runtime_task_registry().create_task(
             _run_operation(),
-            name=task_name,
+            task_name=task_name,
+            owner_type="mcp_metadata_refresh_manager",
+            owner_id=service_id,
+            task_class="operation",
+            diagnostic_context={
+                "service_id": service_id,
+                "operation": operation,
+                "timeout_seconds": self._operation_timeout_seconds,
+            },
         )
         _log_metadata_diagnostic(
             logging.DEBUG,
@@ -366,7 +386,15 @@ class McpMetadataRefreshManager:
             error_type="TimeoutError",
             error=f"operation did not complete within {self._operation_timeout_seconds}s",
         )
-        task.cancel()
+        get_runtime_task_registry().cancel(
+            task,
+            message="mcp metadata operation timeout",
+            diagnostic_context={
+                "service_id": service_id,
+                "operation": operation,
+                "timeout_seconds": self._operation_timeout_seconds,
+            },
+        )
         _log_metadata_diagnostic(
             logging.DEBUG,
             "MCP metadata operation cancel requested after timeout",
@@ -445,7 +473,15 @@ class McpMetadataRefreshManager:
             return
         try:
             while not stop_event.is_set():
+                get_runtime_task_registry().mark_progress(
+                    asyncio.current_task() or "mcp-metadata-refresh-poller",
+                    diagnostic_context={"phase": "refresh_once_started"},
+                )
                 await self.refresh_once()
+                get_runtime_task_registry().mark_progress(
+                    asyncio.current_task() or "mcp-metadata-refresh-poller",
+                    diagnostic_context={"phase": "refresh_once_completed"},
+                )
                 with suppress(TimeoutError):
                     await asyncio.wait_for(
                         stop_event.wait(),
@@ -457,7 +493,7 @@ class McpMetadataRefreshManager:
             logger.exception("MCP 元数据后台刷新循环异常退出。")
 
     def _schedule_save(self, snapshot: McpServiceMetadataSnapshot) -> None:
-        task = asyncio.create_task(
+        task = get_runtime_task_registry().create_task(
             monitored_to_thread(
                 self._snapshot_repository.save,
                 snapshot,
@@ -467,13 +503,17 @@ class McpMetadataRefreshManager:
                 log=logger,
                 diagnostic_context={"service_id": snapshot.service_id, "cache_operation": "save"},
             ),
-            name=f"mcp-metadata-cache-save-{snapshot.service_id}",
+            task_name=f"mcp-metadata-cache-save-{snapshot.service_id}",
+            owner_type="mcp_metadata_refresh_manager",
+            owner_id=snapshot.service_id,
+            task_class="persist_save",
+            diagnostic_context={"service_id": snapshot.service_id, "cache_operation": "save"},
         )
         self._persist_tasks.add(task)
         task.add_done_callback(self._on_persist_task_done)
 
     def _schedule_delete(self, service_id: str) -> None:
-        task = asyncio.create_task(
+        task = get_runtime_task_registry().create_task(
             monitored_to_thread(
                 self._snapshot_repository.delete,
                 service_id,
@@ -483,7 +523,11 @@ class McpMetadataRefreshManager:
                 log=logger,
                 diagnostic_context={"service_id": service_id, "cache_operation": "delete"},
             ),
-            name=f"mcp-metadata-cache-delete-{service_id}",
+            task_name=f"mcp-metadata-cache-delete-{service_id}",
+            owner_type="mcp_metadata_refresh_manager",
+            owner_id=service_id,
+            task_class="persist_delete",
+            diagnostic_context={"service_id": service_id, "cache_operation": "delete"},
         )
         self._persist_tasks.add(task)
         task.add_done_callback(self._on_persist_task_done)

@@ -16,6 +16,7 @@ from psycopg.types.json import Jsonb
 from agent_runtime.cloud_user_config.config import CloudUserConfigDatabaseConfig
 from agent_runtime.cloud_user_config.local_state import CloudUserConfigLocalStateRepository
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 
 logger = logging.getLogger("agent_runtime.cloud_user_config.postgres_store")
 
@@ -189,10 +190,15 @@ class PostgresUserConfigStore:
     ) -> asyncio.Task[None]:
         """启动 Runtime 后端配置缓存 revision 轮询任务。"""
 
+        interval = max(int(interval_seconds), 1)
         store = cls(config_accessor)
-        return asyncio.create_task(
-            store._poll_database_revision(max(int(interval_seconds), 1)),
-            name="cloud-user-config-cache-revision-poller",
+        return get_runtime_task_registry().create_task(
+            store._poll_database_revision(interval),
+            task_name="cloud-user-config-cache-revision-poller",
+            owner_type="cloud_user_config",
+            owner_id="postgres",
+            task_class="revision_poller",
+            diagnostic_context={"poll_interval_seconds": interval},
         )
 
     def list_payloads(self, namespace: str) -> list[dict[str, Any]]:

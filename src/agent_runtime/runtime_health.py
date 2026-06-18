@@ -7,6 +7,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,7 +66,18 @@ class EventLoopLagMonitor:
     def start(self) -> None:
         if self._task is not None and not self._task.done():
             return
-        self._task = asyncio.create_task(self._run(), name="event-loop-lag-monitor")
+        self._task = get_runtime_task_registry().create_task(
+            self._run(),
+            task_name="event-loop-lag-monitor",
+            owner_type="runtime_health",
+            owner_id="event_loop",
+            task_class="lag_monitor",
+            diagnostic_context={
+                "interval_seconds": self._interval_seconds,
+                "slow_threshold_ms": int(self._slow_threshold_seconds * 1000),
+                "blocked_threshold_ms": int(self._blocked_threshold_seconds * 1000),
+            },
+        )
         logger.debug(
             "Event loop lag monitor diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
             "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
@@ -89,7 +102,11 @@ class EventLoopLagMonitor:
         task = self._task
         self._task = None
         stop_started_at = time.perf_counter()
-        task.cancel()
+        get_runtime_task_registry().cancel(
+            task,
+            message="event loop lag monitor stop",
+            diagnostic_context={"component": "event_loop_lag_monitor"},
+        )
         with suppress(asyncio.CancelledError):
             await task
         logger.debug(
@@ -135,6 +152,15 @@ class EventLoopLagMonitor:
             self._last_lag_seconds = lag_seconds
             self._max_lag_seconds = max(self._max_lag_seconds, lag_seconds)
             self._last_tick_at = time.time()
+            get_runtime_task_registry().mark_progress(
+                asyncio.current_task() or "event-loop-lag-monitor",
+                diagnostic_context={
+                    "last_lag_ms": int(lag_seconds * 1000),
+                    "max_lag_ms": int(self._max_lag_seconds * 1000),
+                    "slow_tick_count": self._slow_tick_count,
+                    "blocked_tick_count": self._blocked_tick_count,
+                },
+            )
             if lag_seconds >= self._blocked_threshold_seconds:
                 self._blocked_tick_count += 1
                 self._last_blocked_tick_at = time.time()

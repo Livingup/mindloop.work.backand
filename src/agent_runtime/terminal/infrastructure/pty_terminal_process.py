@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.terminal.terminal_process import (
     TerminalExitHandler,
     TerminalOutputHandler,
@@ -87,15 +88,33 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 self._sessions.pop(request.terminal_id, None)
             if sys.platform.startswith("win"):
                 session = await _start_windows_terminal(request, on_exit=on_exit)
-                session.task = asyncio.create_task(
+                session.task = get_runtime_task_registry().create_task(
                     self._watch_windows_terminal(session),
-                    name=f"terminal-winpty-watch-{request.terminal_id}",
+                    task_name=f"terminal-winpty-watch-{request.terminal_id}",
+                    owner_type="terminal",
+                    owner_id=request.terminal_id,
+                    task_class="watcher",
+                    diagnostic_context={
+                        "terminal_id": request.terminal_id,
+                        "runtime_token": request.runtime_token,
+                        "platform": sys.platform,
+                        "watcher_type": "winpty",
+                    },
                 )
             else:
                 session = await _start_unix_terminal(request, on_exit=on_exit)
-                session.task = asyncio.create_task(
+                session.task = get_runtime_task_registry().create_task(
                     self._watch_unix_terminal(session),
-                    name=f"terminal-pty-watch-{request.terminal_id}",
+                    task_name=f"terminal-pty-watch-{request.terminal_id}",
+                    owner_type="terminal",
+                    owner_id=request.terminal_id,
+                    task_class="watcher",
+                    diagnostic_context={
+                        "terminal_id": request.terminal_id,
+                        "runtime_token": request.runtime_token,
+                        "platform": sys.platform,
+                        "watcher_type": "pty",
+                    },
                 )
             self._sessions[request.terminal_id] = session
             logger.info(
@@ -137,7 +156,15 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     request.command_id,
                 )
                 if previous.timeout_task is not None:
-                    previous.timeout_task.cancel()
+                    get_runtime_task_registry().cancel(
+                        previous.timeout_task,
+                        message="terminal command replaced",
+                        diagnostic_context={
+                            "terminal_id": request.terminal_id,
+                            "previous_command_id": previous.command_id,
+                            "new_command_id": request.command_id,
+                        },
+                    )
             active = _ActiveCommand(
                 command_id=request.command_id,
                 on_output=on_output,
@@ -145,9 +172,18 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             )
             session.active_command = active
             if request.timeout_ms is not None and request.timeout_ms > 0:
-                active.timeout_task = asyncio.create_task(
+                active.timeout_task = get_runtime_task_registry().create_task(
                     self._enforce_timeout(session, request.command_id, request.timeout_ms),
-                    name=f"terminal-timeout-{request.terminal_id}-{request.command_id}",
+                    task_name=f"terminal-timeout-{request.terminal_id}-{request.command_id}",
+                    owner_type="terminal",
+                    owner_id=request.terminal_id,
+                    task_class="command_timeout",
+                    diagnostic_context={
+                        "terminal_id": request.terminal_id,
+                        "command_id": request.command_id,
+                        "timeout_ms": request.timeout_ms,
+                        "command_chars": len(request.command_line),
+                    },
                 )
             try:
                 await _write_terminal(session, _command_input_text(request.command_line), operation="terminal.command.write")
@@ -162,7 +198,11 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             except BaseException:
                 session.active_command = None
                 if active.timeout_task is not None:
-                    active.timeout_task.cancel()
+                    get_runtime_task_registry().cancel(
+                        active.timeout_task,
+                        message="terminal command start failed",
+                        diagnostic_context={"terminal_id": request.terminal_id, "command_id": request.command_id},
+                    )
                 logger.exception(
                     "PTY command start failed while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
                     request.terminal_id,
@@ -239,7 +279,11 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     terminal_id,
                     session.task.get_name(),
                 )
-                session.task.cancel()
+                get_runtime_task_registry().cancel(
+                    session.task,
+                    message="terminal watcher terminate timeout",
+                    diagnostic_context={"terminal_id": terminal_id, "runtime_token": session.runtime_token},
+                )
                 try:
                     await session.task
                 except asyncio.CancelledError:
@@ -279,9 +323,27 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     break
                 text = decoder.decode(data)
                 if text:
+                    get_runtime_task_registry().mark_progress(
+                        asyncio.current_task() or f"terminal-pty-watch-{session.terminal_id}",
+                        diagnostic_context={
+                            "terminal_id": session.terminal_id,
+                            "active_command_id": _active_command_id(session),
+                            "text_chars": len(text),
+                            "watcher_type": "pty",
+                        },
+                    )
                     await self._handle_terminal_output(session, text)
             text = decoder.flush()
             if text:
+                get_runtime_task_registry().mark_progress(
+                    asyncio.current_task() or f"terminal-pty-watch-{session.terminal_id}",
+                    diagnostic_context={
+                        "terminal_id": session.terminal_id,
+                        "active_command_id": _active_command_id(session),
+                        "text_chars": len(text),
+                        "watcher_type": "pty_flush",
+                    },
+                )
                 await self._handle_terminal_output(session, text)
             exit_code = await session.process.wait()
         except asyncio.CancelledError:
@@ -332,6 +394,15 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                         session.terminal_id,
                         _active_command_id(session),
                         len(text),
+                    )
+                    get_runtime_task_registry().mark_progress(
+                        asyncio.current_task() or f"terminal-winpty-watch-{session.terminal_id}",
+                        diagnostic_context={
+                            "terminal_id": session.terminal_id,
+                            "active_command_id": _active_command_id(session),
+                            "text_chars": len(text),
+                            "watcher_type": "winpty",
+                        },
                     )
                     await self._handle_terminal_output(session, text)
                 else:
@@ -391,7 +462,11 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             return
         session.active_command = None
         if active.timeout_task is not None:
-            active.timeout_task.cancel()
+            get_runtime_task_registry().cancel(
+                active.timeout_task,
+                message="terminal command completed",
+                diagnostic_context={"terminal_id": session.terminal_id, "command_id": command_id},
+            )
         await active.on_exit(exit_code, error_message)
 
     async def _fail_active_command(self, session: _TerminalSession, error_message: str) -> None:
@@ -400,7 +475,11 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             return
         session.active_command = None
         if active.timeout_task is not None:
-            active.timeout_task.cancel()
+            get_runtime_task_registry().cancel(
+                active.timeout_task,
+                message="terminal command failed",
+                diagnostic_context={"terminal_id": session.terminal_id, "command_id": active.command_id},
+            )
         await active.on_exit(None, error_message)
 
     async def _enforce_timeout(self, session: _TerminalSession, command_id: str, timeout_ms: int) -> None:
@@ -409,6 +488,10 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             active = session.active_command
             if active is None or active.command_id != command_id:
                 return
+            get_runtime_task_registry().mark_progress(
+                asyncio.current_task() or f"terminal-timeout-{session.terminal_id}-{command_id}",
+                diagnostic_context={"terminal_id": session.terminal_id, "command_id": command_id, "phase": "timeout_interrupt"},
+            )
             await _write_terminal(session, "\x03", operation="terminal.timeout.interrupt.write")
             await asyncio.sleep(3)
             active = session.active_command

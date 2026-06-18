@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread, shutdown_blocking_executors
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry, shutdown_runtime_tasks
 
 from agent_runtime.auth.runtime_access_policy import (
     LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
@@ -418,9 +419,12 @@ def create_app(
             not mcp_metadata_management_started
             and (mcp_metadata_start_task is None or mcp_metadata_start_task.done())
         ):
-            mcp_metadata_start_task = asyncio.create_task(
+            mcp_metadata_start_task = get_runtime_task_registry().create_task(
                 start_mcp_metadata_management(),
-                name="mcp-metadata-management-start",
+                task_name="mcp-metadata-management-start",
+                owner_type="server",
+                owner_id="runtime_lifespan",
+                task_class="mcp_metadata_start",
             )
         if config_cache_poll_task is None or config_cache_poll_task.done():
             config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
@@ -430,14 +434,29 @@ def create_app(
             codex_oauth_callback_server.start()
             codex_oauth_callback_server_started = True
         if codex_provider_task is None or codex_provider_task.done():
-            codex_provider_task = asyncio.create_task(
+            codex_provider_task = get_runtime_task_registry().create_task(
                 ensure_codex_builtin_provider(),
-                name="codex-oauth-builtin-provider-sync",
+                task_name="codex-oauth-builtin-provider-sync",
+                owner_type="server",
+                owner_id="runtime_lifespan",
+                task_class="codex_provider_sync",
             )
         if auto_connect_task is None or auto_connect_task.done():
-            auto_connect_task = asyncio.create_task(auto_connect_mcp_services())
+            auto_connect_task = get_runtime_task_registry().create_task(
+                auto_connect_mcp_services(),
+                task_name="mcp-auto-connect-enabled-services",
+                owner_type="server",
+                owner_id="runtime_lifespan",
+                task_class="mcp_auto_connect",
+            )
         if lacp_start_task is None or lacp_start_task.done():
-            lacp_start_task = asyncio.create_task(lacp_client.start())
+            lacp_start_task = get_runtime_task_registry().create_task(
+                lacp_client.start(),
+                task_name="lacp-client-start",
+                owner_type="server",
+                owner_id="runtime_lifespan",
+                task_class="lacp_client_start",
+            )
 
     from agent_runtime.agent.north_gateway.agent_runtime_contracts import DetachSceneRequest
     from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
@@ -528,9 +547,16 @@ def create_app(
             )
 
     def _schedule_detach_expired_scene(session) -> None:
-        task = asyncio.create_task(
+        task = get_runtime_task_registry().create_task(
             _detach_expired_scene(session),
-            name=f"scene-session-expired-detach-{session.scene_id}",
+            task_name=f"scene-session-expired-detach-{session.scene_id}",
+            owner_type="server",
+            owner_id=session.scene_id,
+            task_class="scene_expired_detach",
+            diagnostic_context={
+                "scene_id": session.scene_id,
+                "workspace_path": session.workspace_path,
+            },
         )
         detach_tasks.add(task)
 
@@ -618,31 +644,55 @@ def create_app(
             )
             scene_session_registry.stop()
             for task in tuple(detach_tasks):
-                task.cancel()
+                get_runtime_task_registry().cancel(
+                    task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "scene_session_registry", "phase": "shutdown"},
+                )
             for task in tuple(detach_tasks):
                 with suppress(Exception, asyncio.CancelledError):
                     await task
             detach_tasks.clear()
             if mcp_metadata_start_task is not None and not mcp_metadata_start_task.done():
-                mcp_metadata_start_task.cancel()
+                get_runtime_task_registry().cancel(
+                    mcp_metadata_start_task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "mcp_metadata_management", "phase": "shutdown"},
+                )
                 with suppress(Exception, asyncio.CancelledError):
                     await mcp_metadata_start_task
             with suppress(Exception, asyncio.CancelledError):
                 await mcp_gateway.stop_metadata_refresh()
             if auto_connect_task is not None and not auto_connect_task.done():
-                auto_connect_task.cancel()
+                get_runtime_task_registry().cancel(
+                    auto_connect_task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "mcp_auto_connect", "phase": "shutdown"},
+                )
                 with suppress(Exception, asyncio.CancelledError):
                     await auto_connect_task
             if lacp_start_task is not None and not lacp_start_task.done():
-                lacp_start_task.cancel()
+                get_runtime_task_registry().cancel(
+                    lacp_start_task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "lacp_client", "phase": "shutdown"},
+                )
                 with suppress(Exception, asyncio.CancelledError):
                     await lacp_start_task
             if config_cache_poll_task is not None and not config_cache_poll_task.done():
-                config_cache_poll_task.cancel()
+                get_runtime_task_registry().cancel(
+                    config_cache_poll_task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "cloud_user_config", "phase": "shutdown"},
+                )
                 with suppress(Exception, asyncio.CancelledError):
                     await config_cache_poll_task
             if codex_provider_task is not None and not codex_provider_task.done():
-                codex_provider_task.cancel()
+                get_runtime_task_registry().cancel(
+                    codex_provider_task,
+                    message="runtime lifespan shutdown",
+                    diagnostic_context={"component": "codex_oauth_service", "phase": "shutdown"},
+                )
                 with suppress(Exception, asyncio.CancelledError):
                     await codex_provider_task
             await lacp_client.shutdown()
@@ -653,6 +703,13 @@ def create_app(
             runtime_network_monitor.stop()
             with suppress(Exception, asyncio.CancelledError):
                 await execution_loop_logger.stop()
+            with suppress(Exception, asyncio.CancelledError):
+                await shutdown_runtime_tasks(
+                    owner_type="server",
+                    timeout=5.0,
+                    cancel=True,
+                    diagnostic_context={"component": "runtime_lifespan", "phase": "shutdown.final_registry_sweep"},
+                )
             shutdown_blocking_executors(wait=False, cancel_futures=False)
             logger.info(
                 "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "

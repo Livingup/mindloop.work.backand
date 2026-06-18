@@ -14,6 +14,7 @@ from threading import RLock
 from typing import Any, Callable
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,14 @@ class AgentExecutionLoopLogger:
             logger.warning("Agent 执行循环诊断日志无法启动：当前没有运行中的 asyncio event loop。")
             return
         self._flush_queue = asyncio.Queue(maxsize=self._queue_max_size)
-        self._worker_task = loop.create_task(self._flush_worker(), name="agent-execution-loop-log-writer")
+        self._worker_task = get_runtime_task_registry().create_task(
+            self._flush_worker(),
+            task_name="agent-execution-loop-log-writer",
+            owner_type="agent_execution_loop_logger",
+            owner_id="global",
+            task_class="flush_worker",
+            diagnostic_context={"queue_max_size": self._queue_max_size},
+        )
         self._started = True
 
     async def stop(self) -> None:
@@ -146,7 +154,11 @@ class AgentExecutionLoopLogger:
         self._worker_task = None
         self._started = False
         if task is not None and not task.done():
-            task.cancel()
+            get_runtime_task_registry().cancel(
+                task,
+                message="agent execution loop logger stop",
+                diagnostic_context={"component": "agent_execution_loop_logger"},
+            )
             try:
                 await task
             except asyncio.CancelledError:
@@ -466,6 +478,10 @@ class AgentExecutionLoopLogger:
         try:
             while True:
                 instance_id = await queue.get()
+                get_runtime_task_registry().mark_progress(
+                    asyncio.current_task() or "agent-execution-loop-log-writer",
+                    diagnostic_context={"pending_instance_count": len(pending), "phase": "flush_signal_received"},
+                )
                 pending.add(instance_id)
                 queue.task_done()
                 while True:
@@ -477,10 +493,18 @@ class AgentExecutionLoopLogger:
                     queue.task_done()
                 for target_instance_id in tuple(pending):
                     await self._write_instance_snapshot(target_instance_id)
+                get_runtime_task_registry().mark_progress(
+                    asyncio.current_task() or "agent-execution-loop-log-writer",
+                    diagnostic_context={"flushed_instance_count": len(pending), "phase": "flush_batch_completed"},
+                )
                 pending.clear()
         except asyncio.CancelledError:
             for target_instance_id in tuple(pending):
                 await self._write_instance_snapshot(target_instance_id)
+            get_runtime_task_registry().mark_progress(
+                asyncio.current_task() or "agent-execution-loop-log-writer",
+                diagnostic_context={"flushed_instance_count": len(pending), "phase": "flush_worker_cancelled"},
+            )
             raise
 
     async def _write_instance_snapshot(self, instance_id: str) -> None:
