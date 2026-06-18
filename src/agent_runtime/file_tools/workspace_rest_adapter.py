@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -57,6 +59,46 @@ class WorkspaceGitStatusResponse(BaseModel):
     scan_truncated: bool = Field(default=False, description="扫描目录或仓库数量达到边界时为 true，表示结果可能被截断。")
 
 
+class WorkspaceMemoryListRequest(BaseModel):
+    workspace_path: str = Field(description="当前打开项目的工作区根目录路径。")
+
+
+class WorkspaceMemoryReadRequest(BaseModel):
+    workspace_path: str = Field(description="当前打开项目的工作区根目录路径。")
+    agent_id: str = Field(description="记忆文件所属 Agent 目录名；只能是 .spread-ai/memory 下的单层目录名。")
+
+
+class WorkspaceMemorySaveRequest(BaseModel):
+    workspace_path: str = Field(description="当前打开项目的工作区根目录路径。")
+    agent_id: str = Field(description="记忆文件所属 Agent 目录名；只能是 .spread-ai/memory 下的单层目录名。")
+    content: str = Field(description="要保存到 memory.md 的 Markdown 原文。")
+    expected_sha256: str = Field(description="读取时返回的内容 SHA256，用于乐观并发控制。")
+
+
+class WorkspaceMemoryEntryResponse(BaseModel):
+    key: str = Field(description="前端选择与保存时使用的受控条目 key，当前等同 agent_id。")
+    agent_id: str
+    relative_path: str = Field(description="相对 workspace 根目录的记忆文件路径。")
+    size_bytes: int
+    modified_at: float = Field(description="文件最后修改时间 Unix timestamp。")
+    content_sha256: str
+    summary: str = Field(default="", description="记忆文件内容摘要，用于前端列表展示和搜索。")
+
+
+class WorkspaceMemoryListResponse(BaseModel):
+    workspace_path: str
+    memory_root_exists: bool
+    entries: list[WorkspaceMemoryEntryResponse] = Field(default_factory=list)
+
+
+class WorkspaceMemoryReadResponse(WorkspaceMemoryEntryResponse):
+    content: str
+
+
+class WorkspaceMemorySaveResponse(WorkspaceMemoryEntryResponse):
+    status: str = "saved"
+
+
 _EXCLUDED_NAMES = {
     ".git",
     ".mypy_cache",
@@ -77,11 +119,7 @@ def create_workspace_router() -> APIRouter:
 
     @router.post("/tree", response_model=WorkspaceTreeResponse)
     def get_workspace_tree(body: WorkspaceTreeRequest) -> WorkspaceTreeResponse:
-        root = Path(body.directory_path).expanduser().resolve()
-        if not root.exists():
-            raise HTTPException(status_code=404, detail=f"工作目录不存在: {root}")
-        if not root.is_dir():
-            raise HTTPException(status_code=400, detail=f"工作目录不是文件夹: {root}")
+        root = _resolve_workspace_directory(body.directory_path)
         return WorkspaceTreeResponse(
             name=root.name or str(root),
             path=str(root),
@@ -95,14 +133,223 @@ def create_workspace_router() -> APIRouter:
 
     @router.post("/git-status", response_model=WorkspaceGitStatusResponse)
     def get_workspace_git_status(body: WorkspaceGitStatusRequest) -> WorkspaceGitStatusResponse:
-        root = Path(body.workspace_path).expanduser().resolve()
-        if not root.exists():
-            raise HTTPException(status_code=404, detail=f"工作目录不存在: {root}")
-        if not root.is_dir():
-            raise HTTPException(status_code=400, detail=f"工作目录不是文件夹: {root}")
+        root = _resolve_workspace_directory(body.workspace_path)
         return _read_workspace_git_status(root)
 
+    @router.post("/memory/list", response_model=WorkspaceMemoryListResponse)
+    def list_workspace_memory(body: WorkspaceMemoryListRequest) -> WorkspaceMemoryListResponse:
+        root = _resolve_workspace_directory(body.workspace_path)
+        return _list_workspace_memory(root)
+
+    @router.post("/memory/read", response_model=WorkspaceMemoryReadResponse)
+    def read_workspace_memory(body: WorkspaceMemoryReadRequest) -> WorkspaceMemoryReadResponse:
+        root = _resolve_workspace_directory(body.workspace_path)
+        return _read_workspace_memory(root, body.agent_id)
+
+    @router.post("/memory/save", response_model=WorkspaceMemorySaveResponse)
+    def save_workspace_memory(body: WorkspaceMemorySaveRequest) -> WorkspaceMemorySaveResponse:
+        root = _resolve_workspace_directory(body.workspace_path)
+        return _save_workspace_memory(root, body.agent_id, body.content, body.expected_sha256)
+
     return router
+
+
+_MEMORY_FILE_NAME = "memory.md"
+_MEMORY_SUMMARY_MAX_LENGTH = 160
+
+
+def _resolve_workspace_directory(directory_path: str) -> Path:
+    root = Path(directory_path).expanduser().resolve()
+    if not root.exists():
+        raise HTTPException(status_code=404, detail=f"工作目录不存在: {root}")
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail=f"工作目录不是文件夹: {root}")
+    return root
+
+
+def _list_workspace_memory(workspace_root: Path) -> WorkspaceMemoryListResponse:
+    memory_root = _resolve_memory_root(workspace_root, require_exists=False)
+    if not memory_root.exists():
+        return WorkspaceMemoryListResponse(workspace_path=str(workspace_root), memory_root_exists=False, entries=[])
+    _ensure_memory_root_directory(memory_root, workspace_root)
+    entries: list[WorkspaceMemoryEntryResponse] = []
+    try:
+        agent_directories = sorted(
+            [entry for entry in memory_root.iterdir() if entry.is_dir() and not entry.is_symlink()],
+            key=lambda entry: entry.name.casefold(),
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取项目记忆目录失败: {exc}") from exc
+    for agent_directory in agent_directories:
+        memory_file = agent_directory / _MEMORY_FILE_NAME
+        if not memory_file.exists() or memory_file.is_symlink() or not memory_file.is_file():
+            continue
+        try:
+            entries.append(_memory_entry_response(workspace_root, agent_directory.name))
+        except HTTPException:
+            continue
+    return WorkspaceMemoryListResponse(
+        workspace_path=str(workspace_root),
+        memory_root_exists=True,
+        entries=entries,
+    )
+
+
+def _read_workspace_memory(workspace_root: Path, agent_id: str) -> WorkspaceMemoryReadResponse:
+    target = _resolve_agent_memory_file(workspace_root, agent_id, require_exists=True)
+    raw = _read_memory_bytes(target)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=415, detail="记忆文件不是 UTF-8 文本，无法在前端编辑。") from exc
+    entry = _memory_entry_response(workspace_root, agent_id, raw_bytes=raw)
+    return WorkspaceMemoryReadResponse(**entry.model_dump(), content=content)
+
+
+def _save_workspace_memory(
+    workspace_root: Path,
+    agent_id: str,
+    content: str,
+    expected_sha256: str,
+) -> WorkspaceMemorySaveResponse:
+    target = _resolve_agent_memory_file(workspace_root, agent_id, require_exists=True)
+    current_bytes = _read_memory_bytes(target)
+    current_sha256 = _sha256_hex(current_bytes)
+    if expected_sha256 != current_sha256:
+        raise HTTPException(status_code=409, detail="记忆文件已被外部修改，请刷新后再保存。")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    next_bytes = content.encode("utf-8")
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", delete=False, dir=target.parent, prefix=".memory.", suffix=".tmp") as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(next_bytes)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"保存项目记忆失败: {exc}") from exc
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+    entry = _memory_entry_response(workspace_root, agent_id, raw_bytes=next_bytes)
+    return WorkspaceMemorySaveResponse(**entry.model_dump())
+
+
+def _resolve_memory_root(workspace_root: Path, *, require_exists: bool) -> Path:
+    memory_root = workspace_root / ".spread-ai" / "memory"
+    if require_exists and not memory_root.exists():
+        raise HTTPException(status_code=404, detail="当前项目暂无 Agent 记忆目录。")
+    resolved_memory_root = memory_root.resolve(strict=False)
+    if not _is_path_within(resolved_memory_root, workspace_root.resolve()):
+        raise HTTPException(status_code=400, detail="项目记忆目录越界，拒绝访问。")
+    return memory_root
+
+
+def _ensure_memory_root_directory(memory_root: Path, workspace_root: Path) -> None:
+    if memory_root.is_symlink():
+        raise HTTPException(status_code=400, detail="项目记忆目录不能是符号链接。")
+    if not memory_root.is_dir():
+        raise HTTPException(status_code=400, detail="项目记忆路径不是目录。")
+    resolved_memory_root = memory_root.resolve(strict=True)
+    if not _is_path_within(resolved_memory_root, workspace_root.resolve()):
+        raise HTTPException(status_code=400, detail="项目记忆目录越界，拒绝访问。")
+
+
+def _resolve_agent_memory_file(workspace_root: Path, agent_id: str, *, require_exists: bool) -> Path:
+    safe_agent_id = _validate_memory_agent_id(agent_id)
+    memory_root = _resolve_memory_root(workspace_root, require_exists=require_exists)
+    _ensure_memory_root_directory(memory_root, workspace_root)
+    agent_directory = memory_root / safe_agent_id
+    if agent_directory.is_symlink():
+        raise HTTPException(status_code=400, detail="Agent 记忆目录不能是符号链接。")
+    target = agent_directory / _MEMORY_FILE_NAME
+    if require_exists:
+        if not target.exists():
+            raise HTTPException(status_code=404, detail=f"Agent 记忆文件不存在: {safe_agent_id}/{_MEMORY_FILE_NAME}")
+        if not target.is_file():
+            raise HTTPException(status_code=400, detail="Agent 记忆路径不是文件。")
+    if target.is_symlink():
+        raise HTTPException(status_code=400, detail="Agent 记忆文件不能是符号链接。")
+    resolved_target = target.resolve(strict=require_exists)
+    resolved_memory_root = memory_root.resolve(strict=True)
+    if not _is_path_within(resolved_target, resolved_memory_root):
+        raise HTTPException(status_code=400, detail="Agent 记忆文件越界，拒绝访问。")
+    return target
+
+
+def _validate_memory_agent_id(agent_id: str) -> str:
+    normalized = agent_id.strip()
+    if not normalized or normalized in {".", ".."}:
+        raise HTTPException(status_code=400, detail="Agent ID 不能为空或路径保留名。")
+    invalid_characters = {"/", "\\", ":", "\x00"}
+    if any(character in normalized for character in invalid_characters) or ".." in normalized:
+        raise HTTPException(status_code=400, detail="Agent ID 只能是 .spread-ai/memory 下的单层目录名。")
+    return normalized
+
+
+def _memory_entry_response(
+    workspace_root: Path,
+    agent_id: str,
+    *,
+    raw_bytes: bytes | None = None,
+) -> WorkspaceMemoryEntryResponse:
+    target = _resolve_agent_memory_file(workspace_root, agent_id, require_exists=True)
+    stat = target.stat()
+    content_bytes = raw_bytes if raw_bytes is not None else _read_memory_bytes(target)
+    return WorkspaceMemoryEntryResponse(
+        key=agent_id,
+        agent_id=agent_id,
+        relative_path=_relative_path_for_workspace(workspace_root, target),
+        size_bytes=stat.st_size,
+        modified_at=stat.st_mtime,
+        content_sha256=_sha256_hex(content_bytes),
+        summary=_memory_summary_from_bytes(content_bytes),
+    )
+
+
+def _read_memory_bytes(target: Path) -> bytes:
+    try:
+        return target.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取项目记忆失败: {exc}") from exc
+
+
+def _sha256_hex(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _memory_summary_from_bytes(content: bytes) -> str:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    return _memory_summary_from_text(text)
+
+
+def _memory_summary_from_text(content: str) -> str:
+    for line in content.splitlines():
+        normalized = " ".join(line.strip().lstrip("#").strip().split())
+        if not normalized:
+            continue
+        if len(normalized) <= _MEMORY_SUMMARY_MAX_LENGTH:
+            return normalized
+        return f"{normalized[: _MEMORY_SUMMARY_MAX_LENGTH - 1]}…"
+    return ""
+
+
+def _is_path_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        normalized_path = _normalise_path_for_compare(path)
+        normalized_parent = _normalise_path_for_compare(parent)
+        return normalized_path == normalized_parent or normalized_path.startswith(f"{normalized_parent}/")
 
 
 _GIT_COMMAND_TIMEOUT_SECONDS = 3.0

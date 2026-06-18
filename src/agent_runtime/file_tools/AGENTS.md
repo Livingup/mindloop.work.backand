@@ -28,3 +28,8 @@
 - `file_move`：在项目工作区内移动或重命名单个文件，`rename` 作为同目录移动处理。
 
 写入类工具必须显式声明 `project_root`，并在工具内部执行工作区沙箱、`.git` 保护、符号链接拒绝、内容 SHA256 并发校验和原子写入等安全策略。
+
+### Workspace REST 边界
+
+- `/api/workspaces/memory/list`、`/read`、`/save` 只能暴露当前 workspace 下 `.spread-ai/memory/<agent-id>/memory.md`；`agent_id` 必须是单层目录名，目标文件名固定为 `memory.md`。
+- Memory REST 读写必须拒绝 `..`、绝对路径、路径分隔符注入、符号链接逃逸、非 `memory.md` 目标和任意文件读写；保存必须使用 `expected_sha256` 做乐观并发控制，旧 SHA 返回冲突而不是覆盖。
