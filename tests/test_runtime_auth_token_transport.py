@@ -15,6 +15,7 @@ from agent_runtime.auth.runtime_access_policy import (
     is_no_account_api_allowed_path,
 )
 from agent_runtime.server import (
+    _is_runtime_auth_exempt_path,
     _is_runtime_bootstrap_exempt_path,
     _runtime_auth_token_from_request,
     _runtime_cors_allow_origin_regex,
@@ -216,11 +217,15 @@ def test_no_account_api_surface_is_minimal() -> None:
     assert is_no_account_api_allowed_path("/api/auth/bootstrap", "GET") is False
     assert is_no_account_api_allowed_path("/api/system-settings", "GET") is False
     assert is_no_account_api_allowed_path("/api/agent-runtime/scenes", "GET") is False
+    assert is_no_account_api_allowed_path("/api/runtime-diagnostics/concurrency", "GET") is False
 
 
-def test_system_settings_is_not_bootstrap_guard_exempt() -> None:
+def test_system_settings_and_runtime_diagnostics_are_not_bootstrap_guard_exempt() -> None:
     assert _is_runtime_bootstrap_exempt_path("/api/system-settings") is False
+    assert _is_runtime_bootstrap_exempt_path("/api/runtime-diagnostics/concurrency") is False
     assert _is_runtime_bootstrap_exempt_path("/api/runtime-bootstrap/status") is True
+    assert _is_runtime_auth_exempt_path("/api/health") is True
+    assert _is_runtime_auth_exempt_path("/api/runtime-diagnostics/concurrency") is False
 
 
 def test_in_memory_fixed_window_rate_limiter_blocks_after_limit() -> None:

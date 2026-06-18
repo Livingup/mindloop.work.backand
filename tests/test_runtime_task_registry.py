@@ -16,7 +16,7 @@ from agent_runtime.mcp.mcp_client.mcp_value_objects import (
     MCP_CONNECTION_STATUS_DISCONNECTED,
     McpServiceCapabilities,
 )
-from agent_runtime.runtime_health import runtime_task_health_summary
+from agent_runtime.runtime_health import runtime_concurrency_health_snapshot, runtime_task_health_summary
 
 
 def test_runtime_task_registry_tracks_cancel_stop_health_and_redaction() -> None:
@@ -201,6 +201,198 @@ def test_runtime_task_health_summary_is_bounded_and_sanitized(monkeypatch) -> No
         assert "raw-frame" not in str(summary)
 
     asyncio.run(run_case())
+
+
+def test_runtime_concurrency_health_snapshot_is_bounded_sanitized_and_diagnostic() -> None:
+    runtime_tasks = {
+        "total_count": 4,
+        "active_count": 3,
+        "by_status": {"running": 2, "cancelling": 1, "failed": 1},
+        "active_by_owner": {"owner:one": 5, "owner:two": 2},
+        "active_by_class": {"worker": 5, "reader": 2},
+        "stale_progress_seconds": 300.0,
+        "stale_progress_count": 1,
+        "stale_progress_tasks": [
+            {
+                "task_id": "task-stale",
+                "task_name": "stale-worker",
+                "owner_type": "test",
+                "owner_id": "one",
+                "task_class": "worker",
+                "status": "running",
+                "seconds_since_progress": 900,
+            }
+        ],
+        "cancelling_count": 1,
+        "cancelling_tasks": [
+            {
+                "task_id": "task-cancelling",
+                "task_name": "cancelling-worker",
+                "owner_type": "test",
+                "owner_id": "two",
+                "task_class": "worker",
+                "status": "cancelling",
+            }
+        ],
+        "recent_terminal_tasks": [
+            {
+                "task_id": "task-failed",
+                "task_name": "failed-worker",
+                "owner_type": "test",
+                "owner_id": "three",
+                "task_class": "worker",
+                "status": "failed",
+                "last_error_type": "RuntimeError",
+            }
+        ],
+    }
+    blocking_scheduler = {
+        "pools": {
+            "communication": {
+                "submitted": 7,
+                "pending": 2,
+                "active": 4,
+                "completed": 1,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {
+                    "publish.secret.token": {
+                        "submitted": 7,
+                        "pending": 2,
+                        "active": 4,
+                        "completed": 1,
+                        "failed": 0,
+                        "cancelled": 0,
+                    }
+                },
+            },
+            "db": {
+                "submitted": 1,
+                "pending": 0,
+                "active": 0,
+                "completed": 0,
+                "failed": 1,
+                "cancelled": 0,
+                "operations": {},
+            },
+        },
+        "executors": {
+            "communication": {
+                "max_workers": 4,
+                "isolated": True,
+                "executor_pool": "communication",
+                "runtime": {
+                    "work_queue_size": 2,
+                    "thread_count": 4,
+                    "alive_thread_count": 4,
+                    "shutdown": False,
+                    "broken": None,
+                },
+            }
+        },
+    }
+    network = {
+        "active_http_requests": 3,
+        "active_sse_connections": 2,
+        "event_hub_queue_full_count": 1,
+        "dropped_log_records": 0,
+        "queued_log_records": 5,
+        "url": "https://user:password@example.test/path?token=secret",
+        "authorization_header": "Bearer secret-token",
+        "raw_payload": "should-not-appear",
+    }
+
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={
+            "status": "slow_recently",
+            "monitor_running": True,
+            "last_lag_ms": 2500,
+            "max_lag_ms": 3000,
+            "slow_tick_count": 2,
+            "blocked_tick_count": 0,
+        },
+        network_snapshot=network,
+        runtime_task_summary=runtime_tasks,
+        blocking_scheduler_snapshot=blocking_scheduler,
+        top_limit=1,
+    )
+
+    assert snapshot["status"] == "degraded"
+    assert snapshot["diagnostic_only"] is True
+    assert snapshot["signals"]["event_loop"]["lagging"] is True
+    assert snapshot["signals"]["runtime_tasks"]["stale_progress"] is True
+    assert snapshot["signals"]["network"]["event_hub_queue_pressure"] is True
+    assert snapshot["blocking_scheduler"]["totals"]["pending"] == 2
+    assert snapshot["blocking_scheduler"]["totals"]["executor_work_queue_size"] == 2
+    assert len(snapshot["blocking_scheduler"]["top_active_pools"]) == 1
+    assert len(snapshot["runtime_tasks"]["top_active_owners"]) == 1
+    assert "top_operations" not in snapshot["blocking_scheduler"]
+    payload_text = str(snapshot).lower()
+    assert "diagnostic_context" not in payload_text
+    assert "should-not-appear" not in payload_text
+    assert "authorization" not in payload_text
+    assert "password" not in payload_text
+    assert "token" not in payload_text
+
+
+def test_runtime_concurrency_health_snapshot_detail_is_bounded_and_keeps_operation_counters_only() -> None:
+    blocking_scheduler = {
+        "pools": {
+            f"pool-{index}": {
+                "submitted": index + 1,
+                "pending": index,
+                "active": index,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "operations": {
+                    f"operation-{index}": {
+                        "submitted": index + 1,
+                        "pending": index,
+                        "active": index,
+                        "completed": 0,
+                        "failed": 0,
+                        "cancelled": 0,
+                    }
+                },
+            }
+            for index in range(5)
+        },
+        "executors": {},
+    }
+
+    snapshot = runtime_concurrency_health_snapshot(
+        event_loop_snapshot={"status": "ok", "monitor_running": True},
+        network_snapshot={},
+        runtime_task_summary={
+            "total_count": 0,
+            "active_count": 0,
+            "by_status": {},
+            "active_by_owner": {},
+            "active_by_class": {},
+            "stale_progress_seconds": 300.0,
+            "stale_progress_count": 0,
+            "stale_progress_tasks": [],
+            "cancelling_count": 0,
+            "cancelling_tasks": [],
+            "recent_terminal_tasks": [],
+        },
+        blocking_scheduler_snapshot=blocking_scheduler,
+        top_limit=2,
+        operation_limit=2,
+        include_blocking_operations=True,
+    )
+
+    assert snapshot["status"] == "attention"
+    assert snapshot["limits"] == {
+        "top_limit": 2,
+        "operation_limit": 2,
+        "include_blocking_operations": True,
+    }
+    assert len(snapshot["blocking_scheduler"]["top_active_pools"]) == 2
+    assert len(snapshot["blocking_scheduler"]["top_operations"]) == 2
+    operation = snapshot["blocking_scheduler"]["top_operations"][0]
+    assert set(operation) == {"pool", "operation", "submitted", "pending", "active", "completed", "failed", "cancelled"}
 
 
 class _LacpRegistrationRegistryLifecycleStub:

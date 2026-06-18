@@ -193,7 +193,12 @@ def create_app(
     from agent_runtime.logs_management.north_gateway.logs_management_rest_adapter import (
         create_logs_management_router,
     )
-    from agent_runtime.runtime_health import EventLoopLagMonitor, runtime_task_health_summary
+    from agent_runtime.runtime_health import (
+        EventLoopLagMonitor,
+        runtime_concurrency_health_snapshot,
+        runtime_concurrency_limit,
+        runtime_task_health_summary,
+    )
     from agent_runtime.runtime_network_monitor import (
         new_network_trace_id,
         runtime_network_monitor,
@@ -936,12 +941,44 @@ def create_app(
 
     @app.get("/api/health")
     def health_check() -> dict[str, object]:
+        event_loop_snapshot = event_loop_monitor.snapshot()
+        network_snapshot = runtime_network_monitor.snapshot()
+        runtime_tasks = runtime_task_health_summary()
         return {
             "status": "ok",
-            "event_loop": event_loop_monitor.snapshot(),
-            "network": runtime_network_monitor.snapshot(),
-            "runtime_tasks": runtime_task_health_summary(),
+            "event_loop": event_loop_snapshot,
+            "network": network_snapshot,
+            "runtime_tasks": runtime_tasks,
+            "concurrency": runtime_concurrency_health_snapshot(
+                event_loop_snapshot=event_loop_snapshot,
+                network_snapshot=network_snapshot,
+                runtime_task_summary=runtime_tasks,
+            ),
         }
+
+    @app.get("/api/runtime-diagnostics/concurrency")
+    def runtime_concurrency_diagnostics(
+        detail: bool = False,
+        limit: int | None = None,
+        operation_limit: int | None = None,
+    ) -> dict[str, object]:
+        top_limit = runtime_concurrency_limit(limit)
+        bounded_operation_limit = runtime_concurrency_limit(operation_limit)
+        event_loop_snapshot = event_loop_monitor.snapshot()
+        network_snapshot = runtime_network_monitor.snapshot()
+        runtime_tasks = runtime_task_health_summary(
+            stale_limit=top_limit,
+            cancelling_limit=top_limit,
+            recent_terminal_limit=min(top_limit, 100),
+        )
+        return runtime_concurrency_health_snapshot(
+            event_loop_snapshot=event_loop_snapshot,
+            network_snapshot=network_snapshot,
+            runtime_task_summary=runtime_tasks,
+            top_limit=top_limit,
+            operation_limit=bounded_operation_limit,
+            include_blocking_operations=detail,
+        )
 
     app.include_router(
         create_runtime_auth_router(runtime_auth_service),
