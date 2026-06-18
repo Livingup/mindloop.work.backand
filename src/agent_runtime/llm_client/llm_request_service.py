@@ -24,6 +24,7 @@ from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
 )
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_CODEX_RESPONSES,
@@ -56,6 +57,69 @@ _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
 }
 logger = logging.getLogger(__name__)
 _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
+
+
+def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
+    raw = (value or "unknown").strip()
+    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
+    return (safe.strip("-._") or "unknown")[:max_length]
+
+
+def _runtime_event_payload_size(payload: dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        return len(repr(payload))
+
+
+def _runtime_event_publish_context(
+    *,
+    phase: str,
+    event_type: str,
+    payload: dict[str, Any],
+    conversation_id: str,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "phase": phase,
+        "event_type": event_type,
+        "conversation_id": conversation_id,
+        "source": "llm_client",
+        "payload_keys": sorted(str(key) for key in payload),
+        "payload_size": _runtime_event_payload_size(payload),
+        "payload_key_count": len(payload),
+    }
+    if error_type is not None:
+        context["error_type"] = error_type
+    return context
+
+
+async def _publish_runtime_event_with_bounded_failure(
+    coro: Any,
+    *,
+    event_type: str,
+    payload: dict[str, Any],
+    conversation_id: str,
+) -> None:
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - publish diagnostics must not expose raw payload or exception text
+        task = asyncio.current_task()
+        task_or_id: asyncio.Task[Any] | str = task or f"llm-runtime-event-publish-{_safe_runtime_task_label(event_type)}"
+        get_runtime_task_registry().mark_progress(
+            task_or_id,
+            diagnostic_context=_runtime_event_publish_context(
+                phase="runtime_event_publish.failed",
+                event_type=event_type,
+                payload=payload,
+                conversation_id=conversation_id,
+                error_type=exc.__class__.__name__,
+            ),
+        )
+        logger.error("异步运行时事件发布失败: event_type=%s error_type=%s", event_type, exc.__class__.__name__)
+        raise RuntimeError("Runtime event publish failed.") from None
 
 
 class LlmRequestService:
@@ -764,17 +828,24 @@ def _schedule_runtime_event_publish(
     except RuntimeError:
         running_loop = None
     if running_loop is event_loop:
-        task = event_loop.create_task(coro)
-
-        def on_done(done_task: asyncio.Task[None]) -> None:
-            try:
-                done_task.result()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("异步运行时事件发布失败: event_type=%s", event_type)
-
-        task.add_done_callback(on_done)
+        get_runtime_task_registry().create_task(
+            _publish_runtime_event_with_bounded_failure(
+                coro,
+                event_type=event_type,
+                payload=payload,
+                conversation_id=conversation_id,
+            ),
+            task_name=f"llm-runtime-event-publish-{_safe_runtime_task_label(event_type)}",
+            owner_type="llm_request_service",
+            owner_id=conversation_id,
+            task_class="runtime_event_publish",
+            diagnostic_context=_runtime_event_publish_context(
+                phase="runtime_event_publish.scheduled",
+                event_type=event_type,
+                payload=payload,
+                conversation_id=conversation_id,
+            ),
+        )
         return
     future = asyncio.run_coroutine_threadsafe(coro, event_loop)
 

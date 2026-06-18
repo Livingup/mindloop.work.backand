@@ -64,6 +64,7 @@ from agent_runtime.conversation_message.message.models import (
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.context_compression.compression_service import ContextCompressionService
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import (
@@ -98,6 +99,12 @@ _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD = 5
 _AGENT_STAGE_PROGRESS_LOG_INTERVAL_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+
+
+def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
+    raw = (value or "unknown").strip()
+    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
+    return (safe.strip("-._") or "unknown")[:max_length]
 
 
 @dataclass(frozen=True, slots=True)
@@ -627,7 +634,24 @@ class AgentExecutionEngine:
             expected_next="run_agent_instance",
         )
         interrupt_state = _AgentExecutionInterruptState()
-        task_handle = asyncio.create_task(self._run_agent_instance(task, instance, request, interrupt_state=interrupt_state))
+        task_handle = get_runtime_task_registry().create_task(
+            self._run_agent_instance(task, instance, request, interrupt_state=interrupt_state),
+            task_name=f"agent-execution-{_safe_runtime_task_label(instance.instance_id)}",
+            owner_type="agent_execution_engine",
+            owner_id=instance.instance_id,
+            task_class="agent_instance_execution",
+            diagnostic_context={
+                "phase": "background_execution.launch",
+                "agent_task_id": task.task_id,
+                "instance_id": instance.instance_id,
+                "conversation_id": instance.conversation_id,
+                "communication_stream_id": communication_context.stream_id,
+                "agent_definition_id": instance.agent_definition_id,
+                "queued_for_later": False,
+                "active_instance_count": len(self._active_instance_ids),
+                "interrupt_requested": interrupt_state.requested,
+            },
+        )
         self._active_execution_handles[instance.instance_id] = _AgentExecutionHandle(
             task=task_handle,
             interrupt_state=interrupt_state,

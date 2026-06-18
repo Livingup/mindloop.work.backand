@@ -8,6 +8,13 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
+    raw = (value or "unknown").strip()
+    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
+    return (safe.strip("-._") or "unknown")[:max_length]
+
+
 from agent_runtime.agent.agent_instance import AgentInstance
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
@@ -24,6 +31,7 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
     CreateCommunicationStreamRequest,
 )
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.scene.north_gateway.scene_contracts import SceneGateway
 
 
@@ -519,14 +527,49 @@ def _delete_task_terminals(task_id: str) -> None:
             from agent_runtime.terminal.terminal_factory import TerminalFactory
 
             deleted = await TerminalFactory.create().delete_task_terminals(task_id)
+            get_runtime_task_registry().mark_progress(
+                asyncio.current_task() or task_id,
+                diagnostic_context={
+                    "phase": "scene_detach_terminal_cleanup.completed",
+                    "task_id": task_id,
+                    "agent_task_id": task_id,
+                    "target_task_id": task_id,
+                    "reason": "scene_detach",
+                    "deleted_terminal_count": len(deleted),
+                },
+            )
             if deleted:
                 logger.info("Scene detach 清理任务终端完成: task_id=%s terminal_count=%s", task_id, len(deleted))
-        except Exception:
+        except Exception as exc:
+            get_runtime_task_registry().mark_progress(
+                asyncio.current_task() or task_id,
+                diagnostic_context={
+                    "phase": "scene_detach_terminal_cleanup.failed",
+                    "task_id": task_id,
+                    "agent_task_id": task_id,
+                    "target_task_id": task_id,
+                    "reason": "scene_detach",
+                    "error_type": exc.__class__.__name__,
+                },
+            )
             logger.exception("Scene detach 清理任务终端失败: task_id=%s", task_id)
 
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
         asyncio.run(delete())
     else:
-        loop.create_task(delete())
+        get_runtime_task_registry().create_task(
+            delete(),
+            task_name=f"scene-detach-terminal-cleanup-{_safe_runtime_task_label(task_id)}",
+            owner_type="agent_runtime_gateway",
+            owner_id=task_id,
+            task_class="scene_detach_terminal_cleanup",
+            diagnostic_context={
+                "phase": "scene_detach_terminal_cleanup.scheduled",
+                "task_id": task_id,
+                "agent_task_id": task_id,
+                "target_task_id": task_id,
+                "reason": "scene_detach",
+            },
+        )

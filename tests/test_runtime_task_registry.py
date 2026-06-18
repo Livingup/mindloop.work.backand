@@ -1,10 +1,23 @@
 import asyncio
 import logging
 import sys
+from dataclasses import replace
 from contextlib import suppress
 from types import SimpleNamespace
 
+from agent_runtime.agent import agent_execution_engine as agent_execution_engine_module
+from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine, AgentExecutionRequest, AgentExecutionResult
+from agent_runtime.agent.agent_instance import (
+    AGENT_INSTANCE_STATUS_READY,
+    AGENT_INSTANCE_STATUS_RUNNING,
+    AgentInstance,
+    PendingAgentUserMessage,
+)
+from agent_runtime.agent.agent_task import AgentTask
+from agent_runtime.agent.north_gateway import agent_runtime_gateway_impl as agent_runtime_gateway_impl_module
+from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.infrastructure.runtime_task_registry import RuntimeTaskRegistry, runtime_task_registry_admission_policy
+from agent_runtime.llm_client import llm_request_service as llm_request_service_module
 from agent_runtime.lacp import client as lacp_client_module
 from agent_runtime.lacp.client import LacpClient, _safe_ws_owner_id
 from agent_runtime.lacp.config import LacpConfig
@@ -1243,5 +1256,278 @@ def test_stage7_mcp_ready_owner_and_reconnect_diagnostics_are_task_correlated(mo
         assert reconnect_context["reconnect_attempt"] == 1
         assert reconnect_context["error_type"] == "RuntimeError"
         assert "secret token raw failure" not in str(reconnect_context)
+
+    asyncio.run(run_case())
+
+
+def test_stage8_agent_execution_background_task_is_registry_managed(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(agent_execution_engine_module, "get_runtime_task_registry", lambda: registry)
+
+        task = AgentTask(
+            task_id="task-stage8",
+            root_agent_instance_id="instance-stage8",
+            agent_instance_ids=("instance-stage8",),
+        )
+        instance = AgentInstance(
+            instance_id="instance-stage8",
+            task_id=task.task_id,
+            thread_id="thread-stage8",
+            current_working_directory="D:/project/agent",
+            agent_definition_id="coding",
+            llm_provider_id="provider-stage8",
+            llm_model_binding_id="binding-stage8",
+            conversation_id="conversation-stage8",
+            trace_id="trace-stage8",
+            status=AGENT_INSTANCE_STATUS_READY,
+        )
+
+        class RuntimeGateway:
+            def __init__(self) -> None:
+                self.instance = instance
+                self.task = task
+
+            def get_agent_instance(self, instance_id: str) -> AgentInstance:
+                assert instance_id == self.instance.instance_id
+                return self.instance
+
+            def get_task(self, task_id: str) -> AgentTask:
+                assert task_id == self.task.task_id
+                return self.task
+
+            def enqueue_agent_instance_user_message(self, instance_id: str, **kwargs: object):
+                pending = PendingAgentUserMessage(
+                    message_id="pending-stage8",
+                    user_text=str(kwargs["user_text"]),
+                    client_message_id=kwargs.get("client_message_id"),
+                    metadata=dict(kwargs.get("metadata") or {}),
+                )
+                self.instance = replace(self.instance, pending_user_messages=(pending,))
+                return self.instance, pending
+
+        engine = object.__new__(AgentExecutionEngine)
+        engine._runtime_gateway = RuntimeGateway()
+        engine._communication_gateway = None
+        engine._background_tasks = set()
+        engine._active_instance_ids = set()
+        engine._active_execution_handles = {}
+        engine._execution_progress = {}
+        engine._record_execution_instance_event = lambda **_kwargs: None
+        engine._validate_file_input_before_enqueue = lambda _instance, _attachments: asyncio.sleep(0)
+
+        execution_started = asyncio.Event()
+        release_execution = asyncio.Event()
+
+        async def run_agent_instance(_task, _instance, _request, *, interrupt_state):
+            execution_started.set()
+            await release_execution.wait()
+            return AgentExecutionResult(
+                task_id=_task.task_id,
+                instance_id=_instance.instance_id,
+                conversation_id=_instance.conversation_id or "conversation-stage8",
+                trace_file_path="trace.md",
+                assistant_message=None,
+                communication_stream_id=_request.communication_stream_id,
+            )
+
+        engine._run_agent_instance = run_agent_instance
+
+        result = await engine.submit_agent_instance_message(
+            agent_instance_id="instance-stage8",
+            user_text="hello",
+            communication_stream_id="stream-stage8",
+            client_message_id="client-stage8",
+        )
+        await asyncio.wait_for(execution_started.wait(), timeout=1)
+
+        assert result.status == "accepted"
+        assert result.queued_for_later is False
+        assert result.pending_message_id == "pending-stage8"
+        assert result.communication_stream_id == "stream-stage8"
+        assert "instance-stage8" in engine._active_instance_ids
+        assert "instance-stage8" in engine._active_execution_handles
+        [task_handle] = list(engine._background_tasks)
+        assert engine._active_execution_handles["instance-stage8"].task is task_handle
+
+        active = registry.snapshot(include_completed=False)
+        record = _record_by_class(active, "agent_instance_execution")
+        assert record["task_name"] == "agent-execution-instance-stage8"
+        assert record["owner_type"] == "agent_execution_engine"
+        assert record["owner_id"] == "instance-stage8"
+        context = record["diagnostic_context"]
+        assert context == {
+            "phase": "background_execution.launch",
+            "agent_task_id": "task-stage8",
+            "instance_id": "instance-stage8",
+            "conversation_id": "conversation-stage8",
+            "communication_stream_id": "stream-stage8",
+            "agent_definition_id": "coding",
+            "queued_for_later": False,
+            "active_instance_count": 1,
+            "interrupt_requested": False,
+        }
+
+        release_execution.set()
+        await asyncio.wait_for(task_handle, timeout=1)
+        await asyncio.sleep(0)
+        assert engine._background_tasks == set()
+        assert engine._active_instance_ids == set()
+        assert engine._active_execution_handles == {}
+        assert registry.snapshot()["by_status"]["completed"] == 1
+
+    asyncio.run(run_case())
+
+
+def test_stage8_scene_detach_terminal_cleanup_is_registry_managed(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(agent_runtime_gateway_impl_module, "get_runtime_task_registry", lambda: registry)
+
+        deleted_task_ids: list[str] = []
+
+        class TerminalGateway:
+            async def delete_task_terminals(self, task_id: str) -> list[object]:
+                deleted_task_ids.append(task_id)
+                return [object(), object()]
+
+        monkeypatch.setitem(
+            sys.modules,
+            "agent_runtime.terminal.terminal_factory",
+            SimpleNamespace(TerminalFactory=SimpleNamespace(create=lambda: TerminalGateway())),
+        )
+
+        agent_runtime_gateway_impl_module._delete_task_terminals("task-stage8-scene")
+        active = registry.snapshot(include_completed=False)
+        record = _record_by_class(active, "scene_detach_terminal_cleanup")
+        assert record["task_name"] == "scene-detach-terminal-cleanup-task-stage8-scene"
+        assert record["owner_type"] == "agent_runtime_gateway"
+        assert record["owner_id"] == "task-stage8-scene"
+        assert record["diagnostic_context"] == {
+            "phase": "scene_detach_terminal_cleanup.scheduled",
+            "task_id": "task-stage8-scene",
+            "agent_task_id": "task-stage8-scene",
+            "target_task_id": "task-stage8-scene",
+            "reason": "scene_detach",
+        }
+
+        [cleanup_task] = [task for task in asyncio.all_tasks() if task.get_name() == record["task_name"]]
+        await asyncio.wait_for(cleanup_task, timeout=1)
+        await asyncio.sleep(0)
+
+        completed = _record_by_class(registry.snapshot(), "scene_detach_terminal_cleanup")
+        assert deleted_task_ids == ["task-stage8-scene"]
+        assert completed["status"] == "completed"
+        assert completed["diagnostic_context"] == {
+            "phase": "scene_detach_terminal_cleanup.completed",
+            "task_id": "task-stage8-scene",
+            "agent_task_id": "task-stage8-scene",
+            "target_task_id": "task-stage8-scene",
+            "reason": "scene_detach",
+            "deleted_terminal_count": 2,
+        }
+        assert "command" not in str(completed).lower()
+        assert "terminal output" not in str(completed).lower()
+
+    asyncio.run(run_case())
+
+
+def test_stage8_llm_runtime_event_publish_same_loop_is_registry_managed_and_bounded(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(llm_request_service_module, "get_runtime_task_registry", lambda: registry)
+        published: list[tuple[object, str, dict[str, object], str | None, dict[str, object] | None]] = []
+
+        class Publisher:
+            async def publish(self, context, event_type, payload, *, source=None, metadata=None, **_kwargs):
+                published.append((context, event_type, payload, source, metadata))
+
+        context = RuntimeCommunicationContext(stream_id="stream-stage8")
+        payload = {
+            "delta": "secret raw LLM delta text",
+            "thinking": "secret raw thinking text",
+            "tool_output": "secret raw tool output",
+        }
+        llm_request_service_module._schedule_runtime_event_publish(
+            publisher=Publisher(),
+            context=context,
+            event_type="llm.response.delta",
+            payload=payload,
+            event_loop=asyncio.get_running_loop(),
+            conversation_id="conversation-stage8",
+        )
+
+        active = registry.snapshot(include_completed=False)
+        record = _record_by_class(active, "runtime_event_publish")
+        assert record["task_name"] == "llm-runtime-event-publish-llm.response.delta"
+        assert record["owner_type"] == "llm_request_service"
+        assert record["owner_id"] == "conversation-stage8"
+        scheduled_context = record["diagnostic_context"]
+        assert scheduled_context["phase"] == "runtime_event_publish.scheduled"
+        assert scheduled_context["event_type"] == "llm.response.delta"
+        assert scheduled_context["conversation_id"] == "conversation-stage8"
+        assert scheduled_context["source"] == "llm_client"
+        assert scheduled_context["payload_keys"] == "[redacted]"
+        assert scheduled_context["payload_key_count"] == "[redacted]"
+        assert scheduled_context["payload_size"] == "[redacted]"
+        assert "secret raw" not in str(scheduled_context)
+
+        [publish_task] = [task for task in asyncio.all_tasks() if task.get_name() == record["task_name"]]
+        await asyncio.wait_for(publish_task, timeout=1)
+        await asyncio.sleep(0)
+        assert published == [(context, "llm.response.delta", payload, "llm_client", {"conversation_id": "conversation-stage8"})]
+        assert registry.snapshot()["by_status"]["completed"] == 1
+
+    asyncio.run(run_case())
+
+
+def test_stage8_llm_runtime_event_publish_failure_diagnostics_are_bounded(monkeypatch, caplog) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(llm_request_service_module, "get_runtime_task_registry", lambda: registry)
+
+        class Publisher:
+            async def publish(self, *_args, **_kwargs):
+                raise RuntimeError("secret raw provider payload should not leak")
+
+        payload = {
+            "delta": "secret raw LLM delta text",
+            "payload": "secret raw payload value",
+        }
+        with caplog.at_level(logging.ERROR):
+            llm_request_service_module._schedule_runtime_event_publish(
+                publisher=Publisher(),
+                context=RuntimeCommunicationContext(stream_id="stream-stage8"),
+                event_type="llm.response.delta",
+                payload=payload,
+                event_loop=asyncio.get_running_loop(),
+                conversation_id="conversation-stage8",
+            )
+            record = _record_by_class(registry.snapshot(include_completed=False), "runtime_event_publish")
+            [publish_task] = [task for task in asyncio.all_tasks() if task.get_name() == record["task_name"]]
+            with suppress(RuntimeError):
+                await asyncio.wait_for(publish_task, timeout=1)
+            await asyncio.sleep(0)
+
+        failed = _record_by_class(registry.snapshot(), "runtime_event_publish")
+        assert failed["status"] == "failed"
+        assert failed["last_error_type"] == "RuntimeError"
+        assert failed["last_error"] == "Runtime event publish failed."
+        failure_context = failed["diagnostic_context"]
+        assert failure_context["phase"] == "runtime_event_publish.failed"
+        assert failure_context["event_type"] == "llm.response.delta"
+        assert failure_context["conversation_id"] == "conversation-stage8"
+        assert failure_context["source"] == "llm_client"
+        assert failure_context["payload_keys"] == "[redacted]"
+        assert failure_context["payload_key_count"] == "[redacted]"
+        assert failure_context["payload_size"] == "[redacted]"
+        assert failure_context["error_type"] == "RuntimeError"
+        diagnostic_text = str(failed).lower()
+        log_text = caplog.text.lower()
+        assert "secret raw" not in diagnostic_text
+        assert "provider payload" not in diagnostic_text
+        assert "secret raw" not in log_text
+        assert "provider payload" not in log_text
+        assert "traceback" not in log_text
 
     asyncio.run(run_case())
