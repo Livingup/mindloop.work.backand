@@ -100,6 +100,7 @@ Desktop.ini
 !/tests/test_workspace_memory_rest_adapter.py
 !/tests/test_context_compression_worker_contents.py
 !/tests/test_context_compression_worker_fanout.py
+!/tests/test_context_compression_worker_activity_publish.py
 !/tests/test_mcp_metadata_cache.py
 
 /web-frontend/

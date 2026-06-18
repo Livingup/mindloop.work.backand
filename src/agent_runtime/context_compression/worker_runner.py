@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
+from collections.abc import Coroutine
 from typing import Any, Callable
 
 from agent_runtime.context_compression.event_publisher import (
@@ -23,11 +25,17 @@ from agent_runtime.context_compression.summary_tools import ContextSummaryToolEx
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
 from agent_runtime.llm_client.llm_request_service import LlmProviderModelServiceUnavailable, LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
+
+
+logger = logging.getLogger(__name__)
+_WORKER_ACTIVITY_PUBLISH_OWNER_TYPE = "context_compression_worker_runner"
+_WORKER_ACTIVITY_PUBLISH_TASK_CLASS = "context_compression_worker_activity_publish"
 
 
 class ContextCompressionWorkerRunner:
@@ -130,22 +138,39 @@ class ContextCompressionWorkerRunner:
                 return
             last_activity_signature = signature
 
-            async def publish() -> None:
-                await self._publish_worker_activity(
-                    communication_context,
-                    job,
+            # Stage 8/P1.3 protected helper: activity events are best-effort,
+            # short-lived fire-and-forget publishes for UI/status observability.
+            # They are not section worker tasks, do not participate in fan-out/job
+            # lifecycle decisions, and must never copy activity text/details into
+            # Registry diagnostics or logs.
+            def schedule_publish() -> None:
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                _schedule_context_compression_activity_publish(
+                    self._publish_worker_activity(
+                        communication_context,
+                        job,
+                        worker_name=worker_name,
+                        worker_role=worker_role,
+                        output_section=output_section,
+                        input_mode=input_mode,
+                        resolved_model=resolved_model,
+                        kind=kind,
+                        text=text,
+                        details=details,
+                        duration_ms=duration_ms,
+                    ),
+                    event_loop=event_loop,
+                    job=job,
                     worker_name=worker_name,
                     worker_role=worker_role,
                     output_section=output_section,
                     input_mode=input_mode,
-                    resolved_model=resolved_model,
-                    kind=kind,
-                    text=text,
+                    activity_kind=kind,
                     details=details,
-                    duration_ms=int((time.perf_counter() - started_at) * 1000),
+                    duration_ms=duration_ms,
                 )
 
-            event_loop.call_soon_threadsafe(lambda: asyncio.create_task(publish()))
+            event_loop.call_soon_threadsafe(schedule_publish)
 
         def observe_llm_event(event_type: str, payload: dict[str, Any]) -> None:
             activity = _activity_from_llm_event(event_type, payload)
@@ -349,6 +374,180 @@ class ContextCompressionWorkerRunner:
             payload["worker"]["error_message"] = error_message
             payload["error_message"] = error_message
         await self._event_publisher.publish(context, event_type, payload, source="context_compression_worker_runner")
+
+
+def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
+    raw = (value or "unknown").strip()
+    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
+    return (safe.strip("-._") or "unknown")[:max_length]
+
+
+def _worker_activity_publish_context(
+    *,
+    phase: str,
+    job: CompressionJob,
+    worker_id: str,
+    worker_name: str,
+    worker_role: str,
+    output_section: str | None,
+    input_mode: str,
+    activity_kind: str,
+    details: dict[str, Any] | None,
+    duration_ms: int | None = None,
+    reason: str | None = None,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "phase": phase,
+        "event_type": CONTEXT_COMPRESSION_WORKER_ACTIVITY,
+        "job_id": job.job_id,
+        "agent_task_id": job.task_id,
+        "agent_instance_id": job.agent_instance_id,
+        "root_conversation_id": job.root_conversation_id,
+        "source_conversation_id": job.source_conversation_id,
+        "compression_index": job.compression_index,
+        "worker_id": worker_id,
+        "worker_name": worker_name,
+        "worker_role": worker_role,
+        "output_section": output_section,
+        "input_mode": input_mode,
+        "activity_kind": activity_kind,
+    }
+    if duration_ms is not None:
+        context["duration_ms"] = duration_ms
+    if reason is not None:
+        context["reason"] = reason
+    if error_type is not None:
+        context["error_type"] = error_type
+    if details is not None:
+        context["activity_detail_key_count"] = len(details)
+    return context
+
+
+async def _publish_worker_activity_with_bounded_failure(
+    coro: Any,
+    *,
+    job: CompressionJob,
+    worker_id: str,
+    worker_name: str,
+    worker_role: str,
+    output_section: str | None,
+    input_mode: str,
+    activity_kind: str,
+    details: dict[str, Any] | None,
+    duration_ms: int,
+) -> None:
+    try:
+        await coro
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not expose activity payloads or raw exception text
+        task = asyncio.current_task()
+        if task is not None:
+            get_runtime_task_registry().mark_progress(
+                task,
+                diagnostic_context=_worker_activity_publish_context(
+                    phase="context_compression.worker_activity_publish.failed",
+                    job=job,
+                    worker_id=worker_id,
+                    worker_name=worker_name,
+                    worker_role=worker_role,
+                    output_section=output_section,
+                    input_mode=input_mode,
+                    activity_kind=activity_kind,
+                    details=details,
+                    duration_ms=duration_ms,
+                    reason="publish_failed",
+                    error_type=exc.__class__.__name__,
+                ),
+            )
+        logger.error(
+            "Context compression worker activity publish failed: event_type=%s job_id=%s worker_id=%s activity_kind=%s error_type=%s",
+            CONTEXT_COMPRESSION_WORKER_ACTIVITY,
+            job.job_id,
+            worker_id,
+            activity_kind,
+            exc.__class__.__name__,
+        )
+        return
+    task = asyncio.current_task()
+    if task is not None:
+        get_runtime_task_registry().mark_progress(
+            task,
+            diagnostic_context=_worker_activity_publish_context(
+                phase="context_compression.worker_activity_publish.completed",
+                job=job,
+                worker_id=worker_id,
+                worker_name=worker_name,
+                worker_role=worker_role,
+                output_section=output_section,
+                input_mode=input_mode,
+                activity_kind=activity_kind,
+                details=details,
+                duration_ms=duration_ms,
+                reason="completed",
+            ),
+        )
+
+
+def _schedule_context_compression_activity_publish(
+    coro: Any,
+    *,
+    event_loop: asyncio.AbstractEventLoop,
+    job: CompressionJob,
+    worker_name: str,
+    worker_role: str,
+    output_section: str | None,
+    input_mode: str,
+    activity_kind: str,
+    details: dict[str, Any] | None,
+    duration_ms: int,
+) -> None:
+    worker_id = context_compression_worker_id(worker_name, worker_role, output_section)
+    safe_worker_id = _safe_runtime_task_label(worker_id, max_length=48)
+    safe_activity_kind = _safe_runtime_task_label(activity_kind, max_length=32)
+    if event_loop.is_closed():
+        logger.warning(
+            "Context compression worker activity publish skipped because event loop is closed: event_type=%s job_id=%s worker_id=%s activity_kind=%s",
+            CONTEXT_COMPRESSION_WORKER_ACTIVITY,
+            job.job_id,
+            worker_id,
+            activity_kind,
+        )
+        if isinstance(coro, Coroutine):
+            coro.close()
+        return
+    get_runtime_task_registry().create_task(
+        _publish_worker_activity_with_bounded_failure(
+            coro,
+            job=job,
+            worker_id=worker_id,
+            worker_name=worker_name,
+            worker_role=worker_role,
+            output_section=output_section,
+            input_mode=input_mode,
+            activity_kind=activity_kind,
+            details=details,
+            duration_ms=duration_ms,
+        ),
+        task_name=f"context-compression-worker-activity-publish-{safe_worker_id}-{safe_activity_kind}",
+        owner_type=_WORKER_ACTIVITY_PUBLISH_OWNER_TYPE,
+        owner_id=worker_id,
+        task_class=_WORKER_ACTIVITY_PUBLISH_TASK_CLASS,
+        diagnostic_context=_worker_activity_publish_context(
+            phase="context_compression.worker_activity_publish.scheduled",
+            job=job,
+            worker_id=worker_id,
+            worker_name=worker_name,
+            worker_role=worker_role,
+            output_section=output_section,
+            input_mode=input_mode,
+            activity_kind=activity_kind,
+            details=details,
+            duration_ms=duration_ms,
+            reason="scheduled",
+        ),
+    )
 
 
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
