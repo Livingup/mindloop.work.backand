@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from agent_runtime.infrastructure.runtime_task_registry import RuntimeTaskRegistry
 
@@ -69,7 +70,7 @@ def test_runtime_task_registry_tracks_cancel_stop_health_and_redaction() -> None
     asyncio.run(run_case())
 
 
-def test_runtime_task_registry_register_alias_and_done_callback_failure_are_queryable() -> None:
+def test_runtime_task_registry_register_alias_and_done_callback_failure_are_queryable(caplog) -> None:
     async def run_case() -> None:
         registry = RuntimeTaskRegistry(completed_task_retention=8)
 
@@ -84,22 +85,26 @@ def test_runtime_task_registry_register_alias_and_done_callback_failure_are_quer
             raise RuntimeError("done callback secret token should be redacted")
 
         registry._on_task_done = fail_once
-        registered = registry.register(
-            task,
-            owner_type="test_owner",
-            owner_id="owner-2",
-            task_class="registered_worker",
-            diagnostic_context={"safe": "value"},
-        )
-        assert registered is task
-        await task
-        await asyncio.sleep(0)
+        with caplog.at_level(logging.ERROR, logger="agent_runtime.infrastructure.runtime_task_registry"):
+            registered = registry.register(
+                task,
+                owner_type="test_owner",
+                owner_id="owner-2",
+                task_class="registered_worker",
+                diagnostic_context={"safe": "value"},
+            )
+            assert registered is task
+            await task
+            await asyncio.sleep(0)
 
         failed_callback_record = registry.snapshot()["tasks"][0]
         assert failed_callback_record["task_name"] == "pre-created-task"
         assert failed_callback_record["done_callback_error_type"] == "RuntimeError"
         assert failed_callback_record["done_callback_error"] == "[redacted]"
         assert failed_callback_record["health_snapshot"]["has_error"] is True
+        assert "[redacted]" in caplog.text
+        assert "done callback secret token should be redacted" not in caplog.text
+        assert "Traceback" not in caplog.text
 
         second_task = registry.create(
             finish(),

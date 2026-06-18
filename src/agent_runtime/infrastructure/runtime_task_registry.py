@@ -538,16 +538,19 @@ class RuntimeTaskRegistry:
         try:
             self._on_task_done(task)
         except BaseException as exc:  # noqa: BLE001 - done callbacks must never leak to the loop
+            error_type = exc.__class__.__name__
+            sanitized_error = _sanitize_error_text(str(exc))
             with self._lock:
                 task_id = self._task_ids.get(task)
                 record = self._records.get(task_id) if task_id is not None else None
                 if record is not None:
-                    record.done_callback_error_type = exc.__class__.__name__
-                    record.done_callback_error = _sanitize_error_text(str(exc))
-            logger.exception(
-                "Runtime task registry done-callback processing failed: task_id=%s error_type=%s",
-                self.task_id_for(task),
-                exc.__class__.__name__,
+                    record.done_callback_error_type = error_type
+                    record.done_callback_error = sanitized_error
+            logger.error(
+                "Runtime task registry done-callback processing failed: task_id=%s error_type=%s error=%s",
+                task_id,
+                error_type,
+                sanitized_error,
             )
 
     def _on_task_done(self, task: asyncio.Task[Any]) -> None:
