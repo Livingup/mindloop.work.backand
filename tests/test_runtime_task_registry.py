@@ -960,3 +960,288 @@ def test_stage4_mcp_connection_owner_is_registry_managed_and_disconnect_stops_ow
         assert registry.snapshot()["by_status"]["completed"] == 1
 
     asyncio.run(run_case())
+
+
+def _record_by_class(snapshot: dict[str, object], task_class: str) -> dict[str, object]:
+    records = [record for record in snapshot["tasks"] if record["task_class"] == task_class]
+    assert len(records) == 1
+    return records[0]
+
+
+def test_stage7_lacp_lifecycle_diagnostics_are_task_correlated_and_sanitized(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(lacp_client_module, "get_runtime_task_registry", lambda: registry)
+
+        endpoint = "wss://user:secret@relay.example.test:9443/team/live?token=secret-token&api_key=hidden"
+        config = LacpConfig(
+            enabled=True,
+            registry_url=endpoint,
+            api_key="secret-api-key",
+            reconnect_initial_delay_seconds=0.01,
+            reconnect_max_delay_seconds=0.01,
+            request_timeout_seconds=0.01,
+        )
+        registration_registry = _LacpRegistrationRegistryLifecycleStub()
+        client = LacpClient(config_accessor=lambda: config, registration_registry=registration_registry)
+        connected = asyncio.Event()
+        reader_started = asyncio.Event()
+
+        class FakeWebSocket:
+            def __aiter__(self) -> "FakeWebSocket":
+                return self
+
+            async def __anext__(self) -> str:
+                reader_started.set()
+                await asyncio.Event().wait()
+                raise StopAsyncIteration
+
+            async def send(self, _message: str) -> None:
+                return None
+
+            async def close(self) -> None:
+                return None
+
+        class FakeConnect:
+            async def __aenter__(self) -> FakeWebSocket:
+                connected.set()
+                return FakeWebSocket()
+
+            async def __aexit__(self, exc_type, exc, traceback) -> bool:
+                return False
+
+        async def resolve_ws_endpoint(_config: LacpConfig) -> str:
+            return endpoint
+
+        def fake_connect(ws_endpoint: str, **_kwargs) -> FakeConnect:
+            assert ws_endpoint == endpoint
+            return FakeConnect()
+
+        monkeypatch.setattr(client, "_resolve_ws_endpoint", resolve_ws_endpoint)
+        monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=fake_connect))
+
+        await client.start()
+        await asyncio.wait_for(connected.wait(), timeout=1)
+        await asyncio.wait_for(reader_started.wait(), timeout=1)
+
+        active = registry.snapshot(include_completed=False)
+        run_record = _record_by_class(active, "client_run_loop")
+        reader_record = _record_by_class(active, "websocket_reader")
+        run_context = run_record["diagnostic_context"]
+        reader_context = reader_record["diagnostic_context"]
+        assert run_context["phase"] == "reader_task.created"
+        assert run_context["task_id"] == run_record["task_id"]
+        assert run_context["reader_task_id"] == reader_record["task_id"]
+        assert run_context["endpoint_owner_id"] == "relay.example.test-9443-team-live"
+        assert reader_context["phase"] == "reader.waiting"
+        assert reader_context["task_id"] == reader_record["task_id"]
+        assert reader_context["endpoint_owner_id"] == "relay.example.test-9443-team-live"
+        assert "secret" not in str(active).lower()
+        assert "token" not in str(active).lower()
+        assert "api_key" not in str(active).lower()
+
+        await client.shutdown()
+        await asyncio.sleep(0)
+
+        completed = registry.snapshot()
+        reader_completed = _record_by_class(completed, "websocket_reader")
+        run_completed = _record_by_class(completed, "client_run_loop")
+        assert reader_completed["diagnostic_context"]["phase"] == "reader.exit"
+        assert reader_completed["diagnostic_context"]["reason"] in {"reader_cancelled", "reader_completed"}
+        assert run_completed["diagnostic_context"]["phase"] in {"client_run_loop.cancelled", "websocket.disconnected"}
+        assert "secret" not in str(completed).lower()
+        assert "token" not in str(completed).lower()
+        assert "api_key" not in str(completed).lower()
+
+    asyncio.run(run_case())
+
+
+def test_stage7_lacp_pending_request_failure_reasons_are_bounded(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        monkeypatch.setattr(lacp_client_module, "get_runtime_task_registry", lambda: registry)
+
+        config = LacpConfig(
+            enabled=True,
+            registry_url="wss://relay.example.test/ws",
+            api_key="secret-api-key",
+            request_timeout_seconds=0.01,
+        )
+        registration_registry = _LacpRegistrationRegistryLifecycleStub()
+        client = LacpClient(config_accessor=lambda: config, registration_registry=registration_registry)
+
+        async def run_loop_marker() -> None:
+            await asyncio.Event().wait()
+
+        run_task = registry.create_task(
+            run_loop_marker(),
+            task_name="lacp-client-run-loop",
+            owner_type="lacp_client",
+            owner_id="global",
+            task_class="client_run_loop",
+        )
+        client._task = run_task
+
+        try:
+            try:
+                await client._send_request({"type": "register"}, expected_type="register_ack")
+            except RuntimeError as exc:
+                assert str(exc) == "LACP WebSocket is not connected."
+            disconnected_context = _record_by_class(registry.snapshot(include_completed=False), "client_run_loop")["diagnostic_context"]
+            assert disconnected_context["phase"] == "pending_request.failed"
+            assert disconnected_context["reason"] == "websocket_disconnected"
+            assert disconnected_context["expected_type"] == "register_ack"
+            assert disconnected_context["error_type"] == "RuntimeError"
+
+            class TimeoutWebSocket:
+                async def send(self, _message: str) -> None:
+                    return None
+
+            client._ws = TimeoutWebSocket()
+            try:
+                await client._send_request({"type": "register"}, expected_type="register_ack")
+            except TimeoutError as exc:
+                assert str(exc) == "LACP request timed out."
+            timeout_context = _record_by_class(registry.snapshot(include_completed=False), "client_run_loop")["diagnostic_context"]
+            assert timeout_context["phase"] == "pending_request.failed"
+            assert timeout_context["reason"] == "request_timeout"
+            assert timeout_context["expected_type"] == "register_ack"
+            assert timeout_context["timeout_seconds"] == 0.01
+            assert timeout_context["error_type"] == "TimeoutError"
+
+            async def fake_send_json(frame: dict[str, object]) -> None:
+                request_id = frame["request_id"]
+                future = client._pending_requests.pop(request_id)
+                unexpected_type = "unexpected-" + "x" * 200
+                future.set_result({"type": unexpected_type, "payload": "secret-token-raw-payload"})
+
+            client._ws = object()
+            monkeypatch.setattr(client, "_send_json", fake_send_json)
+            try:
+                await client._send_request({"type": "register"}, expected_type="register_ack")
+            except RuntimeError as exc:
+                assert str(exc) == "Unexpected LACP response type: " + ("unexpected-" + "x" * 200)[:80]
+            unexpected_context = _record_by_class(registry.snapshot(include_completed=False), "client_run_loop")["diagnostic_context"]
+            assert unexpected_context["phase"] == "pending_request.failed"
+            assert unexpected_context["reason"] == "unexpected_response_type"
+            assert unexpected_context["expected_type"] == "register_ack"
+            assert unexpected_context["response_type"] == ("unexpected-" + "x" * 200)[:80]
+            assert unexpected_context["error_type"] == "RuntimeError"
+            assert "secret-token-raw-payload" not in str(unexpected_context)
+
+            future = asyncio.get_running_loop().create_future()
+            client._pending_requests["pending-secret-request-id"] = future
+            client._fail_pending(RuntimeError("LACP client stopped."), reason="client_stopped", task=run_task)
+            stopped_context = _record_by_class(registry.snapshot(include_completed=False), "client_run_loop")["diagnostic_context"]
+            assert stopped_context["phase"] == "pending_requests.failed"
+            assert stopped_context["reason"] == "client_stopped"
+            assert stopped_context["pending_request_count"] == 1
+            assert stopped_context["error_type"] == "RuntimeError"
+            assert client._pending_requests == {}
+        finally:
+            registry.cancel(run_task, message="test cleanup")
+            with suppress(asyncio.CancelledError):
+                await run_task
+
+    asyncio.run(run_case())
+
+
+def test_stage7_mcp_ready_owner_and_reconnect_diagnostics_are_task_correlated(monkeypatch) -> None:
+    async def run_case() -> None:
+        registry = RuntimeTaskRegistry(completed_task_retention=8)
+        progress_contexts: list[dict[str, object]] = []
+        original_mark_progress = registry.mark_progress
+
+        def record_mark_progress(
+            task_or_id: object,
+            *,
+            diagnostic_context: dict[str, object] | None = None,
+            **kwargs: object,
+        ) -> None:
+            if diagnostic_context is not None:
+                progress_contexts.append(dict(diagnostic_context))
+            original_mark_progress(task_or_id, diagnostic_context=diagnostic_context, **kwargs)
+
+        registry.mark_progress = record_mark_progress
+        monkeypatch.setattr(mcp_session_manager_module, "get_runtime_task_registry", lambda: registry)
+
+        manager = McpSessionManager()
+        definition = _mcp_definition("svc_stage7")
+
+        class FakeSession:
+            async def initialize(self) -> SimpleNamespace:
+                return SimpleNamespace(
+                    capabilities=SimpleNamespace(tools=object(), resources=None),
+                    serverInfo=SimpleNamespace(name="stage7", version="1.0"),
+                    instructions="bounded",
+                )
+
+        async def create_session(_definition: McpServiceDefinition, _exit_stack: object) -> FakeSession:
+            return FakeSession()
+
+        monkeypatch.setattr(manager, "_create_session", create_session)
+
+        capabilities = await manager.connect(definition)
+        assert capabilities.supports_tools is True
+        active = registry.snapshot(include_completed=False)
+        await asyncio.sleep(0)
+        owner_record = _record_by_class(active, "connection_owner")
+        owner_context = owner_record["diagnostic_context"]
+        assert owner_context["phase"] in {"connection.connected", "close_event.waiting"}
+        assert owner_context["service_id"] == "svc_stage7"
+        assert owner_context["transport_type"] == "StdioTransportConfig"
+        assert owner_context["task_id"] == owner_record["task_id"]
+        owner_task_id = owner_record["task_id"]
+        owner_contexts = [context for context in progress_contexts if context.get("service_id") == "svc_stage7"]
+        owner_phases = {context.get("phase") for context in owner_contexts}
+        assert "owner_task.created" in owner_phases
+        assert "ready_future.waiting" in owner_phases
+        assert "ready_future.completed" in owner_phases
+        assert "owner_task.started" in owner_phases
+        assert "ready_future.set_result" in owner_phases
+        assert "close_event.waiting" in owner_phases
+        assert all(context.get("task_id") == owner_task_id for context in owner_contexts if "task_id" in context)
+        assert "secret" not in str(active).lower()
+        assert "traceback" not in str(active).lower()
+
+        await manager.disconnect(definition.service_id)
+        await asyncio.sleep(0)
+        owner_completed = _record_by_class(registry.snapshot(), "connection_owner")
+        assert owner_completed["diagnostic_context"]["phase"] == "owner_task.cleanup.completed"
+        assert owner_completed["diagnostic_context"]["reason"] == "exit_stack_closed"
+
+        reconnect_definition = _mcp_definition("svc_reconnect_stage7")
+        reconnect_state = manager._state(reconnect_definition.service_id)
+        reconnect_state.retry_attempt = 1
+        reconnect_started = asyncio.Event()
+
+        async def failing_connect(_definition: McpServiceDefinition, *, status: str) -> None:
+            reconnect_started.set()
+            raise RuntimeError("secret token raw failure")
+
+        async def no_sleep(_delay: float) -> None:
+            reconnect_definition.enabled = False
+
+        monkeypatch.setattr(manager, "_connect", failing_connect)
+        monkeypatch.setattr(mcp_session_manager_module.asyncio, "sleep", no_sleep)
+        reconnect_task = registry.create_task(
+            manager._reconnect_loop(reconnect_definition),
+            task_name="mcp-reconnect-loop-svc_reconnect_stage7",
+            owner_type="mcp_session_manager",
+            owner_id=reconnect_definition.service_id,
+            task_class="reconnect_loop",
+        )
+        await asyncio.wait_for(reconnect_started.wait(), timeout=1)
+        await reconnect_task
+        reconnect_record = _record_by_class(registry.snapshot(), "reconnect_loop")
+        reconnect_context = reconnect_record["diagnostic_context"]
+        assert reconnect_context["phase"] == "reconnect_loop.connect_failed"
+        assert reconnect_context["reason"] == "connect_exception"
+        assert reconnect_context["service_id"] == "svc_reconnect_stage7"
+        assert reconnect_context["transport_type"] == "StdioTransportConfig"
+        assert reconnect_context["task_id"] == reconnect_record["task_id"]
+        assert reconnect_context["reconnect_attempt"] == 1
+        assert reconnect_context["error_type"] == "RuntimeError"
+        assert "secret token raw failure" not in str(reconnect_context)
+
+    asyncio.run(run_case())

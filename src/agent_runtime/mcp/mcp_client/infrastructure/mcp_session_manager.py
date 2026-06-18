@@ -62,6 +62,12 @@ def _transport_type_name(definition: McpServiceDefinition) -> str:
     return type(definition.transport).__name__
 
 
+def _runtime_task_id_for(task: asyncio.Task[Any] | None) -> str | None:
+    if task is None:
+        return None
+    return get_runtime_task_registry().task_id_for(task)
+
+
 def _log_mcp_phase(
     level: int,
     message: str,
@@ -80,10 +86,11 @@ def _log_mcp_phase(
 ) -> None:
     if not logger.isEnabledFor(level):
         return
+    error_present = error is not None
     logger.log(
         level,
         "%s: trace_id=%s stream_id=%s event_type=%s service_id=%s operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
-        "status=%s transport_type=%s owner_task_name=%s error_type=%s error=%s",
+        "status=%s transport_type=%s owner_task_name=%s error_type=%s error_present=%s",
         message,
         None,
         None,
@@ -98,7 +105,7 @@ def _log_mcp_phase(
         transport_type,
         owner_task_name,
         error_type,
-        error,
+        error_present,
     )
 
 
@@ -509,6 +516,19 @@ class McpSessionManager:
                     "service_id": service_id,
                     "transport_type": transport_type,
                     "status": state.status,
+                    "phase": "owner_task.created",
+                },
+            )
+            owner_task_id = _runtime_task_id_for(owner_task)
+            get_runtime_task_registry().mark_progress(
+                owner_task,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "status": state.status,
+                    "phase": "owner_task.created",
+                    "task_id": owner_task_id,
+                    "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
                 },
             )
             _log_mcp_phase(
@@ -527,11 +547,34 @@ class McpSessionManager:
 
             try:
                 ready_wait_started_at = time.perf_counter()
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "ready_future.waiting",
+                        "task_id": owner_task_id,
+                        "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
+                    },
+                )
                 session, capabilities = await asyncio.wait_for(
                     asyncio.shield(ready_future),
                     timeout=_MCP_CONNECT_TIMEOUT_SECONDS,
                 )
                 ready_wait_ms = _duration_ms_since(ready_wait_started_at)
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "ready_future.completed",
+                        "task_id": owner_task_id,
+                        "duration_ms": ready_wait_ms,
+                        "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
+                    },
+                )
                 _log_mcp_phase(
                     _slow_or_debug(ready_wait_ms),
                     "MCP connect ready future completed",
@@ -556,6 +599,17 @@ class McpSessionManager:
                 state.retry_attempt = 0
                 state.next_retry_at = None
                 state.last_connected_at = time.time()
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "connection.connected",
+                        "task_id": owner_task_id,
+                        "duration_ms": _duration_ms_since(connect_started_at),
+                    },
+                )
                 _log_mcp_phase(
                     logging.INFO,
                     "MCP service connected",
@@ -578,6 +632,20 @@ class McpSessionManager:
                 return capabilities
             except TimeoutError as e:
                 ready_wait_ms = _duration_ms_since(ready_wait_started_at)
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "ready_future.timeout",
+                        "reason": "ready_future_timeout",
+                        "task_id": owner_task_id,
+                        "duration_ms": ready_wait_ms,
+                        "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
+                        "error_type": "TimeoutError",
+                    },
+                )
                 _log_mcp_phase(
                     logging.ERROR,
                     "MCP connect ready future timed out",
@@ -602,6 +670,18 @@ class McpSessionManager:
                     operation="mcp.connect.timeout_cleanup",
                 )
                 cleanup_ms = _duration_ms_since(cleanup_started_at)
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "timeout_cleanup.completed",
+                        "reason": "ready_future_timeout",
+                        "task_id": owner_task_id,
+                        "duration_ms": cleanup_ms,
+                    },
+                )
                 _log_mcp_phase(
                     _slow_or_debug(cleanup_ms),
                     "MCP connect timeout cleanup completed",
@@ -619,6 +699,19 @@ class McpSessionManager:
                 self._record_failure(state, error)
                 raise ConnectionError(error) from e
             except asyncio.CancelledError as e:
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "ready_future.cancelled",
+                        "reason": "connect_cancelled",
+                        "task_id": owner_task_id,
+                        "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
+                        "error_type": "CancelledError",
+                    },
+                )
                 _log_mcp_phase(
                     logging.WARNING,
                     "MCP connect cancelled while waiting for readiness",
@@ -647,6 +740,19 @@ class McpSessionManager:
                 self._record_failure(state, error)
                 raise ConnectionError(error) from e
             except Exception as e:
+                get_runtime_task_registry().mark_progress(
+                    owner_task,
+                    diagnostic_context={
+                        "service_id": service_id,
+                        "transport_type": transport_type,
+                        "status": state.status,
+                        "phase": "ready_future.exception",
+                        "reason": "connect_exception",
+                        "task_id": owner_task_id,
+                        "timeout_seconds": _MCP_CONNECT_TIMEOUT_SECONDS,
+                        "error_type": e.__class__.__name__,
+                    },
+                )
                 _log_mcp_phase(
                     logging.ERROR,
                     "MCP connect failed before readiness",
@@ -700,9 +806,18 @@ class McpSessionManager:
         transport_type = _transport_type_name(definition)
         owner_started_at = time.perf_counter()
         start_delay_ms = int((owner_started_at - owner_task_created_at) * 1000)
+        owner_task = asyncio.current_task()
+        owner_task_id = _runtime_task_id_for(owner_task)
+        owner_task_or_id = owner_task or f"mcp-connection-owner-{service_id}"
         get_runtime_task_registry().mark_progress(
-            asyncio.current_task() or f"mcp-connection-owner-{service_id}",
-            diagnostic_context={"service_id": service_id, "transport_type": transport_type, "phase": "owner_task.started"},
+            owner_task_or_id,
+            diagnostic_context={
+                "service_id": service_id,
+                "transport_type": transport_type,
+                "phase": "owner_task.started",
+                "task_id": owner_task_id,
+                "duration_ms": start_delay_ms,
+            },
         )
         _log_mcp_phase(
             _slow_or_debug(start_delay_ms),
@@ -773,11 +888,12 @@ class McpSessionManager:
             if not ready_future.done():
                 ready_future.set_result((session, capabilities))
                 get_runtime_task_registry().mark_progress(
-                    asyncio.current_task() or f"mcp-connection-owner-{service_id}",
+                    owner_task_or_id,
                     diagnostic_context={
                         "service_id": service_id,
                         "transport_type": transport_type,
                         "phase": "ready_future.set_result",
+                        "task_id": owner_task_id,
                     },
                 )
                 _log_mcp_phase(
@@ -793,13 +909,25 @@ class McpSessionManager:
                 )
             close_wait_started_at = time.perf_counter()
             get_runtime_task_registry().mark_progress(
-                asyncio.current_task() or f"mcp-connection-owner-{service_id}",
-                diagnostic_context={"service_id": service_id, "transport_type": transport_type, "phase": "close_event.waiting"},
+                owner_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "close_event.waiting",
+                    "task_id": owner_task_id,
+                },
             )
             await close_event.wait()
             get_runtime_task_registry().mark_progress(
-                asyncio.current_task() or f"mcp-connection-owner-{service_id}",
-                diagnostic_context={"service_id": service_id, "transport_type": transport_type, "phase": "close_event.received"},
+                owner_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "close_event.received",
+                    "reason": "close_event_received",
+                    "task_id": owner_task_id,
+                    "duration_ms": _duration_ms_since(close_wait_started_at),
+                },
             )
             _log_mcp_phase(
                 _slow_or_debug(_duration_ms_since(close_wait_started_at)),
@@ -813,6 +941,18 @@ class McpSessionManager:
                 owner_task_name=task_name,
             )
         except asyncio.CancelledError as e:
+            get_runtime_task_registry().mark_progress(
+                owner_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "owner_task.cancelled",
+                    "reason": "owner_cancelled",
+                    "task_id": owner_task_id,
+                    "duration_ms": _duration_ms_since(owner_started_at),
+                    "error_type": "CancelledError",
+                },
+            )
             _log_mcp_phase(
                 logging.WARNING,
                 "MCP connection owner cancelled",
@@ -829,6 +969,18 @@ class McpSessionManager:
                 ready_future.set_exception(ConnectionError(f"连接 MCP 服务 '{service_id}' 初始化被取消"))
             raise
         except Exception as e:
+            get_runtime_task_registry().mark_progress(
+                owner_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "owner_task.exception",
+                    "reason": "owner_exception",
+                    "task_id": owner_task_id,
+                    "duration_ms": _duration_ms_since(owner_started_at),
+                    "error_type": e.__class__.__name__,
+                },
+            )
             _log_mcp_phase(
                 logging.WARNING,
                 "MCP connection owner failed",
@@ -845,9 +997,25 @@ class McpSessionManager:
             if not ready_future.done():
                 ready_future.set_exception(e)
             else:
-                logger.warning("MCP 服务连接 owner 异常退出: %s — %s", service_id, e)
+                logger.warning(
+                    "MCP 服务连接 owner 异常退出: service_id=%s error_type=%s",
+                    service_id,
+                    e.__class__.__name__,
+                )
         finally:
+            cleanup_started_at = time.perf_counter()
             await self._close_exit_stack(exit_stack, service_id=service_id, operation=operation)
+            get_runtime_task_registry().mark_progress(
+                owner_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "owner_task.cleanup.completed",
+                    "reason": "exit_stack_closed",
+                    "task_id": owner_task_id,
+                    "duration_ms": _duration_ms_since(cleanup_started_at),
+                },
+            )
             current_task = asyncio.current_task()
             conn = self._connections.get(service_id)
             if conn is not None and conn.owner_task is current_task:
@@ -863,6 +1031,7 @@ class McpSessionManager:
     ) -> None:
         actual_service_id = service_id or "unknown"
         task_name = _current_task_name()
+        owner_task_id = _runtime_task_id_for(owner_task)
         stop_started_at = time.perf_counter()
         close_event.set()
         _log_mcp_phase(
@@ -924,7 +1093,13 @@ class McpSessionManager:
             get_runtime_task_registry().cancel(
                 owner_task,
                 message="mcp owner task stop timeout",
-                diagnostic_context={"service_id": actual_service_id, "phase": "owner_task.first_wait.timeout"},
+                diagnostic_context={
+                    "service_id": actual_service_id,
+                    "phase": "owner_task.first_wait.timeout",
+                    "reason": "owner_stop_timeout",
+                    "task_id": owner_task_id,
+                    "timeout_seconds": _MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS,
+                },
             )
             cancel_wait_started_at = time.perf_counter()
             try:
@@ -1051,32 +1226,48 @@ class McpSessionManager:
     async def _reconnect_loop(self, definition: McpServiceDefinition) -> None:
         service_id = definition.service_id
         state = self._state(service_id)
+        transport_type = _transport_type_name(definition)
+        reconnect_task = asyncio.current_task()
+        reconnect_task_id = _runtime_task_id_for(reconnect_task)
+        reconnect_task_or_id = reconnect_task or f"mcp-reconnect-loop-{service_id}"
         try:
             get_runtime_task_registry().mark_progress(
-                asyncio.current_task() or f"mcp-reconnect-loop-{service_id}",
-                diagnostic_context={"service_id": service_id, "phase": "reconnect_loop.started"},
+                reconnect_task_or_id,
+                diagnostic_context={
+                    "service_id": service_id,
+                    "transport_type": transport_type,
+                    "phase": "reconnect_loop.started",
+                    "task_id": reconnect_task_id,
+                    "retry_attempt": state.retry_attempt,
+                },
             )
             while definition.enabled and not self.is_connected(service_id):
                 if state.retry_attempt > 0:
                     delay = self._retry_delay(state.retry_attempt)
                     state.next_retry_at = time.time() + delay
                     get_runtime_task_registry().mark_progress(
-                        asyncio.current_task() or f"mcp-reconnect-loop-{service_id}",
+                        reconnect_task_or_id,
                         diagnostic_context={
                             "service_id": service_id,
+                            "transport_type": transport_type,
                             "phase": "reconnect_loop.sleeping",
+                            "task_id": reconnect_task_id,
                             "retry_attempt": state.retry_attempt,
+                            "reconnect_attempt": state.retry_attempt,
                             "delay_seconds": delay,
                         },
                     )
                     await asyncio.sleep(delay)
                 try:
                     get_runtime_task_registry().mark_progress(
-                        asyncio.current_task() or f"mcp-reconnect-loop-{service_id}",
+                        reconnect_task_or_id,
                         diagnostic_context={
                             "service_id": service_id,
+                            "transport_type": transport_type,
                             "phase": "reconnect_loop.connecting",
+                            "task_id": reconnect_task_id,
                             "retry_attempt": state.retry_attempt,
+                            "reconnect_attempt": state.retry_attempt,
                         },
                     )
                     await self._connect(
@@ -1084,12 +1275,35 @@ class McpSessionManager:
                         status=MCP_CONNECTION_STATUS_RECONNECTING,
                     )
                     get_runtime_task_registry().mark_progress(
-                        asyncio.current_task() or f"mcp-reconnect-loop-{service_id}",
-                        diagnostic_context={"service_id": service_id, "phase": "reconnect_loop.connected"},
+                        reconnect_task_or_id,
+                        diagnostic_context={
+                            "service_id": service_id,
+                            "transport_type": transport_type,
+                            "phase": "reconnect_loop.connected",
+                            "task_id": reconnect_task_id,
+                            "retry_attempt": state.retry_attempt,
+                        },
                     )
                     return
                 except Exception as e:
-                    logger.warning("后台重连 MCP 服务失败: %s — %s", service_id, e)
+                    get_runtime_task_registry().mark_progress(
+                        reconnect_task_or_id,
+                        diagnostic_context={
+                            "service_id": service_id,
+                            "transport_type": transport_type,
+                            "phase": "reconnect_loop.connect_failed",
+                            "reason": "connect_exception",
+                            "task_id": reconnect_task_id,
+                            "retry_attempt": state.retry_attempt,
+                            "reconnect_attempt": state.retry_attempt,
+                            "error_type": e.__class__.__name__,
+                        },
+                    )
+                    logger.warning(
+                        "后台重连 MCP 服务失败: service_id=%s error_type=%s",
+                        service_id,
+                        e.__class__.__name__,
+                    )
         finally:
             if state.reconnect_task is asyncio.current_task():
                 state.reconnect_task = None
