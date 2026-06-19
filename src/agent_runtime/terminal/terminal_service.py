@@ -440,31 +440,49 @@ class TerminalService:
         if mode == "search":
             if not query:
                 raise ValueError("search 模式必须提供 query。")
-            chunks = self._repo.search_output_chunks(
-                terminal_id,
-                query,
+            chunks = await self._read_output_repo_search(
+                terminal_id=terminal_id,
                 command_id=command_id,
+                query=query,
                 case_sensitive=case_sensitive,
                 limit=limit_lines,
+                mode=mode,
             )
         elif mode == "since":
-            chunks = self._repo.list_output_chunks(
-                terminal_id,
+            chunks = await self._read_output_repo_list(
+                terminal_id=terminal_id,
                 command_id=command_id,
                 after_chunk_index=after_chunk_index,
                 limit=limit_lines,
+                mode=mode,
+                operation="terminal.read_output.repo_list",
             )
         elif mode == "page":
-            chunks = self._repo.list_output_chunks(
-                terminal_id,
+            chunks = await self._read_output_repo_list(
+                terminal_id=terminal_id,
                 command_id=command_id,
                 offset=offset,
                 limit=limit_lines,
+                mode=mode,
+                operation="terminal.read_output.repo_list",
             )
         else:
-            terminal_chunks = self._repo.list_output_chunks(terminal_id, limit=5000)
+            terminal_chunks = await self._read_output_repo_list(
+                terminal_id=terminal_id,
+                limit=5000,
+                mode=mode,
+                tail_lines=tail_lines,
+                operation="terminal.read_output.repo_tail_terminal_chunks",
+            )
             command_chunks = (
-                self._repo.list_output_chunks(terminal_id, command_id=command_id, limit=5000)
+                await self._read_output_repo_list(
+                    terminal_id=terminal_id,
+                    command_id=command_id,
+                    limit=5000,
+                    mode=mode,
+                    tail_lines=tail_lines,
+                    operation="terminal.read_output.repo_tail_command_chunks",
+                )
                 if command_id is not None
                 else terminal_chunks
             )
@@ -546,6 +564,72 @@ class TerminalService:
             int((time.perf_counter() - started_at) * 1000),
         )
         return result
+
+    async def _read_output_repo_list(
+        self,
+        *,
+        terminal_id: str,
+        command_id: str | None = None,
+        after_chunk_index: int | None = None,
+        offset: int = 0,
+        limit: int = 500,
+        mode: ReadMode,
+        operation: str,
+        tail_lines: int | None = None,
+    ) -> list[TerminalOutputChunk]:
+        return await monitored_to_thread(
+            self._repo.list_output_chunks,
+            terminal_id,
+            command_id=command_id,
+            after_chunk_index=after_chunk_index,
+            offset=offset,
+            limit=limit,
+            operation=operation,
+            caller="TerminalService.read_output",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={
+                "terminal_id": terminal_id,
+                "command_id": command_id,
+                "mode": mode,
+                "limit_lines": limit,
+                "tail_lines": tail_lines,
+                "after_chunk_index": after_chunk_index,
+                "offset": offset,
+            },
+        )
+
+    async def _read_output_repo_search(
+        self,
+        *,
+        terminal_id: str,
+        command_id: str | None,
+        query: str,
+        case_sensitive: bool,
+        limit: int,
+        mode: ReadMode,
+    ) -> list[TerminalOutputChunk]:
+        return await monitored_to_thread(
+            self._repo.search_output_chunks,
+            terminal_id,
+            query,
+            command_id=command_id,
+            case_sensitive=case_sensitive,
+            limit=limit,
+            operation="terminal.read_output.repo_search",
+            caller="TerminalService.read_output",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={
+                "terminal_id": terminal_id,
+                "command_id": command_id,
+                "mode": mode,
+                "limit_lines": limit,
+                "case_sensitive": case_sensitive,
+                "has_query": True,
+                "query_length": len(query),
+            },
+        )
 
     async def write_input(
         self,

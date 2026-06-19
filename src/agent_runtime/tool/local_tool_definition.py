@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from agent_runtime.tool.tool_execution_models import LoopDecision, ToolCategory
+
+LocalToolExecutionMode = Literal["direct", "blocking"]
 
 # 工具名称最大长度。
 _TOOL_NAME_MAX_LENGTH = 80
@@ -28,6 +30,8 @@ class LocalToolDefinition:
     - group：非空，默认 "default"（工具分组，如 "文件"、"网络"）。
     - public：是否公开，默认 True（列出所有工具时是否可见）。
     - wiki：人类可读的工具介绍文档，可为 None。
+    - execution_mode：默认 direct；只有显式 blocking 的同步工具可进入阻塞调度池。
+    - blocking_pool/blocking_operation：blocking 工具必须显式声明调度池和稳定操作名。
     """
 
     # 工具唯一名称（如 "search_files"），Agent 定义中通过此名称引用。
@@ -56,6 +60,18 @@ class LocalToolDefinition:
 
     # 当前工具允许返回的循环控制决策集合，用于 Runtime 侧做协议约束。
     allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",)
+
+    # 工具执行模式。direct 保持兼容；blocking 表示同步 callable 需要进入 BlockingScheduler。
+    execution_mode: LocalToolExecutionMode = "direct"
+
+    # blocking 模式下使用的 BlockingScheduler 逻辑池名称，必须由工具定义显式声明。
+    blocking_pool: str | None = None
+
+    # blocking 模式下用于诊断和限流统计的稳定操作名，必须由工具定义显式声明。
+    blocking_operation: str | None = None
+
+    # 可选的阻塞执行慢执行阈值（秒）。未设置时使用 BlockingScheduler 默认值。
+    blocking_slow_execution_seconds: float | None = None
 
     def __post_init__(self) -> None:
         """实体创建时校验业务规则。"""
@@ -88,3 +104,21 @@ class LocalToolDefinition:
         # ── allowed_loop_decisions 校验 ──────────────────────────────
         if not self.allowed_loop_decisions:
             raise ValueError("工具允许的循环决策集合不能为空。")
+
+        # ── execution classification 校验 ───────────────────────────
+        if self.execution_mode not in ("direct", "blocking"):
+            raise ValueError(f"未知工具执行模式: {self.execution_mode}")
+
+        if self.execution_mode == "blocking":
+            if not self.blocking_pool or not str(self.blocking_pool).strip():
+                raise ValueError("blocking 工具必须声明 blocking_pool。")
+            if not self.blocking_operation or not self.blocking_operation.strip():
+                raise ValueError("blocking 工具必须声明 blocking_operation。")
+        else:
+            if self.blocking_pool is not None:
+                raise ValueError("direct 工具不能声明 blocking_pool。")
+            if self.blocking_operation is not None:
+                raise ValueError("direct 工具不能声明 blocking_operation。")
+
+        if self.blocking_slow_execution_seconds is not None and self.blocking_slow_execution_seconds <= 0:
+            raise ValueError("blocking_slow_execution_seconds 必须大于 0。")

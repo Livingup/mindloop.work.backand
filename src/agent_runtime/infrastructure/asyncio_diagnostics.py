@@ -177,13 +177,15 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
             pool_name=BlockingPool.DB_BLOCKING.value,
             max_workers=io_workers,
             thread_name_prefix="blocking-db",
-            isolated=False,
+            isolated=True,
+            max_pending=io_workers * 4,
         ),
         BlockingPool.NETWORK.value: BlockingPoolConfig(
             pool_name=BlockingPool.NETWORK.value,
             max_workers=io_workers,
             thread_name_prefix="blocking-network",
-            isolated=False,
+            isolated=True,
+            max_pending=io_workers * 4,
         ),
         BlockingPool.DIAGNOSTIC.value: BlockingPoolConfig(
             pool_name=BlockingPool.DIAGNOSTIC.value,

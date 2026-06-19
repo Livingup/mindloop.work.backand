@@ -55,6 +55,10 @@ class _GlobalRegistry:
             category=getattr(fn, "_tool_category", "business"),
             always_enabled=getattr(fn, "_tool_always_enabled", False),
             allowed_loop_decisions=getattr(fn, "_tool_allowed_loop_decisions", ("continue",)),
+            execution_mode=getattr(fn, "_tool_execution_mode", "direct"),
+            blocking_pool=getattr(fn, "_tool_blocking_pool", None),
+            blocking_operation=getattr(fn, "_tool_blocking_operation", None),
+            blocking_slow_execution_seconds=getattr(fn, "_tool_blocking_slow_execution_seconds", None),
         )
         get_global_repository().add(tool_def)
 

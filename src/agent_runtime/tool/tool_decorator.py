@@ -28,6 +28,10 @@ TOOL_WIKI_ATTR = "_tool_wiki"
 TOOL_CATEGORY_ATTR = "_tool_category"
 TOOL_ALWAYS_ENABLED_ATTR = "_tool_always_enabled"
 TOOL_ALLOWED_LOOP_DECISIONS_ATTR = "_tool_allowed_loop_decisions"
+TOOL_EXECUTION_MODE_ATTR = "_tool_execution_mode"
+TOOL_BLOCKING_POOL_ATTR = "_tool_blocking_pool"
+TOOL_BLOCKING_OPERATION_ATTR = "_tool_blocking_operation"
+TOOL_BLOCKING_SLOW_EXECUTION_SECONDS_ATTR = "_tool_blocking_slow_execution_seconds"
 
 
 def tool(
@@ -40,6 +44,10 @@ def tool(
     category: ToolCategory = "business",
     always_enabled: bool = False,
     allowed_loop_decisions: tuple[LoopDecision, ...] = ("continue",),
+    execution_mode: str = "direct",
+    blocking_pool: str | None = None,
+    blocking_operation: str | None = None,
+    blocking_slow_execution_seconds: float | None = None,
 ) -> Callable[[F], F]:
     """声明一个本地工具函数的装饰器。
 
@@ -52,6 +60,9 @@ def tool(
         group: 工具分组（如 "文件"、"网络"、"数据库"），默认 "default"。
         public: 是否公开（列出所有工具时是否可见），默认 True。
         wiki: 人类可读的工具介绍文档（用于生成系统工具说明文档），可为 None。
+        execution_mode: 工具执行模式，默认 direct；显式 blocking 的同步工具进入 BlockingScheduler。
+        blocking_pool: blocking 模式使用的逻辑池名称。
+        blocking_operation: blocking 模式使用的稳定操作名。
 
     Returns:
         装饰后的原始函数（附加了元数据属性）。
@@ -66,6 +77,10 @@ def tool(
         setattr(fn, TOOL_CATEGORY_ATTR, category)
         setattr(fn, TOOL_ALWAYS_ENABLED_ATTR, always_enabled)
         setattr(fn, TOOL_ALLOWED_LOOP_DECISIONS_ATTR, allowed_loop_decisions)
+        setattr(fn, TOOL_EXECUTION_MODE_ATTR, execution_mode)
+        setattr(fn, TOOL_BLOCKING_POOL_ATTR, blocking_pool)
+        setattr(fn, TOOL_BLOCKING_OPERATION_ATTR, blocking_operation)
+        setattr(fn, TOOL_BLOCKING_SLOW_EXECUTION_SECONDS_ATTR, blocking_slow_execution_seconds)
         # 延迟导入避免循环依赖，注册到全局注册表。
         from agent_runtime.tool._global_registry import get_global_registry
         get_global_registry().register_function(fn)
@@ -120,3 +135,23 @@ def get_tool_always_enabled(fn: Any) -> bool:
 def get_tool_allowed_loop_decisions(fn: Any) -> tuple[LoopDecision, ...]:
     """获取 @tool 装饰函数允许返回的循环决策集合。未装饰时抛出 AttributeError。"""
     return getattr(fn, TOOL_ALLOWED_LOOP_DECISIONS_ATTR)
+
+
+def get_tool_execution_mode(fn: Any) -> str:
+    """获取 @tool 装饰函数执行模式。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_EXECUTION_MODE_ATTR)
+
+
+def get_tool_blocking_pool(fn: Any) -> str | None:
+    """获取 @tool 装饰函数阻塞调度池。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_BLOCKING_POOL_ATTR)
+
+
+def get_tool_blocking_operation(fn: Any) -> str | None:
+    """获取 @tool 装饰函数阻塞操作名。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_BLOCKING_OPERATION_ATTR)
+
+
+def get_tool_blocking_slow_execution_seconds(fn: Any) -> float | None:
+    """获取 @tool 装饰函数阻塞慢执行阈值。未装饰时抛出 AttributeError。"""
+    return getattr(fn, TOOL_BLOCKING_SLOW_EXECUTION_SECONDS_ATTR)

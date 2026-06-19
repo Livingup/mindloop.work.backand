@@ -94,22 +94,27 @@ def test_executor_registry_defaults_and_shared_pool_mapping() -> None:
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
-def test_default_registry_isolates_first_wave_pools_with_bounded_pending_capacity() -> None:
+def test_default_registry_isolates_selected_blocking_pools_with_bounded_pending_capacity() -> None:
     scheduler = BlockingScheduler()
     try:
         executors = scheduler.health_snapshot()["executors"]
 
-        for pool in (BlockingPool.FILE_RESOURCE, BlockingPool.TERMINAL, BlockingPool.TERMINAL_RENDER):
+        for pool in (
+            BlockingPool.FILE_RESOURCE,
+            BlockingPool.TERMINAL,
+            BlockingPool.TERMINAL_RENDER,
+            BlockingPool.DB_BLOCKING,
+            BlockingPool.NETWORK,
+        ):
             pool_snapshot = executors[pool.value]
             assert pool_snapshot["isolated"] is True
             assert pool_snapshot["executor_pool"] == pool.value
             assert pool_snapshot["max_pending"] == pool_snapshot["max_workers"] * 4
 
-        for pool in (BlockingPool.CPU_RENDER, BlockingPool.DB_BLOCKING, BlockingPool.NETWORK):
-            pool_snapshot = executors[pool.value]
-            assert pool_snapshot["isolated"] is False
-            assert pool_snapshot["executor_pool"] == BlockingPool.DEFAULT.value
-            assert pool_snapshot["max_pending"] is None
+        cpu_render_snapshot = executors[BlockingPool.CPU_RENDER.value]
+        assert cpu_render_snapshot["isolated"] is False
+        assert cpu_render_snapshot["executor_pool"] == BlockingPool.DEFAULT.value
+        assert cpu_render_snapshot["max_pending"] is None
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
 

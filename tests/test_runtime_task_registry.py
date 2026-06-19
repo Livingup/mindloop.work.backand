@@ -514,7 +514,18 @@ def test_runtime_concurrency_health_snapshot_detail_is_bounded_and_keeps_operati
     assert len(snapshot["blocking_scheduler"]["top_active_pools"]) == 2
     assert len(snapshot["blocking_scheduler"]["top_operations"]) == 2
     operation = snapshot["blocking_scheduler"]["top_operations"][0]
-    assert set(operation) == {"pool", "operation", "submitted", "pending", "active", "completed", "failed", "cancelled"}
+    assert set(operation) == {
+        "pool",
+        "operation",
+        "submitted",
+        "pending",
+        "active",
+        "completed",
+        "failed",
+        "cancelled",
+        "rejected",
+        "overloaded",
+    }
 
 
 
