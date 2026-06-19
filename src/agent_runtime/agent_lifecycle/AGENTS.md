@@ -32,17 +32,20 @@
 
 注册元数据：`name="message_user"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("continue", "pause")`。
 
-### 2. `pause_task` — 暂停任务等待外部事件
+### 2. `pause_task` — 暂停任务等待外部事件或超时
 
-被动等待型暂停工具，不向用户发送消息。适用于"等待其他 Agent 消息""等待系统事件""等待外部回调"等场景。与 `message_user(action=request_response)` 的区别在于：`request_response` 是主动向用户发问/请求回应并暂停，`pause_task` 不发消息，只暂停等外部事件。
+被动等待型暂停工具，不向用户发送消息。适用于"等待其他 Agent 消息""等待系统事件""等待外部回调"等场景。与 `message_user(action=request_response)` 的区别在于：`request_response` 是主动向用户发问/请求回应并暂停，`pause_task` 不发消息，只暂停等外部事件；即使设置了超时，也不能用来等待真实用户回复。
 
 请求模型 `PauseTaskRequest`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `reason` | str | 暂停原因，说明在等待什么事件或消息 |
+| `timeout_seconds` | float | 暂停持续时间（秒）；省略或 `-1` 表示无限期静默暂停，只能由外部事件唤醒；`>0` 表示外部事件或时间截止任一先到都可唤醒；`0`、小于 `-1` 和非有限数非法 |
 
-注册元数据：`name="pause_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("pause",)`。
+等待子/本地 Agent 或异步系统工作时，调用方应按任务复杂度动态选择正数超时，常见量级约 5–50 分钟；只有在无法预测完成时间时才使用 `-1` 的无限期外部事件等待。
+
+注册元数据：`name="pause_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("pause",)`；返回 metadata 包含 `lifecycle_action="pause"`、`pause_timeout_seconds` 与 `pause_wake_mode`（`external_only` / `external_or_timeout`）。
 
 ### 3. `end_task` — 结束任务并退出（成功终止）
 
@@ -78,7 +81,7 @@
 - `message_user` 额外填充 `frontend_message`，包含前端可直接展示的 text、text_format、channel，以及 metadata 中的 action、options 结构化字段
 - `metadata.lifecycle_action` 记录当前生命周期动作
 
-Runtime 只消费 `BaseToolResult.loop_control.decision` 控制循环，不根据工具名或 action 硬编码分支。
+Runtime 以 `BaseToolResult.loop_control.decision` 控制循环，不根据工具名或 action 硬编码分支；`pause_task` 的定时唤醒策略通过结构化 metadata（`pause_timeout_seconds` / `pause_wake_mode`）传递给 `AgentExecutionEngine`，不要从 `reason` 文本解析超时策略。
 
 ## 工具注册规则
 
@@ -90,7 +93,7 @@ Runtime 只消费 `BaseToolResult.loop_control.decision` 控制循环，不根�
 
 1. 面向用户的沟通必须调用 `message_user`，不要依赖普通 assistant 文本。
 2. `message_user(action=notify)` 做非阻塞同步（进度报告、重要发现告知）；`message_user(action=request_response)` 做问题、确认、审核、选择、求助等需要用户回复的交互。不要用 notify 提问或表达“等用户回复”。
-3. `pause_task` 等待其他 Agent 消息或系统事件（不发消息）；遇到需要用户回复用 `message_user(action=request_response)`，不要用 pause_task。
+3. `pause_task` 等待其他 Agent 消息、系统事件或 `timeout_seconds>0` 的时间截止（不发消息）；`timeout_seconds=-1` 表示无限期外部事件等待，等待子/本地 Agent 时应按复杂度动态选择正数超时（常见约 5–50 分钟），真实用户回复仍必须用 `message_user(action=request_response)`，不要用 pause_task。
 4. 任务成功完成后用 `message_user(action=request_response)` 汇报成果并等待用户验收，得到明确肯定后再 `end_task`。未经用户确认不要直接 `end_task`。
 5. 不可恢复失败用 `fail_task` 报告（不是 `end_task`）。推荐先 `message_user(action=notify)` 告知失败原因和已尝试的方案，再 `fail_task`。常规工具异常框架会自动包装，不需要主动 `fail_task`。
 6. 不要在同一 assistant turn 中混用生命周期工具和业务工具，除非用户明确要求。

@@ -6,16 +6,18 @@ import asyncio
 import os
 import platform
 import logging
+import math
 import time
 import textwrap
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 from agent_runtime.agent.agent_instance import (
+    AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
     AgentInstance,
     PendingAgentUserMessage,
@@ -248,6 +250,19 @@ class _AgentExecutionHandle:
     interrupt_state: _AgentExecutionInterruptState
 
 
+@dataclass(frozen=True, slots=True)
+class _PauseTimeoutHandle:
+    token: str
+    task: asyncio.Task[None]
+    task_id: str
+    instance_id: str
+    conversation_id: str | None
+    deadline: datetime
+    timeout_seconds: float
+    communication_stream_id: str | None
+    request: AgentExecutionRequest
+
+
 @dataclass(slots=True)
 class _AgentExecutionProgressState:
     task_id: str
@@ -346,6 +361,7 @@ class AgentExecutionEngine:
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
+        self._pause_timeout_handles: dict[str, _PauseTimeoutHandle] = {}
         self._execution_progress: dict[str, _AgentExecutionProgressState] = {}
 
     def _set_execution_phase(
@@ -421,6 +437,366 @@ class AgentExecutionEngine:
             file_resource_service=file_resource_service,
         )
 
+    @staticmethod
+    def _pause_wake_metadata_from_tool_results(tool_results: list[BaseToolResult]) -> tuple[float, str]:
+        """从 pause_task 工具结果元数据中提取结构化唤醒策略。"""
+        for result in tool_results:
+            metadata = result.metadata or {}
+            if "pause_timeout_seconds" not in metadata:
+                continue
+            raw_timeout = metadata.get("pause_timeout_seconds")
+            try:
+                timeout_seconds = float(raw_timeout)
+            except (TypeError, ValueError):
+                logger.warning("忽略非法 pause_timeout_seconds 元数据: %r", raw_timeout)
+                continue
+            if not math.isfinite(timeout_seconds) or not (timeout_seconds == -1 or timeout_seconds > 0):
+                logger.warning("忽略越界 pause_timeout_seconds 元数据: %r", raw_timeout)
+                continue
+            if timeout_seconds > 0:
+                return timeout_seconds, "external_or_timeout"
+            return -1.0, "external_only"
+        return -1.0, "external_only"
+
+    def _release_pause_timeout_handle(
+        self,
+        instance_id: str,
+        *,
+        expected_token: str | None = None,
+        cancel_task: bool = True,
+        reason: str,
+    ) -> _PauseTimeoutHandle | None:
+        """释放指定 AgentInstance 的暂停超时句柄；expected_token 用于超时回调幂等竞争。"""
+        handle = self._pause_timeout_handles.get(instance_id)
+        if handle is None:
+            return None
+        if expected_token is not None and handle.token != expected_token:
+            return None
+        self._pause_timeout_handles.pop(instance_id, None)
+        if cancel_task and not handle.task.done():
+            handle.task.cancel()
+        self._record_execution_instance_event(
+            instance_id=instance_id,
+            stage="pause_timeout.release",
+            status="released",
+            summary="暂停超时句柄已释放，后续不会再由该句柄触发恢复。",
+            details={
+                "task_id": handle.task_id,
+                "conversation_id": handle.conversation_id,
+                "token": handle.token,
+                "timeout_seconds": handle.timeout_seconds,
+                "deadline": handle.deadline.isoformat(),
+                "reason": reason,
+                "cancel_task": cancel_task,
+            },
+        )
+        return handle
+
+    def _schedule_pause_timeout(
+        self,
+        *,
+        task_id: str,
+        instance_id: str,
+        conversation_id: str | None,
+        timeout_seconds: float,
+        request: AgentExecutionRequest,
+        communication_context: RuntimeCommunicationContext,
+    ) -> _PauseTimeoutHandle | None:
+        """为一次 pause 周期注册进程内超时唤醒。"""
+        if timeout_seconds <= 0:
+            return None
+        if conversation_id is None:
+            self._record_execution_instance_event(
+                instance_id=instance_id,
+                stage="pause_timeout.schedule",
+                status="skipped",
+                summary="pause_task 请求了超时唤醒，但当前执行没有可复用 conversation_id，已跳过定时器。",
+                details={
+                    "task_id": task_id,
+                    "timeout_seconds": timeout_seconds,
+                    "communication_stream_id": communication_context.stream_id,
+                    "reason": "missing_conversation_id",
+                },
+            )
+            return None
+        self._release_pause_timeout_handle(
+            instance_id,
+            reason="new_pause_cycle",
+        )
+        token = uuid.uuid4().hex
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+        resume_request = replace(
+            request,
+            task_id=task_id,
+            root_instance_id=instance_id,
+            conversation_id=conversation_id,
+            communication_stream_id=communication_context.stream_id,
+        )
+        timeout_task = asyncio.create_task(
+            self._pause_timeout_worker(
+                instance_id=instance_id,
+                token=token,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        handle = _PauseTimeoutHandle(
+            token=token,
+            task=timeout_task,
+            task_id=task_id,
+            instance_id=instance_id,
+            conversation_id=conversation_id,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+            communication_stream_id=communication_context.stream_id,
+            request=resume_request,
+        )
+        self._pause_timeout_handles[instance_id] = handle
+        timeout_task.add_done_callback(
+            lambda done_task, instance_id=instance_id, token=token: self._on_pause_timeout_task_done(
+                done_task,
+                instance_id,
+                token,
+            )
+        )
+        self._record_execution_instance_event(
+            instance_id=instance_id,
+            stage="pause_timeout.schedule",
+            status="scheduled",
+            summary="pause_task 已注册进程内超时唤醒。",
+            details={
+                "task_id": task_id,
+                "conversation_id": conversation_id,
+                "token": token,
+                "timeout_seconds": timeout_seconds,
+                "deadline": deadline.isoformat(),
+                "communication_stream_id": communication_context.stream_id,
+            },
+            expected_next="external_event_or_timeout_resume",
+        )
+        return handle
+
+    async def _pause_timeout_worker(
+        self,
+        *,
+        instance_id: str,
+        token: str,
+        timeout_seconds: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        await self._resume_agent_instance_from_pause_timeout(
+            instance_id=instance_id,
+            token=token,
+        )
+
+    def _on_pause_timeout_task_done(
+        self,
+        task: asyncio.Task[None],
+        instance_id: str,
+        token: str,
+    ) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        handle = self._pause_timeout_handles.get(instance_id)
+        if handle is not None and handle.token == token and handle.task is task:
+            self._pause_timeout_handles.pop(instance_id, None)
+        logger.error(
+            "Agent pause timeout worker failed: instance_id=%s token=%s",
+            instance_id,
+            token,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+    def _record_pause_timeout_skip(
+        self,
+        *,
+        instance_id: str,
+        token: str,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._record_execution_instance_event(
+            instance_id=instance_id,
+            stage="pause_timeout.resume",
+            status="skipped",
+            summary="暂停超时回调未启动恢复执行，因为当前状态已不匹配该暂停周期。",
+            details={
+                "token": token,
+                "reason": reason,
+                **(details or {}),
+            },
+        )
+
+    async def _resume_agent_instance_from_pause_timeout(
+        self,
+        *,
+        instance_id: str,
+        token: str,
+    ) -> None:
+        """超时到期后在不追加用户消息的情况下恢复同一 AgentInstance 执行。"""
+        handle = self._release_pause_timeout_handle(
+            instance_id,
+            expected_token=token,
+            cancel_task=False,
+            reason="timeout_elapsed",
+        )
+        if handle is None:
+            self._record_pause_timeout_skip(
+                instance_id=instance_id,
+                token=token,
+                reason="handle_missing_or_token_mismatch",
+            )
+            return
+        try:
+            current_instance = self._runtime_gateway.get_agent_instance(handle.instance_id)
+        except Exception as exc:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="instance_missing",
+                details={"error_type": exc.__class__.__name__},
+            )
+            return
+        if current_instance.task_id != handle.task_id:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="instance_task_mismatch",
+                details={
+                    "handle_task_id": handle.task_id,
+                    "current_task_id": current_instance.task_id,
+                },
+            )
+            return
+        try:
+            current_task = self._runtime_gateway.get_task(handle.task_id)
+        except Exception as exc:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="task_missing",
+                details={"task_id": handle.task_id, "error_type": exc.__class__.__name__},
+            )
+            return
+        if current_task.is_terminal:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="task_terminal",
+                details={"task_id": current_task.task_id, "task_status": current_task.status},
+            )
+            return
+        if current_instance.conversation_id != handle.conversation_id:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="conversation_mismatch",
+                details={
+                    "handle_conversation_id": handle.conversation_id,
+                    "current_conversation_id": current_instance.conversation_id,
+                },
+            )
+            return
+        active_in_memory = (
+            handle.instance_id in self._active_instance_ids
+            or handle.instance_id in self._active_execution_handles
+        )
+        if current_instance.status == AGENT_INSTANCE_STATUS_RUNNING or active_in_memory:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="already_running",
+                details={
+                    "task_id": current_task.task_id,
+                    "instance_status": current_instance.status,
+                    "active_in_memory": active_in_memory,
+                },
+            )
+            return
+        if current_instance.status != AGENT_INSTANCE_STATUS_READY:
+            self._record_pause_timeout_skip(
+                instance_id=handle.instance_id,
+                token=token,
+                reason="instance_not_ready",
+                details={
+                    "task_id": current_task.task_id,
+                    "instance_status": current_instance.status,
+                },
+            )
+            return
+        resume_request = replace(
+            handle.request,
+            thread_id=current_instance.thread_id,
+            current_working_directory=current_instance.current_working_directory,
+            agent_definition_id=current_instance.agent_definition_id,
+            llm_provider_id=current_instance.llm_provider_id,
+            llm_model_binding_id=current_instance.llm_model_binding_id,
+            task_id=current_task.task_id,
+            root_instance_id=current_instance.instance_id,
+            conversation_id=current_instance.conversation_id,
+            communication_stream_id=handle.communication_stream_id,
+        )
+        communication_context = self._build_communication_context(resume_request, current_task, current_instance)
+        if resume_request.communication_stream_id != communication_context.stream_id:
+            resume_request = replace(resume_request, communication_stream_id=communication_context.stream_id)
+        self._runtime_gateway.resume_task(current_task.task_id)
+        current_instance = self._runtime_gateway.resume_agent_instance(current_instance.instance_id)
+        self._active_instance_ids.add(current_instance.instance_id)
+        interrupt_state = _AgentExecutionInterruptState()
+        task_handle = asyncio.create_task(
+            self._run_agent_instance(
+                current_task,
+                current_instance,
+                resume_request,
+                interrupt_state=interrupt_state,
+            )
+        )
+        self._active_execution_handles[current_instance.instance_id] = _AgentExecutionHandle(
+            task=task_handle,
+            interrupt_state=interrupt_state,
+        )
+        self._background_tasks.add(task_handle)
+        task_handle.add_done_callback(
+            lambda done_task, instance_id=current_instance.instance_id: self._on_background_task_done(
+                done_task,
+                instance_id,
+            )
+        )
+        self._record_execution_instance_event(
+            instance_id=current_instance.instance_id,
+            stage="pause_timeout.resume",
+            status="accepted",
+            summary="pause_task 超时已触发同一 AgentInstance 的无用户消息恢复执行。",
+            details={
+                "task_id": current_task.task_id,
+                "conversation_id": current_instance.conversation_id,
+                "token": token,
+                "timeout_seconds": handle.timeout_seconds,
+                "deadline": handle.deadline.isoformat(),
+                "communication_stream_id": communication_context.stream_id,
+            },
+            expected_next="run_agent_instance_without_new_user_message",
+        )
+        await self._event_publisher.publish(
+            communication_context,
+            "agent.task.pause_timeout.elapsed",
+            {
+                "task_id": current_task.task_id,
+                "agent_instance_id": current_instance.instance_id,
+                "conversation_id": current_instance.conversation_id,
+                "pause_token": token,
+                "timeout_seconds": handle.timeout_seconds,
+                "deadline": handle.deadline.isoformat(),
+                "wake_reason": "timeout_elapsed",
+            },
+            source="agent_execution_engine",
+        )
+
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
         """创建 task + root Agent 实例并执行完整对话循环。"""
         task, instance = self._runtime_gateway.create_task_with_root_agent_instance(
@@ -465,6 +841,10 @@ class AgentExecutionEngine:
                 instance.instance_id,
             )
         await self._validate_file_input_before_enqueue(instance, attachments)
+        self._release_pause_timeout_handle(
+            instance.instance_id,
+            reason="external_user_message",
+        )
         instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
@@ -507,6 +887,10 @@ class AgentExecutionEngine:
                 instance.instance_id,
             )
         await self._validate_file_input_before_enqueue(instance, attachments)
+        released_pause_timeout_handle = self._release_pause_timeout_handle(
+            instance.instance_id,
+            reason="external_user_message",
+        )
         instance, pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
             instance.instance_id,
             user_text=user_text,
@@ -527,6 +911,11 @@ class AgentExecutionEngine:
                 "attachment_count": len(attachments),
                 "task_terminal_before_enqueue": task.is_terminal,
                 "instance_status_after_enqueue": instance.status,
+                "released_pause_timeout_token": (
+                    released_pause_timeout_handle.token
+                    if released_pause_timeout_handle is not None
+                    else None
+                ),
             },
             expected_next="queue_or_launch_execution",
         )
@@ -1631,6 +2020,7 @@ class AgentExecutionEngine:
                         trace_path=trace_path,
                         tool_results=tool_results,
                         communication_context=communication_context,
+                        request=request,
                     )
                     self._record_execution_loop_step(
                         instance_id=instance.instance_id,
@@ -3389,13 +3779,39 @@ class AgentExecutionEngine:
         trace_path: Any,
         tool_results: list[BaseToolResult],
         communication_context: RuntimeCommunicationContext,
+        request: AgentExecutionRequest,
     ) -> None:
         """根据统一工具结果中的 loop_decision 更新运行态。"""
         details = [result.to_serializable_dict() for result in tool_results]
         if loop_decision == "pause":
-            self._runtime_gateway.pause_agent_instance(instance_id)
+            timeout_seconds, wake_mode = self._pause_wake_metadata_from_tool_results(tool_results)
+            current_instance = self._runtime_gateway.pause_agent_instance(instance_id)
             self._runtime_gateway.pause_task(task_id)
-            self._trace_recorder.record_event(trace_path, "instance_paused", details)
+            conversation_id = current_instance.conversation_id or communication_context.metadata.get("conversation_id")
+            timeout_handle = None
+            if timeout_seconds > 0:
+                timeout_handle = self._schedule_pause_timeout(
+                    task_id=task_id,
+                    instance_id=instance_id,
+                    conversation_id=str(conversation_id) if conversation_id else None,
+                    timeout_seconds=timeout_seconds,
+                    request=request,
+                    communication_context=communication_context,
+                )
+            pause_payload = {
+                "wake_mode": wake_mode,
+                "timeout_seconds": timeout_seconds,
+                "wake_deadline": timeout_handle.deadline.isoformat() if timeout_handle is not None else None,
+                "pause_token": timeout_handle.token if timeout_handle is not None else None,
+            }
+            self._trace_recorder.record_event(
+                trace_path,
+                "instance_paused",
+                {
+                    "tool_results": details,
+                    **pause_payload,
+                },
+            )
             await self._publish_loop_decision_event(
                 communication_context,
                 "agent.task.paused",
@@ -3403,6 +3819,7 @@ class AgentExecutionEngine:
                 instance_id=instance_id,
                 loop_decision=loop_decision,
                 tool_results=tool_results,
+                extra_payload=pause_payload,
             )
             return
         if loop_decision == "complete":
@@ -4259,8 +4676,14 @@ def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
         "input — questions, confirmation, selection, reporting completion for review, "
         "dangerous operation approval, asking for help, etc. "
         "Do NOT use `notify` to ask questions or to wait for user reply.\n"
-        "- `pause_task` tool: pause execution and wait for external events (other Agent messages "
-        "or system events) — does NOT send a message. For waiting on user reply use "
+        "- `pause_task` tool: pause execution without sending any message and wait for external "
+        "events (other Agent messages or system events) and, when `timeout_seconds > 0`, a "
+        "best-effort in-process timeout. `timeout_seconds` is the pause duration in seconds: "
+        "omitted or `-1` means indefinite external-event-only waiting, while a positive finite "
+        "value means whichever arrives first — external event or timeout expiry — resumes the "
+        "next LLM loop. For child/local-Agent or async system work, choose a dynamic positive "
+        "timeout based on expected complexity, often roughly 5–50 minutes; use `-1` only when "
+        "the completion time is genuinely unpredictable. For waiting on real user replies use "
         "`message_user(action=request_response)`, not `pause_task`.\n"
         "- `end_task` tool: end task session for SUCCESSFUL completion. Required sequence: "
         "first call `message_user(action=request_response)` to report results and wait for "

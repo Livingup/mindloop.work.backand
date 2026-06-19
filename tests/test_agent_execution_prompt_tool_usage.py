@@ -250,6 +250,27 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
             prompt_text.index("业务 Agent 自定义系统提示词。"),
         )
 
+    def test_system_prompt_includes_pause_task_timeout_runtime_lifecycle_guidance(self) -> None:
+        engine = self._engine_with_local_tools(
+            _local_tool("message_user", category="lifecycle"),
+            _local_tool("pause_task", category="lifecycle"),
+        )
+        prompt = engine._render_system_prompt(
+            AgentDefinition(agent_id="agent-lifecycle", group="default"),
+            "agent-instance-lifecycle",
+            "G:\\project\\agent",
+            {},
+            (_llm_tool("message_user"), _llm_tool("pause_task")),
+        )
+
+        self.assertIsNotNone(prompt)
+        prompt_text = prompt or ""
+        self.assertIn("`timeout_seconds` is the pause duration in seconds", prompt_text)
+        self.assertIn("omitted or `-1` means indefinite external-event-only waiting", prompt_text)
+        self.assertIn("whichever arrives first — external event or timeout expiry", prompt_text)
+        self.assertIn("often roughly 5–50 minutes", prompt_text)
+        self.assertIn("For waiting on real user replies use `message_user(action=request_response)`, not `pause_task`", prompt_text)
+
     def test_local_subagent_message_uses_distinct_prefix_and_instance_routing(self) -> None:
         execution_engine = _ExecutionEngineSubmissionRecorder()
         runtime = SubagentRuntime(

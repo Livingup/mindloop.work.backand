@@ -8,9 +8,10 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import (
@@ -176,26 +177,59 @@ class PauseTaskRequest(BaseToolRequest):
             "会被记录到 trace 供后续追查，不会发送给用户。"
         ),
     )
+    timeout_seconds: float = Field(
+        default=-1,
+        description=(
+            "暂停持续时间（秒）。省略或 -1 表示无限期静默暂停，只等待外部事件唤醒，"
+            "适合无法预测完成时间的外部系统或 Agent 协作；大于 0 表示双通道唤醒："
+            "外部事件先到或时间截止任一先到，Runtime 都会恢复下一次 LLM 循环。"
+            "等待子/本地 Agent 或异步系统工作时应按复杂度动态选择正数，通常可在约 5–50 分钟量级；"
+            "真实用户回复必须使用 message_user(action=request_response)，不要用 pause_task。"
+            "0、小于 -1 和非有限数非法，避免立即自旋或无意义超时。"
+        ),
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _validate_reason(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("reason 不能为空。")
+        return value
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def _validate_timeout_seconds(cls, value: float) -> float:
+        timeout = float(value)
+        if not math.isfinite(timeout):
+            raise ValueError("timeout_seconds 必须是有限数字。")
+        if timeout == -1 or timeout > 0:
+            return timeout
+        raise ValueError("timeout_seconds 只能是 -1 或大于 0 的秒数。")
 
 
 @tool(
     name="pause_task",
     description=(
-        "暂停 Agent 循环，被动等待【外部系统事件】或【其他 Agent 的消息】唤醒。Agent 自身不再做任何动作，循环挂起。不向用户发任何消息。\n"
+        "暂停 Agent 循环，被动等待【外部系统事件】、【其他 Agent 的消息】或可选超时时间唤醒。Agent 自身不再做任何动作，循环挂起。不向用户发任何消息。\n"
         "\n"
-        "【做什么】触发 loop_decision=pause 让 Runtime 暂停当前 Agent 实例。reason 字段记录在等什么事件，供运维追查。\n"
+        "【做什么】触发 loop_decision=pause 让 Runtime 暂停当前 Agent 实例。reason 字段记录在等什么事件，供运维追查；timeout_seconds 是暂停持续时间（秒），用于决定是否注册时间唤醒。\n"
         "\n"
         "【何时使用】\n"
-        "• 多 Agent 协作：等另一个 Agent 把结果推送过来后再继续\n"
-        "• 系统事件等待：等定时器触发、外部 webhook 回调、状态变更通知\n"
-        "• 长耗时异步任务：已发起异步任务，等系统通知任务完成\n"
+        "• 多 Agent 协作：等另一个 Agent 把结果推送过来后再继续；等待子/本地 Agent 时应按任务复杂度动态选择 timeout_seconds>0，通常可在约 5–50 分钟量级\n"
+        "• 系统事件等待：等外部 webhook 回调、状态变更通知，或用 timeout_seconds>0 做定时复查\n"
+        "• 周期性检查：传 timeout_seconds>0，让时间截止或外部事件任一先到都唤醒下一次 LLM 循环\n"
+        "• 长耗时异步任务：已发起异步任务，等系统通知任务完成；必要时可用 timeout_seconds>0 兜底复查\n"
+        "\n"
+        "【参数语义】\n"
+        "• timeout_seconds=-1（默认）：无限期静默暂停，只能由外部事件唤醒；适合无法预测完成时间的外部工作\n"
+        "• timeout_seconds>0：双通道唤醒，外部事件或时间截止任一先到都可唤醒；0、小于 -1 和非有限数非法，避免自旋\n"
         "\n"
         "【不要用于】\n"
-        "• 等用户回复 → 必须用 message_user(action=request_response)。pause_task 不发消息给用户，用户不会看到你在等什么\n"
+        "• 等真实用户回复 → 必须用 message_user(action=request_response)。pause_task 不发消息给用户，用户不会看到你在等什么\n"
         "• 不知道下一步怎么做 → 用 message_user(action=request_response) 求助用户\n"
         "• 任务卡住推进不下去 → 用 fail_task 报告失败\n"
         "\n"
-        "【关键区分】pause_task 是“被动等”——Agent 知道一定会有外部事件唤醒。如果不确定有没有事件来，不要用 pause_task。"
+        "【关键区分】pause_task 是“被动等”——Agent 知道一定会有外部事件或已设置的超时时间唤醒。如果不确定有没有唤醒条件，不要用 pause_task；如果是在等用户输入，不论是否需要超时，都不要用 pause_task。"
     ),
     group="agent_lifecycle",
     category="lifecycle",
@@ -203,16 +237,26 @@ class PauseTaskRequest(BaseToolRequest):
     allowed_loop_decisions=("pause",),
 )
 def pause_task(request: PauseTaskRequest) -> BaseToolResult:
-    """暂停任务等待外部事件。"""
+    """暂停任务等待外部事件或可选超时时间。"""
+    wake_mode = "external_only" if request.timeout_seconds == -1 else "external_or_timeout"
+    output = (
+        "Task paused, waiting for external event."
+        if wake_mode == "external_only"
+        else f"Task paused, waiting for external event or {request.timeout_seconds:g} seconds timeout."
+    )
     return BaseToolResult(
         success=True,
         execution_status="success",
-        output="Task paused, waiting for external event.",
+        output=output,
         loop_control=LoopControl(
             decision="pause",
             reason=f"pause_task: {request.reason}",
         ),
-        metadata={"lifecycle_action": "pause"},
+        metadata={
+            "lifecycle_action": "pause",
+            "pause_timeout_seconds": request.timeout_seconds,
+            "pause_wake_mode": wake_mode,
+        },
     )
 
 
