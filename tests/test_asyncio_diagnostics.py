@@ -11,6 +11,7 @@ import pytest
 from agent_runtime.infrastructure.asyncio_diagnostics import (
     BlockingPool,
     BlockingPoolConfig,
+    BlockingPoolOverloadedError,
     BlockingScheduler,
     ExecutorRegistry,
     _executor_debug_snapshot,
@@ -23,6 +24,8 @@ from agent_runtime.infrastructure.asyncio_diagnostics import (
     monitored_to_thread,
     shutdown_blocking_executors,
 )
+
+from agent_runtime.runtime_health import runtime_concurrency_health_snapshot
 
 
 def _scheduler_with_test_pools() -> BlockingScheduler:
@@ -87,6 +90,26 @@ def test_executor_registry_defaults_and_shared_pool_mapping() -> None:
         assert snapshot[BlockingPool.FILE_RESOURCE.value]["isolated"] is False
         assert snapshot[BlockingPool.FILE_RESOURCE.value]["executor_pool"] == BlockingPool.DEFAULT.value
         assert snapshot[BlockingPool.DEFAULT.value]["max_workers"] == 2
+    finally:
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_default_registry_isolates_first_wave_pools_with_bounded_pending_capacity() -> None:
+    scheduler = BlockingScheduler()
+    try:
+        executors = scheduler.health_snapshot()["executors"]
+
+        for pool in (BlockingPool.FILE_RESOURCE, BlockingPool.TERMINAL, BlockingPool.TERMINAL_RENDER):
+            pool_snapshot = executors[pool.value]
+            assert pool_snapshot["isolated"] is True
+            assert pool_snapshot["executor_pool"] == pool.value
+            assert pool_snapshot["max_pending"] == pool_snapshot["max_workers"] * 4
+
+        for pool in (BlockingPool.CPU_RENDER, BlockingPool.DB_BLOCKING, BlockingPool.NETWORK):
+            pool_snapshot = executors[pool.value]
+            assert pool_snapshot["isolated"] is False
+            assert pool_snapshot["executor_pool"] == BlockingPool.DEFAULT.value
+            assert pool_snapshot["max_pending"] is None
     finally:
         scheduler.shutdown(wait=True, cancel_futures=True)
 
@@ -248,6 +271,121 @@ def test_scheduler_records_await_cancellation_and_worker_finish(caplog: pytest.L
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
+def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.LogCaptureFixture) -> None:
+    scheduler = BlockingScheduler(
+        ExecutorRegistry(
+            {
+                BlockingPool.COMMUNICATION.value: BlockingPoolConfig(
+                    pool_name=BlockingPool.COMMUNICATION.value,
+                    max_workers=1,
+                    thread_name_prefix="test-communication",
+                    isolated=True,
+                    max_pending=1,
+                )
+            }
+        )
+    )
+    test_logger = logging.getLogger("tests.asyncio_diagnostics.rejected")
+    release_worker = threading.Event()
+    first_started = threading.Event()
+    submitted_labels: list[str] = []
+
+    def slow_work(label: str) -> str:
+        submitted_labels.append(label)
+        first_started.set()
+        release_worker.wait(timeout=5)
+        return label
+
+    async def run_case() -> None:
+        first = asyncio.create_task(
+            scheduler.run(
+                slow_work,
+                "first",
+                operation="unit.rejected",
+                caller="test_scheduler_rejects_over_max_pending_without_submitting",
+                pool=BlockingPool.COMMUNICATION,
+                log=test_logger,
+            )
+        )
+        while not first_started.is_set():
+            await asyncio.sleep(0.01)
+        queued = asyncio.create_task(
+            scheduler.run(
+                slow_work,
+                "queued",
+                operation="unit.rejected",
+                caller="test_scheduler_rejects_over_max_pending_without_submitting",
+                pool=BlockingPool.COMMUNICATION,
+                log=test_logger,
+            )
+        )
+        while scheduler.health_snapshot()["pools"][BlockingPool.COMMUNICATION.value]["pending"] < 1:
+            await asyncio.sleep(0.01)
+        with caplog.at_level(logging.WARNING, logger=test_logger.name):
+            with pytest.raises(BlockingPoolOverloadedError) as exc_info:
+                await scheduler.run(
+                    slow_work,
+                    "rejected",
+                    operation="unit.rejected",
+                    caller="test_scheduler_rejects_over_max_pending_without_submitting",
+                    pool=BlockingPool.COMMUNICATION,
+                    log=test_logger,
+                )
+        assert exc_info.value.pool_name == BlockingPool.COMMUNICATION.value
+        assert exc_info.value.pending == 1
+        assert exc_info.value.max_pending == 1
+        release_worker.set()
+        assert await first == "first"
+        assert await queued == "queued"
+
+    try:
+        asyncio.run(run_case())
+        pool_stats = scheduler.health_snapshot()["pools"][BlockingPool.COMMUNICATION.value]
+        op_stats = pool_stats["operations"]["unit.rejected"]
+
+        assert submitted_labels == ["first", "queued"]
+        assert pool_stats["max_pending"] == 1
+        assert pool_stats["submitted"] == 2
+        assert pool_stats["completed"] == 2
+        assert pool_stats["rejected"] == 1
+        assert pool_stats["overloaded"] == 1
+        assert pool_stats["pending"] == 0
+        assert pool_stats["active"] == 0
+        assert op_stats["rejected"] == 1
+        assert op_stats["overloaded"] == 1
+
+        health = runtime_concurrency_health_snapshot(
+            event_loop_snapshot={"monitor_running": True, "status": "ok"},
+            network_snapshot={},
+            runtime_task_summary={
+                "total_count": 0,
+                "active_count": 0,
+                "by_status": {},
+                "active_by_owner": {},
+                "active_by_class": {},
+                "recent_terminal_tasks": [],
+            },
+            blocking_scheduler_snapshot=scheduler.health_snapshot(),
+            include_blocking_operations=True,
+        )
+        blocking_summary = health["blocking_scheduler"]
+        assert health["status"] == "degraded"
+        assert blocking_summary["logical_totals"]["rejected"] == 1
+        assert blocking_summary["logical_totals"]["overloaded"] == 1
+        assert health["signals"]["blocking_scheduler"]["rejected_operations"] == 1
+        assert health["signals"]["blocking_scheduler"]["overloaded_operations"] == 1
+        assert health["signals"]["blocking_scheduler"]["overloaded"] is True
+        assert blocking_summary["top_operations"][0]["rejected"] == 1
+        assert blocking_summary["top_operations"][0]["overloaded"] == 1
+
+        assert "phase=blocking.rejected" in caplog.text
+        assert "pool_rejected=1" in caplog.text
+        assert "operation_overloaded=1" in caplog.text
+    finally:
+        release_worker.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
 def test_scheduler_records_submit_failure_without_stale_pending(caplog: pytest.LogCaptureFixture) -> None:
     scheduler = _scheduler_with_test_pools()
     test_logger = logging.getLogger("tests.asyncio_diagnostics.submit_failure")
@@ -287,12 +425,15 @@ def test_global_pool_configuration_and_health_snapshot_api() -> None:
             max_workers=1,
             isolated=True,
             thread_name_prefix="test-global-file-resource",
+            max_pending=2,
         )
         snapshot = blocking_scheduler_health_snapshot()
 
         assert config.isolated is True
+        assert config.max_pending == 2
         assert snapshot["executors"][BlockingPool.FILE_RESOURCE.value]["isolated"] is True
         assert snapshot["executors"][BlockingPool.FILE_RESOURCE.value]["max_workers"] == 1
+        assert snapshot["executors"][BlockingPool.FILE_RESOURCE.value]["max_pending"] == 2
 
         result = asyncio.run(
             monitored_to_thread(
@@ -304,10 +445,12 @@ def test_global_pool_configuration_and_health_snapshot_api() -> None:
         )
         assert result.startswith("test-global-file-resource")
     finally:
+        reset_workers = max(4, min(16, original_max_workers))
         configure_blocking_pool(
             BlockingPool.FILE_RESOURCE,
-            max_workers=max(4, min(16, original_max_workers)),
-            isolated=False,
+            max_workers=reset_workers,
+            isolated=True,
             thread_name_prefix="blocking-file-resource",
+            max_pending=reset_workers * 4,
         )
         shutdown_blocking_executors(wait=True, cancel_futures=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import threading
@@ -14,6 +15,13 @@ from agent_runtime.file_resource.service import FileResourceCancelledError, File
 logger = logging.getLogger(__name__)
 
 TERMINAL_UPLOAD_STATUSES = {"completed", "failed", "cancelled"}
+
+
+@dataclass(frozen=True, slots=True)
+class _AsyncUploadTaskWaiter:
+    after_seq: int
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +63,7 @@ class FileResourceUploadTask:
     lock: threading.RLock = field(default_factory=threading.RLock)
     condition: threading.Condition = field(init=False)
     events: list[FileResourceUploadTaskEvent] = field(default_factory=list)
+    async_waiters: dict[str, _AsyncUploadTaskWaiter] = field(default_factory=dict)
     status: str = "queued"
     phase: str = "queued"
     message: str = "等待上传处理。"
@@ -119,6 +128,33 @@ class FileResourceUploadTaskService:
                 return True
             task.condition.wait(timeout=timeout_seconds)
             return any(event.seq > after_seq for event in task.events)
+
+    async def wait_for_event_async(self, task: FileResourceUploadTask, after_seq: int, timeout_seconds: float) -> bool:
+        """Wait asynchronously for a later upload event without occupying a blocking executor worker."""
+
+        timeout = max(float(timeout_seconds), 0.0)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bool] = loop.create_future()
+        waiter_id = uuid4().hex
+        with task.lock:
+            if any(event.seq > after_seq for event in task.events):
+                return True
+            task.async_waiters[waiter_id] = _AsyncUploadTaskWaiter(
+                after_seq=after_seq,
+                loop=loop,
+                future=future,
+            )
+        try:
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            except asyncio.TimeoutError:
+                return False
+            return True
+        finally:
+            with task.lock:
+                task.async_waiters.pop(waiter_id, None)
+            if not future.done():
+                future.cancel()
 
     def _run_task(self, task: FileResourceUploadTask) -> None:
         try:
@@ -236,6 +272,27 @@ class FileResourceUploadTaskService:
         if len(task.events) > self._max_retained_events:
             del task.events[: len(task.events) - self._max_retained_events]
         task.condition.notify_all()
+        waiters = [
+            waiter
+            for waiter in task.async_waiters.values()
+            if not waiter.future.done() and (event.seq > waiter.after_seq or status in TERMINAL_UPLOAD_STATUSES)
+        ]
+        _notify_async_waiters(waiters)
+
+
+def _notify_async_waiters(waiters: list[_AsyncUploadTaskWaiter]) -> None:
+    for waiter in waiters:
+        if waiter.loop.is_closed():
+            continue
+        try:
+            waiter.loop.call_soon_threadsafe(_set_async_waiter_result, waiter.future)
+        except RuntimeError:
+            continue
+
+
+def _set_async_waiter_result(future: asyncio.Future[bool]) -> None:
+    if not future.done():
+        future.set_result(True)
 
 
 def _resource_dict(resource, *, name: str | None) -> dict[str, Any]:

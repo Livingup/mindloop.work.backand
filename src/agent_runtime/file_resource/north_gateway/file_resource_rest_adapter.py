@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import asyncio
 import json
 import logging
 from typing import Any
@@ -11,7 +10,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agent_runtime.config import ConfigRegistry
-from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.file_resource.models import ImageResourceMetadata, PdfResourceMetadata
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest, RemoteUrlCreateRequest
 from agent_runtime.file_resource.settings_repository import (
@@ -233,21 +231,10 @@ def create_file_resource_router() -> APIRouter:
                     return
                 if await request.is_disconnected():
                     return
-                has_event = await monitored_to_thread(
-                    task_service.wait_for_event,
+                has_event = await task_service.wait_for_event_async(
                     task,
                     cursor,
                     15,
-                    operation="file_resource.upload_task.wait_for_event",
-                    caller="stream_upload_task_events.event_generator",
-                    pool=BlockingPool.FILE_RESOURCE,
-                    log=logger,
-                    slow_execution_seconds=5.0,
-                    diagnostic_context={
-                        "task_id": task_id,
-                        "cursor": cursor,
-                        "wait_timeout_seconds": 15,
-                    },
                 )
                 if await request.is_disconnected():
                     return

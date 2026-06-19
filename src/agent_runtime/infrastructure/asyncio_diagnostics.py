@@ -45,6 +45,7 @@ class BlockingPoolConfig:
     max_workers: int
     thread_name_prefix: str
     isolated: bool = True
+    max_pending: int | None = None
 
 
 @dataclass(slots=True)
@@ -55,6 +56,8 @@ class _BlockingStats:
     completed: int = 0
     failed: int = 0
     cancelled: int = 0
+    rejected: int = 0
+    overloaded: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -64,6 +67,8 @@ class _BlockingStats:
             "completed": self.completed,
             "failed": self.failed,
             "cancelled": self.cancelled,
+            "rejected": self.rejected,
+            "overloaded": self.overloaded,
         }
 
 
@@ -71,6 +76,28 @@ class _BlockingStats:
 class _StatsSnapshot:
     pool: dict[str, int]
     operation: dict[str, int]
+
+
+@dataclass(slots=True)
+class _AdmissionResult:
+    accepted: bool
+    snapshot: _StatsSnapshot
+    pending: int
+    max_pending: int | None
+
+
+class BlockingPoolOverloadedError(RuntimeError):
+    """Raised when a blocking pool rejects work before executor submission."""
+
+    def __init__(self, *, pool_name: str, operation: str, pending: int, max_pending: int) -> None:
+        self.pool_name = pool_name
+        self.operation = operation
+        self.pending = pending
+        self.max_pending = max_pending
+        super().__init__(
+            "Blocking pool overloaded: "
+            f"pool={pool_name} operation={operation} pending={pending} max_pending={max_pending}"
+        )
 
 
 @dataclass(slots=True)
@@ -123,13 +150,15 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
             pool_name=BlockingPool.TERMINAL.value,
             max_workers=terminal_workers,
             thread_name_prefix="blocking-terminal",
-            isolated=False,
+            isolated=True,
+            max_pending=terminal_workers * 4,
         ),
         BlockingPool.TERMINAL_RENDER.value: BlockingPoolConfig(
             pool_name=BlockingPool.TERMINAL_RENDER.value,
             max_workers=_cpu_render_max_workers(),
             thread_name_prefix="blocking-terminal-render",
-            isolated=False,
+            isolated=True,
+            max_pending=_cpu_render_max_workers() * 4,
         ),
         BlockingPool.CPU_RENDER.value: BlockingPoolConfig(
             pool_name=BlockingPool.CPU_RENDER.value,
@@ -141,7 +170,8 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
             pool_name=BlockingPool.FILE_RESOURCE.value,
             max_workers=io_workers,
             thread_name_prefix="blocking-file-resource",
-            isolated=False,
+            isolated=True,
+            max_pending=io_workers * 4,
         ),
         BlockingPool.DB_BLOCKING.value: BlockingPoolConfig(
             pool_name=BlockingPool.DB_BLOCKING.value,
@@ -201,13 +231,25 @@ def _apply_environment_overrides(configs: dict[str, BlockingPoolConfig]) -> dict
                     pool_name,
                     max_workers_text,
                 )
+        max_pending = config.max_pending
+        max_pending_text = os.environ.get(_env_key_for(pool_name, "MAX_PENDING"))
+        if max_pending_text is not None:
+            try:
+                parsed_max_pending = int(max_pending_text)
+                max_pending = None if parsed_max_pending < 0 else parsed_max_pending
+            except ValueError:
+                logger.warning(
+                    "Invalid blocking pool max pending override ignored: pool=%s value=%s",
+                    pool_name,
+                    max_pending_text,
+                )
         isolated = _parse_env_bool(
             os.environ.get(_env_key_for(pool_name, "ISOLATED")),
             default=config.isolated,
         )
         if pool_name == BlockingPool.DEFAULT.value:
             isolated = True
-        updated[pool_name] = replace(config, max_workers=max_workers, isolated=isolated)
+        updated[pool_name] = replace(config, max_workers=max_workers, isolated=isolated, max_pending=max_pending)
     return updated
 
 
@@ -391,6 +433,7 @@ class ExecutorRegistry:
         max_workers: int | None = None,
         isolated: bool | None = None,
         thread_name_prefix: str | None = None,
+        max_pending: int | None = None,
     ) -> BlockingPoolConfig:
         """Override a pool configuration and recreate the executor on next use."""
         pool_name = _normalize_pool_name(pool)
@@ -401,6 +444,7 @@ class ExecutorRegistry:
                 max_workers=max(1, max_workers if max_workers is not None else current.max_workers),
                 isolated=current.isolated if isolated is None else bool(isolated),
                 thread_name_prefix=thread_name_prefix or current.thread_name_prefix,
+                max_pending=max_pending if max_pending is not None else current.max_pending,
             )
             if pool_name == BlockingPool.DEFAULT.value:
                 next_config = replace(next_config, isolated=True)
@@ -423,9 +467,11 @@ class ExecutorRegistry:
             )
             old_executor.shutdown(wait=False, cancel_futures=False)
         logger.info(
-            "Blocking pool configured: pool=%s max_workers=%s isolated=%s thread_name_prefix=%s executor_pool=%s old_executor_replaced=%s",
+            "Blocking pool configured: pool=%s max_workers=%s max_pending=%s isolated=%s thread_name_prefix=%s "
+            "executor_pool=%s old_executor_replaced=%s",
             pool_name,
             next_config.max_workers,
+            next_config.max_pending,
             next_config.isolated,
             next_config.thread_name_prefix,
             executor_pool_name,
@@ -475,6 +521,7 @@ class ExecutorRegistry:
                 executor = self._executors.get(executor_pool)
                 snapshot[pool_name] = {
                     "max_workers": config.max_workers,
+                    "max_pending": config.max_pending,
                     "thread_name_prefix": config.thread_name_prefix,
                     "isolated": config.isolated,
                     "executor_pool": executor_pool,
@@ -532,6 +579,7 @@ class ExecutorRegistry:
             max_workers=default_thread_pool_max_workers(),
             thread_name_prefix=f"blocking-{pool_name[:24]}",
             isolated=False,
+            max_pending=None,
         )
         self._configs[pool_name] = dynamic
         logger.warning("Dynamic blocking pool created with shared default executor: pool=%s", pool_name)
@@ -579,7 +627,8 @@ class BlockingScheduler:
         queue_slow_threshold_ms = int(slow_queue_seconds * 1000)
         execution_slow_threshold_ms = int(slow_execution_seconds * 1000)
         context = _sanitize_context(diagnostic_context)
-        snapshot = self._record_submitted(pool_name, operation)
+        admission = self._admit_blocking_call(pool_name, operation, logical_config.max_pending)
+        snapshot = admission.snapshot
         call = _SubmittedBlockingCall(
             blocking_call_id=actual_call_id,
             pool_name=pool_name,
@@ -598,6 +647,20 @@ class BlockingScheduler:
             pool_snapshot=snapshot.pool,
             operation_snapshot=snapshot.operation,
         )
+        if not admission.accepted:
+            self._log_blocking_diagnostic(
+                logging.WARNING,
+                "blocking call rejected",
+                call,
+                phase="blocking.rejected",
+                final_state="overloaded",
+            )
+            raise BlockingPoolOverloadedError(
+                pool_name=pool_name,
+                operation=operation,
+                pending=admission.pending,
+                max_pending=admission.max_pending or 0,
+            )
         self._log_blocking_diagnostic(logging.DEBUG, "blocking call submitted", call, phase="blocking.submitted")
         self._log_executor_state(logging.DEBUG, "blocking executor state before submit", call, executor, phase="blocking.executor_before_submit")
 
@@ -765,6 +828,7 @@ class BlockingScheduler:
         return result
 
     def health_snapshot(self) -> dict[str, Any]:
+        executors = self._executor_registry.health_snapshot()
         with self._stats_lock:
             pools: dict[str, Any] = {}
             for pool_name, stats in sorted(self._pool_stats.items()):
@@ -773,10 +837,15 @@ class BlockingScheduler:
                     for (item_pool, operation), op_stats in sorted(self._operation_stats.items())
                     if item_pool == pool_name
                 }
-                pools[pool_name] = {**stats.to_dict(), "operations": operations}
+                executor_config = executors.get(pool_name) if isinstance(executors.get(pool_name), dict) else {}
+                pools[pool_name] = {
+                    **stats.to_dict(),
+                    "max_pending": executor_config.get("max_pending"),
+                    "operations": operations,
+                }
         return {
             "pools": pools,
-            "executors": self._executor_registry.health_snapshot(),
+            "executors": executors,
         }
 
     def configure_pool(
@@ -786,12 +855,14 @@ class BlockingScheduler:
         max_workers: int | None = None,
         isolated: bool | None = None,
         thread_name_prefix: str | None = None,
+        max_pending: int | None = None,
     ) -> BlockingPoolConfig:
         return self._executor_registry.configure_pool(
             pool,
             max_workers=max_workers,
             isolated=isolated,
             thread_name_prefix=thread_name_prefix,
+            max_pending=max_pending,
         )
 
     def shutdown(self, *, wait: bool = False, cancel_futures: bool = False) -> None:
@@ -806,13 +877,34 @@ class BlockingScheduler:
         pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
         return _StatsSnapshot(pool=pool_stats.to_dict(), operation=op_stats.to_dict())
 
-    def _record_submitted(self, pool_name: str, operation: str) -> _StatsSnapshot:
+    def _admit_blocking_call(
+        self,
+        pool_name: str,
+        operation: str,
+        max_pending: int | None,
+    ) -> _AdmissionResult:
         with self._stats_lock:
             pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
+            pending = pool_stats.pending
+            if max_pending is not None and pending >= max_pending:
+                for stats in (pool_stats, op_stats):
+                    stats.rejected += 1
+                    stats.overloaded += 1
+                return _AdmissionResult(
+                    accepted=False,
+                    snapshot=self._snapshot_locked(pool_name, operation),
+                    pending=pending,
+                    max_pending=max_pending,
+                )
             for stats in (pool_stats, op_stats):
                 stats.submitted += 1
                 stats.pending += 1
-            return self._snapshot_locked(pool_name, operation)
+            return _AdmissionResult(
+                accepted=True,
+                snapshot=self._snapshot_locked(pool_name, operation),
+                pending=pending + 1,
+                max_pending=max_pending,
+            )
 
     def _record_worker_started(self, pool_name: str, operation: str) -> _StatsSnapshot:
         with self._stats_lock:
@@ -988,9 +1080,10 @@ class BlockingScheduler:
             "phase=%s task_name=%s duration_ms=%s executor_queue_delay_ms=%s "
             "worker_thread_name=%s pool_max_workers=%s function=%s.%s "
             "pool_active=%s pool_pending=%s pool_submitted=%s pool_completed=%s pool_failed=%s pool_cancelled=%s "
-            "operation_active=%s operation_pending=%s operation_submitted=%s operation_completed=%s "
-            "operation_failed=%s operation_cancelled=%s queue_slow_threshold_ms=%s "
-            "execution_slow_threshold_ms=%s final_state=%s error_type=%s error=%s context=%s",
+            "pool_rejected=%s pool_overloaded=%s operation_active=%s operation_pending=%s operation_submitted=%s "
+            "operation_completed=%s operation_failed=%s operation_cancelled=%s operation_rejected=%s "
+            "operation_overloaded=%s queue_slow_threshold_ms=%s execution_slow_threshold_ms=%s "
+            "final_state=%s error_type=%s error=%s context=%s",
             message,
             call.blocking_call_id,
             call.pool_name,
@@ -1011,12 +1104,16 @@ class BlockingScheduler:
             pool_snapshot.get("completed"),
             pool_snapshot.get("failed"),
             pool_snapshot.get("cancelled"),
+            pool_snapshot.get("rejected"),
+            pool_snapshot.get("overloaded"),
             operation_snapshot.get("active"),
             operation_snapshot.get("pending"),
             operation_snapshot.get("submitted"),
             operation_snapshot.get("completed"),
             operation_snapshot.get("failed"),
             operation_snapshot.get("cancelled"),
+            operation_snapshot.get("rejected"),
+            operation_snapshot.get("overloaded"),
             call.queue_slow_threshold_ms,
             call.execution_slow_threshold_ms,
             final_state,
@@ -1043,12 +1140,14 @@ def configure_blocking_pool(
     max_workers: int | None = None,
     isolated: bool | None = None,
     thread_name_prefix: str | None = None,
+    max_pending: int | None = None,
 ) -> BlockingPoolConfig:
     return _blocking_scheduler.configure_pool(
         pool,
         max_workers=max_workers,
         isolated=isolated,
         thread_name_prefix=thread_name_prefix,
+        max_pending=max_pending,
     )
 
 

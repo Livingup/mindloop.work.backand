@@ -21,7 +21,7 @@ RUNTIME_CONCURRENCY_DEFAULT_TOP_LIMIT = 20
 RUNTIME_CONCURRENCY_DETAIL_MAX_LIMIT = 100
 RUNTIME_CONCURRENCY_RECENT_SECONDS = 300.0
 
-_BLOCKING_COUNTER_KEYS = ("submitted", "pending", "active", "completed", "failed", "cancelled")
+_BLOCKING_COUNTER_KEYS = ("submitted", "pending", "active", "completed", "failed", "cancelled", "rejected", "overloaded")
 _PHYSICAL_EXECUTOR_TOTAL_KEYS = (
     "executor_work_queue_size",
     "executor_thread_count",
@@ -297,6 +297,7 @@ def _blocking_scheduler_concurrency_summary(
 def _blocking_pool_summary(pool_name: str, value: dict[str, Any]) -> dict[str, Any]:
     return {
         "pool": _safe_label(pool_name),
+        "max_pending": _optional_int_value(value.get("max_pending")),
         **{key: _int_value(value.get(key)) for key in _BLOCKING_COUNTER_KEYS},
     }
 
@@ -311,6 +312,7 @@ def _blocking_executor_summary(executor_name: str, value: dict[str, Any]) -> dic
         "executor_role": _executor_role(executor_name, value),
         "isolated": bool(value.get("isolated")),
         "max_workers": _runtime_int_value(runtime, "max_workers", fallback=value.get("max_workers")),
+        "max_pending": _optional_int_value(value.get("max_pending")),
         "work_queue_size": _int_value(runtime.get("work_queue_size")),
         "thread_count": _int_value(runtime.get("thread_count")),
         "alive_thread_count": _int_value(runtime.get("alive_thread_count")),
@@ -574,6 +576,8 @@ def _runtime_concurrency_signals(
     )
     blocking_active = _int_value(logical_totals.get("active"))
     blocking_pending = _int_value(logical_totals.get("pending"))
+    blocking_rejected = _int_value(logical_totals.get("rejected"))
+    blocking_overloaded = _int_value(logical_totals.get("overloaded"))
     executor_queue_size = _int_value(physical_totals.get("executor_work_queue_size"))
     executor_max_workers = _int_value(physical_totals.get("executor_max_workers"))
     executor_shutdown_count = _int_value(physical_totals.get("executor_shutdown_count"))
@@ -587,11 +591,15 @@ def _runtime_concurrency_signals(
         "blocking_scheduler": {
             "active_operations": blocking_active,
             "pending_operations": blocking_pending,
+            "rejected_operations": blocking_rejected,
+            "overloaded_operations": blocking_overloaded,
             "executor_queue_size": executor_queue_size,
             "executor_unavailable": executor_shutdown_count > 0 or executor_broken_count > 0,
             "saturated": executor_max_workers > 0
             and blocking_active >= executor_max_workers
             and (blocking_pending > 0 or executor_queue_size > 0),
+            "overloaded": blocking_overloaded > 0,
+            "recent_rejections": blocking_rejected > 0,
             "recent_failures_or_cancellations": _int_value(logical_totals.get("failed")) > 0
             or _int_value(logical_totals.get("cancelled")) > 0,
             "executor_runtime_totals_deduped": bool(executor_view.get("physical_totals_deduped", False)),
@@ -632,6 +640,7 @@ def _runtime_concurrency_status(signals: dict[str, Any]) -> str:
         bool(event_loop.get("blocked_recently"))
         or bool(blocking_scheduler.get("executor_unavailable"))
         or bool(blocking_scheduler.get("saturated"))
+        or bool(blocking_scheduler.get("overloaded"))
     ):
         return "degraded"
     if (
@@ -639,6 +648,7 @@ def _runtime_concurrency_status(signals: dict[str, Any]) -> str:
         or bool(event_loop.get("lagging"))
         or _int_value(blocking_scheduler.get("pending_operations")) > 0
         or _int_value(blocking_scheduler.get("executor_queue_size")) > 0
+        or bool(blocking_scheduler.get("recent_rejections"))
         or bool(blocking_scheduler.get("recent_failures_or_cancellations"))
         or bool(runtime_tasks.get("stale_progress"))
         or bool(runtime_tasks.get("cancelling_tasks"))
@@ -716,6 +726,12 @@ def _int_value(value: Any) -> int:
     if isinstance(value, int | float):
         return int(value)
     return 0
+
+
+def _optional_int_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _int_value(value)
 
 
 def _safe_label(value: Any, *, default: str = "unknown") -> str:
