@@ -359,26 +359,28 @@ class SubagentRuntime:
         normalized_child_ids = tuple(dict.fromkeys(child_id.strip() for child_id in child_instance_ids if child_id.strip()))
         if not normalized_child_ids:
             raise ValueError("child_agent_instance_ids 至少提供一个。")
-        results: list[dict[str, Any]] = []
+        result_lines: list[str] = []
         all_released_ids: list[str] = []
+        success_count = 0
+        failed_count = 0
         task_id: str | None = None
-        eligibility_by_child: dict[str, tuple[bool, str | None, str | None]] = {}
+        eligibility_by_child: dict[str, tuple[bool, str | None]] = {}
         for child_instance_id in normalized_child_ids:
-            is_releasable, error_code, error_message, child_task_id = self._validate_end_subagent_target(
+            is_releasable, error_message, child_task_id = self._validate_end_subagent_target(
                 parent_instance_id=parent_instance_id,
                 child_instance_id=child_instance_id,
             )
             if child_task_id is not None:
                 task_id = task_id or child_task_id
-            eligibility_by_child[child_instance_id] = (is_releasable, error_code, error_message)
+            eligibility_by_child[child_instance_id] = (is_releasable, error_message)
         for child_instance_id in normalized_child_ids:
-            is_releasable, error_code, error_message = eligibility_by_child[child_instance_id]
+            is_releasable, error_message = eligibility_by_child[child_instance_id]
             if not is_releasable:
-                results.append(
-                    _end_subagent_result(
+                failed_count += 1
+                result_lines.append(
+                    _end_subagent_result_line(
                         child_instance_id,
-                        status="failed",
-                        error_code=error_code or "release_failed",
+                        succeeded=False,
                         error_message=error_message or f"子 Agent 释放失败: {child_instance_id}",
                     )
                 )
@@ -390,11 +392,11 @@ class SubagentRuntime:
                     reason=reason,
                 )
             except (KeyError, PermissionError, ValueError) as exc:
-                results.append(
-                    _end_subagent_result(
+                failed_count += 1
+                result_lines.append(
+                    _end_subagent_result_line(
                         child_instance_id,
-                        status="failed",
-                        error_code=_release_error_code(exc),
+                        succeeded=False,
                         error_message=str(exc),
                     )
                 )
@@ -402,7 +404,8 @@ class SubagentRuntime:
             released_ids = [instance.instance_id for instance in released_instances]
             task_id = updated_task.task_id
             all_released_ids.extend(released_ids)
-            results.append(_end_subagent_result(child_instance_id, status="ended", released_ids=released_ids))
+            success_count += 1
+            result_lines.append(_end_subagent_result_line(child_instance_id, succeeded=True))
             await self._publish_subagent_released(
                 parent_instance_id=parent_instance_id,
                 child_instance_id=child_instance_id,
@@ -410,20 +413,17 @@ class SubagentRuntime:
                 task=updated_task,
                 reason=reason,
             )
-        failed_count = sum(1 for result in results if result["status"] == "failed")
-        if failed_count == 0:
-            status = "ended"
-        elif failed_count == len(results):
-            status = "failed"
-        else:
-            status = "partial_failed"
         return {
-            "status": status,
+            "result_text": _end_subagent_result_text(
+                success_count=success_count,
+                failed_count=failed_count,
+                result_lines=result_lines,
+            ),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "released_agent_instance_ids": all_released_ids,
             "task_id": task_id,
             "parent_agent_instance_id": parent_instance_id,
-            "child_agent_instance_ids": list(normalized_child_ids),
-            "released_agent_instance_ids": all_released_ids,
-            "results": results,
             "reason": reason,
         }
 
@@ -432,41 +432,32 @@ class SubagentRuntime:
         *,
         parent_instance_id: str,
         child_instance_id: str,
-    ) -> tuple[bool, str | None, str | None, str | None]:
+    ) -> tuple[bool, str | None, str | None]:
         try:
             parent = self._runtime_gateway.get_agent_instance(parent_instance_id)
-        except KeyError as exc:
-            return False, "parent_agent_not_found", str(exc), None
-        except ValueError as exc:
-            return False, "invalid_parent_agent", str(exc), None
+        except (KeyError, ValueError) as exc:
+            return False, str(exc), None
         try:
             child = self._runtime_gateway.get_agent_instance(child_instance_id)
-        except KeyError as exc:
-            return False, "child_agent_not_found", str(exc), parent.task_id
-        except ValueError as exc:
-            return False, "invalid_child_agent", str(exc), parent.task_id
+        except (KeyError, ValueError) as exc:
+            return False, str(exc), parent.task_id
         if parent.task_id != child.task_id:
-            return False, "cross_task_child", "父 Agent 与子 Agent 不属于同一任务。", parent.task_id
+            return False, "父 Agent 与子 Agent 不属于同一任务。", parent.task_id
         try:
             task = self._runtime_gateway.get_task(parent.task_id)
         except KeyError as exc:
-            return False, "task_not_found", str(exc), parent.task_id
+            return False, str(exc), parent.task_id
         relation = task.child_relation_of(child_instance_id)
         if relation is None:
-            return False, "not_child_agent", f"子 Agent 实例不属于任务父子关系树: {child_instance_id}", task.task_id
+            return False, f"子 Agent 实例不属于任务父子关系树: {child_instance_id}", task.task_id
         if relation.parent_instance_id != parent_instance_id:
-            return False, "not_direct_child", "只能释放当前 Agent 直接创建的子 Agent。", task.task_id
+            return False, "只能结束当前 Agent 直接创建且尚未释放的子 Agent", task.task_id
         if relation.is_released:
-            return False, "child_agent_already_released", f"子 Agent 已释放: {child_instance_id}", task.task_id
+            return False, f"子 Agent 已释放: {child_instance_id}", task.task_id
         running_instance_id = self._find_running_instance_in_release_subtree(task, child_instance_id)
         if running_instance_id is not None:
-            return (
-                False,
-                "subagent_running",
-                f"子 Agent 仍在运行，不能释放: {running_instance_id}",
-                task.task_id,
-            )
-        return True, None, None, task.task_id
+            return False, _running_subagent_error_message(child_instance_id, running_instance_id), task.task_id
+        return True, None, task.task_id
 
     def _find_running_instance_in_release_subtree(
         self,
@@ -730,31 +721,32 @@ def get_subagent_runtime() -> SubagentRuntime:
     return _runtime
 
 
-def _end_subagent_result(
+def _end_subagent_result_text(
+    *,
+    success_count: int,
+    failed_count: int,
+    result_lines: list[str],
+) -> str:
+    heading = f"批量结束完成：{success_count} 个成功，{failed_count} 个失败。"
+    return "\n".join([heading, *result_lines])
+
+
+def _end_subagent_result_line(
     child_instance_id: str,
     *,
-    status: str,
-    released_ids: list[str] | None = None,
-    error_code: str | None = None,
+    succeeded: bool,
     error_message: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "child_agent_instance_id": child_instance_id,
-        "status": status,
-        "released_agent_instance_ids": list(released_ids or []),
-        "error_code": error_code,
-        "error_message": error_message,
-    }
+) -> str:
+    if succeeded:
+        return f"{child_instance_id} 结束成功"
+    return f"{child_instance_id} 结束失败，原因：{error_message or '未知错误'}"
 
 
-def _release_error_code(exc: Exception) -> str:
-    if isinstance(exc, KeyError):
-        return "agent_not_found"
-    if isinstance(exc, PermissionError):
-        return "permission_denied"
-    if isinstance(exc, ValueError):
-        return "invalid_release_target"
-    return "release_failed"
+def _running_subagent_error_message(child_instance_id: str, running_instance_id: str) -> str:
+    message = "正在运行中，无法结束。只能结束暂停中的子 Agent"
+    if running_instance_id != child_instance_id:
+        return f"{message}（阻塞实例：{running_instance_id}）"
+    return message
 
 
 def _build_parent_history_boundary_message(

@@ -437,14 +437,17 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
 
         self.assertTrue(tool_result.success)
         self.assertEqual(tool_result.execution_status, "success")
-        self.assertEqual(tool_result.output["status"], "failed")
-        self.assertEqual(tool_result.output["released_agent_instance_ids"], [])
-        result = tool_result.output["results"][0]
-        self.assertEqual(result["child_agent_instance_id"], "agent-instance-running-child")
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["released_agent_instance_ids"], [])
-        self.assertEqual(result["error_code"], "subagent_running")
-        self.assertIn("agent-instance-running-child", result["error_message"])
+        output = tool_result.output
+        self.assertNotIn("status", output)
+        self.assertNotIn("results", output)
+        self.assertEqual(output["success_count"], 0)
+        self.assertEqual(output["failed_count"], 1)
+        self.assertEqual(output["released_agent_instance_ids"], [])
+        self.assertEqual(
+            output["result_text"],
+            "批量结束完成：0 个成功，1 个失败。\n"
+            "agent-instance-running-child 结束失败，原因：正在运行中，无法结束。只能结束暂停中的子 Agent",
+        )
         self.assertEqual(service.get_agent_instance("agent-instance-running-child").status, AGENT_INSTANCE_STATUS_RUNNING)
         self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-running-child").is_released)
         self.assertEqual(recorder.events, [])
@@ -468,13 +471,16 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         ))
 
         self.assertTrue(tool_result.success)
-        self.assertEqual(tool_result.output["status"], "ended")
-        self.assertEqual(tool_result.output["released_agent_instance_ids"], ["agent-instance-ready-child"])
-        result = tool_result.output["results"][0]
-        self.assertEqual(result["status"], "ended")
-        self.assertEqual(result["released_agent_instance_ids"], ["agent-instance-ready-child"])
-        self.assertIsNone(result["error_code"])
-        self.assertIsNone(result["error_message"])
+        output = tool_result.output
+        self.assertNotIn("status", output)
+        self.assertNotIn("results", output)
+        self.assertEqual(output["success_count"], 1)
+        self.assertEqual(output["failed_count"], 0)
+        self.assertEqual(output["released_agent_instance_ids"], ["agent-instance-ready-child"])
+        self.assertEqual(
+            output["result_text"],
+            "批量结束完成：1 个成功，0 个失败。\nagent-instance-ready-child 结束成功",
+        )
         with self.assertRaises(KeyError):
             service.get_agent_instance("agent-instance-ready-child")
         self.assertEqual(len(recorder.events), 1)
@@ -514,22 +520,27 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         )
         service.start_agent_instance("agent-instance-running-grandchild")
 
-        output = asyncio.run(end_subagent_tool(
+        tool_result = asyncio.run(end_subagent_tool(
             EndSubagentRequest(
                 child_agent_instance_ids=["agent-instance-blocked-child", "agent-instance-valid-child"],
             ),
             ToolRuntimeContext(agent_instance_id="agent-instance-root"),
-        )).output
+        ))
+        self.assertTrue(tool_result.success)
+        output = tool_result.output
 
-        self.assertEqual(output["status"], "partial_failed")
+        self.assertNotIn("status", output)
+        self.assertNotIn("results", output)
+        self.assertEqual(output["success_count"], 1)
+        self.assertEqual(output["failed_count"], 1)
         self.assertEqual(output["released_agent_instance_ids"], ["agent-instance-valid-child"])
-        results = {item["child_agent_instance_id"]: item for item in output["results"]}
-        self.assertEqual(results["agent-instance-blocked-child"]["status"], "failed")
-        self.assertEqual(results["agent-instance-blocked-child"]["error_code"], "subagent_running")
-        self.assertIn("agent-instance-running-grandchild", results["agent-instance-blocked-child"]["error_message"])
-        self.assertEqual(results["agent-instance-blocked-child"]["released_agent_instance_ids"], [])
-        self.assertEqual(results["agent-instance-valid-child"]["status"], "ended")
-        self.assertEqual(results["agent-instance-valid-child"]["released_agent_instance_ids"], ["agent-instance-valid-child"])
+        self.assertEqual(
+            output["result_text"],
+            "批量结束完成：1 个成功，1 个失败。\n"
+            "agent-instance-blocked-child 结束失败，原因：正在运行中，无法结束。只能结束暂停中的子 Agent"
+            "（阻塞实例：agent-instance-running-grandchild）\n"
+            "agent-instance-valid-child 结束成功",
+        )
         self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-blocked-child").is_released)
         self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-running-grandchild").is_released)
         self.assertEqual(service.get_agent_instance("agent-instance-running-grandchild").status, AGENT_INSTANCE_STATUS_RUNNING)
