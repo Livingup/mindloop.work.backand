@@ -5,11 +5,13 @@ import threading
 import pytest
 
 from agent_runtime.infrastructure.asyncio_diagnostics import (
+    BlockingPool,
     configure_blocking_pool,
     monitored_to_thread,
     shutdown_blocking_executors,
 )
 from agent_runtime.tool.local_tool_definition import LocalToolDefinition
+from agent_runtime.tool.local_tool_factory import LocalToolFactory
 from agent_runtime.tool.local_tool_service import LocalToolService
 from agent_runtime.tool.tool_execution_models import BaseToolResult
 
@@ -182,3 +184,32 @@ def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
     assert result.success is False
     assert result.error_code == "BlockingPoolOverloadedError"
     assert "unit.local_tool.rejected" in (result.error_message or "")
+
+
+def test_actual_file_tools_are_registered_as_explicit_blocking_tools() -> None:
+    gateway = LocalToolFactory.create()
+
+    expected_operations = {
+        "file_read": "tool.file.read",
+        "file_read_line_slice": "tool.file.read_line_slice",
+        "context_document_discover": "tool.file.context_document_discover",
+        "directory_explore": "tool.file.directory_explore",
+        "file_name_search": "tool.file.name_search",
+        "text_search": "tool.file.text_search",
+        "file_modify": "tool.file.modify",
+        "file_create": "tool.file.create",
+        "file_delete": "tool.file.delete",
+        "file_move": "tool.file.move",
+    }
+
+    for tool_name, operation in expected_operations.items():
+        tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.execution_mode == "blocking"
+        assert tool_def.blocking_pool == BlockingPool.FILE_RESOURCE
+        assert tool_def.blocking_operation == operation
+
+    for tool_name in ("web_search", "read_url_context"):
+        tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.execution_mode == "direct"
+        assert tool_def.blocking_pool is None
+        assert tool_def.blocking_operation is None

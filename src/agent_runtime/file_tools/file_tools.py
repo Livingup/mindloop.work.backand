@@ -12,6 +12,7 @@ from typing import Any, Iterator, Literal
 
 from pydantic import BaseModel, Field
 
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool
 from agent_runtime.subprocess_utils import hidden_subprocess_kwargs
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult
@@ -614,6 +615,9 @@ def _read_file_request(file_request: FileReadFileRequest) -> tuple[bool, dict[st
     description=f"批量读取一个或多个文本文件的指定行范围，返回紧凑文本结构：file 层包含 total_lines，segment 层包含 start_line、end_line 和 lines 字符串数组。files 一次最多 {MAX_FILE_READ_FILES} 个；每段 line_count 取值范围为 1 到 {MAX_FILE_READ_LINE_COUNT}。行范围读取中单行超过 {MAX_FILE_READ_MAX_CHARS_PER_LINE} 字符时，该文件读取失败；请根据 error_message 使用 file_read_line_slice 按行号和行内偏移单独读取大行内容。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.read",
 )
 def file_read(request: FileReadRequest) -> BaseToolResult:
     files: list[dict[str, Any]] = []
@@ -642,6 +646,9 @@ def file_read(request: FileReadRequest) -> BaseToolResult:
     description=f"用于单独读取大行内容的行内偏移读取工具；当 file_read 提示部分行内容过大时，传入 file_path、line_number 和 char_start 读取该行从指定字符开始的片段。每次调用由工具内部固定最多返回 {MAX_LINE_SLICE_CHARS} 个字符；如返回 has_more=true，再用 next_char_start 继续读取。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.read_line_slice",
 )
 def file_read_line_slice(request: FileReadLineSliceRequest) -> BaseToolResult:
     path = Path(request.file_path).expanduser().resolve()
@@ -691,6 +698,9 @@ def file_read_line_slice(request: FileReadLineSliceRequest) -> BaseToolResult:
     description="给定项目根目录，返回该项目内所有 AGENTS.md 上下文文档的绝对路径列表。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.context_document_discover",
 )
 def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseToolResult:
     project_root = Path(request.project_root).expanduser().resolve()
@@ -732,6 +742,9 @@ def context_document_discover(request: ContextDocumentDiscoverRequest) -> BaseTo
     description="递进式探索指定目录结构，返回受 depth 和 max_entries 控制的目录/文件摘要。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.directory_explore",
 )
 def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
     root = Path(request.directory_path).expanduser().resolve()
@@ -843,6 +856,9 @@ def directory_explore(request: DirectoryExploreRequest) -> BaseToolResult:
     description="按文件名关键词、文件名正则、相对路径 glob 或扩展名在指定目录下定位候选文件/目录。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.name_search",
 )
 def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
     root = Path(request.search_root).expanduser().resolve()
@@ -957,6 +973,9 @@ def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
     description="在指定目录内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行和可选上下文行。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.text_search",
 )
 def text_search(request: TextSearchRequest) -> BaseToolResult:
     root = Path(request.search_root).expanduser().resolve()

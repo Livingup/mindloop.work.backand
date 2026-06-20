@@ -17,6 +17,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from agent_runtime.file_tools.file_tools import ALWAYS_EXCLUDED_NAMES, _encoding_candidates, _is_binary_file
+from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
 
@@ -368,6 +369,9 @@ def _write_text_atomically(path: Path, text: str, encoding: str) -> None:
     description="在项目工作区内通过连续行精确匹配修改文本文件内容；适用于 Agent 小粒度、安全、可审计地修改源码或配置文件。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.modify",
 )
 def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     """基于 search_lines/replace_lines 对文本文件执行受控修改。"""
@@ -441,6 +445,9 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
     description="在项目工作区内创建新的文本文件；默认禁止覆盖已有文件，覆盖时必须携带旧文件 SHA256。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.create",
 )
 def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     """创建文本文件，必要时在受控边界内创建父目录。"""
@@ -495,6 +502,9 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
     description="在项目工作区内删除单个文件；不支持目录或递归删除，必须提供删除原因。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.delete",
 )
 def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     """删除单个文件，目录删除和递归删除不属于本工具边界。"""
@@ -531,6 +541,9 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
     description="在项目工作区内移动或重命名单个文件；rename 作为同目录移动处理，默认禁止覆盖目标文件。",
     group="file",
     category="system",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.move",
 )
 def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     """移动或重命名单个文件，统一承载 rename 和 move 两类路径变更。"""
