@@ -3,6 +3,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_RUNNING
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
 from agent_runtime.agent.infrastructure.sqlite_agent_runtime_repository import SqliteAgentRuntimeRepository
@@ -12,8 +13,9 @@ from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine
 from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_CHAT_COMPLETIONS, API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import McpServiceSummary
-from agent_runtime.subagent.subagent_runtime import SubagentRuntime
-from agent_runtime.subagent.subagent_tool import EndSubagentRequest
+from agent_runtime.subagent.subagent_runtime import SubagentRuntime, configure_subagent_runtime
+from agent_runtime.subagent.subagent_tool import EndSubagentRequest, end_subagent as end_subagent_tool
+from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
 
 
 class _LocalToolGateway:
@@ -387,6 +389,154 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
                     service.get_agent_instance("agent-instance-child")
             finally:
                 repository.close()
+
+    def _configure_end_subagent_test_runtime(self) -> tuple[AgentRuntimeService, SimpleNamespace]:
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        service.create_task_with_root_agent_instance(
+            task_id="task-end-subagent",
+            root_instance_id="agent-instance-root",
+            thread_id="thread-root",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="parent-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        events = []
+
+        async def publish(context, topic, payload, source=None):
+            events.append({"context": context, "topic": topic, "payload": payload, "source": source})
+
+        configure_subagent_runtime(
+            runtime_gateway=service,
+            agent_definition_gateway=_AgentDefinitionGateway(()),
+            llm_registry_gateway=SimpleNamespace(),
+            execution_engine=SimpleNamespace(),
+            event_publisher=SimpleNamespace(publish=publish),
+            conversation_repository=SimpleNamespace(),
+        )
+        return service, SimpleNamespace(events=events)
+
+    def test_end_subagent_tool_succeeds_with_failed_result_for_running_child(self) -> None:
+        service, recorder = self._configure_end_subagent_test_runtime()
+        service.create_child_agent_instance(
+            task_id="task-end-subagent",
+            parent_instance_id="agent-instance-root",
+            child_instance_id="agent-instance-running-child",
+            thread_id="thread-running-child",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="child-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        service.start_agent_instance("agent-instance-running-child")
+
+        tool_result = asyncio.run(end_subagent_tool(
+            EndSubagentRequest(child_agent_instance_ids=["agent-instance-running-child"]),
+            ToolRuntimeContext(agent_instance_id="agent-instance-root"),
+        ))
+
+        self.assertTrue(tool_result.success)
+        self.assertEqual(tool_result.execution_status, "success")
+        self.assertEqual(tool_result.output["status"], "failed")
+        self.assertEqual(tool_result.output["released_agent_instance_ids"], [])
+        result = tool_result.output["results"][0]
+        self.assertEqual(result["child_agent_instance_id"], "agent-instance-running-child")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["released_agent_instance_ids"], [])
+        self.assertEqual(result["error_code"], "subagent_running")
+        self.assertIn("agent-instance-running-child", result["error_message"])
+        self.assertEqual(service.get_agent_instance("agent-instance-running-child").status, AGENT_INSTANCE_STATUS_RUNNING)
+        self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-running-child").is_released)
+        self.assertEqual(recorder.events, [])
+
+    def test_end_subagent_tool_releases_non_running_child(self) -> None:
+        service, recorder = self._configure_end_subagent_test_runtime()
+        service.create_child_agent_instance(
+            task_id="task-end-subagent",
+            parent_instance_id="agent-instance-root",
+            child_instance_id="agent-instance-ready-child",
+            thread_id="thread-ready-child",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="child-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+
+        tool_result = asyncio.run(end_subagent_tool(
+            EndSubagentRequest(child_agent_instance_ids=["agent-instance-ready-child"]),
+            ToolRuntimeContext(agent_instance_id="agent-instance-root"),
+        ))
+
+        self.assertTrue(tool_result.success)
+        self.assertEqual(tool_result.output["status"], "ended")
+        self.assertEqual(tool_result.output["released_agent_instance_ids"], ["agent-instance-ready-child"])
+        result = tool_result.output["results"][0]
+        self.assertEqual(result["status"], "ended")
+        self.assertEqual(result["released_agent_instance_ids"], ["agent-instance-ready-child"])
+        self.assertIsNone(result["error_code"])
+        self.assertIsNone(result["error_message"])
+        with self.assertRaises(KeyError):
+            service.get_agent_instance("agent-instance-ready-child")
+        self.assertEqual(len(recorder.events), 1)
+        self.assertEqual(recorder.events[0]["topic"], "agent.subagent.released")
+
+    def test_end_subagent_batch_reports_failed_running_descendant_and_releases_valid_child(self) -> None:
+        service, recorder = self._configure_end_subagent_test_runtime()
+        service.create_child_agent_instance(
+            task_id="task-end-subagent",
+            parent_instance_id="agent-instance-root",
+            child_instance_id="agent-instance-blocked-child",
+            thread_id="thread-blocked-child",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="child-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        service.create_child_agent_instance(
+            task_id="task-end-subagent",
+            parent_instance_id="agent-instance-blocked-child",
+            child_instance_id="agent-instance-running-grandchild",
+            thread_id="thread-running-grandchild",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="grandchild-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        service.create_child_agent_instance(
+            task_id="task-end-subagent",
+            parent_instance_id="agent-instance-root",
+            child_instance_id="agent-instance-valid-child",
+            thread_id="thread-valid-child",
+            current_working_directory="G:\\project\\agent",
+            agent_definition_id="child-agent",
+            llm_provider_id="provider",
+            llm_model_binding_id="model",
+        )
+        service.start_agent_instance("agent-instance-running-grandchild")
+
+        output = asyncio.run(end_subagent_tool(
+            EndSubagentRequest(
+                child_agent_instance_ids=["agent-instance-blocked-child", "agent-instance-valid-child"],
+            ),
+            ToolRuntimeContext(agent_instance_id="agent-instance-root"),
+        )).output
+
+        self.assertEqual(output["status"], "partial_failed")
+        self.assertEqual(output["released_agent_instance_ids"], ["agent-instance-valid-child"])
+        results = {item["child_agent_instance_id"]: item for item in output["results"]}
+        self.assertEqual(results["agent-instance-blocked-child"]["status"], "failed")
+        self.assertEqual(results["agent-instance-blocked-child"]["error_code"], "subagent_running")
+        self.assertIn("agent-instance-running-grandchild", results["agent-instance-blocked-child"]["error_message"])
+        self.assertEqual(results["agent-instance-blocked-child"]["released_agent_instance_ids"], [])
+        self.assertEqual(results["agent-instance-valid-child"]["status"], "ended")
+        self.assertEqual(results["agent-instance-valid-child"]["released_agent_instance_ids"], ["agent-instance-valid-child"])
+        self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-blocked-child").is_released)
+        self.assertFalse(service.get_task("task-end-subagent").child_relation_of("agent-instance-running-grandchild").is_released)
+        self.assertEqual(service.get_agent_instance("agent-instance-running-grandchild").status, AGENT_INSTANCE_STATUS_RUNNING)
+        with self.assertRaises(KeyError):
+            service.get_agent_instance("agent-instance-valid-child")
+        self.assertEqual(len(recorder.events), 1)
+        self.assertEqual(recorder.events[0]["payload"]["child_agent_instance_id"], "agent-instance-valid-child")
 
     def test_end_subagent_request_uses_only_child_instance_ids_list(self) -> None:
         fields = EndSubagentRequest.model_fields
