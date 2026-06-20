@@ -89,6 +89,10 @@ def is_first_run_local_only_path(path: str, method: str) -> bool:
         return True
     if path == "/api/runtime-bootstrap/configure" and normalized_method in {"POST", "PUT", "PATCH"}:
         return True
+    if path.startswith("/api/connection-channel/") and normalized_method in {"PUT", "PATCH", "POST"}:
+        return True
+    if path.startswith("/api/local-remote-access/") and normalized_method in {"PUT", "PATCH", "POST"}:
+        return True
     if path.startswith("/api/system-settings"):
         return True
     return False

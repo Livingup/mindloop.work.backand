@@ -122,3 +122,7 @@ lacp:
   request_timeout_seconds: 5
   reconnect_initial_delay_seconds: 1
   reconnect_max_delay_seconds: 30
+
+connection_channel:
+  # 远程浏览器连接通道云服务地址由用户在初始化/设置页配置；YAML 只保存机器本地设置库目录，不预置真实 host/port。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/connection-channel"
