@@ -188,10 +188,6 @@ def create_app(
     from agent_runtime.cloud_user_config.north_gateway.bootstrap_rest_adapter import (
         create_runtime_bootstrap_router,
     )
-    from agent_runtime.connection_channel.factory import ConnectionChannelFactory
-    from agent_runtime.connection_channel.north_gateway.connection_channel_rest_adapter import (
-        create_connection_channel_router,
-    )
     from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
     from agent_runtime.logs_management.service import LogsManagementService
     from agent_runtime.logs_management.north_gateway.logs_management_rest_adapter import (
@@ -289,7 +285,6 @@ def create_app(
     )
     lacp_client = LacpFactory.create_client()
     lacp_settings_repository = _SwitchableRuntimeComponent(LacpFactory.create_settings_repository())
-    connection_channel_service = ConnectionChannelFactory.create_service()
     terminal_gateway = TerminalFactory.create()
     logs_management_service = LogsManagementService()
     system_settings_gateway = SystemSettingsFactory.create()
@@ -1049,16 +1044,6 @@ def create_app(
         tags=["LACP"],
     )
     app.include_router(
-        create_connection_channel_router(connection_channel_service),
-        prefix="/api/local-remote-access",
-        tags=["当前电脑远程访问"],
-    )
-    app.include_router(
-        create_connection_channel_router(connection_channel_service),
-        prefix="/api/connection-channel",
-        tags=["远程浏览器连接通道"],
-    )
-    app.include_router(
         create_llm_model_registry_router(llm_model_registry_gateway),
         prefix="/api/llm-registry",
         tags=["LLM 服务商与模型注册"],
@@ -1208,8 +1193,6 @@ def _is_runtime_bootstrap_exempt_path(path: str) -> bool:
         path == "/api/health"
         or path.startswith("/api/auth/")
         or path.startswith("/api/runtime-bootstrap/")
-        or path.startswith("/api/local-remote-access/")
-        or path.startswith("/api/connection-channel/")
     )
 
 

@@ -47,7 +47,6 @@ from agent_runtime.communication.communication_config import CommunicationConfig
 from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.terminal.terminal_config import TerminalConfig
 from agent_runtime.lacp.config import LacpConfig
-from agent_runtime.connection_channel.config import ConnectionChannelConfig
 from agent_runtime.codex_oauth.config import CodexOAuthConfig
 from agent_runtime.cloud_user_config.config import (
     CloudUserConfigDatabaseConfig,
@@ -146,10 +145,6 @@ class AgentRuntimeConfig:
 
     lacp: LacpConfig = field(
         default_factory=LacpConfig,
-    )
-
-    connection_channel: ConnectionChannelConfig = field(
-        default_factory=ConnectionChannelConfig,
     )
 
     codex_oauth: CodexOAuthConfig = field(
@@ -428,17 +423,6 @@ class ConfigRegistry:
             return LacpConfig()
         return self._get_section_config(
             "lacp", _build_lacp_config,
-        )
-
-    @property
-    def connection_channel(self) -> ConnectionChannelConfig:
-        """实时读取远程浏览器连接通道云服务设置的机器本地存储配置。"""
-        if self._config is not None:
-            return self._config.connection_channel
-        if self._raw_config_data is not None and "connection_channel" not in self._raw_config_data:
-            return ConnectionChannelConfig()
-        return self._get_section_config(
-            "connection_channel", _build_connection_channel_config,
         )
 
     @property
@@ -756,12 +740,6 @@ def _build_lacp_config(data: dict[str, Any]) -> LacpConfig:
         request_timeout_seconds=float(data.get("request_timeout_seconds", 5.0)),
         reconnect_initial_delay_seconds=float(data.get("reconnect_initial_delay_seconds", 1.0)),
         reconnect_max_delay_seconds=float(data.get("reconnect_max_delay_seconds", 30.0)),
-    )
-
-
-def _build_connection_channel_config(data: dict[str, Any]) -> ConnectionChannelConfig:
-    return ConnectionChannelConfig(
-        data_dir=str(data.get("data_dir", "~/.spread-ai/connection-channel")),
     )
 
 

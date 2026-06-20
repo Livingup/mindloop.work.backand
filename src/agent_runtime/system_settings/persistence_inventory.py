@@ -89,9 +89,6 @@ def build_persistence_inventory(
     lacp_data_dir = _config_value(
         raw_config, "lacp", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/lacp"
     )
-    connection_channel_data_dir = _config_value(
-        raw_config, "connection_channel", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/connection-channel"
-    )
     cloud_bootstrap_dir = _config_value(
         raw_config, "cloud_user_config_database", "bootstrap_data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/cloud-user-config"
     )
@@ -434,26 +431,6 @@ def build_persistence_inventory(
             sync_recommendation="field_level_review",
             rationale="LACP registry 地址和启用偏好可能是用户跨设备复用的协作配置，但 API Key 是敏感凭据，且不同机器可能需要不同授权。",
             secret_handling="API Key 必须作为密钥字段加密，且应允许机器本地覆盖或重新授权。",
-        ),
-        PersistenceInventoryItem(
-            item_id="connection_channel_settings",
-            title="当前电脑远程浏览器访问本机设置",
-            scope=MACHINE_LOCAL_CONFIG,
-            storage_medium="SQLite database",
-            storage_location=_join_location(connection_channel_data_dir, "connection_channel_settings.db"),
-            config_sections=["connection_channel"],
-            persisted_data=[
-                "当前电脑用于生成远程浏览器入口的 Host 或域名",
-                "当前电脑远程浏览器入口端口",
-                "remote_access_enabled 显式开启意图",
-                "tunnel_restart_required 重启/重新开启提示状态",
-                "FRP controller 类型、owner/tunnel/task/pid/config-path 元数据",
-                "已应用配置版本、最后启动/停止时间、最后错误和配置更新时间",
-            ],
-            server_sync_candidate=False,
-            sync_recommendation="local_only",
-            rationale="该设置描述远程 PC 或手机浏览器如何回连当前这台 Runtime 所在机器，以及这台机器上的 FRP controller 本机运行元数据；不同机器可能使用不同隧道、域名、端口和 owner 标记，不能进入 cloud_user_config、PostgreSQL 或跨设备同步配置。",
-            migration_notes="设置页、初始化页和远程浏览器入口生成逻辑必须读取同一个后端权威设置；未配置或未开启时只禁用远程浏览器/分享入口，不阻塞本机桌面或本机浏览器使用。",
         ),
         PersistenceInventoryItem(
             item_id="browser_runtime_storage",

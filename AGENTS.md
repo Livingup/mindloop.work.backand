@@ -43,6 +43,8 @@ dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐�
 
 正式 release 监听地址是安全边界。任何非 loopback / LAN 暴露默认值调整前，必须保持无账号首次初始化只能由本机来源完成；未创建 Runtime 本地账号时，除健康检查和账号初始化入口外，普通 `/api/*` 不得因为“无账号”而向 LAN 客户端免认证开放。
 
+远程访问网络通道（FRP/Caddy/VPS/DNS/证书/公网端口/proxy/token/frpc 启停等）属于外部系统网络或部署运维配置；Runtime 与前端不保存、不下载、不启动、不停止也不配置这些通道参数。外部 FRP 若把请求转发到本机完整可用的前端/Runtime 服务入口，程序只按普通 HTTP/API/SSE 请求处理，并继续负责自身认证、first-run 安全和本机监听边界。
+
 正式版配置由 Electron 首次启动时从打包资源 `resources/runtime-config/agent_runtime.yaml` 复制到应用用户数据目录的 `runtime-config/agent_runtime.yaml`，该 YAML 是 packaged release 程序启动元数据权威，承载服务 host/port、本机数据根和 bootstrap/cloud 默认元数据等信息；它不能写入用户资源密钥、Runtime 本地登录凭据或共享云配置的长期本地权威缓存。正式 release 不扫描外部 `.env`，也不把目标机器 `SPREAD_AI_*` / `VITE_*` 环境变量作为启动或业务配置来源；dev/诊断可通过显式 `--env-file` 或 CLI 参数覆盖。Electron packaged 主进程只负责传入配置文件，不负责决定业务数据目录，也不得硬注入 `SPREAD_AI_DATA_ROOT`。`config/agent_runtime.yaml` 中所有运行数据路径都应通过 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}` 表达：正式安装版未显式配置时默认使用 `~/.spread-ai` 用户业务数据；源码 dev 自测必须通过 `config/.env.dev` 显式设置 `SPREAD_AI_DATA_ROOT=~/.spread-ai-dev`，作为可重置的沙箱数据根。除非明确做迁移或兼容性验证，不要让 dev 临时服务直接读写 release 用户数据根。
 
 构建正式版后端 sidecar：
