@@ -1323,6 +1323,7 @@ def test_stage8_agent_execution_background_task_is_registry_managed(monkeypatch)
         engine._background_tasks = set()
         engine._active_instance_ids = set()
         engine._active_execution_handles = {}
+        engine._pause_timeout_handles = {}
         engine._execution_progress = {}
         engine._record_execution_instance_event = lambda **_kwargs: None
         engine._validate_file_input_before_enqueue = lambda _instance, _attachments: asyncio.sleep(0)
