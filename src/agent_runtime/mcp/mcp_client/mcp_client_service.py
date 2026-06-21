@@ -321,11 +321,20 @@ class McpClientService:
         self, service_id: str, tool_name: str, arguments: dict[str, Any]
     ) -> McpToolResult:
         """执行 MCP 工具。"""
-        await self.ensure_connected(service_id)
+        definition = self.get_service(service_id)
+        if not definition.enabled:
+            raise ValueError(f"MCP 服务 '{service_id}' 已禁用")
+
+        status = self._session_manager.get_connection_status(service_id)
+        if not status.connected:
+            if definition.enabled:
+                self._session_manager.schedule_reconnect(definition)
+            raise ConnectionError(self._build_unavailable_message(service_id, status))
+
         try:
             return await self._session_manager.call_tool(service_id, tool_name, arguments)
         except (Exception, asyncio.CancelledError) as e:
-            await self._handle_protocol_failure(service_id, e)
+            self._handle_protocol_failure_nowait(service_id, e)
             raise ConnectionError(f"MCP 服务 '{service_id}' 工具执行失败: {e}") from e
 
     async def list_resources(self, service_id: str) -> list[McpResourceInfo]:
@@ -365,9 +374,31 @@ class McpClientService:
 
         return "\n\n".join(parts) if parts else None
 
+    @staticmethod
+    def _build_unavailable_message(service_id: str, status: McpConnectionStatus) -> str:
+        status_text = status.status or "disconnected"
+        message = f"MCP 服务 '{service_id}' 当前不可用（状态: {status_text}），工具调用已快速失败。"
+        details: list[str] = []
+        if status.last_error:
+            details.append(f"最近错误: {status.last_error}")
+        if status.next_retry_at is not None:
+            details.append(f"后台重连计划时间戳: {status.next_retry_at}")
+        if status.retry_attempt:
+            details.append(f"重连尝试次数: {status.retry_attempt}")
+        if details:
+            message = f"{message} {'；'.join(details)}。"
+        return message
+
     async def _handle_protocol_failure(self, service_id: str, error: BaseException) -> None:
         with suppress(KeyError):
             definition = self.get_service(service_id)
             await self._session_manager.mark_connection_lost(service_id, str(error))
+            if definition.enabled:
+                self._session_manager.schedule_reconnect(definition)
+
+    def _handle_protocol_failure_nowait(self, service_id: str, error: BaseException) -> None:
+        with suppress(KeyError):
+            definition = self.get_service(service_id)
+            self._session_manager.mark_connection_lost_nowait(service_id, str(error))
             if definition.enabled:
                 self._session_manager.schedule_reconnect(definition)

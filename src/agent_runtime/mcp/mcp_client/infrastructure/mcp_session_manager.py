@@ -43,6 +43,7 @@ _MCP_RECONNECT_BASE_DELAY_SECONDS = 2.0
 _MCP_RECONNECT_MAX_DELAY_SECONDS = 60.0
 _MCP_DIAGNOSTIC_SLOW_PHASE_SECONDS = 1.0
 _MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS = 5.0
+_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS = 5.0
 
 
 def _duration_ms_since(started_at: float) -> int:
@@ -212,6 +213,32 @@ class McpSessionManager:
             await self._close_connection(service_id)
             self._record_failure(state, error)
 
+    def mark_connection_lost_nowait(self, service_id: str, error: str) -> None:
+        """在热路径中标记连接异常，不等待 owner task 清理完成。"""
+        state = self._state(service_id)
+        conn = self._connections.pop(service_id, None)
+        self._record_failure(state, error)
+        if conn is None:
+            return
+        get_runtime_task_registry().create_task(
+            self._stop_owner_task(
+                conn.owner_task,
+                conn.close_event,
+                service_id=service_id,
+                operation="mcp.protocol_failure.background_cleanup",
+            ),
+            task_name=f"mcp-connection-cleanup-{service_id}",
+            owner_type="mcp_session_manager",
+            owner_id=service_id,
+            task_class="connection_cleanup",
+            diagnostic_context={
+                "service_id": service_id,
+                "phase": "protocol_failure.cleanup_scheduled",
+                "reason": "connection_lost",
+                "error": error,
+            },
+        )
+
     def schedule_reconnect(self, definition: McpServiceDefinition) -> None:
         """为服务调度后台指数退避重连。"""
         state = self._state(definition.service_id)
@@ -350,7 +377,38 @@ class McpSessionManager:
         解析 CallToolResult，提取文本内容和结构化内容。
         """
         session = self._get_session(service_id)
-        result = await session.call_tool(tool_name, arguments)
+        call_task = get_runtime_task_registry().create_task(
+            session.call_tool(tool_name, arguments),
+            task_name=f"mcp-call-tool-{service_id}-{tool_name}",
+            owner_type="mcp_session_manager",
+            owner_id=service_id,
+            task_class="protocol_call",
+            diagnostic_context={
+                "service_id": service_id,
+                "tool_name": tool_name,
+                "phase": "protocol_call.started",
+                "timeout_seconds": _MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+            },
+        )
+        done, _pending = await asyncio.wait(
+            {call_task},
+            timeout=_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+        )
+        if call_task not in done:
+            get_runtime_task_registry().cancel(
+                call_task,
+                message="mcp tool call timeout",
+                diagnostic_context={
+                    "service_id": service_id,
+                    "tool_name": tool_name,
+                    "phase": "protocol_call.timeout",
+                    "timeout_seconds": _MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+                },
+            )
+            raise TimeoutError(
+                f"MCP 服务 '{service_id}' 工具 '{tool_name}' 执行超时：超过 {_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS}s 未返回"
+            )
+        result = call_task.result()
 
         # 拼接所有 TextContent
         text_parts: list[str] = []
