@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
@@ -185,11 +186,11 @@ def _llm_tool(tool_name: str) -> LlmToolDefinition:
 
 
 class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
-    def _engine_with_local_tools(self, *tools, agent_definitions=()) -> AgentExecutionEngine:
+    def _engine_with_local_tools(self, *tools, agent_definitions=(), skills_dir: str = "G:\\project\\agent\\skills") -> AgentExecutionEngine:
         engine = object.__new__(AgentExecutionEngine)
         engine._local_tool_gateway = _LocalToolGateway(tools)
         engine._agent_definition_gateway = _AgentDefinitionGateway(agent_definitions)
-        engine._skill_gateway = _SkillGateway()
+        engine._skill_gateway = _SkillGateway(skills_dir)
         return engine
 
     def test_system_prompt_starts_with_communication_context_and_instance_id(self) -> None:
@@ -229,7 +230,8 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIn("系统会自动把他的内容追加到你系统提示词中。", prompt_text)
         self.assertIn("# 你的专属项目记忆", prompt_text)
         self.assertIn(
-            "`G:\\project\\agent\\.spread-ai\\memory\\agent-c\\memory.md`是专属于你的关于当前项目的私有记忆文件",
+            "`G:\\project\\agent\\.spread-ai\\memory\\agent-c\\memory.md`是专属于你的关于当前项目的私有记忆文件，"
+            "由你自己自学习进化来管理维护。系统会自动把他的内容追加到你系统提示词中。",
             prompt_text,
         )
         self.assertNotIn("# 沟通环境与身份", prompt_text)
@@ -240,6 +242,72 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
             prompt_text.index("# 身份id和工作空间"),
             prompt_text.index("业务 Agent 自定义系统提示词。"),
         )
+
+    def test_system_prompt_appends_dedicated_skill_and_project_memory_contents_at_tail(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            skill_root = root / "skills"
+            skill_file = skill_root / "agent-tail" / "SKILL.md"
+            memory_file = workspace / ".spread-ai" / "memory" / "agent-tail" / "memory.md"
+            skill_file.parent.mkdir(parents=True)
+            memory_file.parent.mkdir(parents=True)
+            skill_file.write_text("# Skill Body\n\n- skill tail content", encoding="utf-8")
+            memory_file.write_text("# Memory Body\n\n- memory tail content", encoding="utf-8")
+
+            engine = self._engine_with_local_tools(
+                _local_tool("message_user", category="lifecycle"),
+                _local_tool("web_search"),
+                skills_dir=str(skill_root),
+            )
+            prompt = engine._render_system_prompt(
+                AgentDefinition(
+                    agent_id="agent-tail",
+                    group="default",
+                    system_prompt=(SystemPromptSegment(text="AgentDefinition 自定义 prompt。"),),
+                ),
+                "agent-instance-tail",
+                str(workspace),
+                {},
+                (_llm_tool("message_user"), _llm_tool("web_search")),
+            )
+
+        self.assertIsNotNone(prompt)
+        prompt_text = prompt or ""
+        self.assertIn("AgentDefinition 自定义 prompt。", prompt_text)
+        self.assertIn("## Runtime lifecycle tool policy", prompt_text)
+        self.assertIn("# 工具调用注意事项", prompt_text)
+        self.assertIn("# 你的专属 Skill 文件内容", prompt_text)
+        self.assertIn("# Skill Body\n\n- skill tail content", prompt_text)
+        self.assertIn("# 你的专属项目记忆文件内容", prompt_text)
+        self.assertIn("# Memory Body\n\n- memory tail content", prompt_text)
+        self.assertLess(prompt_text.index("# 工具调用注意事项"), prompt_text.index("# 你的专属 Skill 文件内容"))
+        self.assertLess(prompt_text.index("# 你的专属 Skill 文件内容"), prompt_text.index("# 你的专属项目记忆文件内容"))
+        self.assertTrue(prompt_text.endswith("# Memory Body\n\n- memory tail content"))
+
+    def test_system_prompt_skips_missing_dedicated_learning_files_without_empty_headings(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            skill_root = root / "skills"
+            engine = self._engine_with_local_tools(
+                _local_tool("message_user", category="lifecycle"),
+                skills_dir=str(skill_root),
+            )
+            prompt = engine._render_system_prompt(
+                AgentDefinition(agent_id="agent-missing", group="default"),
+                "agent-instance-missing",
+                str(workspace),
+                {},
+                (_llm_tool("message_user"),),
+            )
+
+        self.assertIsNotNone(prompt)
+        prompt_text = prompt or ""
+        self.assertIn("## Runtime lifecycle tool policy", prompt_text)
+        self.assertIn("# 工具调用注意事项", prompt_text)
+        self.assertNotIn("# 你的专属 Skill 文件内容", prompt_text)
+        self.assertNotIn("# 你的专属项目记忆文件内容", prompt_text)
 
     def test_system_prompt_includes_pause_task_timeout_runtime_lifecycle_guidance(self) -> None:
         engine = self._engine_with_local_tools(

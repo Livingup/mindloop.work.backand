@@ -3051,11 +3051,12 @@ class AgentExecutionEngine:
             },
             "llm.prompt.runtime_context.complete",
         )
+        skill_root_directory = self._resolve_skill_root_directory()
         runtime_context_prompt = _build_runtime_context_prompt(
             definition,
             agent_instance_id,
             current_working_directory,
-            self._resolve_skill_root_directory(),
+            skill_root_directory,
         )
         _record_prompt_step(
             "llm.prompt.runtime_context.complete",
@@ -3161,6 +3162,12 @@ class AgentExecutionEngine:
             "llm.prompt.assemble.complete",
         )
 
+        dedicated_learning_files_prompt = _build_dedicated_learning_files_prompt(
+            definition,
+            current_working_directory,
+            skill_root_directory,
+        )
+
         system_prompt = "\n\n".join(
             item
             for item in (
@@ -3171,6 +3178,7 @@ class AgentExecutionEngine:
                 available_subagents_prompt,
                 lifecycle_prompt,
                 tool_usage_notice,
+                dedicated_learning_files_prompt,
             )
             if item.strip()
         ) or None
@@ -4138,9 +4146,57 @@ def _build_runtime_context_prompt(
 
 # 你的专属项目记忆
 
-`{project_memory_file}`是专属于你的关于当前项目的私有记忆文件，由你自己自学习进化来管理维护。
+`{project_memory_file}`是专属于你的关于当前项目的私有记忆文件，由你自己自学习进化来管理维护。系统会自动把他的内容追加到你系统提示词中。
 """
     ).strip()
+
+
+def _build_dedicated_learning_files_prompt(
+    definition: AgentDefinition,
+    current_working_directory: str,
+    skill_root_directory: str,
+    ) -> str:
+    working_directory = Path(current_working_directory).expanduser()
+    resolved_working_directory = working_directory.resolve(strict=False)
+    skill_root_path = Path(skill_root_directory).expanduser().resolve(strict=False) if skill_root_directory else Path("")
+    dedicated_skill_file = skill_root_path / definition.agent_id / "SKILL.md"
+    project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / definition.agent_id / "memory.md"
+    sections: list[str] = []
+    skill_content = _read_optional_prompt_file(dedicated_skill_file)
+    if skill_content:
+        sections.append(
+            "\n\n".join((
+                "# 你的专属 Skill 文件内容",
+                f"以下内容自动读取自 `{dedicated_skill_file}`：",
+                skill_content,
+            ))
+        )
+    memory_content = _read_optional_prompt_file(project_memory_file)
+    if memory_content:
+        sections.append(
+            "\n\n".join((
+                "# 你的专属项目记忆文件内容",
+                f"以下内容自动读取自 `{project_memory_file}`：",
+                memory_content,
+            ))
+        )
+    return "\n\n".join(sections)
+
+
+def _read_optional_prompt_file(file_path: Path) -> str:
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except (OSError, UnicodeError) as exc:
+        logger.warning(
+            "专属提示词附加文件读取失败，已跳过: path=%s, error_type=%s, error=%s",
+            file_path,
+            exc.__class__.__name__,
+            exc,
+        )
+        return ""
+    return content.strip()
 
 
 def _discover_git_roots_under(root: Path) -> list[str]:
