@@ -122,9 +122,9 @@ def test_call_tool_does_not_wait_for_reconnect_lock_when_not_connected():
     asyncio.run(scenario())
 
 
-def test_call_tool_protocol_timeout_marks_connection_lost_and_returns_failure(monkeypatch):
+def test_call_tool_business_timeout_marks_connection_lost_and_returns_failure(monkeypatch):
     async def scenario() -> None:
-        monkeypatch.setattr(session_module, "_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(session_module, "_MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS", 0.01)
         manager = McpSessionManager()
         service = _service(manager)
         close_event = asyncio.Event()

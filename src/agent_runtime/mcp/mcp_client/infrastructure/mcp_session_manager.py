@@ -43,7 +43,7 @@ _MCP_RECONNECT_BASE_DELAY_SECONDS = 2.0
 _MCP_RECONNECT_MAX_DELAY_SECONDS = 60.0
 _MCP_DIAGNOSTIC_SLOW_PHASE_SECONDS = 1.0
 _MCP_STOP_OWNER_TASK_TIMEOUT_SECONDS = 5.0
-_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS = 5.0
+_MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS = 30 * 60.0
 
 
 def _duration_ms_since(started_at: float) -> int:
@@ -387,12 +387,12 @@ class McpSessionManager:
                 "service_id": service_id,
                 "tool_name": tool_name,
                 "phase": "protocol_call.started",
-                "timeout_seconds": _MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+                "timeout_seconds": _MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS,
             },
         )
         done, _pending = await asyncio.wait(
             {call_task},
-            timeout=_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+            timeout=_MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS,
         )
         if call_task not in done:
             get_runtime_task_registry().cancel(
@@ -402,11 +402,11 @@ class McpSessionManager:
                     "service_id": service_id,
                     "tool_name": tool_name,
                     "phase": "protocol_call.timeout",
-                    "timeout_seconds": _MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS,
+                    "timeout_seconds": _MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS,
                 },
             )
             raise TimeoutError(
-                f"MCP 服务 '{service_id}' 工具 '{tool_name}' 执行超时：超过 {_MCP_PROTOCOL_OPERATION_TIMEOUT_SECONDS}s 未返回"
+                f"MCP 服务 '{service_id}' 工具 '{tool_name}' 执行超时：超过 {_MCP_TOOL_CALL_BUSINESS_TIMEOUT_SECONDS}s 未返回"
             )
         result = call_task.result()
 
