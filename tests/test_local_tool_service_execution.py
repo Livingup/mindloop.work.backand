@@ -204,12 +204,37 @@ def test_actual_file_tools_are_registered_as_explicit_blocking_tools() -> None:
 
     for tool_name, operation in expected_operations.items():
         tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.category == "business"
+        assert tool_def.always_enabled is False
         assert tool_def.execution_mode == "blocking"
         assert tool_def.blocking_pool == BlockingPool.FILE_RESOURCE
         assert tool_def.blocking_operation == operation
 
-    for tool_name in ("web_search", "read_url_context"):
+    for tool_name in ("web_search", "read_url_context", "generate_image"):
         tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.category == "business"
+        assert tool_def.always_enabled is False
         assert tool_def.execution_mode == "direct"
         assert tool_def.blocking_pool is None
         assert tool_def.blocking_operation is None
+
+    for tool_name in (
+        "mcp_get_service_detail",
+        "mcp_list_resources",
+        "mcp_read_resource",
+        "mcp_get_tool_detail",
+        "mcp_call_tool",
+        "create_subagent",
+        "send_agent_message",
+        "get_agent_status",
+        "end_subagent",
+        "list_subagents",
+    ):
+        tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.category == "system"
+        assert tool_def.always_enabled is True
+
+    for tool_name in ("message_user", "pause_task", "end_task", "fail_task"):
+        tool_def = gateway._service._repo.get_by_name(tool_name)  # noqa: SLF001
+        assert tool_def.category == "lifecycle"
+        assert tool_def.always_enabled is True

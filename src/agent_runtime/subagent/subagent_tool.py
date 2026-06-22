@@ -61,7 +61,7 @@ class EndSubagentRequest(BaseToolRequest):
         "创建成功后立即发布 agent.subagent.created 场景事件，前端可据此立刻增加 Agent 标签页。"
     ),
     group="subagent",
-    category="business",
+    category="system",
     allowed_loop_decisions=("continue",),
 )
 async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
@@ -86,7 +86,7 @@ async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContex
         "发送是异步立即返回语义：工具结果只表示目标 Agent 已接受或入队，等待回复请另行调用 pause_task。"
     ),
     group="subagent",
-    category="business",
+    category="system",
     allowed_loop_decisions=("continue",),
 )
 async def send_agent_message(request: SendAgentMessageRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
@@ -105,7 +105,7 @@ async def send_agent_message(request: SendAgentMessageRequest, ctx: ToolRuntimeC
     name="get_agent_status",
     description="查询当前 Agent 自身、未释放直接父 Agent 或未释放直接子 Agent 的公开状态：running / paused / ended。",
     group="subagent",
-    category="business",
+    category="system",
     allowed_loop_decisions=("continue",),
 )
 def get_agent_status(request: GetAgentStatusRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
@@ -122,7 +122,7 @@ def get_agent_status(request: GetAgentStatusRequest, ctx: ToolRuntimeContext) ->
     name="end_subagent",
     description="释放当前 Agent 直接创建的一个或多个子 Agent，并级联释放每个子 Agent 的未释放后代。",
     group="subagent",
-    category="business",
+    category="system",
     allowed_loop_decisions=("continue",),
 )
 async def end_subagent(request: EndSubagentRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
@@ -140,7 +140,7 @@ async def end_subagent(request: EndSubagentRequest, ctx: ToolRuntimeContext) -> 
     name="list_subagents",
     description="列出当前 Agent 直接创建且尚未释放的子 Agent。只返回直接子 Agent，不返回孙级或历史已释放子 Agent。",
     group="subagent",
-    category="business",
+    category="system",
     allowed_loop_decisions=("continue",),
 )
 def list_subagents(ctx: ToolRuntimeContext) -> BaseToolResult:

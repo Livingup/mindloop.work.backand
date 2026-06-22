@@ -30,6 +30,7 @@ from agent_runtime.llm_api_protocol import (
 from agent_runtime.llm_client.llm_request_models import LlmToolDefinition
 from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import McpClientGateway
 from agent_runtime.mcp.mcp_client.tool_result_normalizer import normalize_mcp_tool_content_for_llm
+from agent_runtime.tool.local_tool_definition import is_tool_default_enabled_category
 from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
     ToolExecuteRequest,
@@ -282,7 +283,8 @@ class AgentToolDispatcher:
         detail = self._local_tool_gateway.get_tool(tool_use.name)
         metadata = communication_context.metadata if communication_context is not None else {}
         instance_id = str(metadata.get("agent_instance_id") or "")
-        is_allowed = tool_use.name in agent_definition.tool_ids or detail.always_enabled
+        default_enabled = is_tool_default_enabled_category(detail.category)
+        is_allowed = tool_use.name in agent_definition.tool_ids or default_enabled
         if instance_id:
             self._execution_loop_logger.record_step(
                 instance_id=instance_id,
@@ -296,6 +298,8 @@ class AgentToolDispatcher:
                     "tool_name": tool_use.name,
                     "agent_definition_id": agent_definition.agent_id,
                     "declared_in_agent_tool_ids": tool_use.name in agent_definition.tool_ids,
+                    "category": detail.category,
+                    "default_enabled_by_category": default_enabled,
                     "always_enabled": detail.always_enabled,
                 },
                 expected_next="local_tool_gateway.execute" if is_allowed else "tool_dispatch.denied",
@@ -414,7 +418,7 @@ class AgentToolDispatcher:
         visible_tool_names = list(explicit_tool_names)
         all_tools = self._local_tool_gateway.list_tools(public_only=False, group_by=False)
         for item in all_tools:
-            if item.always_enabled and item.tool_name not in visible_tool_names:
+            if is_tool_default_enabled_category(item.category) and item.tool_name not in visible_tool_names:
                 visible_tool_names.append(item.tool_name)
         return tuple(visible_tool_names)
 

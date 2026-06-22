@@ -281,7 +281,7 @@ def test_shared_execution_loop_logger_records_dispatcher_gateway_and_service_too
                 tool_name="diagnostic_echo",
                 description="Echo diagnostic input.",
                 fn=_diagnostic_echo_tool,
-                always_enabled=True,
+                category="system",
             )
             service = LocalToolService(
                 _SingleToolRepository(tool_def),

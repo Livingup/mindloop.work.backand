@@ -85,7 +85,7 @@ Runtime 以 `BaseToolResult.loop_control.decision` 控制循环，不根据工�
 
 ## 工具注册规则
 
-四个工具都通过 `@tool` 装饰器注册为本地工具，共用 `group="agent_lifecycle"` 便于分组展示。`LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool` 触发注册，确保 Agent 执行器创建本地工具网关时这四个工具默认可用。`AgentToolDispatcher` 会把 `always_enabled=True` 的本地工具加入每个 Agent 的 LLM 工具列表，不要求每个 `AgentDefinition.tool_ids` 显式声明。
+四个工具都通过 `@tool` 装饰器注册为本地工具，共用 `group="agent_lifecycle"` 便于分组展示，且必须保持 `category="lifecycle"`。`LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool` 触发注册，确保 Agent 执行器创建本地工具网关时这四个工具进入本地工具库。`AgentToolDispatcher` 会把 `category in {"lifecycle", "system"}` 的本地工具加入每个 Agent 的 LLM 工具列表，不要求每个 `AgentDefinition.tool_ids` 显式声明；`always_enabled` 只是由 category 派生的兼容展示字段。
 
 ## Runtime 协作规则
 

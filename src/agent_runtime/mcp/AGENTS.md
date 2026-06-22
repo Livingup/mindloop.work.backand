@@ -29,6 +29,8 @@ src/agent_runtime/mcp/
 
 将 MCP 客户端能力封装为 5 个本地工具（通过 `@tool` 装饰器注册，async 函数），供 Agent 在对话中自主调用 MCP 服务。
 
+MCP 元工具必须保持 `group="mcp"` 供展示筛选，并保持 `category="system"`，因此默认对 Agent 可见；但它们只提供元操作入口，实际可访问的远端 MCP 服务和工具仍必须受 `AgentDefinition.mcp_tools` 白名单约束，不能因为本地元工具默认可见而绕过授权边界。
+
 依赖 `mcp_client` 子模块的北向网关契约。
 
 ---

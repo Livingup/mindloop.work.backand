@@ -50,7 +50,6 @@ class GenerateImageRequest(BaseModel):
     description=GENERATE_IMAGE_TOOL_DESCRIPTION,
     group="image_generation",
     public=True,
-    always_enabled=True,
 )
 async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     service = get_image_generation_service()

@@ -54,8 +54,8 @@ disabled: false
 | `description` | Agent 用途说明，可选。 |
 | `group` | Agent 分组，默认 `default`。 |
 | `system_prompt` | 系统提示词片段数组，支持 `text` 与 `template_id` 交叉混合。 |
-| `tool_ids` | 本地工具 ID 列表，对应 tool 模块的 `tool_name`。 |
-| `mcp_tools` | MCP 工具绑定，记录 `service_id` 和该服务下允许使用的 `tool_ids`。 |
+| `tool_ids` | 本地业务工具授权列表，对应 tool 模块的 `tool_name`；`category="business"` 的本地工具必须写入此列表才可见/可调，`lifecycle` 与 `system` 工具默认可见，不需要写入。 |
+| `mcp_tools` | MCP 工具绑定，记录 `service_id` 和该服务下允许使用的 `tool_ids`；本地 MCP 元工具默认可见不代表放宽这里的远端服务/工具白名单。 |
 | `skill_ids` | Skill ID 列表，对应 skill 模块的 `skill_id`。 |
 | `available_sub_agent_ids` | 当前 Agent 可调度的子 Agent 定义 ID 列表。 |
 | `builtin_background_agent` | 是否为系统内置后台 Agent。 |

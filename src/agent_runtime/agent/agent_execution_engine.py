@@ -93,6 +93,7 @@ from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import
     PromptSnippetNorthGateway,
 )
 from agent_runtime.skill.north_gateway.skill_contracts import SkillGateway
+from agent_runtime.tool.local_tool_definition import is_tool_default_enabled_category
 from agent_runtime.tool.north_gateway.local_tool_contracts import LocalToolGateway
 from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopDecision, build_tool_error_result
 
@@ -3385,7 +3386,7 @@ class AgentExecutionEngine:
             for item in tools
             if item.category == "lifecycle"
             and item.tool_name in llm_tool_names
-            and (item.always_enabled or item.tool_name in definition.tool_ids)
+            and (is_tool_default_enabled_category(item.category) or item.tool_name in definition.tool_ids)
         ]
 
         lines = [

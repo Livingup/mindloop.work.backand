@@ -13,7 +13,7 @@
 
 ## 工具定义方式
 
-各业务模块使用 `@tool` 装饰器声明工具函数，并在组合根或工厂中显式 import 对应模块来触发注册。面向 CLI 的工具通常由 `cli.py` import；运行时默认启用工具需要由对应工厂触发注册，例如 `LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool`。
+各业务模块使用 `@tool` 装饰器声明工具函数，并在组合根或工厂中显式 import 对应模块来触发注册。面向 CLI 的工具通常由 `cli.py` import；运行时可供 Agent 授权使用的工具需要由对应工厂触发注册，例如 `LocalToolFactory.create()` 会 import `agent_runtime.agent_lifecycle.agent_lifecycle_tool`。注册只表示进入本地工具库，是否默认对 Agent 可见由 `category` 决定。
 
 ### @tool 装饰器字段
 
@@ -21,11 +21,11 @@
 |---|---|---|---|---|
 | `name` | str | 是 | — | 工具唯一名称 |
 | `description` | str | 是 | — | LLM 看到的工具描述（简洁、功能导向） |
-| `group` | str | 否 | `"default"` | 工具分组（如 "文件"、"网络"、"数据库"） |
+| `group` | str | 否 | `"default"` | 展示与筛选分组（如 "文件"、"网络"、"数据库"），不承载默认可用或授权语义 |
 | `public` | bool | 否 | `True` | 是否公开（列出所有工具时是否可见） |
 | `wiki` | str | 否 | `None` | 人类可读的工具介绍文档（用于生成系统工具说明文档） |
-| `category` | `"business" \| "lifecycle" \| "system"` | 否 | `"business"` | 工具类别，普通业务工具使用 business，生命周期沟通工具使用 lifecycle |
-| `always_enabled` | bool | 否 | `False` | 是否默认对所有 Agent 暴露，不需要写入每个 `AgentDefinition.tool_ids` |
+| `category` | `"business" \| "lifecycle" \| "system"` | 否 | `"business"` | 工具类别与默认可用语义来源：`lifecycle`/`system` 默认对所有 Agent 可见，`business` 必须通过 `AgentDefinition.tool_ids` 显式授权 |
+| `always_enabled` | bool | 否 | `False` | 兼容展示字段，由 `category in {"lifecycle", "system"}` 派生；不要用它为 `business` 工具单独制造默认可用例外 |
 | `allowed_loop_decisions` | tuple | 否 | `("continue",)` | 该工具允许返回的循环控制决策集合 |
 
 ### 简单参数示例
@@ -104,7 +104,7 @@ def end_task(request: EndTaskRequest, ctx: ToolRuntimeContext) -> BaseToolResult
 
 ## 工具注册机制
 
-`@tool` 装饰器在模块被导入时自动将工具注册到全局注册表。不采用 `pkgutil.walk_packages` 全量扫描（避免启动变慢），而是由组合根或工厂显式 import 工具模块来触发注册。**新增工具模块时需要选择合适的注册触发点：面向 CLI 的工具通常在 `cli.py` 中 import；运行时必须默认可用的工具需要在对应 Factory 中 import。**
+`@tool` 装饰器在模块被导入时自动将工具注册到全局注册表。不采用 `pkgutil.walk_packages` 全量扫描（避免启动变慢），而是由组合根或工厂显式 import 工具模块来触发注册。**新增工具模块时需要选择合适的注册触发点：面向 CLI 的工具通常在 `cli.py` 中 import；运行时工具需要在对应 Factory 中 import 才能进入本地工具库。默认可见性只由 `category` 决定，`group` 与 import 位置都不能绕过 `AgentDefinition.tool_ids`。**
 
 ```
 程序启动

@@ -43,8 +43,9 @@ class _GlobalRegistry:
 
     def register_function(self, fn: Any) -> None:
         """从 @tool 装饰的函数提取元数据并注册到全局仓储。"""
-        from agent_runtime.tool.local_tool_definition import LocalToolDefinition
+        from agent_runtime.tool.local_tool_definition import LocalToolDefinition, is_tool_default_enabled_category
 
+        category = getattr(fn, "_tool_category", "business")
         tool_def = LocalToolDefinition(
             tool_name=getattr(fn, "_tool_name"),
             description=getattr(fn, "_tool_description"),
@@ -52,8 +53,8 @@ class _GlobalRegistry:
             group=getattr(fn, "_tool_group", "default"),
             public=getattr(fn, "_tool_public", True),
             wiki=getattr(fn, "_tool_wiki", None),
-            category=getattr(fn, "_tool_category", "business"),
-            always_enabled=getattr(fn, "_tool_always_enabled", False),
+            category=category,
+            always_enabled=is_tool_default_enabled_category(category),
             allowed_loop_decisions=getattr(fn, "_tool_allowed_loop_decisions", ("continue",)),
             execution_mode=getattr(fn, "_tool_execution_mode", "direct"),
             blocking_pool=getattr(fn, "_tool_blocking_pool", None),

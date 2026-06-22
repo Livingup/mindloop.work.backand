@@ -173,7 +173,9 @@ class _ExecutionEngineSubmissionRecorder:
         )
 
 
-def _local_tool(tool_name: str, *, category: str = "business", always_enabled: bool = True):
+def _local_tool(tool_name: str, *, category: str = "business", always_enabled: bool | None = None):
+    if always_enabled is None:
+        always_enabled = category in {"lifecycle", "system"}
     return SimpleNamespace(
         tool_name=tool_name,
         category=category,
@@ -658,9 +660,9 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         mcp_gateway = _McpGateway()
         dispatcher = AgentToolDispatcher(
             local_tool_gateway=_LocalToolGateway((
-                _local_tool("mcp_get_service_detail"),
-                _local_tool("mcp_get_tool_detail"),
-                _local_tool("mcp_call_tool"),
+                _local_tool("mcp_get_service_detail", category="system"),
+                _local_tool("mcp_get_tool_detail", category="system"),
+                _local_tool("mcp_call_tool", category="system"),
             )),
             mcp_client_gateway=mcp_gateway,
         )
@@ -684,9 +686,9 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertFalse(any(tool.name.startswith("mcp__") for tool in llm_tools))
 
         engine = self._engine_with_local_tools(
-            _local_tool("mcp_get_service_detail"),
-            _local_tool("mcp_get_tool_detail"),
-            _local_tool("mcp_call_tool"),
+            _local_tool("mcp_get_service_detail", category="system"),
+            _local_tool("mcp_get_tool_detail", category="system"),
+            _local_tool("mcp_call_tool", category="system"),
         )
         engine._mcp_client_gateway = mcp_gateway
         prompt = asyncio.run(engine._load_mcp_services_prompt(definition))
@@ -704,8 +706,8 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
             mcp_gateway = _McpGateway()
             dispatcher = AgentToolDispatcher(
                 local_tool_gateway=_LocalToolGateway((
-                    _local_tool("mcp_get_tool_detail"),
-                    _local_tool("mcp_call_tool"),
+                    _local_tool("mcp_get_tool_detail", category="system"),
+                    _local_tool("mcp_call_tool", category="system"),
                 )),
                 mcp_client_gateway=mcp_gateway,
             )
@@ -735,8 +737,8 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
 
     def test_mcp_services_prompt_guides_meta_tools_and_records_prompt_preparation_steps(self) -> None:
         engine = self._engine_with_local_tools(
-            _local_tool("mcp_get_tool_detail"),
-            _local_tool("mcp_call_tool"),
+            _local_tool("mcp_get_tool_detail", category="system"),
+            _local_tool("mcp_call_tool", category="system"),
         )
         engine._mcp_client_gateway = _McpGateway()
         records = []
@@ -789,8 +791,8 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
 
     def test_system_prompt_injects_available_subagent_ids_and_descriptions(self) -> None:
         engine = self._engine_with_local_tools(
-            _local_tool("create_subagent"),
-            _local_tool("send_agent_message"),
+            _local_tool("create_subagent", category="system"),
+            _local_tool("send_agent_message", category="system"),
             agent_definitions=(
                 AgentDefinition(
                     agent_id="research-agent",

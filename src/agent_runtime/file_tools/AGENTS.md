@@ -8,6 +8,7 @@
 
 - `tool` 模块负责统一工具协议、注册表、Schema 生成、执行服务和静态查询入口。
 - `file_tools` 模块负责文件系统相关工具的业务实现，并通过 `@tool` 注册到统一工具体系。
+- 文件工具必须保持 `group="file"` 供展示筛选，并保持 `category="business"`；它们不属于默认可见系统工具，Agent 只有在 `AgentDefinition.tool_ids` 显式授权后才能看到或调用。
 - 本地工具执行依赖完整 Runtime / Agent 执行环境，不通过 CLI 提供通用执行命令。
 
 ## 当前工具

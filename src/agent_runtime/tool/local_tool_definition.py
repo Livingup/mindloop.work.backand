@@ -8,6 +8,8 @@ from typing import Any, Callable, Literal
 from agent_runtime.tool.tool_execution_models import LoopDecision, ToolCategory
 
 LocalToolExecutionMode = Literal["direct", "blocking"]
+DEFAULT_ENABLED_TOOL_CATEGORIES: frozenset[ToolCategory] = frozenset(("lifecycle", "system"))
+
 
 # 工具名称最大长度。
 _TOOL_NAME_MAX_LENGTH = 80
@@ -52,10 +54,10 @@ class LocalToolDefinition:
     # 人类可读的工具介绍文档（用于生成系统工具说明文档），可为 None。
     wiki: str | None = None
 
-    # 工具类别。普通业务工具默认不表达生命周期，只返回 continue 决策。
+    # 工具类别。category 是授权和系统语义层级：lifecycle/system 默认对所有 Agent 可用，business 需显式授权。
     category: ToolCategory = "business"
 
-    # 是否默认对所有 Agent 可用。生命周期工具等系统级工具可使用该能力自动注入。
+    # 是否默认对所有 Agent 可用。该字段由 category 派生，必须等于 category in DEFAULT_ENABLED_TOOL_CATEGORIES。
     always_enabled: bool = False
 
     # 当前工具允许返回的循环控制决策集合，用于 Runtime 侧做协议约束。
@@ -105,6 +107,10 @@ class LocalToolDefinition:
         if not self.allowed_loop_decisions:
             raise ValueError("工具允许的循环决策集合不能为空。")
 
+        # ── 默认可用规则归一化 ───────────────────────────────────────
+        # always_enabled 是对外展示与兼容字段，真实默认可用语义统一由 category 派生。
+        object.__setattr__(self, "always_enabled", is_tool_default_enabled_category(self.category))
+
         # ── execution classification 校验 ───────────────────────────
         if self.execution_mode not in ("direct", "blocking"):
             raise ValueError(f"未知工具执行模式: {self.execution_mode}")
@@ -122,3 +128,8 @@ class LocalToolDefinition:
 
         if self.blocking_slow_execution_seconds is not None and self.blocking_slow_execution_seconds <= 0:
             raise ValueError("blocking_slow_execution_seconds 必须大于 0。")
+
+
+def is_tool_default_enabled_category(category: ToolCategory) -> bool:
+    """判断指定工具类别是否默认对所有 Agent 可用。"""
+    return category in DEFAULT_ENABLED_TOOL_CATEGORIES

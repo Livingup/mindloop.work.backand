@@ -40,7 +40,6 @@ class ReadUrlContextToolRequest(BaseModel):
     description=WEB_SEARCH_TOOL_DESCRIPTION,
     group="web_tools",
     public=True,
-    always_enabled=True,
 )
 async def web_search(request: WebSearchToolRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     try:
@@ -67,7 +66,6 @@ async def web_search(request: WebSearchToolRequest, ctx: ToolRuntimeContext) -> 
     description=READ_URL_CONTEXT_TOOL_DESCRIPTION,
     group="web_tools",
     public=True,
-    always_enabled=True,
 )
 async def read_url_context(request: ReadUrlContextToolRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     try:

@@ -92,7 +92,7 @@ class McpCallToolRequest(BaseToolRequest):
     name="mcp_get_service_detail",
     description="获取 MCP 服务的能力信息和使用指南（instructions）。用于了解服务支持哪些能力、获取跨工具的使用策略。",
     group="mcp",
-    always_enabled=True,
+    category="system",
     wiki="查询指定 MCP 服务的 capabilities（是否支持 tools/resources）和 instructions（使用指南）。"
     "在调用 MCP 工具前建议先用此工具了解服务的使用策略。",
 )
@@ -126,7 +126,7 @@ async def mcp_get_service_detail(request: McpGetServiceDetailRequest) -> str | B
     name="mcp_list_resources",
     description="列出 MCP 服务的可用资源（URI、名称、MIME 类型）。用于发现服务提供的上下文数据。",
     group="mcp",
-    always_enabled=True,
+    category="system",
     wiki="列出指定 MCP 服务暴露的所有资源。"
     "返回资源列表，每个资源包含 uri、name、description、mime_type。",
 )
@@ -162,7 +162,7 @@ async def mcp_list_resources(request: McpListResourcesRequest) -> str | BaseTool
     name="mcp_read_resource",
     description="读取 MCP 服务的指定资源内容。需要先用 mcp_list_resources 获取资源 URI。",
     group="mcp",
-    always_enabled=True,
+    category="system",
     wiki="读取指定 MCP 服务上某个资源的具体内容。"
     "需要提供 service_id 和资源的 URI（从 mcp_list_resources 获取）。",
 )
@@ -196,7 +196,7 @@ async def mcp_read_resource(request: McpReadResourceRequest) -> str | BaseToolRe
     name="mcp_get_tool_detail",
     description="获取 MCP 服务上指定工具的参数定义（inputSchema）。在调用 mcp_call_tool 前必须先用此工具了解参数格式。",
     group="mcp",
-    always_enabled=True,
+    category="system",
     wiki="批量获取指定 MCP 服务上一个或多个工具的完整参数定义（JSON Schema）。"
     "tool_names 是逗号分隔的工具名列表。"
     "在调用 mcp_call_tool 前务必先查看工具参数定义。",
@@ -234,7 +234,7 @@ async def mcp_get_tool_detail(request: McpGetToolDetailRequest) -> str | BaseToo
     name="mcp_call_tool",
     description="执行 MCP 服务上的工具。必须先用 mcp_get_tool_detail 了解参数格式后再调用。",
     group="mcp",
-    always_enabled=True,
+    category="system",
     wiki="执行指定 MCP 服务上的工具。"
     "arguments 为 JSON 格式的工具参数。"
     "调用前必须先用 mcp_get_tool_detail 查看参数定义。",
