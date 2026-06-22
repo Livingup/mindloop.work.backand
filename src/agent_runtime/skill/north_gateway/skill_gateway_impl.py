@@ -2,9 +2,12 @@
 """Skill 北向网关实现。"""
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
+from threading import RLock
 
 from agent_runtime.skill.builtin_skill_installer import (
+    BUILTIN_CONFIG_MANAGEMENT_SKILL_ID,
     BuiltinSkillInstaller,
     BuiltinSkillInstallResult,
 )
@@ -35,6 +38,9 @@ class SkillGatewayImpl:
         self._settings_repository = settings_repository
         self._default_skills_dir_accessor = default_skills_dir_accessor
         self._builtin_skill_installer = builtin_skill_installer
+        self._builtin_skill_ensure_lock = RLock()
+        self._builtin_skill_last_ensured_at = 0.0
+        self._builtin_skill_last_skills_dir: str | None = None
 
     def list_skills(self) -> list[SkillInfo]:
         """列出所有已发现的 Skill（合并应用层分组）。"""
@@ -63,7 +69,7 @@ class SkillGatewayImpl:
         if self._settings_repository is None:
             raise RuntimeError("Skill 设置仓储未初始化。")
         settings = self._settings_repository.save_settings(skills_dir=skills_dir)
-        self.ensure_builtin_skills(settings.skills_dir)
+        self.ensure_builtin_skills(settings.skills_dir, force=True)
         self.refresh()
         return settings
 
@@ -72,7 +78,12 @@ class SkillGatewayImpl:
             raise RuntimeError("Skill 设置仓储未初始化。")
         return self._settings_repository.db_path()
 
-    def ensure_builtin_skills(self, skills_dir: str | None = None) -> list[BuiltinSkillInstallResult]:
+    def ensure_builtin_skills(
+        self,
+        skills_dir: str | None = None,
+        *,
+        force: bool = False,
+    ) -> list[BuiltinSkillInstallResult]:
         """幂等安装/升级 Runtime 随包内置 Skill，并在变更后刷新仓库缓存。"""
         if self._builtin_skill_installer is None:
             return []
@@ -83,10 +94,30 @@ class SkillGatewayImpl:
             target_dir = self._settings_repository.get_settings(
                 default_skills_dir=self._default_skills_dir_accessor(),
             ).skills_dir
-        results = self._builtin_skill_installer.install_all(target_dir)
-        if any(result.changed for result in results):
-            self.refresh()
-        return results
+
+        with self._builtin_skill_ensure_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._builtin_skill_last_skills_dir == target_dir
+                and now - self._builtin_skill_last_ensured_at < 1.0
+                and not self._builtin_skill_missing()
+            ):
+                return []
+
+            results = self._builtin_skill_installer.install_all(target_dir)
+            self._builtin_skill_last_skills_dir = target_dir
+            self._builtin_skill_last_ensured_at = time.monotonic()
+            if any(result.changed for result in results):
+                self.refresh()
+            return results
+
+    def _builtin_skill_missing(self) -> bool:
+        try:
+            self._service.get_skill(BUILTIN_CONFIG_MANAGEMENT_SKILL_ID)
+        except KeyError:
+            return True
+        return False
 
     def set_skill_group(self, skill_id: str, group: str) -> None:
         """设置指定 Skill 的应用层分组。"""

@@ -9,16 +9,27 @@ import os
 import shutil
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from threading import RLock
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_CONFIG_MANAGEMENT_SKILL_ID = "spread-ai-config-management"
 BUILTIN_SKILL_MANAGED_BY = "spread-ai-runtime"
 _BUILTIN_SKILLS_DIR_ENV = "SPREAD_AI_BUILTIN_SKILLS_DIR"
+_SOURCE_METADATA_CACHE_TTL_SECONDS = 30.0
+_INSTALL_LOCK_TIMEOUT_SECONDS = 10.0
+_INSTALL_LOCK_STALE_SECONDS = 120.0
+_INSTALL_LOCK_POLL_SECONDS = 0.05
+
+_INSTALL_PROCESS_LOCK = RLock()
+_SOURCE_METADATA_CACHE_LOCK = RLock()
+_SOURCE_METADATA_CACHE: dict[str, tuple[float, "_BuiltinSkillSourceMetadata"]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,11 +59,21 @@ class BuiltinSkillInstallResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _BuiltinSkillSourceMetadata:
+    package_id: str
+    managed_by: str
+    version: str
+    source_hash: str
+    manifest_state: tuple[int, int]
+
+
 class BuiltinSkillInstaller:
     """Install release-bundled Skills into the user configured Skill repository.
 
     Built-in Skills are copied as managed packages. Existing user directories are never
     overwritten unless their manifest declares the same package as managed by this runtime.
+    A process lock plus a target-root lockfile protects concurrent first installs/upgrades.
     """
 
     def __init__(self, *, source_root: Path | None = None) -> None:
@@ -63,7 +84,7 @@ class BuiltinSkillInstaller:
         return [self.install_skill(BUILTIN_CONFIG_MANAGEMENT_SKILL_ID, skills_dir)]
 
     def install_skill(self, skill_id: str, skills_dir: str | Path) -> BuiltinSkillInstallResult:
-        """Install one built-in Skill idempotently."""
+        """Install one built-in Skill idempotently and conflict-safely."""
         target_root = Path(skills_dir).expanduser()
         target = target_root / skill_id
         source = self._resolve_source_root() / skill_id
@@ -77,23 +98,57 @@ class BuiltinSkillInstaller:
             logger.warning(result.message)
             return result
 
-        manifest = _read_json_object(source / "manifest.json")
-        version = str(manifest.get("version") or "0.0.0")
-        managed_by = str(manifest.get("managed_by") or "")
-        package_id = str(manifest.get("package_id") or skill_id)
-        if managed_by != BUILTIN_SKILL_MANAGED_BY or package_id != skill_id:
+        try:
+            target_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            result = BuiltinSkillInstallResult(
+                skill_id=skill_id,
+                target_path=str(target),
+                status="target_unavailable",
+                message=f"Skill 目标目录不可用: {target_root}: {exc}",
+            )
+            logger.warning(result.message)
+            return result
+
+        lock_path = target_root / f".{skill_id}.install.lock"
+        with _INSTALL_PROCESS_LOCK:
+            try:
+                with _install_lockfile(lock_path):
+                    return self._install_skill_locked(skill_id, source, target)
+            except TimeoutError as exc:
+                result = BuiltinSkillInstallResult(
+                    skill_id=skill_id,
+                    target_path=str(target),
+                    status="skipped_locked",
+                    message=f"另一个进程正在安装内置 Skill，已跳过本次安装: {exc}",
+                )
+                logger.warning(result.message)
+                return result
+
+    def _install_skill_locked(
+        self,
+        skill_id: str,
+        source: Path,
+        target: Path,
+    ) -> BuiltinSkillInstallResult:
+        """Install after process/file lock acquisition; re-checks target state inside lock."""
+        source_metadata = _load_source_metadata(source)
+        version = source_metadata.version
+        source_hash = source_metadata.source_hash
+        if (
+            source_metadata.managed_by != BUILTIN_SKILL_MANAGED_BY
+            or source_metadata.package_id != skill_id
+        ):
             result = BuiltinSkillInstallResult(
                 skill_id=skill_id,
                 target_path=str(target),
                 status="source_invalid",
                 message="内置 Skill manifest 缺少正确的 managed_by/package_id 标记。",
                 version=version,
+                source_hash=source_hash,
             )
             logger.error(result.message)
             return result
-
-        source_hash = _directory_hash(source)
-        target_root.mkdir(parents=True, exist_ok=True)
 
         if target.exists():
             if not target.is_dir():
@@ -202,10 +257,96 @@ class BuiltinSkillInstaller:
         return candidates[0] if candidates else Path("builtin-skills")
 
 
+@contextmanager
+def _install_lockfile(lock_path: Path) -> Iterator[None]:
+    """Acquire a best-effort cross-process install lock using an exclusive lockfile."""
+    fd: int | None = None
+    deadline = time.monotonic() + _INSTALL_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            payload = json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+            )
+            os.write(fd, payload.encode("utf-8"))
+            break
+        except FileExistsError:
+            if _lockfile_is_stale(lock_path):
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(lock_path)
+            time.sleep(_INSTALL_LOCK_POLL_SECONDS)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("删除内置 Skill 安装锁文件失败: %s", lock_path, exc_info=True)
+
+
+def _lockfile_is_stale(lock_path: Path) -> bool:
+    try:
+        age_seconds = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    return age_seconds > _INSTALL_LOCK_STALE_SECONDS
+
+
+def _load_source_metadata(source: Path) -> _BuiltinSkillSourceMetadata:
+    manifest_path = source / "manifest.json"
+    manifest = _read_json_object(manifest_path)
+    try:
+        manifest_stat = manifest_path.stat()
+        manifest_state = (manifest_stat.st_mtime_ns, manifest_stat.st_size)
+    except OSError:
+        manifest_state = (0, 0)
+
+    cache_key = str(source.resolve())
+    now = time.monotonic()
+    with _SOURCE_METADATA_CACHE_LOCK:
+        cached = _SOURCE_METADATA_CACHE.get(cache_key)
+        if cached is not None:
+            cached_at, metadata = cached
+            if (
+                now - cached_at < _SOURCE_METADATA_CACHE_TTL_SECONDS
+                and metadata.manifest_state == manifest_state
+            ):
+                return metadata
+
+    metadata = _BuiltinSkillSourceMetadata(
+        package_id=str(manifest.get("package_id") or source.name),
+        managed_by=str(manifest.get("managed_by") or ""),
+        version=str(manifest.get("version") or "0.0.0"),
+        source_hash=_directory_hash(source),
+        manifest_state=manifest_state,
+    )
+    with _SOURCE_METADATA_CACHE_LOCK:
+        _SOURCE_METADATA_CACHE[cache_key] = (now, metadata)
+    return metadata
+
+
 def _copy_ignore(directory: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
-        if name in {".git", "__pycache__"} or name.endswith(".pyc") or name.endswith(".pyo"):
+        if (
+            name in {".git", "__pycache__"}
+            or name.endswith(".pyc")
+            or name.endswith(".pyo")
+            or name.endswith(".lock")
+        ):
             ignored.add(name)
     return ignored
 
