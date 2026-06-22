@@ -12,6 +12,7 @@ const RESOURCE_PATHS = Object.freeze({
   "llm-policy": "/api/llm-registry/execution-policies",
   prompt: "/api/prompt-snippets",
   skill: "/api/skills",
+  tool: "/api/tools/",
 })
 
 const RESOURCES = new Set(Object.keys(RESOURCE_PATHS))
@@ -149,8 +150,9 @@ function ensureSupportedNodeVersion() {
 function helpText() {
   return [
     "Usage: node scripts/manage-config.mjs <resource> <action> [options]",
-    "Resources: agent, mcp, llm-model, llm-provider, llm-policy, prompt, skill",
+    "Resources: agent, mcp, llm-model, llm-provider, llm-policy, prompt, skill, tool",
     "Actions: list, get, create, update, patch, delete, enable, disable, resolved, reorder",
+    "Read-only metadata: skill list/get and tool list/get. Tool execution is not exposed.",
     "Options: --id <id> --sub-path <path> --file <path|-> --runtime-url <url> --login-file <path> --token-file <path> --token-stdin --auth-file <path>",
     "Auth priority: explicit token sources first, then login properties file, then advanced token environment fallbacks. Never pass passwords or tokens as command-line values.",
   ].join("\n")
@@ -198,6 +200,9 @@ async function execute(args) {
 
 async function buildRequest(args) {
   const { resource, action, id, subPath } = args
+  if (resource === "tool") {
+    return buildToolReadRequest(args)
+  }
   switch (action) {
     case "list":
       return { method: "GET", relativePath: id ? relativePath(id, subPath) : "?summary=true", body: null }
@@ -255,6 +260,25 @@ async function buildRequest(args) {
   }
 }
 
+function buildToolReadRequest(args) {
+  const { action, id, subPath } = args
+  if (subPath) {
+    throw new ConfigClientError("Tool metadata only supports top-level list/get; --sub-path is not supported.")
+  }
+  switch (action) {
+    case "list":
+      if (id) {
+        throw new ConfigClientError("tool list does not accept --id; use tool get --id <tool_name> for detail.")
+      }
+      return { method: "GET", relativePath: "", body: null }
+    case "get":
+      requireId(id, "tool get")
+      return { method: "GET", relativePath: relativePath(id), body: null }
+    default:
+      throw new ConfigClientError(`${action} is not supported for read-only tool metadata. Use tool list or tool get --id <tool_name>.`)
+  }
+}
+
 function rejectSkillWrite(resource) {
   if (resource === "skill") {
     throw new ConfigClientError("Skill metadata is read-only.")
@@ -287,13 +311,14 @@ function escapeSegment(value) {
 }
 
 function joinEndpoint(runtimeUrl, basePath, relative) {
+  const normalizedBasePath = basePath.replace(/\/+$/, "")
   if (!relative) {
     return `${runtimeUrl}${basePath}`
   }
   if (relative.startsWith("?")) {
-    return `${runtimeUrl}${basePath}${relative}`
+    return `${runtimeUrl}${normalizedBasePath}/${relative}`
   }
-  return `${runtimeUrl}${basePath}/${relative}`
+  return `${runtimeUrl}${normalizedBasePath}/${relative}`
 }
 
 async function resolveAuth(args, runtimeUrl, loginProperties) {

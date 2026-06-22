@@ -1,10 +1,10 @@
 ---
 name: spread-ai-config-management
-description: Manage Spread AI configuration through the local Runtime REST API. Use for Agent definitions, MCP service configuration, LLM model/provider/execution policy configuration, prompt snippets, and read-only Skill metadata. Do not use for runtime task lifecycle, tool execution, remote MCP consumption, logs, terminal, file resources, Scene, communication, or context-compression operations.
+description: Manage Spread AI configuration through the local Runtime REST API. Use for Agent definitions, MCP service configuration, LLM model/provider/execution policy configuration, prompt snippets, read-only Skill metadata, and read-only local tool metadata discovery for Agent tool_ids. Do not use for runtime task lifecycle, tool execution, remote MCP consumption, logs, terminal, file resources, Scene, communication, or context-compression operations.
 compatibility: Cross-platform. Requires Node.js 18+ available as node, or SPREAD_AI_CONFIG_MANAGEMENT_NODE pointing to a Node executable. Requires the Spread AI Runtime backend to be running and reachable on localhost.
 metadata:
   display-name: Spread AI Configuration Management
-  version: "1.2.1"
+  version: "1.2.2"
   managed-by: spread-ai-runtime
   entrypoint.node: scripts/manage-config.mjs
   entrypoint.windows-cmd: scripts/manage-config.cmd
@@ -22,12 +22,13 @@ Use this built-in Skill when a user asks to manage persistent Spread AI configur
 - LLM model metadata, provider definitions, and execution policies.
 - Prompt snippets/templates.
 - Skill metadata lookup only.
+- Local Runtime tool metadata lookup only, to discover valid tool IDs/details for Agent definition `tool_ids`.
 
 # Operating boundary
 
 This Skill is a REST client for the local Runtime backend. It must not write PostgreSQL, YAML, SQLite, or local configuration files directly. Start or locate the Runtime backend first, then call its authenticated REST API.
 
-Do not use this Skill for runtime task lifecycle, tool execution, remote MCP service calls, log streaming, terminal sessions, file resources, Scene/session management, communication streams, or context-compression runtime operations.
+Do not use this Skill for runtime task lifecycle, tool execution, remote MCP service calls, log streaming, terminal sessions, file resources, Scene/session management, communication streams, or context-compression runtime operations. The `tool` resource is intentionally limited to read-only local metadata discovery (`list` and `get`) so Agent definitions can reference valid `tool_ids`; it never calls `/api/tools/{name}/exec`.
 
 # Cross-platform entrypoints
 
@@ -53,4 +54,4 @@ The Node client calls `POST /api/auth/login`, uses the returned token only in me
 
 Advanced diagnostic token sources remain available: explicit `--token-file`, `--token-stdin`, and `--auth-file` take precedence over `--login-file`; environment token/token-file/auth-file variables are fallback paths after login-file. If no auth source is provided, the script returns structured JSON with `code: "auth_required"`. Login failure and rate limiting also return structured JSON errors without credential values.
 
-For writes, place UTF-8 JSON or supported YAML payloads in `--file <path>` or pass `--file -` to read the payload from stdin. JSON is the baseline cross-platform input format. The Node core owns the optional YAML parsing path; wrappers must not parse or transform complex payloads. Use `list` for summaries and `get --id <id>` for detail. For child-resource operations such as provider model bindings, execution-policy candidates, Agent MCP/Skill relations, or prompt content, pass the parent `--id` and a slash-separated `--sub-path` that maps to the REST child path, then use `create`, `update`, `patch`, `delete`, or `reorder` as appropriate.
+For writes, place UTF-8 JSON or supported YAML payloads in `--file <path>` or pass `--file -` to read the payload from stdin. JSON is the baseline cross-platform input format. The Node core owns the optional YAML parsing path; wrappers must not parse or transform complex payloads. Use `list` for summaries and `get --id <id>` for detail. Use `tool list` to discover public local Runtime tool IDs and `tool get --id <tool_name>` to read a tool's detail/schema before placing the name in an Agent definition `tool_ids` array. For child-resource operations such as provider model bindings, execution-policy candidates, Agent MCP/Skill relations, or prompt content, pass the parent `--id` and a slash-separated `--sub-path` that maps to the REST child path, then use `create`, `update`, `patch`, `delete`, or `reorder` as appropriate.

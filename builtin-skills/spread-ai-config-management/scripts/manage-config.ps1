@@ -5,7 +5,7 @@ The core implementation lives in manage-config.mjs and runs with Node.
 [CmdletBinding()]
 param(
   [Parameter(Position = 0, Mandatory = $true)]
-  [ValidateSet('agent', 'mcp', 'llm-model', 'llm-provider', 'llm-policy', 'prompt', 'skill')]
+  [ValidateSet('agent', 'mcp', 'llm-model', 'llm-provider', 'llm-policy', 'prompt', 'skill', 'tool')]
   [string]$Resource,
 
   [Parameter(Position = 1, Mandatory = $true)]
