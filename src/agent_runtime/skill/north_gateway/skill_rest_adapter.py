@@ -48,7 +48,7 @@ class RefreshResponse(BaseModel):
 
 
 class SkillInstallationResponse(BaseModel):
-    """内置 Skill 安装/升级诊断响应。"""
+    """内置 Skill 安装/跳过诊断响应。"""
 
     skill_id: str
     target_path: str
@@ -156,7 +156,7 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
 
     @router.get("/builtin-installation", response_model=list[SkillInstallationResponse])
     def get_builtin_skill_installation() -> list[dict[str, Any]]:
-        """诊断内置 Skill 在当前用户 Skill 仓库中的安装/升级状态。"""
+        """诊断内置 Skill 在当前用户 Skill 仓库中的安装/跳过状态。"""
         return [result.to_dict() for result in gateway.ensure_builtin_skills()]
 
     @router.get("/{skill_id}", response_model=SkillInfoResponse)

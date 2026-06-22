@@ -84,7 +84,7 @@ class SkillGatewayImpl:
         *,
         force: bool = False,
     ) -> list[BuiltinSkillInstallResult]:
-        """幂等安装/升级 Runtime 随包内置 Skill，并在变更后刷新仓库缓存。"""
+        """幂等安装/跳过 Runtime 随包内置 Skill，并在首次安装后刷新仓库缓存。"""
         if self._builtin_skill_installer is None:
             return []
         target_dir = skills_dir

@@ -9,9 +9,9 @@ Skill 遵循 Agent Skills Open Standard；每个 Skill 是文件系统上的一�
 ## 关键边界
 
 - 本模块不再提供 OS/system CLI；不要恢复 `spread-ai skill ...` 或 `skill_cli_adapter.py`。
-- Runtime 随 release 携带内置 `spread-ai-config-management` Skill，后端通过 `BuiltinSkillInstaller` 幂等安装/升级到用户配置的 Skill 仓库目录。
-- 内置 Skill 目录若不存在则安装；若同名目录由 `manifest.json` 标记 `managed_by=spread-ai-runtime` 且 `package_id=spread-ai-config-management`，可按 source hash/version 升级；同名非托管目录不得覆盖，只返回诊断。
-- 安装触发点：SkillFactory 创建时、Skill settings 保存后、Skill list/get 兜底读路径。安装导致内容变化时必须刷新仓库缓存。
+- Runtime 随 release 携带内置 `spread-ai-config-management` Skill，后端通过 `BuiltinSkillInstaller` 幂等安装/跳过到用户配置的 Skill 仓库目录。
+- 内置 Skill 目录若不存在则安装；同名目录已存在时直接跳过，不读取、写入或复制 `manifest.json`，不自动更新、不覆盖用户目录；目标路径存在但不是目录时只返回冲突诊断。
+- 安装触发点：SkillFactory 创建时、Skill settings 保存后、Skill list/get 兜底读路径。首次安装导致内容变化时必须刷新仓库缓存。
 - `POST /api/skills/refresh` 只保留内部/诊断兜底；公共配置管理脚本不依赖它。
 - Skill 元数据对公共管理脚本只读：允许 list/get，不提供 refresh/settings/group/content 写入入口。
 
@@ -48,7 +48,7 @@ Skill 遵循 Agent Skills Open Standard；每个 Skill 是文件系统上的一�
 ```
 src/agent_runtime/skill/
 ├── __init__.py
-├── builtin_skill_installer.py              # 内置 Skill 幂等安装/升级
+├── builtin_skill_installer.py              # 内置 Skill 幂等安装/跳过
 ├── skill_config.py                         # 模块配置 dataclass
 ├── skill_definition.py                     # 领域实体（聚合根）
 ├── skill_repository.py                     # 仓储接口（Protocol）

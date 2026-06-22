@@ -69,7 +69,7 @@ class SkillGateway(Protocol):
         ...
 
     def ensure_builtin_skills(self, skills_dir: str | None = None) -> list[BuiltinSkillInstallResult]:
-        """幂等安装/升级 Runtime 随包内置 Skill，并返回诊断信息。"""
+        """幂等安装/跳过 Runtime 随包内置 Skill，并返回诊断信息。"""
         ...
 
     def set_skill_group(self, skill_id: str, group: str) -> None:
