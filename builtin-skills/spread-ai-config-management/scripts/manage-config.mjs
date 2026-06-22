@@ -29,11 +29,12 @@ const ACTIONS = new Set([
 ])
 
 class ConfigClientError extends Error {
-  constructor(message, { status = null, exitCode = 1 } = {}) {
+  constructor(message, { status = null, exitCode = 1, code = null } = {}) {
     super(message)
     this.name = "ConfigClientError"
     this.status = status
     this.exitCode = exitCode
+    this.code = code
   }
 }
 
@@ -47,6 +48,9 @@ async function main(argv) {
   } catch (error) {
     if (error instanceof ConfigClientError) {
       const payload = { error: error.message }
+      if (error.code !== null) {
+        payload.code = error.code
+      }
       if (error.status !== null) {
         payload.status = error.status
       }
@@ -65,9 +69,10 @@ function parseArgs(argv) {
     subPath: null,
     file: null,
     runtimeUrl: process.env.SPREAD_AI_RUNTIME_URL || null,
-    tokenFile: process.env.SPREAD_AI_RUNTIME_TOKEN_FILE || null,
+    tokenFile: null,
     tokenStdin: false,
-    authFile: process.env.SPREAD_AI_RUNTIME_AUTH_FILE || null,
+    authFile: null,
+    loginFile: firstNonBlankEnv("SPREAD_AI_RUNTIME_LOGIN_FILE", "SPREAD_AI_MANAGEMENT_LOGIN_FILE"),
   }
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -97,6 +102,9 @@ function parseArgs(argv) {
         break
       case "--auth-file":
         options.authFile = requireValue(argv, ++index, arg)
+        break
+      case "--login-file":
+        options.loginFile = requireValue(argv, ++index, arg)
         break
       case "--help":
       case "-h":
@@ -143,42 +151,49 @@ function helpText() {
     "Usage: node scripts/manage-config.mjs <resource> <action> [options]",
     "Resources: agent, mcp, llm-model, llm-provider, llm-policy, prompt, skill",
     "Actions: list, get, create, update, patch, delete, enable, disable, resolved, reorder",
-    "Options: --id <id> --sub-path <path> --file <path|-> --runtime-url <url> --token-file <path> --token-stdin --auth-file <path>",
+    "Options: --id <id> --sub-path <path> --file <path|-> --runtime-url <url> --login-file <path> --token-file <path> --token-stdin --auth-file <path>",
+    "Auth priority: explicit token sources first, then login properties file, then advanced token environment fallbacks. Never pass passwords or tokens as command-line values.",
   ].join("\n")
 }
 
 async function execute(args) {
   const { method, relativePath, body } = await buildRequest(args)
-  const runtimeUrl = (args.runtimeUrl || DEFAULT_RUNTIME_URL).replace(/\/+$/, "")
+  const explicitTokenRequested = Boolean(args.tokenFile || args.tokenStdin || args.authFile)
+  const loginProperties = args.loginFile && !explicitTokenRequested ? await readLoginProperties(args.loginFile) : null
+  const runtimeUrl = (args.runtimeUrl || loginProperties?.runtime_url || DEFAULT_RUNTIME_URL).replace(/\/+$/, "")
   const url = joinEndpoint(runtimeUrl, RESOURCE_PATHS[args.resource], relativePath)
   const headers = { Accept: "application/json" }
-  const token = await readAuthToken(args)
-  if (token) {
-    headers.Authorization = `Bearer ${token}`
-  }
+  const auth = await resolveAuth(args, runtimeUrl, loginProperties)
+  headers.Authorization = `Bearer ${auth.token}`
   const init = { method, headers }
   if (body !== null) {
     headers["Content-Type"] = "application/json; charset=utf-8"
     init.body = body
   }
 
-  let response
   try {
-    response = await fetch(url, init)
-  } catch (error) {
-    throw new ConfigClientError(error instanceof Error ? error.message : String(error))
-  }
-  const text = await response.text()
-  if (!response.ok) {
-    throw new ConfigClientError(errorMessageFromResponse(text, response.statusText), { status: response.status })
-  }
-  if (!text.trim()) {
-    if (method === "DELETE") {
-      return { status: "success", resource: args.resource, id: args.id }
+    let response
+    try {
+      response = await fetch(url, init)
+    } catch (error) {
+      throw new ConfigClientError(error instanceof Error ? error.message : String(error))
     }
-    return {}
+    const text = await response.text()
+    if (!response.ok) {
+      throw configErrorFromResponse(text, response.statusText, response.status)
+    }
+    if (!text.trim()) {
+      if (method === "DELETE") {
+        return { status: "success", resource: args.resource, id: args.id }
+      }
+      return {}
+    }
+    return parseJsonOrText(text)
+  } finally {
+    if (auth.logoutAfterUse) {
+      await logoutToken(runtimeUrl, auth.token)
+    }
   }
-  return parseJsonOrText(text)
 }
 
 async function buildRequest(args) {
@@ -281,24 +296,177 @@ function joinEndpoint(runtimeUrl, basePath, relative) {
   return `${runtimeUrl}${basePath}/${relative}`
 }
 
-async function readAuthToken(args) {
+async function resolveAuth(args, runtimeUrl, loginProperties) {
   if (args.tokenFile) {
-    return stripUtf8Bom(await readUtf8File(args.tokenFile, "Token file not found")).trim()
+    return { token: await readTokenFile(args.tokenFile, "Token file not found"), logoutAfterUse: false }
   }
   if (args.tokenStdin) {
-    return stripUtf8Bom(await readStdin()).trim()
+    const token = stripUtf8Bom(await readStdin()).trim()
+    if (token) {
+      return { token, logoutAfterUse: false }
+    }
+    throw missingAuthError("Token stdin was empty.")
   }
   if (args.authFile) {
-    const text = await readUtf8File(args.authFile, "Auth file not found")
-    const parsed = parseJsonObject(text, `Invalid auth file: ${args.authFile}`)
-    const token = parsed.access_token || parsed.token
-    if (typeof token === "string" && token.trim()) {
-      return token.trim()
-    }
-    throw new ConfigClientError("Auth file must contain access_token or token.")
+    return { token: await readTokenFromAuthFile(args.authFile, "Auth file"), logoutAfterUse: false }
   }
-  const envToken = process.env.SPREAD_AI_RUNTIME_TOKEN
-  return envToken && envToken.trim() ? envToken.trim() : null
+
+  if (loginProperties) {
+    return { token: await loginForToken(runtimeUrl, loginProperties), logoutAfterUse: true }
+  }
+
+  const fallbackTokenFile = firstNonBlankEnv("SPREAD_AI_MANAGEMENT_TOKEN_FILE", "SPREAD_AI_RUNTIME_TOKEN_FILE")
+  if (fallbackTokenFile) {
+    return { token: await readTokenFile(fallbackTokenFile, "Token file not found"), logoutAfterUse: false }
+  }
+
+  const fallbackEnvToken = firstNonBlankEnv("SPREAD_AI_MANAGEMENT_TOKEN", "SPREAD_AI_RUNTIME_TOKEN")
+  if (fallbackEnvToken) {
+    return { token: fallbackEnvToken, logoutAfterUse: false }
+  }
+
+  const fallbackAuthFile = firstNonBlankEnv("SPREAD_AI_MANAGEMENT_AUTH_FILE", "SPREAD_AI_RUNTIME_AUTH_FILE")
+  if (fallbackAuthFile) {
+    return { token: await readTokenFromAuthFile(fallbackAuthFile, "Auth file"), logoutAfterUse: false }
+  }
+
+  throw missingAuthError("No Runtime authentication source was provided.")
+}
+
+function firstNonBlankEnv(...names) {
+  for (const name of names) {
+    const value = process.env[name]
+    if (typeof value === "string" && value.trim()) {
+      return value.trim()
+    }
+  }
+  return null
+}
+
+async function readTokenFile(filePath, missingPrefix) {
+  const token = stripUtf8Bom(await readUtf8File(filePath, missingPrefix)).trim()
+  if (token) {
+    return token
+  }
+  throw missingAuthError(`${missingPrefix}: token file is empty.`)
+}
+
+async function readTokenFromAuthFile(authFile, label) {
+  const text = await readUtf8File(authFile, `${label} not found`)
+  const parsed = parseJsonObject(text, `Invalid ${label.toLowerCase()}: ${authFile}`)
+  const token = parsed.access_token || parsed.token
+  if (typeof token === "string" && token.trim()) {
+    return token.trim()
+  }
+  throw missingAuthError(`${label} must contain access_token or token.`)
+}
+
+function missingAuthError(detail) {
+  return new ConfigClientError(
+    `${detail} Provide a UTF-8 login properties file with username and password via --login-file or SPREAD_AI_RUNTIME_LOGIN_FILE. Explicit token sources (--token-file, --token-stdin, --auth-file) and token environment variables are advanced fallback paths only.`,
+    { status: 401, code: "auth_required" },
+  )
+}
+
+async function readLoginProperties(filePath) {
+  const text = stripUtf8Bom(await readUtf8File(filePath, "Login file not found"))
+  const properties = parseProperties(text, "login file")
+  const username = stringProperty(properties, "username")
+  const password = stringProperty(properties, "password")
+  if (!username || !password) {
+    throw new ConfigClientError("Login file must contain non-empty username and password fields.", { code: "auth_required", status: 401 })
+  }
+  return {
+    username,
+    password,
+    runtime_url: stringProperty(properties, "runtime_url"),
+    device_id: stringProperty(properties, "device_id") || "spread-ai-config-management",
+    client_kind: stringProperty(properties, "client_kind") || "builtin-management-skill",
+  }
+}
+
+function parseProperties(text, label) {
+  const result = {}
+  const lines = text.split(/\r?\n/)
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index]
+    const trimmed = raw.trim()
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue
+    }
+    const separatorIndex = raw.indexOf("=")
+    if (separatorIndex <= 0) {
+      throw new ConfigClientError(`Invalid ${label}: line ${index + 1} must use key=value syntax.`)
+    }
+    const key = raw.slice(0, separatorIndex).trim()
+    if (!key) {
+      throw new ConfigClientError(`Invalid ${label}: line ${index + 1} has an empty key.`)
+    }
+    result[key] = raw.slice(separatorIndex + 1).trim()
+  }
+  return result
+}
+
+function stringProperty(properties, key) {
+  const value = properties[key]
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+async function loginForToken(runtimeUrl, loginProperties) {
+  const loginUrl = `${runtimeUrl}/api/auth/login`
+  const response = await fetchJson(
+    loginUrl,
+    {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        username: loginProperties.username,
+        password: loginProperties.password,
+        device_id: loginProperties.device_id,
+        client_kind: loginProperties.client_kind,
+      }),
+    },
+    "Runtime login request failed",
+  )
+  const parsed = parseJsonObject(response.text, "Invalid Runtime login response")
+  const token = parsed.access_token
+  if (typeof token === "string" && token.trim()) {
+    return token.trim()
+  }
+  throw new ConfigClientError("Runtime login response did not contain access_token.", { status: response.status, code: "auth_required" })
+}
+
+async function logoutToken(runtimeUrl, token) {
+  try {
+    await fetchJson(
+      `${runtimeUrl}/api/auth/logout`,
+      {
+        method: "POST",
+        headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+      },
+      "Runtime logout request failed",
+      { ignoreHttpError: true },
+    )
+  } catch {
+    // Logout is best-effort cleanup for this script-owned login session. Do not surface it because
+    // doing so would hide the management operation result and must never reveal token material.
+  }
+}
+
+async function fetchJson(url, init, networkErrorPrefix, { ignoreHttpError = false } = {}) {
+  let response
+  try {
+    response = await fetch(url, init)
+  } catch (error) {
+    throw new ConfigClientError(`${networkErrorPrefix}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const text = await response.text()
+  if (!response.ok && !ignoreHttpError) {
+    const error = configErrorFromResponse(text, response.statusText, response.status)
+    const loginCode = response.status === 429 ? "login_rate_limited" : "login_failed"
+    throw new ConfigClientError(`Runtime login failed: ${error.message}`, { status: response.status, code: loginCode })
+  }
+  return { status: response.status, text }
 }
 
 async function readPayload(filePath) {
@@ -553,25 +721,58 @@ function parseJsonOrText(text) {
   }
 }
 
-function errorMessageFromResponse(text, statusText) {
+function configErrorFromResponse(text, statusText, status) {
+  const parsed = parseResponseBody(text)
+  const message = responseErrorMessage(parsed, text, statusText)
+  const explicitCode = parsed && typeof parsed === "object" && typeof parsed.code === "string"
+    ? parsed.code
+    : null
+  const code = explicitCode || authErrorCode(status, message, parsed)
+  return new ConfigClientError(message, { status, code })
+}
+
+function parseResponseBody(text) {
+  if (!text.trim()) {
+    return null
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+function responseErrorMessage(parsed, text, statusText) {
   if (!text.trim()) {
     return statusText || "Runtime request failed"
   }
-  try {
-    const parsed = JSON.parse(text)
-    if (parsed && typeof parsed === "object") {
-      if (typeof parsed.detail === "string") {
-        return parsed.detail
-      }
-      if (typeof parsed.error === "string") {
-        return parsed.error
-      }
-      return JSON.stringify(parsed)
+  if (parsed && typeof parsed === "object") {
+    if (typeof parsed.detail === "string") {
+      return parsed.detail
+    }
+    if (typeof parsed.error === "string") {
+      return parsed.error
     }
     return JSON.stringify(parsed)
-  } catch {
-    return text.trim()
   }
+  if (parsed !== null) {
+    return JSON.stringify(parsed)
+  }
+  return text.trim()
+}
+
+function authErrorCode(status, message, parsed) {
+  if (status !== 401 && status !== 403) {
+    return null
+  }
+  const text = `${message} ${JSON.stringify(parsed || {})}`.toLowerCase()
+  if (text.includes("expired") || text.includes("过期")) {
+    return "token_expired"
+  }
+  if (status === 401) {
+    return "auth_required"
+  }
+  return "permission_denied"
 }
 
 function writeJson(value, stream) {

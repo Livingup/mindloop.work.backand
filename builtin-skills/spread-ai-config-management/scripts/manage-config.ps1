@@ -16,9 +16,10 @@ param(
   [string]$SubPath,
   [string]$File,
   [string]$RuntimeUrl = $env:SPREAD_AI_RUNTIME_URL,
-  [string]$TokenFile = $env:SPREAD_AI_RUNTIME_TOKEN_FILE,
+  [string]$TokenFile,
   [switch]$TokenStdin,
-  [string]$AuthFile = $env:SPREAD_AI_RUNTIME_AUTH_FILE
+  [string]$AuthFile,
+  [string]$LoginFile = $env:SPREAD_AI_RUNTIME_LOGIN_FILE
 )
 
 Set-StrictMode -Version 2.0
@@ -71,6 +72,7 @@ Add-OptionalArgument -Arguments $forwardArgs -Name '--file' -Value $File
 Add-OptionalArgument -Arguments $forwardArgs -Name '--runtime-url' -Value $RuntimeUrl
 Add-OptionalArgument -Arguments $forwardArgs -Name '--token-file' -Value $TokenFile
 Add-OptionalArgument -Arguments $forwardArgs -Name '--auth-file' -Value $AuthFile
+Add-OptionalArgument -Arguments $forwardArgs -Name '--login-file' -Value $LoginFile
 if ($TokenStdin) {
   $forwardArgs.Add('--token-stdin')
 }

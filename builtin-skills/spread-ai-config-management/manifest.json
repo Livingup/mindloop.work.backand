@@ -1,8 +1,8 @@
 {
   "package_id": "spread-ai-config-management",
   "managed_by": "spread-ai-runtime",
-  "version": "1.2.0",
-  "description": "Built-in cross-platform Skill package for managing Spread AI configuration through the local Runtime REST API.",
+  "version": "1.2.1",
+  "description": "Built-in cross-platform Skill package for managing Spread AI configuration through the authenticated local Runtime REST API with login properties authentication support.",
   "runtime_requirements": {
     "node": ">=18"
   },
