@@ -1,15 +1,12 @@
 ---
 name: spread-ai-config-management
 description: Manage Spread AI configuration through the local Runtime REST API. Use for Agent definitions, MCP service configuration, LLM model/provider/execution policy configuration, prompt snippets, read-only Skill metadata, and read-only local tool metadata discovery for Agent tool_ids. Do not use for runtime task lifecycle, tool execution, remote MCP consumption, logs, terminal, file resources, Scene, communication, or context-compression operations.
-compatibility: Cross-platform. Requires Node.js 18+ available as node, or SPREAD_AI_CONFIG_MANAGEMENT_NODE pointing to a Node executable. Requires the Spread AI Runtime backend to be running and reachable on localhost.
+compatibility: Cross-platform through Node.js 18+. Runtime/Agent callers invoke the Node entrypoint directly; this Skill does not rely on OS-specific wrapper scripts.
 metadata:
   display-name: Spread AI Configuration Management
-  version: "1.2.2"
+  version: "1.2.3"
   managed-by: spread-ai-runtime
   entrypoint.node: scripts/manage-config.mjs
-  entrypoint.windows-cmd: scripts/manage-config.cmd
-  entrypoint.windows-powershell: scripts/manage-config.ps1
-  entrypoint.posix-shell: scripts/manage-config
 allowed-tools: terminal_execute_command terminal_read_output
 ---
 
@@ -30,21 +27,15 @@ This Skill is a REST client for the local Runtime backend. It must not write Pos
 
 Do not use this Skill for runtime task lifecycle, tool execution, remote MCP service calls, log streaming, terminal sessions, file resources, Scene/session management, communication streams, or context-compression runtime operations. The `tool` resource is intentionally limited to read-only local metadata discovery (`list` and `get`) so Agent definitions can reference valid `tool_ids`; it never calls `/api/tools/{name}/exec`.
 
-# Cross-platform entrypoints
+# Cross-platform entrypoint
 
-The single core implementation is:
+The formal Runtime/Agent entrypoint is the Node.js script:
 
 ```text
-scripts/manage-config.mjs <resource> <action> [options]
+node scripts/manage-config.mjs <resource> <action> [options]
 ```
 
-Run it with Node.js 18+ on Windows, macOS, or Linux. The package also includes thin wrappers that delegate to the same Node implementation:
-
-- Windows CMD: `scripts/manage-config.cmd`
-- Windows PowerShell: `scripts/manage-config.ps1`
-- macOS/Linux POSIX shell: `scripts/manage-config`
-
-The built-in Skill is installed as one cross-platform package on every platform. Platform differences are represented by entrypoint metadata and wrappers inside the package; the installer must not copy different Skill directories per platform.
+Node.js 18+ is the cross-platform runtime layer for Windows, macOS, and Linux. This Skill package intentionally does not provide Windows PowerShell, Windows CMD, or POSIX shell wrapper entrypoints for Runtime/Agent execution; avoiding OS-specific wrappers keeps the Skill contract identical on every platform and ensures all authentication, REST routing, payload parsing, and error handling stay in `manage-config.mjs`.
 
 # Authentication and payloads
 
