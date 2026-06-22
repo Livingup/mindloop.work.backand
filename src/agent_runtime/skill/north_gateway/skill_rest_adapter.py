@@ -16,6 +16,16 @@ from agent_runtime.skill.north_gateway.skill_contracts import SkillGateway
 # ── 响应模型 ──────────────────────────────────────────────────
 
 
+class SkillSummaryResponse(BaseModel):
+    """Skill 摘要响应，不包含目录路径或正文。"""
+
+    skill_id: str
+    name: str
+    description: str
+    group: str = "default"
+    metadata: dict[str, str] = {}
+
+
 class SkillInfoResponse(BaseModel):
     """Skill 信息响应。"""
 
@@ -35,6 +45,18 @@ class RefreshResponse(BaseModel):
 
     message: str
     count: int
+
+
+class SkillInstallationResponse(BaseModel):
+    """内置 Skill 安装/升级诊断响应。"""
+
+    skill_id: str
+    target_path: str
+    status: str
+    message: str
+    version: str | None = None
+    source_hash: str | None = None
+    changed: bool = False
 
 
 class SetGroupBody(BaseModel):
@@ -81,10 +103,21 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
     """
     router = APIRouter()
 
-    @router.get("", response_model=list[SkillInfoResponse])
-    def list_skills() -> list[dict[str, Any]]:
-        """列出所有已发现的 Skill。"""
+    @router.get("", response_model=list[dict[str, Any]])
+    def list_skills(summary: bool = False) -> list[dict[str, Any]]:
+        """列出所有已发现的 Skill；summary=true 时仅返回摘要元数据。"""
         skills = gateway.list_skills()
+        if summary:
+            return [
+                {
+                    "skill_id": s.skill_id,
+                    "name": s.name,
+                    "description": s.description,
+                    "group": s.group,
+                    "metadata": s.metadata,
+                }
+                for s in skills
+            ]
         return [
             {
                 "skill_id": s.skill_id,
@@ -121,6 +154,30 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
             updated_at=settings.updated_at,
         )
 
+    @router.get("/builtin-installation", response_model=list[SkillInstallationResponse])
+    def get_builtin_skill_installation() -> list[dict[str, Any]]:
+        """诊断内置 Skill 在当前用户 Skill 仓库中的安装/升级状态。"""
+        return [result.to_dict() for result in gateway.ensure_builtin_skills()]
+
+    @router.get("/{skill_id}", response_model=SkillInfoResponse)
+    def get_skill(skill_id: str) -> dict[str, Any]:
+        """读取指定 Skill 的元数据详情。"""
+        try:
+            skill = gateway.get_skill(skill_id)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return {
+            "skill_id": skill.skill_id,
+            "name": skill.name,
+            "description": skill.description,
+            "directory_path": skill.directory_path,
+            "license": skill.license,
+            "compatibility": skill.compatibility,
+            "metadata": skill.metadata,
+            "allowed_tools": skill.allowed_tools,
+            "group": skill.group,
+        }
+
     @router.patch("/{skill_id}/group", response_model=StatusResponse)
     def set_skill_group(skill_id: str, body: SetGroupBody) -> dict[str, Any]:
         """设置指定 Skill 的应用层分组。"""
@@ -140,7 +197,7 @@ def create_skill_router(gateway: SkillGateway) -> APIRouter:
 
     @router.post("/refresh", response_model=RefreshResponse)
     def refresh_skills() -> dict[str, Any]:
-        """触发重新扫描 Skill 仓库目录。"""
+        """内部/诊断兜底：强制重新扫描 Skill 仓库目录。公共 CLI 不依赖该接口。"""
         gateway.refresh()
         skills = gateway.list_skills()
         return {"message": "Skill 仓库已重新扫描", "count": len(skills)}

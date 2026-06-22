@@ -591,6 +591,10 @@ def _build_skill_config(data: dict[str, Any]) -> SkillConfig:
         kwargs["skill_groups_file"] = str(data["skill_groups_file"])
     if "settings_dir" in data:
         kwargs["settings_dir"] = str(data["settings_dir"])
+    if "auto_refresh_enabled" in data:
+        kwargs["auto_refresh_enabled"] = bool(data["auto_refresh_enabled"])
+    if "snapshot_check_interval_seconds" in data:
+        kwargs["snapshot_check_interval_seconds"] = float(data["snapshot_check_interval_seconds"])
     return SkillConfig(**kwargs)
 
 

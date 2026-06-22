@@ -352,6 +352,7 @@ def _prompt_payload(prompt: ContextCompressionWorkerPrompt) -> dict[str, Any]:
         "input_mode": prompt.input_mode,
         "worker_name": prompt.worker_name,
         "prompt_text": prompt.prompt_text,
+        "default_prompt_text": prompt.default_prompt_text,
         "is_custom": True,
         "revision": prompt.revision,
         "created_at": prompt.created_at,

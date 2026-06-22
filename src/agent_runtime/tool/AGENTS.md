@@ -158,12 +158,9 @@ class ToolSchemaGenerator(Protocol):
 
 ### 北向网关
 
-- **`LocalToolGateway`**：网关契约（Protocol），定义对外服务接口和数据模型。外部消费方（Agent 定义模块、执行引擎、CLI、REST）通过此契约访问本模块能力。
-- **CLI adapter**：挂在 `spread-ai tool ...` 子命令下，供 Agent / 外部 AI 发现和查询系统工具。
-  - `spread-ai tool list` — 列出所有公开工具（支持 `--group` 筛选、`--group-by` 分组）
-  - `spread-ai tool get <names>` — 查询指定工具详情，支持逗号分隔多个工具名（如 `add,greet`）
-  - `spread-ai tool groups` — 列出所有工具分组名称
-- **REST adapter**：挂在 `/api/tools/` 路由下。
+- **`LocalToolGateway`**：网关契约（Protocol），定义对外服务接口和数据模型。外部消费方（Agent 定义模块、执行引擎、REST）通过此契约访问本模块能力。
+- 本模块不再提供 OS/system CLI，也不作为公共配置管理 Skill 的覆盖范围。
+- **REST adapter**：挂在 `/api/tools/` 路由下，供前端/内部诊断读取本地工具元数据。
 
 ### 基础设施层
 
@@ -195,7 +192,6 @@ tool/
 │   ├── __init__.py
 │   ├── local_tool_gateway.py          # 北向网关契约（Protocol）
 │   ├── local_tool_contracts.py        # 对外数据模型（DTO）
-│   ├── local_tool_cli_adapter.py      # CLI 接入
 │   └── local_tool_rest_adapter.py     # REST 接入
 └── AGENTS.md
 ```

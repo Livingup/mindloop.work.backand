@@ -212,8 +212,8 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
         ]
 
     @router.get("/{service_id}", response_model=McpServiceInfoResponse)
-    async def get_service(service_id: str) -> dict:
-        """获取指定 MCP 服务的定义配置。"""
+    async def get_service(service_id: str, include_secrets: bool = False) -> dict:
+        """获取指定 MCP 服务的定义配置；默认脱敏 env/header 中的敏感值。"""
         await gateway.reconcile_if_config_changed()
         try:
             info = gateway.get_service(service_id)
@@ -223,7 +223,7 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
             "service_id": info.service_id,
             "name": info.name,
             "description": info.description,
-            "transport": info.transport,
+            "transport": info.transport if include_secrets else _mask_transport(info.transport),
             "enabled": info.enabled,
             "connected": info.connected,
             "connection_status": info.connection_status,
@@ -313,6 +313,24 @@ def create_mcp_config_router(gateway: McpClientGateway) -> APIRouter:
         return {"status": "success", "message": f"已连接 MCP 服务: {service_id}"}
 
     return router
+
+
+def _mask_transport(transport: dict[str, Any]) -> dict[str, Any]:
+    masked = dict(transport)
+    for key in ("env", "headers"):
+        value = masked.get(key)
+        if isinstance(value, dict):
+            masked[key] = _mask_secret_mapping(value)
+    return masked
+
+
+def _mask_secret_mapping(values: dict[str, Any]) -> dict[str, Any]:
+    sensitive_markers = ("authorization", "api-key", "apikey", "x-api-key", "token", "secret", "password", "key")
+    masked: dict[str, Any] = {}
+    for key, value in values.items():
+        name = str(key)
+        masked[name] = "********" if any(marker in name.lower() for marker in sensitive_markers) else value
+    return masked
 
 
 # ══════════════════════════════════════════

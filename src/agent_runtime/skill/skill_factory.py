@@ -2,6 +2,7 @@
 """Skill 模块依赖装配。"""
 from __future__ import annotations
 
+from agent_runtime.skill.builtin_skill_installer import BuiltinSkillInstaller
 from agent_runtime.skill.infrastructure.filesystem_skill_repository import (
     FilesystemSkillRepository,
 )
@@ -26,10 +27,17 @@ class SkillFactory:
         settings_repository = SkillSettingsRepository(
             data_dir_accessor=lambda: ConfigRegistry.instance().skill_service.settings_dir,
         )
+        builtin_skill_installer = BuiltinSkillInstaller()
+        current_settings = settings_repository.get_settings(
+            default_skills_dir=ConfigRegistry.instance().skill_service.skills_dir,
+        )
+        builtin_skill_installer.install_all(current_settings.skills_dir)
         repo = FilesystemSkillRepository(
             skills_dir_accessor=lambda: settings_repository.get_settings(
                 default_skills_dir=ConfigRegistry.instance().skill_service.skills_dir,
             ).skills_dir,
+            auto_refresh_enabled_accessor=lambda: ConfigRegistry.instance().skill_service.auto_refresh_enabled,
+            snapshot_check_interval_seconds_accessor=lambda: ConfigRegistry.instance().skill_service.snapshot_check_interval_seconds,
         )
         group_store = SkillGroupStore(
             group_file_accessor=lambda: ConfigRegistry.instance().skill_service.skill_groups_file,
@@ -40,4 +48,5 @@ class SkillFactory:
             group_store,
             settings_repository=settings_repository,
             default_skills_dir_accessor=lambda: ConfigRegistry.instance().skill_service.skills_dir,
+            builtin_skill_installer=builtin_skill_installer,
         )

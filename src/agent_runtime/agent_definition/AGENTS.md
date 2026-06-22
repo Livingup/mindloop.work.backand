@@ -82,7 +82,6 @@ agent_definition/
 ├── north_gateway/
 │   ├── agent_definition_contracts.py      # 北向请求模型与 Protocol
 │   ├── agent_definition_gateway_impl.py   # 北向网关实现
-│   ├── agent_definition_cli_adapter.py    # spread-ai agent CLI
 │   └── agent_definition_rest_adapter.py   # /api/agents REST 路由
 ├── infrastructure/
 │   └── yaml_agent_definition_repository.py # YAML 文件仓储实现
@@ -97,20 +96,10 @@ agent_definition/
 
 ---
 
-## CLI
+## REST 与内置管理 Skill
 
-```bash
-spread-ai agent list
-spread-ai agent list --group development --exclude-disabled
-spread-ai agent get coding-agent
-spread-ai agent create --file coding-agent.yaml
-spread-ai agent update coding-agent --file coding-agent-update.yaml
-spread-ai agent delete coding-agent
-spread-ai agent enable coding-agent
-spread-ai agent disable coding-agent
-```
+本模块不再提供 OS/system CLI。Agent 定义管理通过 Runtime REST `/api/agents` 暴露，release 内置 `spread-ai-config-management` Skill 脚本作为 REST client 调用这些端点。复杂写入载荷由脚本通过文件或 stdin 转成 JSON 请求体，不直接写仓储文件。
 
-CLI 输入复杂字段时使用 YAML 文件，输出统一为 JSON，方便用户和外部 Agent 调用。
 
 ---
 

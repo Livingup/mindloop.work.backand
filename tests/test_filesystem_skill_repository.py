@@ -112,6 +112,45 @@ class FilesystemSkillRepositoryTests(unittest.TestCase):
         self.assertEqual(skill.name, "Runtime Skill")
         self.assertTrue(skill.directory_path.endswith("Physical-Container"))
 
+    def test_list_all_auto_refreshes_created_modified_and_deleted_skills(self) -> None:
+        with TemporaryDirectory() as tmp:
+            skills_dir = Path(tmp)
+            _write_skill(skills_dir / "A", name="SkillA", description="旧描述")
+            repo = FilesystemSkillRepository(
+                lambda: str(skills_dir),
+                snapshot_check_interval_seconds_accessor=lambda: 0.0,
+            )
+
+            self.assertEqual([skill.skill_id for skill in repo.list_all()], ["SkillA"])
+
+            _write_skill(skills_dir / "B", name="SkillB", description="新增 Skill")
+            self.assertEqual([skill.skill_id for skill in repo.list_all()], ["SkillA", "SkillB"])
+
+            _write_skill(skills_dir / "A", name="SkillA", description="更新后的长描述")
+            skill_a = repo.get_by_id("SkillA")
+            self.assertEqual(skill_a.description, "更新后的长描述")
+
+            (skills_dir / "B" / "SKILL.md").unlink()
+            self.assertEqual([skill.skill_id for skill in repo.list_all()], ["SkillA"])
+            with self.assertRaises(KeyError):
+                repo.get_by_id("SkillB")
+
+    def test_auto_refresh_can_be_disabled_for_cached_reads(self) -> None:
+        with TemporaryDirectory() as tmp:
+            skills_dir = Path(tmp)
+            _write_skill(skills_dir / "A", name="SkillA", description="旧描述")
+            repo = FilesystemSkillRepository(
+                lambda: str(skills_dir),
+                auto_refresh_enabled_accessor=lambda: False,
+                snapshot_check_interval_seconds_accessor=lambda: 0.0,
+            )
+
+            _write_skill(skills_dir / "B", name="SkillB", description="新增 Skill")
+            self.assertEqual([skill.skill_id for skill in repo.list_all()], ["SkillA"])
+
+            repo.scan()
+            self.assertEqual([skill.skill_id for skill in repo.list_all()], ["SkillA", "SkillB"])
+
 
 if __name__ == "__main__":
     unittest.main()

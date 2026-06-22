@@ -4,40 +4,35 @@
 
 ---
 
-## 开发环境安装与拉取代码后的依赖刷新
+## 开发环境安装与配置管理入口边界
 
-`spread-ai` 命令由 `AgentRuntime/pyproject.toml` 的 `[project.scripts]` 声明生成，Windows 下通常表现为 Python 环境 `Scripts` 目录中的 `spread-ai.exe`。它只是 CLI 启动器，负责调用 `agent_runtime.cli:main`，业务代码仍从当前安装的 `agent-runtime` 包中导入。
+本仓库不再提供 `spread-ai` OS/system CLI，也不再通过 `pyproject.toml [project.scripts]` 暴露配置管理命令。不要新增或恢复 `agent_runtime.cli`、`*_cli_adapter.py`、release CLI exe、PATH 注入或直接读写 PG/YAML/SQLite 的传统 CLI。
 
-本项目开发态建议在 `AgentRuntime` 目录执行 editable 安装：
+配置管理的长期入口是 Runtime 后端 REST API，以及 release 随包内置并自动安装到用户 Skill 仓库的 `spread-ai-config-management` Skill/脚本；该脚本只是本机 REST client，必须复用 Runtime auth/cache/reconcile/持久化逻辑。
+
+本项目开发态如需刷新依赖，仍可在 `AgentRuntime` 目录执行 editable 安装：
 
 ```powershell
 python -m pip install -e .
 ```
 
-普通 `.py` 源码变更不需要重新安装；editable 安装会让 `spread-ai.exe` 继续导入工作区中的最新源码。但拉取代码、切换分支或合并代码后，如果出现以下变化，需要重新执行 `python -m pip install -e .` 刷新安装元数据和依赖：
-
-- `pyproject.toml` 中新增、删除或修改了 `dependencies` / `optional-dependencies`。
-- `pyproject.toml` 中新增、删除或修改了 `[project.scripts]` 命令入口，例如 `spread-ai = "agent_runtime.cli:main"`。
-- 包结构、构建配置、包名、入口模块路径发生变化。
-- 当前 Python 环境发生变化，例如从全局 Python 切换到虚拟环境，或更换了解释器。
-
-如果只拉取到普通业务源码变更，且 `pyproject.toml` 未变化，通常无需重新生成 `spread-ai.exe`。如果运行时出现 `ModuleNotFoundError`，优先检查当前 `spread-ai` 所在 Python 环境是否已重新安装依赖。
+普通 `.py` 源码变更不需要重新安装。拉取代码、切换分支或合并代码后，如果 `pyproject.toml` 的 `dependencies` / `optional-dependencies`、包结构、构建配置、包名或入口模块路径发生变化，再重新执行 `python -m pip install -e .`。
 
 ---
 
 ## dev 与正式版启动/打包边界
 
-`spread-ai serve` 只作为开发、调试、CI 和后端诊断入口，不作为正式 Windows 桌面产品的用户启动入口。正式版用户只启动前端仓库打包出来的 `Spread AI.exe`；该 Electron exe 会在 packaged 模式下读取随包复制到用户数据目录的 `agent_runtime.yaml`，用其中 `agent_runtime_service.service_host/service_port` 作为 release 启动元数据权威，自动拉起随包携带的后端 sidecar `spread-ai-runtime.exe`，等待 `/api/health` 成功后再打开窗口，并在应用退出时关闭后端进程。
+正式版用户只启动前端仓库打包出来的 `Spread AI.exe`；该 Electron exe 会在 packaged 模式下读取随包复制到用户数据目录的 `agent_runtime.yaml`，用其中 `agent_runtime_service.service_host/service_port` 作为 release 启动元数据权威，自动拉起随包携带的后端 sidecar `spread-ai-runtime.exe`，等待 `/api/health` 成功后再打开窗口，并在应用退出时关闭后端进程。
 
-dev 后端在本仓库独立启动，推荐使用项目内配置目录：
+dev 后端在本仓库独立启动时，使用内部后端模块而不是 OS CLI，推荐使用项目内配置目录：
 
 ```powershell
-spread-ai serve --config-file config/agent_runtime.yaml --env-file config/.env.dev
+python -m agent_runtime.desktop_server --config-file config/agent_runtime.yaml --env-file config/.env.dev
 ```
 
 dev 端口由 `config/.env.dev` 中的 `SPREAD_AI_SERVICE_PORT` 提供，推荐固定为 `18000`；dev 数据根由 `SPREAD_AI_DATA_ROOT` 提供，默认固定为 `~/.spread-ai-dev`，用于源码自测沙箱，避免写入正式安装版默认使用的 `~/.spread-ai` 用户数据。`config/.env.dev` 只能保存 dev 启动元数据覆盖，且必须通过 `--env-file config/.env.dev` 显式传入；`config/.env` 与 `config/.env.prod` 不再作为 OSS、云端 PostgreSQL 密码或其他用户业务密钥来源。
 
-正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行 `spread-ai serve` 启动正式后端。正式 release 后端监听地址和端口由 `agent_runtime.yaml` 的 `agent_runtime_service.service_host/service_port` 决定，Electron packaged 主进程正常只传 `--config-file`，不再用 `--host` / `--port` 覆盖 release 配置；如果 YAML 配置端口被占用，应由 Electron 启动前检查并清晰失败，不得静默切换随机端口。正式 sidecar 可额外接收 `--frontend-dist-dir` 挂载同一份 Vite production `dist/`：`/api/*` 仍是 Runtime API，非 `/api` 路径服务 release SPA，供 PC/手机浏览器按页面自身 HTTP origin 访问同一个 Runtime。
+正式后端入口是 `agent_runtime.desktop_server:main`，由 PyInstaller 打包成 sidecar exe，供 Electron packaged 主进程内部调用。不要要求用户手动执行任何 `spread-ai` OS CLI 启动正式后端。正式 release 后端监听地址和端口由 `agent_runtime.yaml` 的 `agent_runtime_service.service_host/service_port` 决定，Electron packaged 主进程正常只传 `--config-file`，不再用 `--host` / `--port` 覆盖 release 配置；如果 YAML 配置端口被占用，应由 Electron 启动前检查并清晰失败，不得静默切换随机端口。正式 sidecar 可额外接收 `--frontend-dist-dir` 挂载同一份 Vite production `dist/`：`/api/*` 仍是 Runtime API，非 `/api` 路径服务 release SPA，供 PC/手机浏览器按页面自身 HTTP origin 访问同一个 Runtime。
 
 正式 release 后端是 PyInstaller `--noconsole` GUI sidecar；任何从 Runtime 后端启动的普通 Windows 子进程（git、rg、node、诊断命令等）默认必须复用 `agent_runtime.subprocess_utils.hidden_subprocess_kwargs()` 或等价隐藏策略，避免用户执行 Agent 任务时出现 CMD/控制台黑框闪烁。`WINPTY_SHOW_CONSOLE=1` 仅允许作为显式本机诊断开关，正式终端 PTY 环境不得无意继承该变量。
 
@@ -73,13 +68,13 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 ### 全局配置注册中心（config）
 
-全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析和 watchdog 文件监听热更新；不会自动加载 YAML 同目录 `.env`，只有调用方显式传入的 `--env-file` 会作为启动元数据覆盖来源。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象，避免无关模块的必填环境变量阻塞 CLI 子命令。`spread-ai config init --source <agent_runtime.yaml> [--force]` 负责把用户提供的服务配置复制到 `~/.spread-ai/agent_runtime.yaml`；普通 CLI 管理命令默认加载这一份初始化后的运行配置。`spread-ai serve` 是开发/诊断入口，默认同样加载 `~/.spread-ai/agent_runtime.yaml`，但允许通过 `--config-file` 与 `--env-file` 显式指定开发态配置源。正式 Windows 桌面版不通过 `spread-ai serve` 启动，而由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置（统一文件资源服务、会话持久化、Agent 运行态仓储与 Trace 目录、通用通信、Agent 执行循环、提示词模板、Skill 服务、MCP 客户端、Agent 定义、LLM 服务商与模型注册）均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护。CLI 入口（`cli.py`）作为组合根，各模块网关通过工厂函数延迟创建（命令执行时 ConfigRegistry 已就绪），工厂函数以 `Callable` 形式传给 CLI adapter，adapter 在命令回调中调用。运行时 REST 服务装配在 `agent_runtime.server` 中，供 `spread-ai serve` 与正式版内部后端入口复用。
+全局单例 ConfigRegistry，统一加载运行时 YAML 配置并分发给各业务域。支持环境变量占位符 `${ENV_VAR}` / `${ENV_VAR:-default}` 解析和 watchdog 文件监听热更新；不会自动加载 YAML 同目录 `.env`，只有调用方显式传入的 `--env-file` 会作为启动元数据覆盖来源。启动时只读取原始 YAML，各业务配置段在被访问时才解析环境变量并构建强类型配置对象。正式 Windows 桌面版由 Electron packaged 主进程内部拉起 `agent_runtime.desktop_server` 打包出的 sidecar 后端。仓库根目录的 `config/agent_runtime.yaml` 作为项目提供的初始化配置来源示例/开发态服务配置存在。所有业务模块的配置均纳入同一配置体系，各模块只认 ConfigRegistry 内存数据，不关心配置文件的初始化与维护；配置管理对外走 Runtime REST 与内置 Skill 脚本，不再走 OS CLI。
 
 #### 用户全局配置云端 PostgreSQL 边界
 
 `cloud_user_config_database` 的 YAML 段只保存云端 PostgreSQL 默认连接元数据；真正可用的 PostgreSQL 启动凭据（包括 password，以及必要时同一组 host/port/database/username）属于每台机器本地用户数据，由 runtime bootstrap 本地存储覆盖，不能写入同一个云端 PostgreSQL 库以免形成自举悖论。缺少本机 bootstrap 凭据时，REST 服务只能进入初始化引导有限模式，不得把已批准的共享配置悄悄落回本地权威。
 
-本机到云端的数据迁移只能通过一次性运维入口执行，例如 `spread-ai config migrate-user-global-to-cloud` 或等价手工脚本；不得在 runtime bootstrap、服务启动或普通业务请求中自动导入本机数据。完成迁移后再切换共享域 CRUD 权威。启用 PostgreSQL 后，已批准共享域必须以同一个 PostgreSQL 权威库为准；Runtime 后端可以维护只读进程内缓存并轮询数据库侧 revision 以降低读取成本，但该缓存不能成为失败后的本地权威或 silent fallback，也不能由前端保存、比较或轮询 revision。
+本机到云端的数据迁移只能通过一次性受控运维入口或等价手工脚本执行；不得在 runtime bootstrap、服务启动或普通业务请求中自动导入本机数据。完成迁移后再切换共享域 CRUD 权威。启用 PostgreSQL 后，已批准共享域必须以同一个 PostgreSQL 权威库为准；Runtime 后端可以维护只读进程内缓存并轮询数据库侧 revision 以降低读取成本，但该缓存不能成为失败后的本地权威或 silent fallback，也不能由前端保存、比较或轮询 revision。
 
 当前已批准共享/云端权威范围包括 prompt snippets、Agent definitions、主 LLM Registry、图像生成 LLM Registry、图像生成运行时设置、Web Tools 运行时设置、context-compression 运行时设置与 worker prompts、`streamable-http` MCP 服务定义、LACP registry-service 设置，以及通过 bootstrap 配置的 OSS 对象存储设置。`stdio` MCP 服务定义、LACP instance registrations/runtime state、Skill、conversation/history、terminal/runtime state、scene/project/workspace、诊断数据、机器本地路径等仍属于本机或混合数据，不得进入云端用户共享配置，除非后续重新做范围设计并获确认。
 
@@ -97,7 +92,7 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 ### 统一工具模块（tool）
 
-负责本地工具的定义、自动发现、注册、执行、统一执行协议，以及各 LLM 平台工具 JSON Schema 的生成与缓存管理。通过 `@tool` 装饰器声明工具函数（支持 name、description、group、public、wiki、category、always_enabled、allowed_loop_decisions 元数据），import 时自动注册到全局仓储。`group` 只用于展示与筛选；`category` 承载默认可见语义，只有 `lifecycle` 与 `system` 工具默认对所有 Agent 可见，`business` 工具必须通过 `AgentDefinition.tool_ids` 显式授权；`always_enabled` 是由 category 派生的兼容展示字段，不能为 business 工具单独制造例外。所有工具执行结果统一归一为 `BaseToolResult` / `ToolExecuteResult`：旧工具可继续返回原始业务值，运行时会自动包装为 `output` 且默认 `loop_control.decision=continue`；新工具可直接返回 `BaseToolResult` 表达 `success`、`execution_status`、`error_message`、`frontend_message` 和 `loop_control`。工具异常由 `LocalToolService` 转换为结构化失败结果，普通业务工具默认只允许 `continue`，生命周期工具可通过 `allowed_loop_decisions` 声明 `pause` / `complete` / `fail` 等决策。内置函数签名→JSON Schema 解析器支持基本类型、Optional、List、Dict、Literal、Pydantic BaseModel，以及 OpenAI / Claude / Gemini 三个平台的 Schema 生成器实现，其中 Gemini 生成器会内联 Pydantic `$defs/$ref` 以支持嵌套结构化参数。Schema 生成是本模块职责，LLM 统一调用客户端只取现成 schema。DDD 分层：领域实体（聚合根）+ 仓储接口/内存实现 + 领域服务（四个业务用例）+ 北向网关（Gateway 契约 + CLI adapter + REST adapter）。CLI 命令：`spread-ai tool list/get/groups`。工具执行不提供 CLI 命令（工具可返回多模态数据，不适合 CLI 场景）。
+负责本地工具的定义、自动发现、注册、执行、统一执行协议，以及各 LLM 平台工具 JSON Schema 的生成与缓存管理。通过 `@tool` 装饰器声明工具函数，import 时自动注册到全局仓储。`category` 承载默认可见语义，只有 `lifecycle` 与 `system` 工具默认对所有 Agent 可见，`business` 工具必须通过 `AgentDefinition.tool_ids` 显式授权。工具异常由 `LocalToolService` 转换为结构化失败结果，生命周期工具可通过 `allowed_loop_decisions` 声明生命周期决策。Schema 生成是本模块职责，LLM 统一调用客户端只取现成 schema。本模块不再提供 OS CLI 发现入口。
 
 ### Agent 生命周期控制模块（agent_lifecycle）
 
@@ -107,21 +102,21 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 拆分为两个子模块：
 
-**mcp_client** — 通用 MCP 服务管理和调用能力。不关心程序如何使用 MCP 服务，面向 MCP 协议提供通用能力。DDD 分层：领域实体 McpServiceDefinition（聚合根，含嵌套传输配置值对象 StdioTransportConfig / StreamableHttpTransportConfig）+ 值对象 5 个（McpServiceCapabilities / McpToolInfo / McpToolSummary / McpResourceInfo / McpResourceContent / McpToolResult）+ 仓储接口/YAML 实现（~/.spread-ai/mcp-servers/{service_id}.yaml）+ McpSessionManager（MCP SDK 连接池，支持 stdio 和 streamable-http 传输）+ 领域服务 McpClientService（配置管理 + 协议操作）+ 北向网关（McpClientGateway Protocol + DTO + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai mcp-config list/get/add/update/remove/enable/disable`（配置管理）+ `spread-ai mcp inspect/tools/tool-detail/resources/read-resource`（协议操作）。
+**mcp_client** — 通用 MCP 服务管理和调用能力。不关心程序如何使用 MCP 服务，面向 MCP 协议提供通用能力。配置管理通过 Runtime REST `/api/mcp-config` 暴露给前端和内置配置管理 Skill；协议操作 REST `/api/mcp` 供运行时受控使用，不作为 OS CLI 公共面。DDD 分层保留领域实体、仓储、会话管理、领域服务、北向网关、REST 适配器与工厂。
 
 **mcp_meta_tools** — 供 Agent 使用的 5 个 MCP 元工具（@tool 装饰器注册为本地工具，async 函数）：mcp_get_service_detail / mcp_list_resources / mcp_read_resource / mcp_get_tool_detail / mcp_call_tool。它们保持 `group="mcp"`、`category="system"`，默认对 Agent 可见；实际可用的远端 MCP 服务和工具仍必须由 `AgentDefinition.mcp_tools` 白名单约束。依赖 mcp_client 北向网关契约。
 
-**工具注册机制**：各模块的 `@tool` 装饰工具函数需在组合根或工厂中显式 import 对应模块来触发注册（不采用全量扫描，避免启动变慢）。面向 CLI 的工具模块通常在 `cli.py` 中 import；运行时必须默认可用的工具（如 `agent_lifecycle`）需要在 `LocalToolFactory.create()` 中 import，确保 Agent 执行器创建本地工具网关时已注册。
+**工具注册机制**：各模块的 `@tool` 装饰工具函数需在组合根或工厂中显式 import 对应模块来触发注册（不采用全量扫描，避免启动变慢）。运行时必须默认可用的工具（如 `agent_lifecycle`）需要在 `LocalToolFactory.create()` 中 import，确保 Agent 执行器创建本地工具网关时已注册。
 
-**CLI 设计原则**：`spread-ai` 是给用户、脚本、CI 和外部 Agent 调用的统一脚本命令入口。命令按业务域组织，输入输出保持结构化；复杂输入使用文件；错误输出 JSON 且使用非 0 exit code；查询命令不产生业务副作用；子命令不能被无关模块配置阻塞。
+**配置管理脚本原则**：release 内置 `spread-ai-config-management` Skill 脚本是本机 Runtime REST client；它不直接写 PG/YAML/SQLite，不承载业务规则，不绕过 Runtime auth。
 
 ### Skill 模块（skill）
 
-Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录（通用公共目录，不绑定本项目），解析各子目录中 `SKILL.md` 的 YAML frontmatter，提供 Skill 列表查询和刷新能力。遵循 Agent Skills Open Standard 规范。Skill 仓库路径在 `config/agent_runtime.yaml` 的 `skill_service.skills_dir` 中配置。用户直接在仓库目录下创建/编辑/删除 Skill 子目录，无需通过 API。启动时自动扫描 + 接口触发重新扫描。只解析 frontmatter 元数据（name、description、license、compatibility、metadata、allowed-tools），不读取 Markdown 正文（Agent 拿到目录路径后自行按规范读取）。DDD 分层：领域实体 SkillDefinition（聚合根，含 name 格式校验）+ 仓储接口/文件系统实现（扫描目录 + 解析 SKILL.md）+ 领域服务 + 北向网关（SkillGateway Protocol + DTO + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai skill list`（列出所有 Skill）/ `spread-ai skill refresh`（重新扫描）。REST：`GET /api/skills` / `POST /api/skills/refresh`。
+Skill 发现与元数据管理。扫描用户配置的 Skill 仓库目录，解析各子目录中 `SKILL.md` 的 YAML frontmatter。后端会在启动、Skill settings 保存以及 list/get 兜底读路径幂等安装/升级 release 内置 `spread-ai-config-management` Skill；同名非托管目录不得覆盖。公共查询走 REST：`GET /api/skills?summary=true`、`GET /api/skills/{skill_id}`，`POST /api/skills/refresh` 只保留内部诊断兜底。
 
 ### Agent 定义模块（agent_definition）
 
-负责 Agent 静态模板数据管理。每个 Agent 定义一个 YAML 文件，文件名即 `agent_id`，默认存储在 `~/.spread-ai/agents/` 下，配置项为 `agent_definition.definitions_dir`。定义字段包括 `agent_id`、可选 `name` / `description`、`group`、系统提示词混合数组、本地工具 ID、MCP 服务工具绑定、Skill ID、可用子 Agent ID、是否系统内置后台 Agent、是否禁用。系统提示词数组支持 `text` 与 `template_id` 交叉混合并保持顺序，例如 `[{text: ...}, {template_id: ...}, {text: ...}]`。DDD 分层：领域实体 AgentDefinition（聚合根，携带文件名安全和引用列表去重校验）+ 值对象 SystemPromptSegment / McpToolBinding + 仓储接口/YAML 实现（`~/.spread-ai/agents/{agent_id}.yaml`）+ 领域服务 + 北向网关（Protocol + 请求模型 + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai agent list/get/create/update/delete/enable/disable`。REST：`/api/agents` CRUD + enable/disable。
+负责 Agent 静态模板数据管理。每个 Agent 定义一个 YAML 文件，文件名即 `agent_id`，默认存储在 `~/.spread-ai/agents/` 下，配置项为 `agent_definition.definitions_dir`。定义字段包括系统提示词混合数组、本地工具 ID、MCP 服务工具绑定、Skill ID、可用子 Agent ID、默认/允许 LLM 执行策略等。对外管理入口是 REST `/api/agents` CRUD + enable/disable；list 支持 `summary=true` 供内置配置管理 Skill 低噪声查询。
 
 ### Agent 运行时实例与任务管理模块（agent）
 
@@ -139,7 +134,7 @@ Phase-1 访问模型是单 Runtime 主机的多端接入：后端 runtime-local 
 
 ### LLM 服务商与模型注册模块（llm_model_registry）
 
-负责用户自定义的 LLM 模型型号元数据、服务商定义、服务商模型接入项和执行策略组管理。主配置只保存注册数据根目录 `llm_model_registry.registry_dir`，默认 `~/.spread-ai/llm-model-registry`；运行期权威数据存储为该目录下的 `llm_model_registry.sqlite3`，legacy YAML 只作为一次性迁移输入，不在应用启动或仓储初始化时自动导入。模型元数据字段包括 `model_id`、`context_window`、`max_output_tokens`、`compression_threshold`、`supports_tool_calling`、`supports_structured_output`、`supported_input_modalities`，其中 `supported_input_modalities` 只能从系统统一输入模态 `text` / `image` / `pdf` 中选择，统一来源为 `src/agent_runtime/input_modality.py`。服务商定义字段包括 `provider_id`、默认 `api_base_url`、服务商级 `custom_headers`、默认 `api_keys`、`retry` 重试策略，以及 `models` 接入项列表；每个接入项包含 `id`、关联 `model_id`、请求实际模型名 `model_alias`、全局枚举 `api_format`（允许值：`anthropic_messages` / `openai_responses` / `openai_chat_completions` / `gemini_generate_content` / `zhipu_chat_completions`）、自定义 JSON 字符串 `tool_choice` / `thinking` / `custom_request_params`、模型专属 `api_base_url`、模型专属 `custom_headers` 和模型专属 `api_keys`。服务商级 `api_keys`、模型接入项 `api_keys`、服务商模型接入项列表和执行策略候选项列表的顺序均有业务含义，SQLite 仓储必须通过 position 字段保序，前端保存时不得按名称、ID 或时间重新排序；API Key 数组顺序即运行时轮换优先级。领域规则：ID 需要满足跨平台文件名安全格式；保存服务商时校验接入项引用的模型元数据必须存在；删除模型元数据会阻止删除仍被服务商引用的模型；删除服务商会阻止删除仍被执行策略组引用的服务商；保存执行策略组时校验候选项引用的服务商模型接入项必须存在；接入项 ID 在同一服务商内不能重复；`api_format` 通过全局 `llm_api_protocol` 枚举校验并可推导 `sdk_platform`（`anthropic` / `openai` / `gemini` / `zhipu`）；`thinking` / `tool_choice` / `custom_request_params` 只校验 JSON 字符串合法性，不理解厂商语义；解析接入项时模型专属 base URL/API Keys 覆盖服务商默认值，headers 由服务商级与模型级合并且模型级同名覆盖。DDD 分层：领域实体 LlmModelMetadata / LlmProviderDefinition / LlmExecutionPolicy（聚合根）+ 值对象 LlmApiKey / LlmRetryPolicy / LlmProviderModelBinding / LlmExecutionPolicyCandidate + 仓储接口/SQLite 实现 + 领域服务 + 北向网关（Protocol + 请求模型 + 网关实现）+ CLI 适配器 + REST 适配器 + 工厂。CLI 命令：`spread-ai llm-registry models list/get/save/delete`、`spread-ai llm-registry providers list/get/save/delete`、`spread-ai llm-registry resolve`。REST：`/api/llm-registry/models`、`/api/llm-registry/providers`、`/api/llm-registry/execution-policies`、`/api/llm-registry/providers/{provider_id}/models/{binding_id}/resolved`。
+负责用户自定义的 LLM 模型型号元数据、服务商定义、服务商模型接入项和执行策略组管理。运行期权威数据存储在 `llm_model_registry.registry_dir/llm_model_registry.sqlite3`，legacy YAML 只作为一次性迁移输入。服务商级 API Key、模型接入项 API Key、模型接入项列表和执行策略候选项列表的顺序均有业务含义，仓储必须保序。对外管理入口是 REST `/api/llm-registry/models`、`/providers`、`/execution-policies` 与 provider model resolved 端点；list 支持 `summary=true`，provider/detail/resolved 默认脱敏 API Key，只有受控调用显式 `include_secrets=true` 才返回明文。
 
 ### 日志工作区与日志清理边界
 

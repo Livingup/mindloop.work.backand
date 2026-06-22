@@ -1,0 +1,9 @@
+{
+  "package_id": "spread-ai-config-management",
+  "managed_by": "spread-ai-runtime",
+  "version": "1.1.0",
+  "description": "Built-in Skill package for managing Spread AI configuration through the local Runtime REST API.",
+  "entrypoints": {
+    "windows_powershell": "scripts/manage-config.ps1"
+  }
+}

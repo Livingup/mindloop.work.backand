@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from agent_runtime.skill.builtin_skill_installer import (
+    BuiltinSkillInstaller,
+    BuiltinSkillInstallResult,
+)
 from agent_runtime.skill.infrastructure.skill_group_store import SkillGroupStore
 from agent_runtime.skill.north_gateway.skill_contracts import SkillInfo
 from agent_runtime.skill.settings_repository import SkillSettingsRepository
@@ -24,33 +28,28 @@ class SkillGatewayImpl:
         *,
         settings_repository: SkillSettingsRepository | None = None,
         default_skills_dir_accessor: Callable[[], str] | None = None,
+        builtin_skill_installer: BuiltinSkillInstaller | None = None,
     ) -> None:
         self._service = service
         self._group_store = group_store
         self._settings_repository = settings_repository
         self._default_skills_dir_accessor = default_skills_dir_accessor
+        self._builtin_skill_installer = builtin_skill_installer
 
     def list_skills(self) -> list[SkillInfo]:
         """列出所有已发现的 Skill（合并应用层分组）。"""
-        items = self._service.list_skills()
+        self.ensure_builtin_skills()
         groups = self._group_store.get_all()
-        return [
-            SkillInfo(
-                skill_id=item["skill_id"],
-                name=item["name"],
-                description=item["description"],
-                directory_path=item["directory_path"],
-                license=item.get("license"),
-                compatibility=item.get("compatibility"),
-                metadata=item.get("metadata", {}),
-                allowed_tools=item.get("allowed_tools"),
-                group=groups.get(item["skill_id"], SkillGroupStore.DEFAULT_GROUP),
-            )
-            for item in items
-        ]
+        return [self._to_skill_info(item, groups) for item in self._service.list_skills()]
+
+    def get_skill(self, skill_id: str) -> SkillInfo:
+        """根据 skill_id 获取 Skill 元数据详情。"""
+        self.ensure_builtin_skills()
+        groups = self._group_store.get_all()
+        return self._to_skill_info(self._service.get_skill(skill_id), groups)
 
     def refresh(self) -> None:
-        """触发重新扫描 Skill 仓库目录。"""
+        """内部/诊断用途：触发重新扫描 Skill 仓库目录。"""
         self._service.refresh()
 
     def get_settings(self):
@@ -64,6 +63,7 @@ class SkillGatewayImpl:
         if self._settings_repository is None:
             raise RuntimeError("Skill 设置仓储未初始化。")
         settings = self._settings_repository.save_settings(skills_dir=skills_dir)
+        self.ensure_builtin_skills(settings.skills_dir)
         self.refresh()
         return settings
 
@@ -72,16 +72,29 @@ class SkillGatewayImpl:
             raise RuntimeError("Skill 设置仓储未初始化。")
         return self._settings_repository.db_path()
 
+    def ensure_builtin_skills(self, skills_dir: str | None = None) -> list[BuiltinSkillInstallResult]:
+        """幂等安装/升级 Runtime 随包内置 Skill，并在变更后刷新仓库缓存。"""
+        if self._builtin_skill_installer is None:
+            return []
+        target_dir = skills_dir
+        if target_dir is None:
+            if self._settings_repository is None or self._default_skills_dir_accessor is None:
+                return []
+            target_dir = self._settings_repository.get_settings(
+                default_skills_dir=self._default_skills_dir_accessor(),
+            ).skills_dir
+        results = self._builtin_skill_installer.install_all(target_dir)
+        if any(result.changed for result in results):
+            self.refresh()
+        return results
+
     def set_skill_group(self, skill_id: str, group: str) -> None:
         """设置指定 Skill 的应用层分组。"""
         self._group_store.set_group(skill_id, group)
 
     def get_skill_content(self, skill_id: str) -> str:
         """读取指定 Skill 的 SKILL.md 正文（去除 frontmatter）。"""
-        items = self._service.list_skills()
-        target = next((s for s in items if s["skill_id"] == skill_id), None)
-        if target is None:
-            raise KeyError(f"Skill '{skill_id}' 不存在")
+        target = self._service.get_skill(skill_id)
 
         from pathlib import Path
 
@@ -91,6 +104,21 @@ class SkillGatewayImpl:
 
         content = skill_md.read_text(encoding="utf-8")
         return _strip_frontmatter(content)
+
+    @staticmethod
+    def _to_skill_info(item: dict[str, object], groups: dict[str, str]) -> SkillInfo:
+        skill_id = str(item["skill_id"])
+        return SkillInfo(
+            skill_id=skill_id,
+            name=str(item["name"]),
+            description=str(item["description"]),
+            directory_path=str(item["directory_path"]),
+            license=item.get("license") if isinstance(item.get("license"), str) else None,
+            compatibility=item.get("compatibility") if isinstance(item.get("compatibility"), str) else None,
+            metadata=item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {},
+            allowed_tools=item.get("allowed_tools") if isinstance(item.get("allowed_tools"), str) else None,
+            group=groups.get(skill_id, SkillGroupStore.DEFAULT_GROUP),
+        )
 
 
 def _strip_frontmatter(content: str) -> str:

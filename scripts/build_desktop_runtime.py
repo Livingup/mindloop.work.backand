@@ -48,6 +48,8 @@ def main() -> None:
         "psycopg",
         "--copy-metadata",
         "psycopg",
+        "--add-data",
+        f"{repo_root / 'builtin-skills'}{';' if sys.platform == 'win32' else ':'}builtin-skills",
         str(repo_root / "src" / "agent_runtime" / "desktop_server.py"),
     ]
     subprocess.run(command, cwd=repo_root, check=True)

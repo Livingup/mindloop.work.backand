@@ -17,7 +17,11 @@ class SkillRepository(Protocol):
     """
 
     def list_all(self) -> list[SkillDefinition]:
-        """列出所有已发现的 Skill。"""
+        """列出所有已发现的 Skill。实现应保证返回前完成必要的新鲜度检查。"""
+        ...
+
+    def get_by_id(self, skill_id: str) -> SkillDefinition:
+        """根据 skill_id 获取 Skill。实现应保证返回前完成必要的新鲜度检查。"""
         ...
 
     def scan(self) -> None:

@@ -24,7 +24,24 @@ def test_runtime_bootstrap_guard_promotes_same_process_after_durable_readiness(t
         ConfigRegistry.load(str(config_path), watch=False)
         app = create_app()
         with TestClient(app) as client:
-            blocked = client.get("/api/prompt-snippets")
+            unauthenticated_blocked = client.get("/api/prompt-snippets")
+            assert unauthenticated_blocked.status_code == 401
+            assert unauthenticated_blocked.json()["bootstrap_required"] is True
+
+            auth_response = client.post(
+                "/api/auth/bootstrap",
+                json={
+                    "username": "admin",
+                    "password": "StrongerPassw0rd!",
+                    "device_id": "pytest",
+                    "client_kind": "pytest",
+                },
+            )
+            assert auth_response.status_code == 200
+            token = auth_response.json()["access_token"]
+            auth_headers = {"Authorization": f"Bearer {token}"}
+
+            blocked = client.get("/api/prompt-snippets", headers=auth_headers)
             assert blocked.status_code == 503
             assert blocked.json()["bootstrap_required"] is True
 
@@ -33,7 +50,7 @@ def test_runtime_bootstrap_guard_promotes_same_process_after_durable_readiness(t
             health = client.get("/api/health")
             assert health.status_code == 200
 
-            promoted = client.get("/api/prompt-snippets")
+            promoted = client.get("/api/prompt-snippets", headers=auth_headers)
             assert promoted.status_code != 503
             assert promoted.status_code < 500
     finally:

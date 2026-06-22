@@ -366,29 +366,18 @@ class McpClientGateway(Protocol):
         ...
 ```
 
-#### CLI / REST 接口
+#### REST 接口
 
-**配置管理**（`spread-ai mcp-config`，纯本地 CRUD）：
+本模块不再提供 OS/system CLI。MCP 服务配置管理通过 Runtime REST `/api/mcp-config` 暴露给前端和内置 `spread-ai-config-management` Skill 脚本；远程 MCP 协议操作仍保留在 `/api/mcp`，但不属于公共配置管理脚本覆盖范围。
 
-| 能力 | CLI 命令 | REST API | 说明 |
-|---|---|---|---|
-| 列出已配置的 MCP 服务 | `spread-ai mcp-config list` | `GET /api/mcp/services` | 返回所有服务摘要 |
-| 查看服务配置详情 | `spread-ai mcp-config get <id>` | `GET /api/mcp/services/{id}` | 配置 + 连接状态 |
-| 添加 MCP 服务配置 | `spread-ai mcp-config add --file <yaml>` | `POST /api/mcp/services` | 写入 YAML 配置文件 |
-| 更新 MCP 服务配置 | `spread-ai mcp-config update <id> --file <yaml>` | `PUT /api/mcp/services/{id}` | 部分更新 |
-| 删除 MCP 服务配置 | `spread-ai mcp-config remove <id>` | `DELETE /api/mcp/services/{id}` | 删除 YAML + 断开连接 |
-| 启用服务 | `spread-ai mcp-config enable <id>` | — | 设置 enabled=true |
-| 禁用服务 | `spread-ai mcp-config disable <id>` | — | 设置 enabled=false |
-
-**协议操作**（`spread-ai mcp`，需连接远程服务）：
-
-| 能力 | CLI 命令 | REST API | 说明 |
-|---|---|---|---|
-| 查看服务能力 | `spread-ai mcp inspect <id>` | `GET /api/mcp/services/{id}/detail` | capabilities + instructions |
-| 列出服务工具 | `spread-ai mcp tools <id>` | `GET /api/mcp/services/{id}/tools` | 工具名称 + 描述 |
-| 查看工具参数 | `spread-ai mcp tool-detail <id> <tool> [tool2...]` | `GET /api/mcp/services/{id}/tools/{tool}` | 工具 inputSchema |
-| 列出资源 | `spread-ai mcp resources <id>` | `GET /api/mcp/services/{id}/resources` | 资源列表 |
-| 读取资源 | `spread-ai mcp read-resource <id> <uri>` | `POST /api/mcp/services/{id}/resources/read` | 资源内容 |
+| 能力 | REST API | 说明 |
+|---|---|---|
+| 列出已配置的 MCP 服务 | `GET /api/mcp-config/` | 返回所有服务摘要 |
+| 查看服务配置详情 | `GET /api/mcp-config/{id}` | 配置 + 连接状态 |
+| 添加 MCP 服务配置 | `POST /api/mcp-config/` | 写入服务配置 |
+| 更新 MCP 服务配置 | `PATCH /api/mcp-config/{id}` | 部分更新 |
+| 删除 MCP 服务配置 | `DELETE /api/mcp-config/{id}` | 删除配置 + 断开连接 |
+| 启用/禁用服务 | `POST /api/mcp-config/{id}/enable` / `disable` | 设置 enabled 状态 |
 
 ### 数据流
 
@@ -482,8 +471,7 @@ src/agent_runtime/mcp/mcp_client/
 │   ├── __init__.py
 │   ├── mcp_client_contracts.py         # 北向网关契约（McpClientGateway Protocol + DTO）
 │   ├── mcp_client_gateway_impl.py      # 网关实现
-│   ├── mcp_client_cli_adapter.py       # CLI 适配器：spread-ai mcp-config / mcp
-│   └── mcp_client_rest_adapter.py      # REST 适配器：/api/mcp/...
+│   └── mcp_client_rest_adapter.py      # REST 适配器：/api/mcp-config 与 /api/mcp
 └── mcp_client_factory.py               # 工厂：组装依赖
 ```
 

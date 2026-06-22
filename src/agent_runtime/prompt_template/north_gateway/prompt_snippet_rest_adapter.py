@@ -46,6 +46,11 @@ class SnippetUpdateBody(BaseModel):
     new_category: str | None = None
 
 
+class SnippetContentBody(BaseModel):
+    """提示词片段正文更新请求体。"""
+    text: str
+
+
 # ── 路由工厂 ─────────────────────────────────────────────────────
 
 
@@ -60,12 +65,17 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
     """
     router = APIRouter()
 
-    @router.get("/", response_model=list[SnippetResponse])
-    def list_snippets() -> list[SnippetResponse]:
-        """列出所有提示词片段摘要。"""
+    @router.get("/", response_model=list[dict])
+    def list_snippets(summary: bool = False) -> list[dict]:
+        """列出所有提示词片段；summary=true 时不返回正文。"""
         snippets = gateway.list_snippets()
+        if summary:
+            return [
+                SnippetSummaryResponse(name=s.name, category=s.category).model_dump()
+                for s in snippets
+            ]
         return [
-            SnippetResponse(name=s.name, text=s.text, category=s.category)
+            SnippetResponse(name=s.name, text=s.text, category=s.category).model_dump()
             for s in snippets
         ]
 
@@ -77,6 +87,33 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
         except KeyError:
             raise HTTPException(status_code=404, detail=f"提示词片段不存在: {name}")
         return SnippetResponse(name=snippet.name, text=snippet.text, category=snippet.category)
+
+    @router.get("/{name}/content", response_model=dict[str, str])
+    def get_snippet_content(name: str) -> dict[str, str]:
+        """获取提示词片段正文，供管理脚本按 ID 拉取长文本。"""
+        try:
+            snippet = gateway.get_snippet(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"提示词片段不存在: {name}")
+        return {"name": snippet.name, "text": snippet.text}
+
+    @router.put("/{name}/content", response_model=SnippetResponse)
+    def set_snippet_content(name: str, body: SnippetContentBody) -> SnippetResponse:
+        """仅替换提示词片段正文，不修改名称和分类。"""
+        try:
+            snippet = gateway.update_snippet(
+                PromptSnippetUpdateRequest(current_name=name, new_text=body.text),
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"提示词片段不存在: {name}")
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return SnippetResponse(name=snippet.name, text=snippet.text, category=snippet.category)
+
+    @router.patch("/{name}/content", response_model=SnippetResponse)
+    def patch_snippet_content(name: str, body: SnippetContentBody) -> SnippetResponse:
+        """仅替换提示词片段正文；PATCH 作为内容子资源的部分写入口。"""
+        return set_snippet_content(name, body)
 
     @router.post("/", response_model=SnippetResponse, status_code=201)
     def create_snippet(body: SnippetCreateBody) -> SnippetResponse:
@@ -114,6 +151,11 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
         except ValueError as e:
             raise HTTPException(status_code=409, detail=str(e))
         return SnippetResponse(name=snippet.name, text=snippet.text, category=snippet.category)
+
+    @router.patch("/{current_name}", response_model=SnippetResponse)
+    def patch_snippet(current_name: str, body: SnippetUpdateBody) -> SnippetResponse:
+        """部分更新提示词片段元数据或正文，语义与 PUT 保持一致。"""
+        return update_snippet(current_name, body)
 
     @router.delete("/{name}", status_code=204)
     def delete_snippet(name: str) -> None:

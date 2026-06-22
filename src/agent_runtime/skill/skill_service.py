@@ -30,6 +30,10 @@ class SkillService:
         skills = self._repo.list_all()
         return [self._to_dict(s) for s in skills]
 
+    def get_skill(self, skill_id: str) -> dict[str, Any]:
+        """根据 skill_id 获取单个 Skill 的完整元数据。"""
+        return self._to_dict(self._repo.get_by_id(skill_id))
+
     def refresh(self) -> None:
         """触发重新扫描 Skill 仓库目录。"""
         logger.info("触发 Skill 仓库重新扫描")
