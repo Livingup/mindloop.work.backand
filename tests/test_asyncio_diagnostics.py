@@ -102,6 +102,7 @@ def test_default_registry_isolates_selected_blocking_pools_with_bounded_pending_
         for pool in (
             BlockingPool.FILE_RESOURCE,
             BlockingPool.TERMINAL,
+            BlockingPool.TERMINAL_CONTROL,
             BlockingPool.TERMINAL_RENDER,
             BlockingPool.DB_BLOCKING,
             BlockingPool.NETWORK,
@@ -110,6 +111,12 @@ def test_default_registry_isolates_selected_blocking_pools_with_bounded_pending_
             assert pool_snapshot["isolated"] is True
             assert pool_snapshot["executor_pool"] == pool.value
             assert pool_snapshot["max_pending"] == pool_snapshot["max_workers"] * 4
+
+        terminal_read_snapshot = executors[BlockingPool.TERMINAL_READ.value]
+        assert terminal_read_snapshot["isolated"] is True
+        assert terminal_read_snapshot["executor_pool"] == BlockingPool.TERMINAL_READ.value
+        assert terminal_read_snapshot["max_pending"] == terminal_read_snapshot["max_workers"] * 2
+        assert terminal_read_snapshot["executor_pool"] != executors[BlockingPool.TERMINAL_CONTROL.value]["executor_pool"]
 
         cpu_render_snapshot = executors[BlockingPool.CPU_RENDER.value]
         assert cpu_render_snapshot["isolated"] is False

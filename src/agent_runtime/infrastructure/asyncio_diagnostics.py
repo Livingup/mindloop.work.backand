@@ -29,6 +29,8 @@ class BlockingPool(str, Enum):
 
     COMMUNICATION = "communication"
     TERMINAL = "terminal"
+    TERMINAL_READ = "terminal_read"
+    TERMINAL_CONTROL = "terminal_control"
     TERMINAL_RENDER = "terminal_render"
     CPU_RENDER = "cpu_render"
     FILE_RESOURCE = "file_resource"
@@ -133,6 +135,7 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
     default_workers = default_thread_pool_max_workers()
     io_workers = max(4, min(16, default_workers))
     terminal_workers = max(8, min(32, default_workers))
+    terminal_control_workers = max(4, min(8, default_workers))
     return {
         BlockingPool.DEFAULT.value: BlockingPoolConfig(
             pool_name=BlockingPool.DEFAULT.value,
@@ -152,6 +155,20 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
             thread_name_prefix="blocking-terminal",
             isolated=True,
             max_pending=terminal_workers * 4,
+        ),
+        BlockingPool.TERMINAL_READ.value: BlockingPoolConfig(
+            pool_name=BlockingPool.TERMINAL_READ.value,
+            max_workers=terminal_workers,
+            thread_name_prefix="blocking-terminal-read",
+            isolated=True,
+            max_pending=terminal_workers * 2,
+        ),
+        BlockingPool.TERMINAL_CONTROL.value: BlockingPoolConfig(
+            pool_name=BlockingPool.TERMINAL_CONTROL.value,
+            max_workers=terminal_control_workers,
+            thread_name_prefix="blocking-terminal-control",
+            isolated=True,
+            max_pending=terminal_control_workers * 4,
         ),
         BlockingPool.TERMINAL_RENDER.value: BlockingPoolConfig(
             pool_name=BlockingPool.TERMINAL_RENDER.value,

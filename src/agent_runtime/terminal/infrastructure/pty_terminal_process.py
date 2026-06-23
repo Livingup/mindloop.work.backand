@@ -23,6 +23,8 @@ from agent_runtime.terminal.terminal_process import (
 
 logger = logging.getLogger(__name__)
 _PTY_READ_CHUNK_SIZE = 4096
+_WINDOWS_PTY_CONTROL_TIMEOUT_SECONDS = 5.0
+_WINDOWS_PTY_CONTROL_SLOW_QUEUE_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -188,6 +190,13 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             try:
                 await _write_terminal(session, _command_input_text(request.command_line), operation="terminal.command.write")
             except asyncio.CancelledError:
+                session.active_command = None
+                if active.timeout_task is not None:
+                    get_runtime_task_registry().cancel(
+                        active.timeout_task,
+                        message="terminal command start cancelled",
+                        diagnostic_context={"terminal_id": request.terminal_id, "command_id": request.command_id},
+                    )
                 logger.warning(
                     "PTY command start cancelled while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
                     request.terminal_id,
@@ -380,7 +389,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     session.winpty,
                     operation="terminal.windows_pty.read",
                     caller="PtyTerminalProcessManager._watch_windows_terminal",
-                    pool=BlockingPool.TERMINAL,
+                    pool=BlockingPool.TERMINAL_READ,
                     log=logger,
                     diagnostic_context={
                         "terminal_id": session.terminal_id,
@@ -711,25 +720,14 @@ async def _write_terminal(session: _TerminalSession, text: str, *, operation: st
         )
         return
     if session.winpty is not None:
-        try:
-            await monitored_to_thread(
-                session.winpty.write,
-                text,
-                operation=operation,
-                caller="_write_terminal",
-                pool=BlockingPool.TERMINAL,
-                log=logger,
-                diagnostic_context={
-                    "terminal_id": session.terminal_id,
-                    "runtime_token": session.runtime_token,
-                    "active_command_id": _active_command_id(session),
-                    "payload_bytes": payload_bytes,
-                },
-            )
-        except BaseException as exc:
-            if _is_process_control_exception(exc):
-                raise
-            raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
+        await _run_windows_pty_control(
+            session,
+            session.winpty.write,
+            text,
+            operation=operation,
+            caller="_write_terminal",
+            diagnostic_context={"payload_bytes": payload_bytes},
+        )
         return
     raise KeyError(f"终端运行时不可写: {session.terminal_id}")
 
@@ -765,93 +763,31 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
             await session.process.wait()
     if session.winpty is not None:
         try:
-            await monitored_to_thread(
+            await _run_windows_pty_control(
+                session,
                 session.winpty.close,
                 True,
                 operation="terminal.windows_pty.close",
                 caller="_close_terminal_session",
-                pool=BlockingPool.TERMINAL,
-                log=logger,
-                diagnostic_context={
-                    "terminal_id": session.terminal_id,
-                    "runtime_token": session.runtime_token,
-                    "active_command_id": _active_command_id(session),
-                    "reason": reason,
-                    "close_signature": "close_true",
-                },
+                diagnostic_context={"reason": reason, "close_signature": "close_true"},
             )
         except TypeError:
             try:
-                await monitored_to_thread(
+                await _run_windows_pty_control(
+                    session,
                     session.winpty.close,
                     operation="terminal.windows_pty.close",
                     caller="_close_terminal_session",
-                    pool=BlockingPool.TERMINAL,
-                    log=logger,
-                    diagnostic_context={
-                        "terminal_id": session.terminal_id,
-                        "runtime_token": session.runtime_token,
-                        "active_command_id": _active_command_id(session),
-                        "reason": reason,
-                        "close_signature": "close_no_args",
-                    },
+                    diagnostic_context={"reason": reason, "close_signature": "close_no_args"},
                 )
             except BaseException as exc:
                 if _is_process_control_exception(exc):
                     raise
-                try:
-                    await monitored_to_thread(
-                        session.winpty.kill,
-                        operation="terminal.windows_pty.kill",
-                        caller="_close_terminal_session",
-                        pool=BlockingPool.TERMINAL,
-                        log=logger,
-                        diagnostic_context={
-                            "terminal_id": session.terminal_id,
-                            "runtime_token": session.runtime_token,
-                            "active_command_id": _active_command_id(session),
-                            "reason": reason,
-                            "after_close_error_type": exc.__class__.__name__,
-                        },
-                    )
-                except BaseException as kill_exc:
-                    if _is_process_control_exception(kill_exc):
-                        raise
-                    logger.warning(
-                        "Windows PTY kill after close TypeError fallback failed: terminal_id=%s reason=%s error_type=%s error=%s",
-                        session.terminal_id,
-                        reason,
-                        kill_exc.__class__.__name__,
-                        str(kill_exc),
-                    )
+                await _kill_windows_pty_after_close_failure(session, reason=reason, exc=exc)
         except BaseException as exc:
             if _is_process_control_exception(exc):
                 raise
-            try:
-                await monitored_to_thread(
-                    session.winpty.kill,
-                    operation="terminal.windows_pty.kill",
-                    caller="_close_terminal_session",
-                    pool=BlockingPool.TERMINAL,
-                    log=logger,
-                    diagnostic_context={
-                        "terminal_id": session.terminal_id,
-                        "runtime_token": session.runtime_token,
-                        "active_command_id": _active_command_id(session),
-                        "reason": reason,
-                        "after_close_error_type": exc.__class__.__name__,
-                    },
-                )
-            except BaseException as kill_exc:
-                if _is_process_control_exception(kill_exc):
-                    raise
-                logger.warning(
-                    "Windows PTY kill after close failure failed: terminal_id=%s reason=%s error_type=%s error=%s",
-                    session.terminal_id,
-                    reason,
-                    kill_exc.__class__.__name__,
-                    str(kill_exc),
-                )
+            await _kill_windows_pty_after_close_failure(session, reason=reason, exc=exc)
     logger.info(
         "PTY terminal close completed: terminal_id=%s runtime_token=%s reason=%s duration_ms=%s",
         session.terminal_id,
@@ -859,6 +795,95 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
         reason,
         int((time.perf_counter() - close_started_at) * 1000),
     )
+
+
+async def _run_windows_pty_control(
+    session: _TerminalSession,
+    func: Any,
+    /,
+    *args: Any,
+    operation: str,
+    caller: str,
+    diagnostic_context: dict[str, Any] | None = None,
+    timeout_seconds: float = _WINDOWS_PTY_CONTROL_TIMEOUT_SECONDS,
+    **kwargs: Any,
+) -> Any:
+    command_id = _active_command_id(session)
+    context = {
+        "terminal_id": session.terminal_id,
+        "runtime_token": session.runtime_token,
+        "active_command_id": command_id,
+        "command_id": command_id,
+        "timeout_seconds": timeout_seconds,
+    }
+    if diagnostic_context:
+        context.update(diagnostic_context)
+    try:
+        return await asyncio.wait_for(
+            monitored_to_thread(
+                func,
+                *args,
+                operation=operation,
+                caller=caller,
+                pool=BlockingPool.TERMINAL_CONTROL,
+                log=logger,
+                slow_queue_seconds=_WINDOWS_PTY_CONTROL_SLOW_QUEUE_SECONDS,
+                diagnostic_context=context,
+                **kwargs,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            "Windows PTY control operation timed out: terminal_id=%s runtime_token=%s command_id=%s operation=%s timeout_seconds=%s",
+            session.terminal_id,
+            session.runtime_token,
+            command_id,
+            operation,
+            timeout_seconds,
+        )
+        raise RuntimeError(
+            f"Windows PTY control operation timed out: operation={operation} "
+            f"terminal_id={session.terminal_id} timeout_seconds={timeout_seconds}"
+        ) from exc
+    except BaseException as exc:
+        if _is_process_control_exception(exc):
+            raise
+        if isinstance(exc, TypeError):
+            raise
+        raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
+
+
+async def _kill_windows_pty_after_close_failure(
+    session: _TerminalSession,
+    *,
+    reason: str,
+    exc: BaseException,
+    fallback: str = "close_failure",
+) -> None:
+    try:
+        await _run_windows_pty_control(
+            session,
+            session.winpty.kill,
+            operation="terminal.windows_pty.kill",
+            caller="_close_terminal_session",
+            diagnostic_context={
+                "reason": reason,
+                "fallback": fallback,
+                "after_close_error_type": exc.__class__.__name__,
+            },
+        )
+    except BaseException as kill_exc:
+        if _is_process_control_exception(kill_exc):
+            raise
+        logger.warning(
+            "Windows PTY kill after close failure failed: terminal_id=%s reason=%s fallback=%s error_type=%s error=%s",
+            session.terminal_id,
+            reason,
+            fallback,
+            kill_exc.__class__.__name__,
+            str(kill_exc),
+        )
 
 
 def _session_alive(session: _TerminalSession) -> bool:
