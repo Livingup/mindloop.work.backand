@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -96,7 +97,12 @@ class ImageGenerationService:
     def validate_policy(self, policy_group_id: str) -> None:
         self._require_usable_policy(policy_group_id)
 
-    async def generate_image(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+    async def generate_image(
+        self,
+        request: ImageGenerationRequest,
+        *,
+        tool_context: Any | None = None,
+    ) -> ImageGenerationResult:
         if not request.prompt.strip():
             raise ValueError("prompt must not be empty.")
         settings = self._settings_repository.get_settings()
@@ -105,6 +111,9 @@ class ImageGenerationService:
         policy = self._llm_registry_gateway.resolve_execution_policy(settings.llm_policy_group_id)
         request_body = self._build_request_body(request)
         use_edit_endpoint = "images" in request_body
+        internal_communication_context = _tool_internal_communication_context(tool_context)
+        event_publisher = getattr(tool_context, "event_publisher", None)
+        llm_call_id = f"llm-call-image-generation-{uuid.uuid4().hex}"
         last_error: Exception | None = None
         attempt_count = 0
         for candidate_index, candidate in enumerate(policy.candidates):
@@ -112,8 +121,10 @@ class ImageGenerationService:
             self._assert_supported_model(resolved)
             api_key_items = list(resolved.api_keys)
             api_keys: list[str | None] = [item.key for item in api_key_items] or [None]
+            tool_count = 1 if _is_gpt_image_agent_model(resolved) else 0
             max_retries = max(0, int(resolved.retry.max_retries_per_key))
             for api_key_index, raw_api_key in enumerate(api_keys):
+                api_key_name = api_key_items[api_key_index].name if api_key_index < len(api_key_items) else None
                 try:
                     api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
                 except Exception as exc:
@@ -122,6 +133,32 @@ class ImageGenerationService:
                 for retry_index in range(max_retries + 1):
                     attempt_count += 1
                     attempt_started_at = time.perf_counter()
+                    llm_request_id = _build_image_generation_llm_request_id(
+                        llm_call_id=llm_call_id,
+                        candidate_index=candidate_index,
+                        api_key_index=api_key_index,
+                        retry_index=retry_index,
+                    )
+                    request_payload = _build_image_generation_llm_request_payload(
+                        llm_call_id=llm_call_id,
+                        llm_request_id=llm_request_id,
+                        resolved=resolved,
+                        candidate_index=candidate_index,
+                        api_key_index=api_key_index,
+                        api_key_label=_image_generation_api_key_label(api_key_name),
+                        retry_index=retry_index,
+                        attempt_count=attempt_count,
+                        tool_count=tool_count,
+                        api_key_count=len(api_keys),
+                        tool_context=tool_context,
+                    )
+                    await _publish_internal_llm_event(
+                        event_publisher,
+                        internal_communication_context,
+                        "llm.request.started",
+                        request_payload,
+                        request,
+                    )
                     try:
                         if _is_gpt_image_agent_model(resolved):
                             response = await self._run_gpt_image_agent(
@@ -145,6 +182,28 @@ class ImageGenerationService:
                         images = self._ingest_images(response, output_format=str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT))
                         if not images:
                             raise RuntimeError("OpenAI Images API returned no image data.")
+                        elapsed_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+                        await _publish_internal_llm_event(
+                            event_publisher,
+                            internal_communication_context,
+                            "llm.response.started",
+                            {**request_payload, "content_type": "image_generation"},
+                            request,
+                        )
+                        await _publish_internal_llm_event(
+                            event_publisher,
+                            internal_communication_context,
+                            "llm.response.completed",
+                            {
+                                **request_payload,
+                                "assistant_part_count": len(images),
+                                "thinking_part_count": 0,
+                                "tool_use_part_count": tool_count,
+                                "duration_ms": elapsed_ms,
+                                "call_duration_ms": elapsed_ms,
+                            },
+                            request,
+                        )
                         logger.info(
                             "Image generation attempt succeeded: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s attempt_count=%s elapsed_ms=%s",
                             settings.llm_policy_group_id,
@@ -154,7 +213,7 @@ class ImageGenerationService:
                             api_key_index,
                             retry_index,
                             attempt_count,
-                            int((time.perf_counter() - attempt_started_at) * 1000),
+                            elapsed_ms,
                         )
                         return ImageGenerationResult(
                             images=tuple(images),
@@ -170,6 +229,25 @@ class ImageGenerationService:
                         )
                     except Exception as exc:
                         last_error = exc
+                        elapsed_ms = int((time.perf_counter() - attempt_started_at) * 1000)
+                        will_retry = retry_index < max_retries
+                        await _publish_internal_llm_event(
+                            event_publisher,
+                            internal_communication_context,
+                            "llm.request.failed",
+                            {
+                                **request_payload,
+                                "error_type": exc.__class__.__name__,
+                                "error_message": str(exc),
+                                "failed_stage": "image_generation",
+                                "partial_response": False,
+                                "retryable": will_retry,
+                                "will_retry": will_retry,
+                                "final": not will_retry,
+                                "duration_ms": elapsed_ms,
+                            },
+                            request,
+                        )
                         logger.warning(
                             "Image generation attempt failed: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s max_retries=%s attempt_count=%s elapsed_ms=%s error=%s: %s",
                             settings.llm_policy_group_id,
@@ -180,7 +258,7 @@ class ImageGenerationService:
                             retry_index,
                             max_retries,
                             attempt_count,
-                            int((time.perf_counter() - attempt_started_at) * 1000),
+                            elapsed_ms,
                             exc.__class__.__name__,
                             exc,
                         )
@@ -317,6 +395,99 @@ class ImageGenerationService:
             input_items.extend(_replayable_gpt_image_agent_output_items(raw_response))
             input_items.append(_build_gpt_image_agent_continue_input(round_index))
         raise RuntimeError(f"gpt-5.5 image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
+
+
+def _tool_internal_linkage_payload(tool_context: Any | None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"execution_scope": "tool_internal"}
+    for attr_name, payload_key in (
+        ("parent_tool_call_id", "parent_tool_call_id"),
+        ("tool_name", "tool_name"),
+        ("parent_llm_request_id", "parent_llm_request_id"),
+        ("parent_llm_call_id", "parent_llm_call_id"),
+    ):
+        value = getattr(tool_context, attr_name, None)
+        if value is not None:
+            payload[payload_key] = value
+    return payload
+
+
+def _tool_internal_communication_context(tool_context: Any | None) -> Any | None:
+    communication_context = getattr(tool_context, "communication_context", None)
+    if communication_context is None:
+        return None
+    with_metadata = getattr(communication_context, "with_metadata", None)
+    if not callable(with_metadata):
+        return communication_context
+    return with_metadata(**_tool_internal_linkage_payload(tool_context))
+
+
+def _build_image_generation_llm_request_id(
+    *,
+    llm_call_id: str,
+    candidate_index: int,
+    api_key_index: int,
+    retry_index: int,
+) -> str:
+    return f"{llm_call_id}:candidate-{candidate_index}:key-{api_key_index}:retry-{retry_index}"
+
+
+def _build_image_generation_llm_request_payload(
+    *,
+    llm_call_id: str,
+    llm_request_id: str,
+    resolved: ResolvedLlmProviderModel,
+    candidate_index: int,
+    api_key_index: int,
+    api_key_label: str | None,
+    retry_index: int,
+    attempt_count: int,
+    tool_count: int,
+    api_key_count: int,
+    tool_context: Any | None,
+) -> dict[str, Any]:
+    return {
+        "llm_call_id": llm_call_id,
+        "llm_request_id": llm_request_id,
+        "candidate_index": candidate_index,
+        "provider_id": resolved.provider_id,
+        "binding_id": resolved.binding_id,
+        "model_id": resolved.model_id,
+        "model_alias": resolved.model_alias,
+        "api_format": resolved.api_format,
+        "api_key_index": api_key_index,
+        "api_key_label": api_key_label,
+        "retry_index": retry_index,
+        "attempt_count": attempt_count,
+        "tool_count": tool_count,
+        "api_key_count": api_key_count,
+        **_tool_internal_linkage_payload(tool_context),
+    }
+
+
+def _image_generation_api_key_label(api_key_name: str | None) -> str | None:
+    normalized = api_key_name.strip() if isinstance(api_key_name, str) else ""
+    return normalized or None
+
+
+async def _publish_internal_llm_event(
+    event_publisher: Any | None,
+    communication_context: Any | None,
+    event_type: str,
+    payload: dict[str, Any],
+    request: ImageGenerationRequest,
+) -> None:
+    if event_publisher is None or communication_context is None:
+        return
+    try:
+        await event_publisher.publish(
+            communication_context,
+            event_type,
+            payload,
+            source="image_generation",
+            metadata={"conversation_id": request.relay_session_id},
+        )
+    except Exception:
+        logger.exception("Failed to publish image generation internal LLM event: event_type=%s", event_type)
 
 
 def _bounded_count(value: int) -> int:

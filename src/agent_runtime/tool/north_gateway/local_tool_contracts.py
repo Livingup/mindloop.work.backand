@@ -129,6 +129,12 @@ class ToolExecuteRequest(BaseToolRequest):
     )
     trace_id: str | None = PydanticField(default=None, description="执行链路追踪标识。")
     communication_stream_id: str | None = PydanticField(default=None, description="所属通信流标识。")
+    parent_tool_call_id: str | None = PydanticField(default=None, description="当前工具调用 ID，供工具内部请求回链父级工具调用。")
+    parent_llm_request_id: str | None = PydanticField(default=None, description="触发当前工具调用的父级 LLM request 标识。")
+    parent_llm_call_id: str | None = PydanticField(default=None, description="触发当前工具调用的父级 LLM call 标识。")
+    execution_scope: str | None = PydanticField(default=None, description="当前工具事件的执行归属范围。")
+    communication_context: Any | None = PydanticField(default=None, exclude=True, description="原始 RuntimeCommunicationContext，仅供本地工具运行态透传使用。")
+    event_publisher: Any | None = PydanticField(default=None, exclude=True, description="运行时事件发布器，仅供本地工具内部请求发布 scene 事件使用。")
 
     def __init__(
         self,

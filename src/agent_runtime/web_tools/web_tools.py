@@ -51,7 +51,8 @@ async def web_search(request: WebSearchToolRequest, ctx: ToolRuntimeContext) -> 
                 allowed_domains=tuple(request.allowed_domains),
                 blocked_domains=tuple(request.blocked_domains),
                 recency=request.recency,
-            )
+            ),
+            tool_context=ctx
         )
     except Exception as exc:
         return build_tool_error_result(
@@ -75,7 +76,8 @@ async def read_url_context(request: ReadUrlContextToolRequest, ctx: ToolRuntimeC
                 additional_urls=tuple(request.additional_urls),
                 question=request.question,
                 max_summary_tokens=request.max_summary_tokens,
-            )
+            ),
+            tool_context=ctx
         )
     except Exception as exc:
         return build_tool_error_result(

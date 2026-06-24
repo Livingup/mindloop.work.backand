@@ -75,6 +75,13 @@ class ToolRuntimeContext(BaseModel):
     )
     trace_id: str | None = Field(default=None, description="执行链路追踪标识。")
     communication_stream_id: str | None = Field(default=None, description="所属通信流标识。")
+    tool_name: str | None = Field(default=None, description="当前工具名称，由调度器注入。")
+    parent_tool_call_id: str | None = Field(default=None, description="当前工具调用 ID，供工具内部请求回链父级工具调用。")
+    parent_llm_request_id: str | None = Field(default=None, description="触发当前工具调用的父级 LLM request 标识。")
+    parent_llm_call_id: str | None = Field(default=None, description="触发当前工具调用的父级 LLM call 标识。")
+    execution_scope: str | None = Field(default=None, description="执行归属范围，例如 agent_loop 或 tool_internal。")
+    communication_context: Any | None = Field(default=None, description="原始 RuntimeCommunicationContext，仅供工具内部运行态透传使用。")
+    event_publisher: Any | None = Field(default=None, description="运行时事件发布器，仅供工具内部请求发布 scene 事件使用。")
 
 
 class BaseToolResult(BaseModel):

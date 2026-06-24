@@ -127,6 +127,7 @@ class AgentToolDispatcher:
         started_at = time.perf_counter()
         metadata = communication_context.metadata if communication_context is not None else {}
         instance_id = str(metadata.get("agent_instance_id") or "")
+        tool_linkage_payload = _tool_linkage_payload(communication_context)
         if instance_id:
             self._execution_loop_logger.record_step(
                 instance_id=instance_id,
@@ -160,6 +161,7 @@ class AgentToolDispatcher:
                 "tool_source": source,
                 "input": tool_use.input,
                 "arguments_preview": _preview_arguments(tool_use.input),
+                **tool_linkage_payload,
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -216,6 +218,7 @@ class AgentToolDispatcher:
                         "error_type": exc.__class__.__name__,
                         "error_message": str(exc),
                     },
+                    **tool_linkage_payload,
                 },
                 source="tool_dispatcher",
                 correlation_id=tool_call_id,
@@ -267,6 +270,7 @@ class AgentToolDispatcher:
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "result_preview": _preview_tool_result(result.tool_result),
                 "ui_preview": _preview_tool_ui(result.tool_result),
+                **tool_linkage_payload,
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -320,6 +324,12 @@ class AgentToolDispatcher:
                 communication_stream_id=(
                     communication_context.stream_id if communication_context is not None else None
                 ),
+                parent_tool_call_id=_tool_use_ref(tool_use),
+                parent_llm_request_id=metadata.get("parent_llm_request_id"),
+                parent_llm_call_id=metadata.get("parent_llm_call_id"),
+                execution_scope=metadata.get("execution_scope") or "agent_loop",
+                communication_context=communication_context,
+                event_publisher=self._event_publisher,
             ),
         )
         return ToolDispatchResult(
@@ -512,6 +522,22 @@ def _ensure_dict_arguments(value: Any) -> dict[str, Any]:
     if value is None:
         return {}
     return {"input": value}
+
+
+def _tool_linkage_payload(communication_context: RuntimeCommunicationContext | None) -> dict[str, Any]:
+    metadata = communication_context.metadata if communication_context is not None else {}
+    payload: dict[str, Any] = {}
+    for key in (
+        "execution_scope",
+        "parent_tool_call_id",
+        "tool_name",
+        "parent_llm_request_id",
+        "parent_llm_call_id",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 def _tool_use_ref(tool_use: ToolUsePart) -> str:

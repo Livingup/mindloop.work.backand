@@ -284,6 +284,8 @@ class _PromptWithConversationResult:
     conversation: Any
     instance: AgentInstance
     conversation_history_copy_message_count: int
+    llm_call_id: str | None
+    llm_request_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1688,6 +1690,11 @@ class AgentExecutionEngine:
                 )
 
                 tool_uses = _extract_tool_uses(assistant_message)
+                tool_communication_context = communication_context.with_metadata(
+                    parent_llm_call_id=prompt_result.llm_call_id,
+                    parent_llm_request_id=prompt_result.llm_request_id,
+                    execution_scope="agent_loop",
+                )
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     frame_id=current_frame_id,
@@ -1708,7 +1715,7 @@ class AgentExecutionEngine:
                     if tool_uses:
                         tool_result_message, tool_results = await self._build_interrupted_tool_results(
                             tool_uses,
-                            communication_context,
+                            tool_communication_context,
                             interrupt_state=interrupt_state,
                             phase="before_tool_start",
                         )
@@ -1875,7 +1882,7 @@ class AgentExecutionEngine:
                     self._execute_tool_uses(
                         agent_definition,
                         tool_uses,
-                        communication_context,
+                        tool_communication_context,
                         conversation_id=conversation.id,
                         assistant_message_index=assistant_message_index,
                         interrupt_state=interrupt_state,
@@ -2854,6 +2861,8 @@ class AgentExecutionEngine:
                     conversation=conversation,
                     instance=instance,
                     conversation_history_copy_message_count=conversation_history_copy_message_count,
+                    llm_call_id=response.llm_call_id or llm_call_id,
+                    llm_request_id=response.llm_request_id,
                 )
             except LlmRequestCancelled:
                 raise
@@ -3486,10 +3495,14 @@ class AgentExecutionEngine:
             )
         running_tools: list[dict[str, Any]] = []
         for tool_use in tool_uses:
+            tool_communication_context = communication_context.with_metadata(
+                parent_tool_call_id=_tool_use_ref(tool_use),
+                tool_name=tool_use.name,
+            )
             if interrupt_state.requested:
                 cancelled_result = await self._build_cancelled_tool_dispatch_result(
                     tool_use,
-                    communication_context,
+                    tool_communication_context,
                     interrupt_state=interrupt_state,
                     phase="not_started",
                 )
@@ -3541,7 +3554,7 @@ class AgentExecutionEngine:
             tool_task = asyncio.create_task(self._execute_single_tool_use(
                 definition,
                 tool_use,
-                communication_context,
+                tool_communication_context,
             ))
             tasks.append((tool_use, tool_task))
         if tasks:
