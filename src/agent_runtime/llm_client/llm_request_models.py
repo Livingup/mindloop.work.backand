@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent_runtime.conversation_message.message.models import Conversation, UniMessage
-from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext, RuntimeEventPublisher
+from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
 )
@@ -65,9 +65,6 @@ class LlmPromptRequest:
     # 可选运行时通信上下文。LLM 请求服务在关键节点通过该上下文发布实时事件。
     communication_context: RuntimeCommunicationContext | None = None
 
-    # 可选按请求指定的事件发布器。用于工具内部请求复用共享 LLM 服务时仍能发布 scene 事件。
-    event_publisher: RuntimeEventPublisher | None = None
-
     llm_call_id: str | None = None
 
     candidate_index: int = 0
@@ -110,7 +107,3 @@ class LlmPromptResponse:
     model_id: str | None = None
 
     model_alias: str | None = None
-
-    llm_call_id: str | None = None
-
-    llm_request_id: str | None = None

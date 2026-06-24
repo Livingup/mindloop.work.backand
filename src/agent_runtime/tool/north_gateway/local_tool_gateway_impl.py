@@ -80,13 +80,6 @@ class LocalToolGatewayImpl:
             conversation_history_copy_message_count=request.conversation_history_copy_message_count,
             trace_id=request.trace_id,
             communication_stream_id=request.communication_stream_id,
-            tool_name=request.tool_name,
-            parent_tool_call_id=request.parent_tool_call_id or request.request_id,
-            parent_llm_request_id=request.parent_llm_request_id,
-            parent_llm_call_id=request.parent_llm_call_id,
-            execution_scope=request.execution_scope,
-            communication_context=request.communication_context,
-            event_publisher=request.event_publisher,
         )
         if self._execution_loop_logger is not None and request.agent_instance_id:
             self._execution_loop_logger.record_step(

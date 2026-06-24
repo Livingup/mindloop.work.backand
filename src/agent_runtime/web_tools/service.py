@@ -76,7 +76,7 @@ class WebToolsService:
     def supported_api_formats(self) -> tuple[str, ...]:
         return self._adapter_registry.supported_api_formats()
 
-    async def web_search(self, request: WebSearchRequest, tool_context: Any | None = None) -> WebToolResult:
+    async def web_search(self, request: WebSearchRequest) -> WebToolResult:
         queries = _normalize_text_batch(
             request.query,
             request.additional_queries,
@@ -99,7 +99,7 @@ class WebToolsService:
             for query in queries
         )
         if len(requests) == 1:
-            return await self._execute_single("web_search", requests[0], tool_context)
+            return await self._execute_single("web_search", requests[0])
         return await self._execute_batch(
             "web_search",
             WebSearchRequest(
@@ -111,10 +111,9 @@ class WebToolsService:
                 recency=recency,
             ),
             requests,
-            tool_context,
         )
 
-    async def read_url_context(self, request: ReadUrlContextRequest, tool_context: Any | None = None) -> WebToolResult:
+    async def read_url_context(self, request: ReadUrlContextRequest) -> WebToolResult:
         urls = _normalize_text_batch(
             request.url,
             request.additional_urls,
@@ -135,7 +134,7 @@ class WebToolsService:
             for url in urls
         )
         if len(requests) == 1:
-            return await self._execute_single("read_url_context", requests[0], tool_context)
+            return await self._execute_single("read_url_context", requests[0])
         return await self._execute_batch(
             "read_url_context",
             ReadUrlContextRequest(
@@ -145,7 +144,6 @@ class WebToolsService:
                 max_summary_tokens=request.max_summary_tokens,
             ),
             requests,
-            tool_context,
         )
 
     async def _execute_batch(
@@ -153,13 +151,12 @@ class WebToolsService:
         operation: WebToolOperation,
         batch_request: WebSearchRequest | ReadUrlContextRequest,
         requests: tuple[WebSearchRequest | ReadUrlContextRequest, ...],
-        tool_context: Any | None,
     ) -> WebToolResult:
         semaphore = asyncio.Semaphore(WEB_TOOL_BATCH_CONCURRENCY)
 
         async def run_one(item: WebSearchRequest | ReadUrlContextRequest) -> WebToolResult:
             async with semaphore:
-                return await self._execute_single(operation, item, tool_context)
+                return await self._execute_single(operation, item)
 
         outputs = await asyncio.gather(*(run_one(item) for item in requests), return_exceptions=True)
         return _merge_batch_results(operation, batch_request, requests, outputs)
@@ -168,7 +165,6 @@ class WebToolsService:
         self,
         operation: WebToolOperation,
         request: WebSearchRequest | ReadUrlContextRequest,
-        tool_context: Any | None,
     ) -> WebToolResult:
         resolved_candidates = self._resolve_enabled_candidates()
         last_error: Exception | None = None
@@ -182,15 +178,13 @@ class WebToolsService:
                     [TextPart(text=_build_user_prompt(operation, request))],
                     [TextPartMeta()],
                 )
-                communication_context = _tool_internal_communication_context(tool_context, operation)
                 response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
                         conversation=conversation,
                         resolved_model=resolved,
                         system_prompt=build_web_tool_system_prompt(operation),
                         request_overrides=request_overrides,
-                        communication_context=communication_context,
-                        event_publisher=getattr(tool_context, "event_publisher", None),
+                        communication_context=None,
                         llm_call_id=None,
                         candidate_index=candidate_index,
                         next_resolved_model=(
@@ -245,22 +239,6 @@ class WebToolsService:
             candidate.model_binding_id,
         )
         self._adapter_registry.get(resolved.api_format)
-
-
-def _tool_internal_communication_context(tool_context: Any | None, operation: WebToolOperation) -> Any | None:
-    communication_context = getattr(tool_context, "communication_context", None)
-    if communication_context is None:
-        return None
-    with_metadata = getattr(communication_context, "with_metadata", None)
-    if not callable(with_metadata):
-        return communication_context
-    return with_metadata(
-        execution_scope="tool_internal",
-        parent_tool_call_id=getattr(tool_context, "parent_tool_call_id", None) or getattr(tool_context, "request_id", None),
-        tool_name=getattr(tool_context, "tool_name", None) or operation,
-        parent_llm_request_id=getattr(tool_context, "parent_llm_request_id", None),
-        parent_llm_call_id=getattr(tool_context, "parent_llm_call_id", None),
-    )
 
 
 def _build_user_prompt(

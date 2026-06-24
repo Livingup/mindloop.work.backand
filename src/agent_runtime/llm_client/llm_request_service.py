@@ -178,7 +178,6 @@ class LlmRequestService:
         if not api_keys:
             api_keys = [None]
 
-        event_publisher = request.event_publisher or self._event_publisher
         llm_call_id = request.llm_call_id or f"llm-call-{uuid.uuid4().hex}"
         call_started_at = time.perf_counter()
         attempt_count = 0
@@ -212,9 +211,8 @@ class LlmRequestService:
                     attempt_count=attempt_count,
                     tool_count=len(tool_schemas),
                     api_key_count=len(api_keys),
-                    execution_linkage=_llm_execution_linkage_payload(request),
                 )
-                await event_publisher.publish(
+                await self._event_publisher.publish(
                     request.communication_context,
                     "llm.request.started",
                     request_payload,
@@ -244,7 +242,7 @@ class LlmRequestService:
                     "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                     **retry_target,
                 }
-                await event_publisher.publish(
+                await self._event_publisher.publish(
                     request.communication_context,
                     "llm.request.failed",
                     failed_payload,
@@ -264,9 +262,8 @@ class LlmRequestService:
                 attempt_count=attempt_count,
                 tool_count=len(tool_schemas),
                 api_key_count=len(api_keys),
-                execution_linkage=_llm_execution_linkage_payload(request),
             )
-            await event_publisher.publish(
+            await self._event_publisher.publish(
                 request.communication_context,
                 "llm.request.started",
                 request_payload,
@@ -298,9 +295,8 @@ class LlmRequestService:
                         attempt_count=attempt_count,
                         tool_count=len(tool_schemas),
                         api_key_count=len(api_keys),
-                        execution_linkage=_llm_execution_linkage_payload(request),
                     )
-                    await event_publisher.publish(
+                    await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.started",
                         request_payload,
@@ -317,7 +313,7 @@ class LlmRequestService:
                 conversation_state_snapshot = copy.deepcopy(request.conversation.state)
                 try:
                     stream_event_handler = _build_stream_event_handler(
-                        publisher=event_publisher,
+                        publisher=self._event_publisher,
                         context=request.communication_context,
                         event_loop=asyncio.get_running_loop(),
                         conversation_id=request.conversation.id,
@@ -335,7 +331,6 @@ class LlmRequestService:
                         retry_index=retry_index,
                         attempt_count=attempt_count,
                         stream_state=stream_state,
-                        execution_linkage=_llm_execution_linkage_payload(request),
                     )
                     raw_response = await _await_client_request(
                         client.request(
@@ -366,7 +361,7 @@ class LlmRequestService:
                     if not stream_state.get("response_started"):
                         stream_state["response_started"] = True
                         response_started_payload = {**request_payload, "content_type": None}
-                        await event_publisher.publish(
+                        await self._event_publisher.publish(
                             request.communication_context,
                             "llm.response.started",
                             response_started_payload,
@@ -403,7 +398,7 @@ class LlmRequestService:
                         "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                         "reason": str(exc) or "LLM request cancelled.",
                     }
-                    await event_publisher.publish(
+                    await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.cancelled",
                         cancelled_payload,
@@ -449,7 +444,7 @@ class LlmRequestService:
                         "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                         **retry_target,
                     }
-                    await event_publisher.publish(
+                    await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.failed",
                         failed_payload,
@@ -473,7 +468,7 @@ class LlmRequestService:
                         "token_usage": token_usage,
                         "context_window_max": resolved.context_window,
                     }
-                    await event_publisher.publish(
+                    await self._event_publisher.publish(
                         request.communication_context,
                         "llm.response.completed",
                         completed_payload,
@@ -492,12 +487,10 @@ class LlmRequestService:
                         binding_id=resolved.binding_id,
                         model_id=resolved.model_id,
                         model_alias=resolved.model_alias,
-                        llm_call_id=llm_call_id,
-                        llm_request_id=llm_request_id,
                     )
         if last_error is not None:
             if request.next_resolved_model is None:
-                await event_publisher.publish(
+                await self._event_publisher.publish(
                     request.communication_context,
                     "llm.call.failed",
                     {
@@ -507,7 +500,6 @@ class LlmRequestService:
                         "error_type": last_error.__class__.__name__,
                         "error_message": str(last_error),
                         "duration_ms": int((time.perf_counter() - call_started_at) * 1000),
-                        **_llm_execution_linkage_payload(request),
                     },
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
@@ -607,7 +599,6 @@ def _build_request_attempt_payload(
     attempt_count: int,
     tool_count: int,
     api_key_count: int,
-    execution_linkage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "llm_call_id": llm_call_id,
@@ -624,25 +615,7 @@ def _build_request_attempt_payload(
         "attempt_count": attempt_count,
         "tool_count": tool_count,
         "api_key_count": api_key_count,
-        **(execution_linkage or {}),
     }
-
-
-def _llm_execution_linkage_payload(request: LlmPromptRequest) -> dict[str, Any]:
-    communication_context = request.communication_context
-    metadata = communication_context.metadata if communication_context is not None else {}
-    payload: dict[str, Any] = {}
-    for key in (
-        "execution_scope",
-        "parent_tool_call_id",
-        "tool_name",
-        "parent_llm_request_id",
-        "parent_llm_call_id",
-    ):
-        value = metadata.get(key)
-        if value is not None:
-            payload[key] = value
-    return payload
 
 
 def _build_retry_target_payload(
@@ -768,7 +741,6 @@ def _build_stream_event_handler(
     retry_index: int,
     attempt_count: int,
     stream_state: dict[str, bool],
-    execution_linkage: dict[str, Any] | None,
 ) -> Callable[[dict[str, Any]], None]:
     semantic_parser = LlmSemanticStreamParser(api_format)
 
@@ -788,7 +760,6 @@ def _build_stream_event_handler(
             "api_key_label": api_key_label,
             "retry_index": retry_index,
             "attempt_count": attempt_count,
-            **(execution_linkage or {}),
         }
         events_to_publish: list[tuple[str, dict[str, Any]]] = []
         if event_type == "llm.response.stream.started":

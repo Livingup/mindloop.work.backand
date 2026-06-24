@@ -67,8 +67,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
             mask_path=request.mask_path,
             input_fidelity=request.input_fidelity,
             relay_session_id=ctx.conversation_id,
-        ),
-        tool_context=ctx,
+        )
     )
     resources = [
         {
