@@ -40,6 +40,10 @@ class LlmRuntimeEventPublishAdmissionLimits:
     global_reserved_control_count: int = 128
     global_max_pending_bytes: int = 16 * 1024 * 1024
     global_reserved_control_bytes: int = 2 * 1024 * 1024
+    # Oversized payloads cannot be charged against the byte budget, so cap their
+    # simultaneous inline publishes separately across every request on one loop.
+    global_max_oversized_inline_count: int = 8
+    global_reserved_control_oversized_inline_count: int = 2
 
     def __post_init__(self) -> None:
         _validate_limit_pair(
@@ -62,6 +66,11 @@ class LlmRuntimeEventPublishAdmissionLimits:
             self.global_max_pending_bytes,
             self.global_reserved_control_bytes,
         )
+        _validate_limit_pair(
+            "global oversized inline count",
+            self.global_max_oversized_inline_count,
+            self.global_reserved_control_oversized_inline_count,
+        )
 
     @property
     def request_content_pending_count(self) -> int:
@@ -78,6 +87,13 @@ class LlmRuntimeEventPublishAdmissionLimits:
     @property
     def global_content_pending_bytes(self) -> int:
         return self.global_max_pending_bytes - self.global_reserved_control_bytes
+
+    @property
+    def global_content_oversized_inline_count(self) -> int:
+        return (
+            self.global_max_oversized_inline_count
+            - self.global_reserved_control_oversized_inline_count
+        )
 
 
 DEFAULT_LLM_RUNTIME_EVENT_PUBLISH_ADMISSION_LIMITS = LlmRuntimeEventPublishAdmissionLimits()
@@ -185,9 +201,73 @@ class _GlobalRuntimeEventPublishBudget:
         )
 
 
+class _GlobalOversizedRuntimeEventPublishAdmission:
+    """One event-loop-wide token gate for payloads larger than byte admission allows."""
+
+    def __init__(self, limits: LlmRuntimeEventPublishAdmissionLimits) -> None:
+        self._limits = limits
+        self._condition = asyncio.Condition()
+        self._active_count = 0
+        self._active_content_count = 0
+        self._active_control_count = 0
+        self._peak_active_count = 0
+        self._wait_count = 0
+        self._admitted_count = 0
+
+    async def acquire(self, *, is_control: bool) -> tuple[bool, dict[str, Any]]:
+        waited = False
+        async with self._condition:
+            while not self._fits(is_control=is_control):
+                if not waited:
+                    waited = True
+                    self._wait_count += 1
+                await self._condition.wait()
+            self._active_count += 1
+            if is_control:
+                self._active_control_count += 1
+            else:
+                self._active_content_count += 1
+            self._peak_active_count = max(self._peak_active_count, self._active_count)
+            self._admitted_count += 1
+            return waited, self.snapshot()
+
+    async def release(self, *, is_control: bool) -> dict[str, Any]:
+        async with self._condition:
+            self._active_count = max(0, self._active_count - 1)
+            if is_control:
+                self._active_control_count = max(0, self._active_control_count - 1)
+            else:
+                self._active_content_count = max(0, self._active_content_count - 1)
+            snapshot = self.snapshot()
+            self._condition.notify_all()
+            return snapshot
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "active_count": self._active_count,
+            "active_content_count": self._active_content_count,
+            "active_control_count": self._active_control_count,
+            "peak_active_count": self._peak_active_count,
+            "wait_count": self._wait_count,
+            "admitted_count": self._admitted_count,
+            "max_active_count": self._limits.global_max_oversized_inline_count,
+            "reserved_control_count": self._limits.global_reserved_control_oversized_inline_count,
+        }
+
+    def _fits(self, *, is_control: bool) -> bool:
+        limit = (
+            self._limits.global_max_oversized_inline_count
+            if is_control
+            else self._limits.global_content_oversized_inline_count
+        )
+        return self._active_count < limit
+
+
 _GLOBAL_BUDGETS_LOCK = threading.RLock()
 _GLOBAL_BUDGETS: weakref.WeakSet[_GlobalRuntimeEventPublishBudget] = weakref.WeakSet()
+_GLOBAL_OVERSIZED_INLINE_ADMISSIONS: weakref.WeakSet[_GlobalOversizedRuntimeEventPublishAdmission] = weakref.WeakSet()
 _LOOP_BUDGETS_ATTRIBUTE = "_agent_runtime_llm_publish_budgets"
+_LOOP_OVERSIZED_INLINE_ADMISSIONS_ATTRIBUTE = "_agent_runtime_llm_publish_oversized_inline_admissions"
 
 
 def _global_budget_for_running_loop(
@@ -207,10 +287,28 @@ def _global_budget_for_running_loop(
         return budget
 
 
+def _global_oversized_inline_admission_for_running_loop(
+    limits: LlmRuntimeEventPublishAdmissionLimits,
+) -> _GlobalOversizedRuntimeEventPublishAdmission:
+    loop = asyncio.get_running_loop()
+    with _GLOBAL_BUDGETS_LOCK:
+        admissions_by_limits = getattr(loop, _LOOP_OVERSIZED_INLINE_ADMISSIONS_ATTRIBUTE, None)
+        if admissions_by_limits is None:
+            admissions_by_limits = {}
+            setattr(loop, _LOOP_OVERSIZED_INLINE_ADMISSIONS_ATTRIBUTE, admissions_by_limits)
+        admission = admissions_by_limits.get(limits)
+        if admission is None:
+            admission = _GlobalOversizedRuntimeEventPublishAdmission(limits)
+            admissions_by_limits[limits] = admission
+            _GLOBAL_OVERSIZED_INLINE_ADMISSIONS.add(admission)
+        return admission
+
+
 def llm_runtime_event_publish_admission_snapshot() -> dict[str, Any]:
     """Return current process observations for all live event-loop budgets."""
     with _GLOBAL_BUDGETS_LOCK:
         snapshots = [budget.snapshot() for budget in _GLOBAL_BUDGETS]
+        oversized_inline_snapshots = [admission.snapshot() for admission in _GLOBAL_OVERSIZED_INLINE_ADMISSIONS]
     return {
         "event_loop_count": len(snapshots),
         "pending_count": sum(int(item["pending_count"]) for item in snapshots),
@@ -219,6 +317,13 @@ def llm_runtime_event_publish_admission_snapshot() -> dict[str, Any]:
         "peak_pending_bytes": sum(int(item["peak_pending_bytes"]) for item in snapshots),
         "wait_count": sum(int(item["wait_count"]) for item in snapshots),
         "budgets": snapshots,
+        "oversized_inline": {
+            "event_loop_count": len(oversized_inline_snapshots),
+            "active_count": sum(int(item["active_count"]) for item in oversized_inline_snapshots),
+            "peak_active_count": sum(int(item["peak_active_count"]) for item in oversized_inline_snapshots),
+            "wait_count": sum(int(item["wait_count"]) for item in oversized_inline_snapshots),
+            "admissions": oversized_inline_snapshots,
+        },
     }
 
 
@@ -240,6 +345,7 @@ class LlmRuntimeEventPublishQueue:
         self._llm_request_id = llm_request_id
         self._limits = limits
         self._global_budget = global_budget or _global_budget_for_running_loop(limits)
+        self._global_oversized_inline_admission = _global_oversized_inline_admission_for_running_loop(limits)
         self._task_registry = task_registry or get_runtime_task_registry()
         self._condition = asyncio.Condition()
         self._queue: deque[_PendingRuntimeEvent] = deque()
@@ -253,6 +359,7 @@ class LlmRuntimeEventPublishQueue:
         self._failed_message_count = 0
         self._local_wait_count = 0
         self._global_wait_count = 0
+        self._global_oversized_inline_wait_count = 0
         self._oversized_inline_count = 0
         self._inline_publish_active = False
         self._closed = False
@@ -265,7 +372,12 @@ class LlmRuntimeEventPublishQueue:
         payload_size = _payload_size_bytes(actual_payload)
         is_control = event_type != _CONTENT_DELTA_EVENT_TYPE
         if payload_size > self._inline_threshold_bytes(is_control=is_control):
-            await self._publish_oversized_inline(event_type, actual_payload, payload_size)
+            await self._publish_oversized_inline(
+                event_type,
+                actual_payload,
+                payload_size,
+                is_control=is_control,
+            )
             return
         await self._submit_bounded(
             event_type=event_type,
@@ -301,12 +413,14 @@ class LlmRuntimeEventPublishQueue:
             "failed_message_count": self._failed_message_count,
             "local_wait_count": self._local_wait_count,
             "global_wait_count": self._global_wait_count,
+            "global_oversized_inline_wait_count": self._global_oversized_inline_wait_count,
             "oversized_inline_count": self._oversized_inline_count,
             "request_max_pending_count": self._limits.request_max_pending_count,
             "request_reserved_control_count": self._limits.request_reserved_control_count,
             "request_max_pending_bytes": self._limits.request_max_pending_bytes,
             "request_reserved_control_bytes": self._limits.request_reserved_control_bytes,
             "global": self._global_budget.snapshot(),
+            "global_oversized_inline": self._global_oversized_inline_admission.snapshot(),
         }
 
     async def _submit_bounded(
@@ -372,9 +486,11 @@ class LlmRuntimeEventPublishQueue:
         event_type: str,
         payload: dict[str, Any],
         payload_size: int,
+        *,
+        is_control: bool,
     ) -> None:
         logger.warning(
-            "LLM runtime event exceeds pending byte budget; publishing inline: "
+            "LLM runtime event exceeds pending byte budget; publishing through bounded inline admission: "
             "conversation_id=%s llm_request_id=%s event_type=%s payload_bytes=%s",
             self._conversation_id,
             self._llm_request_id,
@@ -390,7 +506,15 @@ class LlmRuntimeEventPublishQueue:
             self._inline_publish_active = True
             self._submitted_event_count += 1
             self._oversized_inline_count += 1
+        admission_acquired = False
         try:
+            global_waited, _global_snapshot = await self._global_oversized_inline_admission.acquire(
+                is_control=is_control,
+            )
+            admission_acquired = True
+            if global_waited:
+                self._global_oversized_inline_wait_count += 1
+                self._log_admission_wait(event_type, phase="global_oversized_inline_capacity")
             await self._publish(event_type, payload)
         except asyncio.CancelledError:
             raise
@@ -407,6 +531,8 @@ class LlmRuntimeEventPublishQueue:
         else:
             self._published_message_count += 1
         finally:
+            if admission_acquired:
+                await self._global_oversized_inline_admission.release(is_control=is_control)
             async with self._condition:
                 self._inline_publish_active = False
                 self._condition.notify_all()

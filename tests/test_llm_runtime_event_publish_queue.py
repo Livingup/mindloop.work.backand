@@ -421,6 +421,79 @@ def test_oversized_event_is_published_inline_and_observed_without_pending_growth
     asyncio.run(run_case())
 
 
+def test_oversized_inline_admission_is_globally_bounded_and_reserves_control_capacity() -> None:
+    async def run_case() -> None:
+        limits = LlmRuntimeEventPublishAdmissionLimits(
+            request_max_pending_count=4,
+            request_reserved_control_count=1,
+            request_max_pending_bytes=128,
+            request_reserved_control_bytes=32,
+            global_max_pending_count=8,
+            global_reserved_control_count=2,
+            global_max_pending_bytes=512,
+            global_reserved_control_bytes=64,
+            global_max_oversized_inline_count=2,
+            global_reserved_control_oversized_inline_count=1,
+        )
+        gate = _GatePublisher()
+        queues = [
+            LlmRuntimeEventPublishQueue(
+                publish=gate,
+                conversation_id="conversation-1",
+                llm_request_id=f"oversized-global-{index}",
+                limits=limits,
+                task_registry=RuntimeTaskRegistry(),
+            )
+            for index in range(3)
+        ]
+
+        first_content = asyncio.create_task(
+            queues[0].submit("llm.content.delta", _content_payload("oversized-global-0", "A" * 512))
+        )
+        await gate.wait_started(1)
+        control_payload = {
+            "llm_request_id": "oversized-global-1",
+            "provider_event_type": "completed",
+            "detail": "C" * 512,
+        }
+        reserved_control = asyncio.create_task(
+            queues[1].submit("llm.content.completed", control_payload)
+        )
+        await gate.wait_started(2)
+
+        blocked_content = asyncio.create_task(
+            queues[2].submit("llm.content.delta", _content_payload("oversized-global-2", "B" * 512))
+        )
+        await _wait_until(
+            lambda: queues[2].snapshot()["global_oversized_inline"]["wait_count"] >= 1
+        )
+        assert blocked_content.done() is False
+        admission_snapshot = queues[2].snapshot()["global_oversized_inline"]
+        assert admission_snapshot["active_count"] == limits.global_max_oversized_inline_count
+        assert admission_snapshot["active_content_count"] == 1
+        assert admission_snapshot["active_control_count"] == 1
+        assert admission_snapshot["peak_active_count"] <= limits.global_max_oversized_inline_count
+        process_snapshot = llm_runtime_event_publish_admission_snapshot()["oversized_inline"]
+        assert any(
+            admission["max_active_count"] == limits.global_max_oversized_inline_count
+            and admission["active_count"] == limits.global_max_oversized_inline_count
+            for admission in process_snapshot["admissions"]
+        )
+
+        gate.release.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_content, reserved_control, blocked_content),
+            timeout=1,
+        )
+        await asyncio.wait_for(asyncio.gather(*(queue.close() for queue in queues)), timeout=1)
+        assert queues[2].snapshot()["global_oversized_inline_wait_count"] >= 1
+        completed_types = [event_type for event_type, _payload in gate.completed]
+        assert "llm.content.completed" in completed_types
+        assert completed_types.count("llm.content.delta") == 2
+
+    asyncio.run(run_case())
+
+
 def test_stream_event_emitter_awaits_async_handler_and_keeps_sync_handler_compatible() -> None:
     async def run_case() -> None:
         calls: list[tuple[str, str]] = []
