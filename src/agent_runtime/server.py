@@ -127,6 +127,9 @@ def create_app(
         create_llm_http_trace_router,
     )
     from agent_runtime.llm_client import LlmClientFactory
+    from agent_runtime.llm_client.llm_runtime_event_publish_queue import (
+        llm_runtime_event_publish_admission_snapshot,
+    )
     from agent_runtime.image_generation.north_gateway.image_generation_rest_adapter import (
         create_image_generation_router,
     )
@@ -949,6 +952,7 @@ def create_app(
             "event_loop": event_loop_snapshot,
             "network": network_snapshot,
             "runtime_tasks": runtime_tasks,
+            "llm_runtime_event_publish": llm_runtime_event_publish_admission_snapshot(),
             "concurrency": runtime_concurrency_health_snapshot(
                 event_loop_snapshot=event_loop_snapshot,
                 network_snapshot=network_snapshot,

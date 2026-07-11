@@ -2,15 +2,16 @@
 """通用 LLM 请求客户端的南向协议适配器。"""
 from __future__ import annotations
 
-import json
-import copy
 import asyncio
+import copy
+import inspect
+import json
 import platform
 import sys
 import time
 import urllib.parse
 from dataclasses import asdict, is_dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 import httpx
 
@@ -34,7 +35,7 @@ from agent_runtime.llm_http_trace.models import LlmHttpTraceContext
 from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 
-StreamEventHandler = Callable[[dict[str, Any]], None]
+StreamEventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 CancellationChecker = Callable[[], bool]
 _DEFAULT_USER_AGENT = "mindloop.ai"
 _DEFAULT_LLM_HTTP_TIMEOUT_SECONDS = 300.0
@@ -657,27 +658,34 @@ async def _read_sse_response_text(
     handler: StreamEventHandler | None,
     cancellation_checker: CancellationChecker | None,
 ) -> str:
-    _emit_stream_event(handler, "llm.response.stream.started", {"content_type": content_type})
     event_count = 0
     lines: list[str] = []
     event_lines: list[str] = []
     try:
+        await _emit_stream_event(handler, "llm.response.stream.started", {"content_type": content_type})
         async for line in response.aiter_lines():
             _raise_if_cancelled(cancellation_checker)
             if line == "":
                 lines.append("\n")
-                event_count += _emit_sse_block_event(handler, event_lines)
+                event_count += await _emit_sse_block_event(handler, event_lines)
                 event_lines = []
             else:
                 line_with_break = f"{line}\n"
                 lines.append(line_with_break)
                 event_lines.append(line_with_break)
         if event_lines:
-            event_count += _emit_sse_block_event(handler, event_lines)
-        _emit_stream_event(handler, "llm.response.stream.completed", {"event_count": event_count})
+            event_count += await _emit_sse_block_event(handler, event_lines)
+        await _emit_stream_event(handler, "llm.response.stream.completed", {"event_count": event_count})
         return "".join(lines)
+    except asyncio.CancelledError as exc:
+        await _emit_stream_event(
+            handler,
+            "llm.response.stream.failed",
+            {"event_count": event_count, "error_type": exc.__class__.__name__, "error_message": str(exc)},
+        )
+        raise
     except Exception as exc:
-        _emit_stream_event(
+        await _emit_stream_event(
             handler,
             "llm.response.stream.failed",
             {"event_count": event_count, "error_type": exc.__class__.__name__, "error_message": str(exc)},
@@ -714,7 +722,7 @@ def _raise_if_cancelled(cancellation_checker: CancellationChecker | None) -> Non
         raise LlmRequestCancelled("LLM request cancelled.")
 
 
-def _emit_sse_block_event(handler: StreamEventHandler | None, event_lines: list[str]) -> int:
+async def _emit_sse_block_event(handler: StreamEventHandler | None, event_lines: list[str]) -> int:
     block = "".join(event_lines)
     parsed = list(_iter_sse_events(block + "\n\n"))
     emitted = 0
@@ -733,18 +741,21 @@ def _emit_sse_block_event(handler: StreamEventHandler | None, event_lines: list[
             if isinstance(data, dict):
                 payload["data_type"] = data.get("type")
                 payload["data"] = data
-        _emit_stream_event(handler, "llm.response.stream.event", payload)
+        await _emit_stream_event(handler, "llm.response.stream.event", payload)
         emitted += 1
     return emitted
 
 
-def _emit_stream_event(
+async def _emit_stream_event(
     handler: StreamEventHandler | None,
     event_type: str,
     payload: dict[str, Any],
 ) -> None:
-    if handler is not None:
-        handler({"event_type": event_type, "payload": payload})
+    if handler is None:
+        return
+    result = handler({"event_type": event_type, "payload": payload})
+    if inspect.isawaitable(result):
+        await result
 
 
 def _count_sse_events(text: str) -> int:

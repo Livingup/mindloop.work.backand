@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -24,7 +24,6 @@ from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
 )
-from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_CODEX_RESPONSES,
@@ -43,6 +42,7 @@ from agent_runtime.llm_client.llm_request_models import (
     LlmPromptRequest,
     LlmPromptResponse,
 )
+from agent_runtime.llm_client.llm_runtime_event_publish_queue import LlmRuntimeEventPublishQueue
 from agent_runtime.llm_client.llm_stream_events import LlmSemanticStreamParser
 from agent_runtime.llm_http_trace.models import LlmHttpTraceContext
 from agent_runtime.llm_http_trace.service import LlmHttpTraceService
@@ -57,69 +57,6 @@ _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
 }
 logger = logging.getLogger(__name__)
 _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
-
-
-def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
-    raw = (value or "unknown").strip()
-    safe = "".join(char if char.isalnum() or char in {".", "_", "-"} else "-" for char in raw)
-    return (safe.strip("-._") or "unknown")[:max_length]
-
-
-def _runtime_event_payload_size(payload: dict[str, Any]) -> int:
-    try:
-        return len(json.dumps(payload, ensure_ascii=False, default=str))
-    except Exception:
-        return len(repr(payload))
-
-
-def _runtime_event_publish_context(
-    *,
-    phase: str,
-    event_type: str,
-    payload: dict[str, Any],
-    conversation_id: str,
-    error_type: str | None = None,
-) -> dict[str, Any]:
-    context: dict[str, Any] = {
-        "phase": phase,
-        "event_type": event_type,
-        "conversation_id": conversation_id,
-        "source": "llm_client",
-        "payload_keys": sorted(str(key) for key in payload),
-        "payload_size": _runtime_event_payload_size(payload),
-        "payload_key_count": len(payload),
-    }
-    if error_type is not None:
-        context["error_type"] = error_type
-    return context
-
-
-async def _publish_runtime_event_with_bounded_failure(
-    coro: Any,
-    *,
-    event_type: str,
-    payload: dict[str, Any],
-    conversation_id: str,
-) -> None:
-    try:
-        await coro
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - publish diagnostics must not expose raw payload or exception text
-        task = asyncio.current_task()
-        task_or_id: asyncio.Task[Any] | str = task or f"llm-runtime-event-publish-{_safe_runtime_task_label(event_type)}"
-        get_runtime_task_registry().mark_progress(
-            task_or_id,
-            diagnostic_context=_runtime_event_publish_context(
-                phase="runtime_event_publish.failed",
-                event_type=event_type,
-                payload=payload,
-                conversation_id=conversation_id,
-                error_type=exc.__class__.__name__,
-            ),
-        )
-        logger.error("异步运行时事件发布失败: event_type=%s error_type=%s", event_type, exc.__class__.__name__)
-        raise RuntimeError("Runtime event publish failed.") from None
 
 
 class LlmRequestService:
@@ -315,7 +252,6 @@ class LlmRequestService:
                     stream_event_handler = _build_stream_event_handler(
                         publisher=self._event_publisher,
                         context=request.communication_context,
-                        event_loop=asyncio.get_running_loop(),
                         conversation_id=request.conversation.id,
                         request_event_observer=request.request_event_observer,
                         llm_call_id=llm_call_id,
@@ -725,7 +661,6 @@ def _build_stream_event_handler(
     *,
     publisher: RuntimeEventPublisher,
     context: Any,
-    event_loop: asyncio.AbstractEventLoop,
     conversation_id: str,
     request_event_observer: Callable[[str, dict[str, Any]], None] | None,
     llm_call_id: str,
@@ -741,10 +676,25 @@ def _build_stream_event_handler(
     retry_index: int,
     attempt_count: int,
     stream_state: dict[str, bool],
-) -> Callable[[dict[str, Any]], None]:
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
     semantic_parser = LlmSemanticStreamParser(api_format)
 
-    def handle(event: dict[str, Any]) -> None:
+    async def publish_semantic_event(event_type: str, payload: dict[str, Any]) -> None:
+        await publisher.publish(
+            context,
+            event_type,
+            payload,
+            source="llm_client",
+            metadata={"conversation_id": conversation_id},
+        )
+
+    publish_queue = LlmRuntimeEventPublishQueue(
+        publish=publish_semantic_event,
+        conversation_id=conversation_id,
+        llm_request_id=llm_request_id,
+    )
+
+    async def handle(event: dict[str, Any]) -> None:
         event_type = str(event.get("event_type") or "llm.response.stream.event")
         event_payload = dict(event.get("payload") or {})
         base_payload = {
@@ -790,72 +740,15 @@ def _build_stream_event_handler(
                 for semantic in semantic_events
                 if semantic.event_type not in _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS
             )
-        for publish_event_type, publish_payload in events_to_publish:
-            _notify_request_observer(request_event_observer, publish_event_type, publish_payload)
-            _schedule_runtime_event_publish(
-                publisher=publisher,
-                context=context,
-                event_type=publish_event_type,
-                payload=publish_payload,
-                event_loop=event_loop,
-                conversation_id=conversation_id,
-            )
+        try:
+            for publish_event_type, publish_payload in events_to_publish:
+                _notify_request_observer(request_event_observer, publish_event_type, publish_payload)
+                await publish_queue.submit(publish_event_type, publish_payload)
+        finally:
+            if event_type in {"llm.response.stream.completed", "llm.response.stream.failed"}:
+                await publish_queue.close()
 
     return handle
-
-
-def _schedule_runtime_event_publish(
-    *,
-    publisher: RuntimeEventPublisher,
-    context: Any,
-    event_type: str,
-    payload: dict[str, Any],
-    event_loop: asyncio.AbstractEventLoop,
-    conversation_id: str,
-) -> None:
-    if event_loop.is_closed():
-        logger.warning("运行时事件发布被跳过，event loop 已关闭: event_type=%s", event_type)
-        return
-    coro = publisher.publish(
-        context,
-        event_type,
-        payload,
-        source="llm_client",
-        metadata={"conversation_id": conversation_id},
-    )
-    try:
-        running_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        running_loop = None
-    if running_loop is event_loop:
-        get_runtime_task_registry().create_task(
-            _publish_runtime_event_with_bounded_failure(
-                coro,
-                event_type=event_type,
-                payload=payload,
-                conversation_id=conversation_id,
-            ),
-            task_name=f"llm-runtime-event-publish-{_safe_runtime_task_label(event_type)}",
-            owner_type="llm_request_service",
-            owner_id=conversation_id,
-            task_class="runtime_event_publish",
-            diagnostic_context=_runtime_event_publish_context(
-                phase="runtime_event_publish.scheduled",
-                event_type=event_type,
-                payload=payload,
-                conversation_id=conversation_id,
-            ),
-        )
-        return
-    future = asyncio.run_coroutine_threadsafe(coro, event_loop)
-
-    def on_threadsafe_done(done_future: Any) -> None:
-        try:
-            done_future.result()
-        except Exception:
-            logger.exception("跨线程运行时事件发布失败: event_type=%s", event_type)
-
-    future.add_done_callback(on_threadsafe_done)
 
 
 def _apply_render_side_effects(conversation: Any, api_format: str, rendered_messages: Any) -> None:

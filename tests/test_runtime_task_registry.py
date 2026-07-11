@@ -18,6 +18,7 @@ from agent_runtime.agent.north_gateway import agent_runtime_gateway_impl as agen
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.infrastructure.runtime_task_registry import RuntimeTaskRegistry, runtime_task_registry_admission_policy
 from agent_runtime.llm_client import llm_request_service as llm_request_service_module
+from agent_runtime.llm_client import llm_runtime_event_publish_queue as llm_publish_queue_module
 from agent_runtime.lacp import client as lacp_client_module
 from agent_runtime.lacp.client import LacpClient, _safe_ws_owner_id
 from agent_runtime.lacp.config import LacpConfig
@@ -1444,96 +1445,95 @@ def test_stage8_scene_detach_terminal_cleanup_is_registry_managed(monkeypatch) -
     asyncio.run(run_case())
 
 
-def test_stage8_llm_runtime_event_publish_same_loop_is_registry_managed_and_bounded(monkeypatch) -> None:
+def test_stage8_llm_runtime_event_publish_same_loop_is_registry_managed_and_bounded() -> None:
     async def run_case() -> None:
         registry = RuntimeTaskRegistry(completed_task_retention=8)
-        monkeypatch.setattr(llm_request_service_module, "get_runtime_task_registry", lambda: registry)
-        published: list[tuple[object, str, dict[str, object], str | None, dict[str, object] | None]] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+        published: list[tuple[str, dict[str, object]]] = []
 
-        class Publisher:
-            async def publish(self, context, event_type, payload, *, source=None, metadata=None, **_kwargs):
-                published.append((context, event_type, payload, source, metadata))
+        async def publish(event_type: str, payload: dict[str, object]) -> None:
+            started.set()
+            await release.wait()
+            published.append((event_type, payload))
 
-        context = RuntimeCommunicationContext(stream_id="stream-stage8")
         payload = {
+            "llm_call_id": "call-stage8",
+            "llm_request_id": "request-stage8",
+            "candidate_index": 0,
+            "provider_event_type": "message",
             "delta": "secret raw LLM delta text",
             "thinking": "secret raw thinking text",
             "tool_output": "secret raw tool output",
         }
-        llm_request_service_module._schedule_runtime_event_publish(
-            publisher=Publisher(),
-            context=context,
-            event_type="llm.response.delta",
-            payload=payload,
-            event_loop=asyncio.get_running_loop(),
+        queue = llm_publish_queue_module.LlmRuntimeEventPublishQueue(
+            publish=publish,
             conversation_id="conversation-stage8",
+            llm_request_id="request-stage8",
+            task_registry=registry,
         )
+        await queue.submit("llm.content.delta", payload)
+        await asyncio.wait_for(started.wait(), timeout=1)
 
         active = registry.snapshot(include_completed=False)
-        record = _record_by_class(active, "runtime_event_publish")
-        assert record["task_name"] == "llm-runtime-event-publish-llm.response.delta"
+        record = _record_by_class(active, "runtime_event_publish_drain")
+        assert record["task_name"] == "llm-runtime-event-drain-request-stage8"
         assert record["owner_type"] == "llm_request_service"
-        assert record["owner_id"] == "conversation-stage8"
+        assert record["owner_id"] == "request-stage8"
         scheduled_context = record["diagnostic_context"]
-        assert scheduled_context["phase"] == "runtime_event_publish.scheduled"
-        assert scheduled_context["event_type"] == "llm.response.delta"
+        assert scheduled_context["phase"] == "runtime_event_publish_drain.scheduled"
         assert scheduled_context["conversation_id"] == "conversation-stage8"
-        assert scheduled_context["source"] == "llm_client"
-        assert scheduled_context["payload_keys"] == "[redacted]"
-        assert scheduled_context["payload_key_count"] == "[redacted]"
-        assert scheduled_context["payload_size"] == "[redacted]"
+        assert scheduled_context["llm_request_id"] == "request-stage8"
+        assert scheduled_context["pending_count"] == 1
+        assert scheduled_context["request_max_pending_count"] == 64
         assert "secret raw" not in str(scheduled_context)
 
-        [publish_task] = [task for task in asyncio.all_tasks() if task.get_name() == record["task_name"]]
-        await asyncio.wait_for(publish_task, timeout=1)
+        release.set()
+        await asyncio.wait_for(queue.close(), timeout=1)
         await asyncio.sleep(0)
-        assert published == [(context, "llm.response.delta", payload, "llm_client", {"conversation_id": "conversation-stage8"})]
-        assert registry.snapshot()["by_status"]["completed"] == 1
+        assert published == [("llm.content.delta", payload)]
+        completed = _record_by_class(registry.snapshot(), "runtime_event_publish_drain")
+        assert completed["status"] == "completed"
+        assert completed["diagnostic_context"]["published_message_count"] == 1
 
     asyncio.run(run_case())
 
 
-def test_stage8_llm_runtime_event_publish_failure_diagnostics_are_bounded(monkeypatch, caplog) -> None:
+def test_stage8_llm_runtime_event_publish_failure_diagnostics_are_bounded(caplog) -> None:
     async def run_case() -> None:
         registry = RuntimeTaskRegistry(completed_task_retention=8)
-        monkeypatch.setattr(llm_request_service_module, "get_runtime_task_registry", lambda: registry)
 
-        class Publisher:
-            async def publish(self, *_args, **_kwargs):
-                raise RuntimeError("secret raw provider payload should not leak")
+        async def publish(_event_type: str, _payload: dict[str, object]) -> None:
+            raise RuntimeError("secret raw provider payload should not leak")
 
         payload = {
+            "llm_call_id": "call-stage8",
+            "llm_request_id": "request-stage8",
+            "candidate_index": 0,
+            "provider_event_type": "message",
             "delta": "secret raw LLM delta text",
             "payload": "secret raw payload value",
         }
+        queue = llm_publish_queue_module.LlmRuntimeEventPublishQueue(
+            publish=publish,
+            conversation_id="conversation-stage8",
+            llm_request_id="request-stage8",
+            task_registry=registry,
+        )
         with caplog.at_level(logging.ERROR):
-            llm_request_service_module._schedule_runtime_event_publish(
-                publisher=Publisher(),
-                context=RuntimeCommunicationContext(stream_id="stream-stage8"),
-                event_type="llm.response.delta",
-                payload=payload,
-                event_loop=asyncio.get_running_loop(),
-                conversation_id="conversation-stage8",
-            )
-            record = _record_by_class(registry.snapshot(include_completed=False), "runtime_event_publish")
-            [publish_task] = [task for task in asyncio.all_tasks() if task.get_name() == record["task_name"]]
-            with suppress(RuntimeError):
-                await asyncio.wait_for(publish_task, timeout=1)
+            await queue.submit("llm.content.delta", payload)
+            await asyncio.wait_for(queue.close(), timeout=1)
             await asyncio.sleep(0)
 
-        failed = _record_by_class(registry.snapshot(), "runtime_event_publish")
-        assert failed["status"] == "failed"
-        assert failed["last_error_type"] == "RuntimeError"
-        assert failed["last_error"] == "Runtime event publish failed."
+        failed = _record_by_class(registry.snapshot(), "runtime_event_publish_drain")
+        assert failed["status"] == "completed"
+        assert failed["last_error_type"] is None
         failure_context = failed["diagnostic_context"]
-        assert failure_context["phase"] == "runtime_event_publish.failed"
-        assert failure_context["event_type"] == "llm.response.delta"
+        assert failure_context["phase"] == "runtime_event_publish_drain.failed"
+        assert failure_context["last_event_type"] == "llm.content.delta"
         assert failure_context["conversation_id"] == "conversation-stage8"
-        assert failure_context["source"] == "llm_client"
-        assert failure_context["payload_keys"] == "[redacted]"
-        assert failure_context["payload_key_count"] == "[redacted]"
-        assert failure_context["payload_size"] == "[redacted]"
-        assert failure_context["error_type"] == "RuntimeError"
+        assert failure_context["llm_request_id"] == "request-stage8"
+        assert failure_context["failed_message_count"] == 1
         diagnostic_text = str(failed).lower()
         log_text = caplog.text.lower()
         assert "secret raw" not in diagnostic_text
