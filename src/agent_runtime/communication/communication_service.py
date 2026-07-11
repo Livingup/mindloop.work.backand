@@ -428,6 +428,59 @@ class CommunicationService:
             **hub_diagnostics,
         }
 
+    async def _iter_live_gap_messages(
+        self,
+        stream_id: str,
+        *,
+        after_seq: int,
+        live_seq: int,
+    ) -> AsyncIterator[CommunicationMessage]:
+        """从 durable log 分页补齐到指定 live seq，禁止跨越缺口推进 cursor。"""
+        cursor = max(after_seq, 0)
+        while cursor < live_seq:
+            gap_messages = await monitored_to_thread(
+                self._repository.list_messages,
+                stream_id,
+                operation="communication.subscribe.gap_messages",
+                caller="CommunicationService.subscribe_messages",
+                pool=BlockingPool.COMMUNICATION,
+                log=logger,
+                diagnostic_context={
+                    "stream_id": stream_id,
+                    "cursor": cursor,
+                    "live_seq": live_seq,
+                    "limit": 5000,
+                },
+                after_seq=cursor,
+                limit=5000,
+            )
+            if not gap_messages:
+                raise RuntimeError(
+                    "通信日志无法补齐实时事件缺口: "
+                    f"stream_id={stream_id}, expected_seq={cursor + 1}, live_seq={live_seq}"
+                )
+            page_progressed = False
+            for gap_message in gap_messages:
+                if gap_message.seq <= cursor:
+                    continue
+                expected_seq = cursor + 1
+                if gap_message.seq != expected_seq:
+                    raise RuntimeError(
+                        "通信日志存在不可恢复的实时事件缺口: "
+                        f"stream_id={stream_id}, expected_seq={expected_seq}, "
+                        f"actual_seq={gap_message.seq}, live_seq={live_seq}"
+                    )
+                cursor = gap_message.seq
+                page_progressed = True
+                yield gap_message
+                if cursor >= live_seq:
+                    return
+            if not page_progressed:
+                raise RuntimeError(
+                    "通信日志补齐未产生进度: "
+                    f"stream_id={stream_id}, cursor={cursor}, live_seq={live_seq}"
+                )
+
     async def subscribe_messages(
         self,
         stream_id: str,
@@ -479,24 +532,13 @@ class CommunicationService:
                 if message.seq <= cursor:
                     continue
                 if message.seq > cursor + 1:
-                    gap_messages = await monitored_to_thread(
-                        self._repository.list_messages,
+                    async for gap_message in self._iter_live_gap_messages(
                         stream_id,
-                        operation="communication.subscribe.gap_messages",
-                        caller="CommunicationService.subscribe_messages",
-                        pool=BlockingPool.COMMUNICATION,
-                        log=logger,
-                        diagnostic_context={"stream_id": stream_id, "cursor": cursor, "live_seq": message.seq, "limit": 5000},
                         after_seq=cursor,
-                        limit=5000,
-                    )
-                    for gap_message in gap_messages:
-                        if gap_message.seq <= cursor:
-                            continue
+                        live_seq=message.seq,
+                    ):
                         cursor = gap_message.seq
                         yield gap_message
-                        if cursor >= message.seq:
-                            break
                     if message.seq <= cursor:
                         continue
                 cursor = message.seq

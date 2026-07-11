@@ -336,24 +336,6 @@ class SqliteCommunicationRepository:
         finally:
             self._lock.release()
 
-    def advance_stream_cursor(self, stream_id: str, *, seq: int) -> None:
-        if seq <= 0:
-            return
-        with self._lock:
-            conn = self._connection()
-            self._advance_stream_cursor(conn, stream_id, seq)
-            conn.commit()
-
-    def _advance_stream_cursor(self, conn: sqlite3.Connection, stream_id: str, seq: int) -> None:
-        conn.execute(
-            """
-            UPDATE communication_streams
-            SET last_seq = CASE WHEN last_seq < ? THEN ? ELSE last_seq END
-            WHERE stream_id = ?
-            """,
-            (seq, seq, stream_id),
-        )
-
     def list_messages(
         self,
         stream_id: str,
@@ -364,8 +346,6 @@ class SqliteCommunicationRepository:
         """按通信流和 seq 增量读取消息。"""
         with self._lock:
             conn = self._connection()
-            self._advance_stream_cursor(conn, stream_id, after_seq)
-            conn.commit()
             rows = conn.execute(
                 """
                 SELECT message_id, stream_id, seq, type, topic, source, actor_id,

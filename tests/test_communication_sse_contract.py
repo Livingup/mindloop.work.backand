@@ -6,6 +6,7 @@ from typing import Any
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_service import CommunicationService
 from agent_runtime.communication.communication_stream import CommunicationStream
+from agent_runtime.communication.infrastructure.sqlite_communication_repository import SqliteCommunicationRepository
 from agent_runtime.communication.north_gateway import communication_rest_adapter as adapter
 from agent_runtime.communication.north_gateway.communication_contracts import (
     CreateCommunicationStreamRequest,
@@ -261,6 +262,70 @@ def test_communication_service_closes_live_subscription_when_consumer_disconnect
         first = await anext(subscription)
         assert first.seq == 1
         await subscription.aclose()
+        assert event_hub.closed is True
+
+    asyncio.run(run_case())
+
+
+def test_sqlite_history_read_does_not_advance_producer_sequence(tmp_path) -> None:
+    repository = SqliteCommunicationRepository(lambda: str(tmp_path))
+    repository.create_stream(CommunicationStream(stream_id="stream-1", topic="agent.task"))
+    first = repository.append_message(_message(0, message_id="message-first"))
+    repository.list_messages("stream-1", after_seq=1000, limit=1)
+    second = repository.append_message(_message(0, message_id="message-second"))
+    try:
+        assert first.seq == 1
+        assert second.seq == 2
+    finally:
+        repository.close()
+
+
+def test_communication_service_pages_live_gap_without_skipping_messages() -> None:
+    async def run_case() -> None:
+        repository = _SequenceRepository(
+            replay_batches=[[]],
+            gap_batches=[
+                [_message(seq) for seq in range(1, 5001)],
+                [_message(5001), _message(5002)],
+            ],
+        )
+        event_hub = _EventHub([_message(5002, message_id="live-5002")])
+        service = CommunicationService(repository, event_hub)
+        subscription = service.subscribe_messages("stream-1", after_seq=0)
+        yielded: list[CommunicationMessage] = []
+        try:
+            for _ in range(5002):
+                yielded.append(await anext(subscription))
+        finally:
+            await subscription.aclose()
+
+        assert [message.seq for message in yielded] == list(range(1, 5003))
+        assert repository.calls == [(0, 5000), (0, 5000), (5000, 5000)]
+        assert event_hub.closed is True
+
+    asyncio.run(run_case())
+
+
+def test_communication_service_fails_when_live_gap_is_not_durable() -> None:
+    async def run_case() -> None:
+        repository = _SequenceRepository(
+            replay_batches=[[]],
+            gap_batches=[[_message(1)], []],
+        )
+        event_hub = _EventHub([_message(3, message_id="live-3")])
+        service = CommunicationService(repository, event_hub)
+        subscription = service.subscribe_messages("stream-1", after_seq=0)
+        try:
+            first = await anext(subscription)
+            assert first.seq == 1
+            try:
+                await anext(subscription)
+            except RuntimeError as exc:
+                assert "无法补齐实时事件缺口" in str(exc)
+            else:
+                raise AssertionError("missing durable gap must terminate the subscription")
+        finally:
+            await subscription.aclose()
         assert event_hub.closed is True
 
     asyncio.run(run_case())
