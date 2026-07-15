@@ -19,6 +19,7 @@ from agent_runtime.terminal.north_gateway.terminal_contracts import (
     WriteTerminalInputRequest,
     WriteTerminalInputResult,
 )
+from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
 
 ReadMode = Literal["tail", "page", "since", "search"]
 
@@ -139,6 +140,11 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                     shell=body.shell,
                 )
             )
+        except TerminalCapacityExceededError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={"error_code": exc.error_code, "message": str(exc), **exc.to_metadata()},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return _terminal_to_response(terminal)
@@ -158,6 +164,11 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                     timeout_ms=body.timeout_ms,
                 )
             )
+        except TerminalCapacityExceededError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={"error_code": exc.error_code, "message": str(exc), **exc.to_metadata()},
+            ) from exc
         except KeyError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except ValueError as exc:

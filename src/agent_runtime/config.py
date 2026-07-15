@@ -756,6 +756,10 @@ def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
             else None
         ),
         max_output_chars_per_read=int(data.get("max_output_chars_per_read", 50000)),
+        max_live_terminals=int(data.get("max_live_terminals", 200)),
+        max_live_terminals_per_agent=int(data.get("max_live_terminals_per_agent", 16)),
+        output_coalesce_interval_ms=int(data.get("output_coalesce_interval_ms", 33)),
+        output_coalesce_max_bytes=int(data.get("output_coalesce_max_bytes", 8192)),
     )
 
 

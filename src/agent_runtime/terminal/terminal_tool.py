@@ -12,6 +12,7 @@ from agent_runtime.terminal.north_gateway.terminal_contracts import (
     ReadTerminalOutputRequest,
     WriteTerminalInputRequest,
 )
+from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
 from agent_runtime.terminal.terminal_factory import TerminalFactory
 from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
@@ -59,17 +60,27 @@ class TerminalWriteInputToolRequest(BaseToolRequest):
 )
 async def terminal_create(request: TerminalCreateToolRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     gateway = TerminalFactory.create()
-    info = await gateway.create_terminal(
-        CreateTerminalRequest(
-            cwd=request.cwd,
-            shell=request.shell,
-            task_id=ctx.task_id,
-            agent_instance_id=ctx.agent_instance_id,
-            communication_stream_id=ctx.communication_stream_id,
-            request_id=ctx.request_id,
-            trace_id=ctx.trace_id,
+    try:
+        info = await gateway.create_terminal(
+            CreateTerminalRequest(
+                cwd=request.cwd,
+                shell=request.shell,
+                task_id=ctx.task_id,
+                agent_instance_id=ctx.agent_instance_id,
+                communication_stream_id=ctx.communication_stream_id,
+                request_id=ctx.request_id,
+                trace_id=ctx.trace_id,
+            )
         )
-    )
+    except TerminalCapacityExceededError as exc:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code=exc.error_code,
+            error_message=str(exc),
+            output=exc.to_metadata(),
+            metadata=exc.to_metadata(),
+        )
     return BaseToolResult(
         success=True,
         execution_status="success",
@@ -90,17 +101,27 @@ async def terminal_create(request: TerminalCreateToolRequest, ctx: ToolRuntimeCo
 )
 async def terminal_execute_command(request: TerminalExecuteCommandToolRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     gateway = TerminalFactory.create()
-    result = await gateway.execute_command(
-        ExecuteTerminalCommandRequest(
-            command_line=request.command_line,
-            terminal_id=request.terminal_id,
-            task_id=ctx.task_id,
-            agent_instance_id=ctx.agent_instance_id,
-            communication_stream_id=ctx.communication_stream_id,
-            request_id=ctx.request_id,
-            trace_id=ctx.trace_id,
+    try:
+        result = await gateway.execute_command(
+            ExecuteTerminalCommandRequest(
+                command_line=request.command_line,
+                terminal_id=request.terminal_id,
+                task_id=ctx.task_id,
+                agent_instance_id=ctx.agent_instance_id,
+                communication_stream_id=ctx.communication_stream_id,
+                request_id=ctx.request_id,
+                trace_id=ctx.trace_id,
+            )
         )
-    )
+    except TerminalCapacityExceededError as exc:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code=exc.error_code,
+            error_message=str(exc),
+            output=exc.to_metadata(),
+            metadata=exc.to_metadata(),
+        )
     return BaseToolResult(
         success=result.accepted,
         execution_status="success" if result.accepted else "failed",

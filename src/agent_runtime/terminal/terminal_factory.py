@@ -14,13 +14,21 @@ from agent_runtime.terminal.terminal_service import TerminalRuntimeScopeResolver
 class TerminalFactory:
     _lock = RLock()
     _gateway: TerminalGatewayImpl | None = None
-    _config_signature: tuple[str, str | None, int] | None = None
+    _config_signature: tuple[object, ...] | None = None
 
     @classmethod
     def create(cls) -> TerminalGatewayImpl:
         with cls._lock:
             config = cls._read_config()
-            signature = (config.data_dir, config.default_shell, config.max_output_chars_per_read)
+            signature = (
+                config.data_dir,
+                config.default_shell,
+                config.max_output_chars_per_read,
+                config.max_live_terminals,
+                config.max_live_terminals_per_agent,
+                config.output_coalesce_interval_ms,
+                config.output_coalesce_max_bytes,
+            )
             if cls._gateway is None or cls._config_signature != signature:
                 communication_gateway = CommunicationFactory.create()
                 agent_runtime_gateway = AgentRuntimeFactory.create(
@@ -42,6 +50,10 @@ class TerminalFactory:
                     communication_gateway=communication_gateway,
                     default_shell=config.default_shell,
                     max_output_chars_per_read=config.max_output_chars_per_read,
+                    max_live_terminals=config.max_live_terminals,
+                    max_live_terminals_per_agent=config.max_live_terminals_per_agent,
+                    output_coalesce_interval_ms=config.output_coalesce_interval_ms,
+                    output_coalesce_max_bytes=config.output_coalesce_max_bytes,
                 )
                 cls._gateway = TerminalGatewayImpl(service)
                 cls._config_signature = signature

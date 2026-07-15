@@ -134,8 +134,12 @@ def _cpu_render_max_workers() -> int:
 def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
     default_workers = default_thread_pool_max_workers()
     io_workers = max(4, min(16, default_workers))
-    terminal_workers = max(8, min(32, default_workers))
-    terminal_control_workers = max(4, min(8, default_workers))
+    # Align terminal pools with Phase-1 live capacity (~200 concurrent PTY sessions).
+    # TERMINAL_READ hosts long-lived Windows winpty readers; size must match live quota.
+    terminal_read_workers = 200
+    terminal_control_workers = 32
+    terminal_workers = 32
+    terminal_render_workers = max(4, min(8, _cpu_render_max_workers() * 2))
     return {
         BlockingPool.DEFAULT.value: BlockingPoolConfig(
             pool_name=BlockingPool.DEFAULT.value,
@@ -158,10 +162,10 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
         ),
         BlockingPool.TERMINAL_READ.value: BlockingPoolConfig(
             pool_name=BlockingPool.TERMINAL_READ.value,
-            max_workers=terminal_workers,
+            max_workers=terminal_read_workers,
             thread_name_prefix="blocking-terminal-read",
             isolated=True,
-            max_pending=terminal_workers * 2,
+            max_pending=terminal_read_workers * 2,
         ),
         BlockingPool.TERMINAL_CONTROL.value: BlockingPoolConfig(
             pool_name=BlockingPool.TERMINAL_CONTROL.value,
@@ -172,10 +176,10 @@ def _default_pool_configs() -> dict[str, BlockingPoolConfig]:
         ),
         BlockingPool.TERMINAL_RENDER.value: BlockingPoolConfig(
             pool_name=BlockingPool.TERMINAL_RENDER.value,
-            max_workers=_cpu_render_max_workers(),
+            max_workers=terminal_render_workers,
             thread_name_prefix="blocking-terminal-render",
             isolated=True,
-            max_pending=_cpu_render_max_workers() * 4,
+            max_pending=terminal_render_workers * 4,
         ),
         BlockingPool.CPU_RENDER.value: BlockingPoolConfig(
             pool_name=BlockingPool.CPU_RENDER.value,
