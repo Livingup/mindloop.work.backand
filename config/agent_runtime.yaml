@@ -41,7 +41,8 @@ agent_runtime:
   trace_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/agent-traces"
 
 communication:
-  # 热路径存储：memory=进程内 ring（默认）；sqlite=durable-first 回滚路径。
+  # 热路径存储：memory=进程内 ring（默认，推荐）。
+  # sqlite 已废弃，仅临时回滚保留，不推荐生产使用。
   storage_mode: "${SPREAD_AI_COMMUNICATION_STORAGE_MODE:-memory}"
   # 通用通信流与消息日志 SQLite 数据目录（sqlite 模式；memory 模式默认不写热路径）。
   data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/communication"

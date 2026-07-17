@@ -24,6 +24,7 @@ class CommunicationConfig:
 
     subscriber_queue_size: int = 1000
 
+    # memory=默认热路径；sqlite=已废弃，仅临时回滚保留。
     storage_mode: CommunicationStorageMode = "memory"
 
     memory_ring_max_events: int = 4000

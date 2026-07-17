@@ -2,6 +2,7 @@
 """通用通信模块工厂。"""
 from __future__ import annotations
 
+import logging
 from threading import RLock
 from typing import Any
 
@@ -14,6 +15,8 @@ from agent_runtime.communication.infrastructure.sqlite_communication_repository 
 from agent_runtime.communication.north_gateway.communication_gateway_impl import (
     CommunicationGatewayImpl,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CommunicationFactory:
@@ -47,6 +50,11 @@ class CommunicationFactory:
                 config.idle_scan_interval_seconds,
             )
             if cls._gateway is None or cls._config_signature != signature:
+                if config.storage_mode == "sqlite":
+                    logger.warning(
+                        "communication.storage_mode=sqlite is deprecated; "
+                        "default and recommended mode is memory. sqlite is retained only as a temporary rollback path.",
+                    )
                 if cls._event_hub is not None:
                     cls._event_hub.close()
                 data_dir_accessor = cls._build_data_dir_accessor(config)
