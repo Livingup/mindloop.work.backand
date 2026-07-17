@@ -31,6 +31,7 @@ from agent_runtime.terminal.terminal_command import (
 )
 from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
+from agent_runtime.terminal.terminal_output_ring import TerminalOutputRing
 from agent_runtime.terminal.terminal_process import TerminalProcessManager, TerminalProcessStartRequest, TerminalSessionStartRequest
 from agent_runtime.terminal.terminal_repository import TerminalRepository
 from agent_runtime.terminal.terminal_rendering import render_terminal_chunks
@@ -183,11 +184,15 @@ class TerminalService:
         scope_resolver: TerminalRuntimeScopeResolver,
         communication_gateway: CommunicationGateway | None = None,
         default_shell: str | None = None,
-        max_output_chars_per_read: int = 50000,
+        max_output_chars_per_read: int = 100_000,
         max_live_terminals: int = 200,
         max_live_terminals_per_agent: int = 16,
-        output_coalesce_interval_ms: int = 33,
-        output_coalesce_max_bytes: int = 8192,
+        output_coalesce_interval_ms: int = 50,
+        output_coalesce_max_chars: int | None = None,
+        output_coalesce_max_chunks: int = 32,
+        output_coalesce_max_bytes: int | None = None,
+        output_ring_max_chunks: int = 1000,
+        output_ring_max_chars: int = 100_000,
     ) -> None:
         self._repo = repository
         self._process_manager = process_manager
@@ -198,7 +203,20 @@ class TerminalService:
         self._max_live_terminals = max(1, max_live_terminals)
         self._max_live_terminals_per_agent = max(1, min(max_live_terminals_per_agent, self._max_live_terminals))
         self._output_coalesce_interval_ms = max(0, output_coalesce_interval_ms)
-        self._output_coalesce_max_bytes = max(1, output_coalesce_max_bytes)
+        # 优先 max_chars；兼容旧 max_bytes 配置。
+        coalesce_chars = (
+            output_coalesce_max_chars
+            if output_coalesce_max_chars is not None
+            else output_coalesce_max_bytes
+            if output_coalesce_max_bytes is not None
+            else 16_384
+        )
+        self._output_coalesce_max_chars = max(1, int(coalesce_chars))
+        self._output_coalesce_max_chunks = max(1, int(output_coalesce_max_chunks))
+        self._output_ring = TerminalOutputRing(
+            max_chunks=max(1, output_ring_max_chunks),
+            max_chars=max(1000, output_ring_max_chars),
+        )
         self._locks: dict[str, asyncio.Lock] = {}
         self._byte_offsets: dict[tuple[str, str], int] = {}
         self._stream_bytes: dict[tuple[str, str, str], int] = {}
@@ -914,7 +932,11 @@ class TerminalService:
             pending.parts.append(text)
             pending.chunk_count += 1
             pending.pending_bytes += encoded_len
-            should_flush_now = pending.pending_bytes >= self._output_coalesce_max_bytes
+            pending_chars = sum(len(part) for part in pending.parts)
+            should_flush_now = (
+                pending_chars >= self._output_coalesce_max_chars
+                or pending.chunk_count >= self._output_coalesce_max_chunks
+            )
             if should_flush_now:
                 if pending.flush_task is not None and not pending.flush_task.done():
                     pending.flush_task.cancel()
@@ -1068,6 +1090,7 @@ class TerminalService:
         lock_prefix = f"output:{terminal_id}:"
         for key in [key for key in self._locks if key.startswith(lock_prefix)]:
             self._locks.pop(key, None)
+        self._output_ring.clear_terminal(terminal_id)
 
     def live_terminal_count(self) -> int:
         return len(self._live_slots)
@@ -1240,6 +1263,13 @@ class TerminalService:
         if coalesced:
             payload["coalesced"] = True
             payload["chunk_count"] = source_chunk_count
+        self._output_ring.append(
+            terminal_id=terminal_id,
+            command_id=command_id,
+            chunk_index=chunk_index,
+            stream=stream,
+            chunk=text,
+        )
         await self._publish(
             scope,
             "terminal.output.delta",

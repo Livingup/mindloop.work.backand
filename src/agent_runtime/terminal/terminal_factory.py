@@ -27,7 +27,11 @@ class TerminalFactory:
                 config.max_live_terminals,
                 config.max_live_terminals_per_agent,
                 config.output_coalesce_interval_ms,
+                config.output_coalesce_max_chars,
+                config.output_coalesce_max_chunks,
                 config.output_coalesce_max_bytes,
+                config.output_ring_max_chunks,
+                config.output_ring_max_chars,
             )
             if cls._gateway is None or cls._config_signature != signature:
                 communication_gateway = CommunicationFactory.create()
@@ -53,7 +57,11 @@ class TerminalFactory:
                     max_live_terminals=config.max_live_terminals,
                     max_live_terminals_per_agent=config.max_live_terminals_per_agent,
                     output_coalesce_interval_ms=config.output_coalesce_interval_ms,
+                    output_coalesce_max_chars=config.output_coalesce_max_chars,
+                    output_coalesce_max_chunks=config.output_coalesce_max_chunks,
                     output_coalesce_max_bytes=config.output_coalesce_max_bytes,
+                    output_ring_max_chunks=config.output_ring_max_chunks,
+                    output_ring_max_chars=config.output_ring_max_chars,
                 )
                 cls._gateway = TerminalGatewayImpl(service)
                 cls._config_signature = signature

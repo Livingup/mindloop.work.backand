@@ -761,6 +761,7 @@ def _build_lacp_config(data: dict[str, Any]) -> LacpConfig:
 
 
 def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
+    max_chars = data.get("output_coalesce_max_chars", data.get("output_coalesce_max_bytes", 16_384))
     return TerminalConfig(
         data_dir=str(data.get("data_dir", "~/.spread-ai/terminal")),
         default_shell=(
@@ -768,11 +769,15 @@ def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
             if data.get("default_shell") is not None
             else None
         ),
-        max_output_chars_per_read=int(data.get("max_output_chars_per_read", 50000)),
+        max_output_chars_per_read=int(data.get("max_output_chars_per_read", 100_000)),
         max_live_terminals=int(data.get("max_live_terminals", 200)),
         max_live_terminals_per_agent=int(data.get("max_live_terminals_per_agent", 16)),
-        output_coalesce_interval_ms=int(data.get("output_coalesce_interval_ms", 33)),
-        output_coalesce_max_bytes=int(data.get("output_coalesce_max_bytes", 8192)),
+        output_coalesce_interval_ms=int(data.get("output_coalesce_interval_ms", 50)),
+        output_coalesce_max_chars=int(max_chars),
+        output_coalesce_max_chunks=int(data.get("output_coalesce_max_chunks", 32)),
+        output_coalesce_max_bytes=int(data.get("output_coalesce_max_bytes", max_chars)),
+        output_ring_max_chunks=int(data.get("output_ring_max_chunks", 1000)),
+        output_ring_max_chars=int(data.get("output_ring_max_chars", 100_000)),
     )
 
 
