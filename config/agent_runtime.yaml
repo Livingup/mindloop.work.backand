@@ -41,8 +41,20 @@ agent_runtime:
   trace_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/agent-traces"
 
 communication:
-  # 通用通信流与消息日志 SQLite 数据目录。
+  # 热路径存储：memory=进程内 ring（默认）；sqlite=durable-first 回滚路径。
+  storage_mode: "${SPREAD_AI_COMMUNICATION_STORAGE_MODE:-memory}"
+  # 通用通信流与消息日志 SQLite 数据目录（sqlite 模式；memory 模式默认不写热路径）。
   data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/communication"
+  # 单 stream ring 条数/字节与 MAIN/TERM 双预算。
+  memory_ring_max_events: 4000
+  memory_ring_max_bytes: 25165824
+  memory_ring_main_min_events: 1000
+  memory_ring_terminal_max_events: 3000
+  global_memory_ring_max_bytes: 2684354560
+  subscriber_queue_size: 1000
+  stream_idle_reclaim_minutes: 30
+  stream_idle_shrink_events: 64
+  idle_scan_interval_seconds: 60
 
 scene:
   # 全局 Scene SQLite 数据库文件路径。所有 workspace 共享该数据库，每条 scene 通过 project_id 归属到项目。

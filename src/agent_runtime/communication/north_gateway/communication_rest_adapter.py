@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from contextlib import suppress
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from agent_runtime.communication.communication_errors import CommunicationGapUnrecoverableError
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
@@ -24,6 +25,15 @@ from agent_runtime.runtime_network_monitor import (
     new_network_trace_id,
     runtime_network_monitor,
 )
+
+
+def _gateway_runtime_boot_id(gateway: CommunicationGateway) -> str | None:
+    boot_id = getattr(gateway, "runtime_boot_id", None)
+    if boot_id:
+        return str(boot_id)
+    service = getattr(gateway, "_service", None)
+    nested = getattr(service, "runtime_boot_id", None)
+    return str(nested) if nested else None
 
 
 COMMUNICATION_SSE_EVENT_TYPE = "communication.message"
@@ -125,11 +135,15 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
     @router.get("/streams/{stream_id}/messages", response_model=list[CommunicationMessageResponse])
     def list_messages(
         stream_id: str,
+        response: Response,
         after_seq: int = Query(default=0, ge=0),
         limit: int = Query(default=500, ge=1, le=5000),
         latest: bool = Query(default=False),
     ) -> list[CommunicationMessageResponse]:
         """读取通信流历史消息。"""
+        boot_id = _gateway_runtime_boot_id(gateway)
+        if boot_id:
+            response.headers["X-Runtime-Boot-Id"] = boot_id
         try:
             # latest 用于聊天场景恢复：只取尾部消息窗口，但返回顺序仍保持 seq 升序，方便前端按事件顺序重放。
             messages = (
@@ -139,6 +153,8 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
             )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"通信流不存在: {stream_id}")
+        except CommunicationGapUnrecoverableError as exc:
+            raise HTTPException(status_code=409, detail=exc.to_dict()) from exc
         return [_message_response(message) for message in messages]
 
     @router.post("/streams/{stream_id}/messages", response_model=CommunicationMessageResponse, status_code=201)
@@ -237,6 +253,7 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                             stream_id=stream_id,
                             sent_count=sent_count,
                             keepalive_count=keepalive_count,
+                            runtime_boot_id=_gateway_runtime_boot_id(gateway),
                         )
             except Exception as exc:
                 close_reason = exc.__class__.__name__
@@ -274,14 +291,18 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                     **runtime_network_monitor.snapshot(),
                 })
 
+        sse_headers = {
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+        boot_id = _gateway_runtime_boot_id(gateway)
+        if boot_id:
+            sse_headers["X-Runtime-Boot-Id"] = boot_id
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=sse_headers,
         )
 
     return router
@@ -311,18 +332,23 @@ def _format_sse_message(message: CommunicationMessage) -> str:
     return f"id: {message.seq}\nevent: {COMMUNICATION_SSE_EVENT_TYPE}\ndata: {payload}\n\n"
 
 
-def _format_sse_ping(*, stream_id: str, sent_count: int, keepalive_count: int) -> str:
+def _format_sse_ping(
+    *,
+    stream_id: str,
+    sent_count: int,
+    keepalive_count: int,
+    runtime_boot_id: str | None = None,
+) -> str:
     """格式化浏览器可见的 SSE ping 帧，不占用业务 seq，也不写入通信消息日志。"""
-    payload = json.dumps(
-        {
-            "stream_id": stream_id,
-            "server_time": datetime.now(timezone.utc).isoformat(),
-            "sent_count": sent_count,
-            "keepalive_count": keepalive_count,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    body: dict[str, Any] = {
+        "stream_id": stream_id,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "sent_count": sent_count,
+        "keepalive_count": keepalive_count,
+    }
+    if runtime_boot_id:
+        body["runtime_boot_id"] = runtime_boot_id
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
     return f"event: {COMMUNICATION_SSE_PING_EVENT_TYPE}\ndata: {payload}\n\n"
 
 

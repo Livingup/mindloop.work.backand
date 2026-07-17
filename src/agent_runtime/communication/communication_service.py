@@ -11,6 +11,7 @@ from threading import RLock
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
+from agent_runtime.communication.communication_errors import CommunicationGapUnrecoverableError
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
@@ -109,15 +110,29 @@ class CommunicationService:
         self,
         repository: CommunicationRepository,
         event_hub: InMemoryCommunicationEventHub,
+        *,
+        storage_mode: str = "memory",
     ) -> None:
-        # 通信流与消息日志仓储。SQLite 消息日志是跨重启断线恢复的权威来源。
+        # 通信流与消息日志仓储。sqlite 模式下是权威日志；memory 模式可不写入。
         self._repository = repository
 
-        # 进程内短期事件流。负责在线订阅分发和同进程短期缓冲。
+        # 进程内 ring + fan-out。memory 模式下同时承担权威 seq 与短窗重放。
         self._event_hub = event_hub
+        self._storage_mode = storage_mode if storage_mode in ("memory", "sqlite") else "memory"
 
         self._stream_cache: dict[str, CommunicationStream] = {}
         self._stream_cache_lock = RLock()
+
+    @property
+    def storage_mode(self) -> str:
+        return self._storage_mode
+
+    @property
+    def runtime_boot_id(self) -> str:
+        return self._event_hub.runtime_boot_id
+
+    def _is_memory_mode(self) -> bool:
+        return self._storage_mode == "memory"
 
     def create_stream(
         self,
@@ -137,6 +152,13 @@ class CommunicationService:
             owner_id=owner_id,
             metadata=dict(metadata or {}),
         )
+        if self._is_memory_mode():
+            with self._stream_cache_lock:
+                existing = self._stream_cache.get(actual_stream_id)
+                if existing is not None:
+                    raise ValueError(f"通信流已存在: {actual_stream_id}")
+                self._stream_cache[actual_stream_id] = stream
+            return stream
         created = self._repository.create_stream(stream)
         with self._stream_cache_lock:
             self._stream_cache[created.stream_id] = created
@@ -149,6 +171,8 @@ class CommunicationService:
             cached = self._stream_cache.get(stream_id)
         if cached is not None:
             return cached
+        if self._is_memory_mode():
+            raise KeyError(f"通信流不存在: {stream_id}")
         stream = self._repository.get_stream(stream_id)
         if stream is None:
             raise KeyError(f"通信流不存在: {stream_id}")
@@ -160,6 +184,10 @@ class CommunicationService:
         """关闭通信流。"""
         stream = self.get_stream(stream_id)
         closed = stream.close()
+        if self._is_memory_mode():
+            with self._stream_cache_lock:
+                self._stream_cache[closed.stream_id] = closed
+            return closed
         saved = self._repository.save_stream(closed)
         with self._stream_cache_lock:
             self._stream_cache[saved.stream_id] = saved
@@ -200,6 +228,23 @@ class CommunicationService:
         _require_non_blank(stream_id, "stream_id")
         _require_non_blank(message_type, "message_type")
         try:
+            if self._is_memory_mode():
+                return await self._publish_message_memory(
+                    stream_id=stream_id,
+                    message_type=message_type,
+                    payload=payload,
+                    topic=topic,
+                    source=source,
+                    actor_id=actor_id,
+                    correlation_id=correlation_id,
+                    parent_message_id=parent_message_id,
+                    metadata=metadata,
+                    message_id=message_id,
+                    started_at=started_at,
+                    task_name=task_name,
+                    trace_id=trace_id,
+                    operation=operation,
+                )
             to_thread_submitted_at = time.perf_counter()
             saved = await monitored_to_thread(
                 self._append_message_sync_with_diagnostics,
@@ -384,6 +429,13 @@ class CommunicationService:
         """读取某条通信流中的历史消息。"""
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
+        if self._is_memory_mode():
+            return self._event_hub.list_messages(
+                stream_id,
+                after_seq=max(after_seq, 0),
+                limit=max(min(limit, 5000), 1),
+                enforce_contiguous_gap=True,
+            )
         return self._repository.list_messages(
             stream_id,
             after_seq=max(after_seq, 0),
@@ -403,6 +455,11 @@ class CommunicationService:
         """
         _require_non_blank(stream_id, "stream_id")
         self.get_stream(stream_id)
+        if self._is_memory_mode():
+            return self._event_hub.list_latest_messages(
+                stream_id,
+                limit=max(min(limit, 5000), 1),
+            )
         return self._repository.list_latest_messages(
             stream_id,
             limit=max(min(limit, 5000), 1),
@@ -411,7 +468,10 @@ class CommunicationService:
     def get_stream_diagnostics(self, stream_id: str) -> dict[str, Any]:
         _require_non_blank(stream_id, "stream_id")
         stream = self.get_stream(stream_id)
-        latest_messages = self._repository.list_latest_messages(stream_id, limit=1)
+        if self._is_memory_mode():
+            latest_messages = self._event_hub.list_latest_messages(stream_id, limit=1)
+        else:
+            latest_messages = self._repository.list_latest_messages(stream_id, limit=1)
         latest_message = latest_messages[-1] if latest_messages else None
         hub_diagnostics = self._event_hub.get_stream_diagnostics(stream_id)
         return {
@@ -425,6 +485,8 @@ class CommunicationService:
             "latest_seq": latest_message.seq if latest_message is not None else 0,
             "latest_message_type": latest_message.type if latest_message is not None else None,
             "latest_message_created_at": latest_message.created_at.isoformat() if latest_message is not None else None,
+            "storage_mode": self._storage_mode,
+            "runtime_boot_id": self.runtime_boot_id,
             **hub_diagnostics,
         }
 
@@ -489,6 +551,20 @@ class CommunicationService:
     ) -> AsyncIterator[CommunicationMessage]:
         """订阅某条通信流的新消息。"""
         _require_non_blank(stream_id, "stream_id")
+        if self._is_memory_mode():
+            self.get_stream(stream_id)
+            cursor = max(after_seq, 0)
+            subscription = self._event_hub.subscribe(stream_id, after_seq=cursor)
+            try:
+                async for message in subscription:
+                    if message.seq <= cursor:
+                        continue
+                    cursor = message.seq
+                    yield message
+            finally:
+                await subscription.aclose()
+            return
+
         await monitored_to_thread(
             self.get_stream,
             stream_id,
@@ -548,6 +624,79 @@ class CommunicationService:
             with suppress(asyncio.CancelledError):
                 await next_live_message
             await subscription.aclose()
+
+    async def _publish_message_memory(
+        self,
+        *,
+        stream_id: str,
+        message_type: str,
+        payload: dict[str, Any] | None,
+        topic: str | None,
+        source: str | None,
+        actor_id: str | None,
+        correlation_id: str | None,
+        parent_message_id: str | None,
+        metadata: dict[str, Any] | None,
+        message_id: str | None,
+        started_at: float,
+        task_name: str | None,
+        trace_id: str | None,
+        operation: str,
+    ) -> CommunicationMessage:
+        stream = self.get_stream(stream_id)
+        stream.ensure_active()
+        message = CommunicationMessage(
+            message_id=message_id or _new_id("message"),
+            stream_id=stream.stream_id,
+            seq=0,
+            type=message_type,
+            topic=topic or stream.topic,
+            source=source,
+            actor_id=actor_id,
+            correlation_id=correlation_id,
+            parent_message_id=parent_message_id,
+            payload=dict(payload or {}),
+            metadata=dict(metadata or {}),
+        )
+        hub_started_at = time.perf_counter()
+        saved = await self._event_hub.publish(message)
+        hub_duration_ms = _duration_ms_since(hub_started_at)
+        duration_ms = _duration_ms_since(started_at)
+        level = (
+            logging.WARNING
+            if duration_ms >= int(_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS * 1000)
+            else logging.DEBUG
+        )
+        _log_publish_diagnostic(
+            level,
+            "Communication memory message publish completed",
+            trace_id=trace_id,
+            stream_id=stream_id,
+            event_type=message_type,
+            operation=operation,
+            phase="publish_message.memory.completed",
+            task_name=task_name,
+            duration_ms=duration_ms,
+            correlation_id=correlation_id,
+            message_id=saved.message_id,
+            seq=saved.seq,
+        )
+        if hub_duration_ms >= int(_COMMUNICATION_PUBLISH_SLOW_LOG_SECONDS * 1000):
+            _log_publish_diagnostic(
+                logging.WARNING,
+                "Communication event hub publish slow",
+                trace_id=trace_id,
+                stream_id=stream_id,
+                event_type=message_type,
+                operation=operation,
+                phase="event_hub.publish.completed",
+                task_name=task_name,
+                duration_ms=hub_duration_ms,
+                correlation_id=correlation_id,
+                message_id=saved.message_id,
+                seq=saved.seq,
+            )
+        return saved
 
     def _append_message_sync_with_diagnostics(
         self,

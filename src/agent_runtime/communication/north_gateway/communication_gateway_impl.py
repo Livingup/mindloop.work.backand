@@ -25,6 +25,10 @@ class CommunicationGatewayImpl(CommunicationGateway):
         # 通用通信领域服务。
         self._service = service
 
+    @property
+    def runtime_boot_id(self) -> str:
+        return self._service.runtime_boot_id
+
     def create_stream(self, request: CreateCommunicationStreamRequest) -> CommunicationStream:
         """创建可订阅的逻辑通信流。"""
         return self._service.create_stream(

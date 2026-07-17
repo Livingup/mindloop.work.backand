@@ -727,10 +727,23 @@ def _build_context_compression_config(data: dict[str, Any]) -> ContextCompressio
 
 def _build_communication_config(data: dict[str, Any]) -> CommunicationConfig:
     """从 YAML 字典构建通用通信模块配置。"""
+    storage_mode = str(data.get("storage_mode", "memory")).strip().lower()
+    if storage_mode not in ("memory", "sqlite"):
+        storage_mode = "memory"
+    max_events = int(data.get("memory_ring_max_events", data.get("replay_buffer_size", 4000)))
     return CommunicationConfig(
         data_dir=str(data.get("data_dir", "~/.spread-ai/communication")),
-        replay_buffer_size=int(data.get("replay_buffer_size", 5000)),
+        replay_buffer_size=int(data.get("replay_buffer_size", max_events)),
         subscriber_queue_size=int(data.get("subscriber_queue_size", 1000)),
+        storage_mode=storage_mode,  # type: ignore[arg-type]
+        memory_ring_max_events=max_events,
+        memory_ring_max_bytes=int(data.get("memory_ring_max_bytes", 24 * 1024 * 1024)),
+        memory_ring_main_min_events=int(data.get("memory_ring_main_min_events", 1000)),
+        memory_ring_terminal_max_events=int(data.get("memory_ring_terminal_max_events", 3000)),
+        global_memory_ring_max_bytes=int(data.get("global_memory_ring_max_bytes", 2560 * 1024 * 1024)),
+        stream_idle_reclaim_minutes=int(data.get("stream_idle_reclaim_minutes", 30)),
+        stream_idle_shrink_events=int(data.get("stream_idle_shrink_events", 64)),
+        idle_scan_interval_seconds=int(data.get("idle_scan_interval_seconds", 60)),
     )
 
 

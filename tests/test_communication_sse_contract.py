@@ -234,7 +234,7 @@ def test_communication_service_replays_before_live_gap_fills_and_skips_duplicate
             gap_batches=[[_message(3), _message(4), _message(5)]],
         )
         event_hub = _EventHub([_message(2, message_id="duplicate-live"), _message(5, message_id="live-gap-duplicate"), _message(6)])
-        service = CommunicationService(repository, event_hub)
+        service = CommunicationService(repository, event_hub, storage_mode="sqlite")
         subscription = service.subscribe_messages("stream-1", after_seq=-10)
         yielded: list[CommunicationMessage] = []
         try:
@@ -256,7 +256,7 @@ def test_communication_service_closes_live_subscription_when_consumer_disconnect
     async def run_case() -> None:
         repository = _SequenceRepository(replay_batches=[[]], gap_batches=[])
         event_hub = _EventHub([_message(1)])
-        service = CommunicationService(repository, event_hub)
+        service = CommunicationService(repository, event_hub, storage_mode="sqlite")
         subscription = service.subscribe_messages("stream-1", after_seq=0)
 
         first = await anext(subscription)
@@ -290,7 +290,7 @@ def test_communication_service_pages_live_gap_without_skipping_messages() -> Non
             ],
         )
         event_hub = _EventHub([_message(5002, message_id="live-5002")])
-        service = CommunicationService(repository, event_hub)
+        service = CommunicationService(repository, event_hub, storage_mode="sqlite")
         subscription = service.subscribe_messages("stream-1", after_seq=0)
         yielded: list[CommunicationMessage] = []
         try:
@@ -313,7 +313,7 @@ def test_communication_service_fails_when_live_gap_is_not_durable() -> None:
             gap_batches=[[_message(1)], []],
         )
         event_hub = _EventHub([_message(3, message_id="live-3")])
-        service = CommunicationService(repository, event_hub)
+        service = CommunicationService(repository, event_hub, storage_mode="sqlite")
         subscription = service.subscribe_messages("stream-1", after_seq=0)
         try:
             first = await anext(subscription)

@@ -49,7 +49,7 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
 _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
-    "llm.response.completed",
+    # llm.response.completed 需要发给前端更新 token/context 与已有 execution bubble。
     "llm.response.failed",
     "llm.thinking.delta",
     "llm.tool_call.arguments.delta",
