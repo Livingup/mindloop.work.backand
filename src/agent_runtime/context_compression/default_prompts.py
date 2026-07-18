@@ -451,22 +451,18 @@ TODO_RISK_NATIVE_HISTORY_PROMPT = (
 )
 
 
-DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {'transcript_snapshot': {'RequirementConstraintWorker': REQUIREMENT_CONSTRAINT_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'ProgressPlanWorker': PROGRESS_PLAN_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'CodeArchitectureWorker': CODE_ARCHITECTURE_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'ObservationEvidenceWorker': OBSERVATION_EVIDENCE_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'DecisionRationaleWorker': DECISION_RATIONALE_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'TodoRiskWorker': TODO_RISK_TRANSCRIPT_SNAPSHOT_PROMPT,
-                         'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
-                         'FinalVerifierWorker': FINAL_REVIEW_EDIT_TRANSCRIPT_SNAPSHOT_PROMPT},
- 'native_multimodal_history': {'RequirementConstraintWorker': REQUIREMENT_CONSTRAINT_NATIVE_HISTORY_PROMPT,
-                             'ProgressPlanWorker': PROGRESS_PLAN_NATIVE_HISTORY_PROMPT,
-                             'CodeArchitectureWorker': CODE_ARCHITECTURE_NATIVE_HISTORY_PROMPT,
-                             'ObservationEvidenceWorker': OBSERVATION_EVIDENCE_NATIVE_HISTORY_PROMPT,
-                             'DecisionRationaleWorker': DECISION_RATIONALE_NATIVE_HISTORY_PROMPT,
-                             'TodoRiskWorker': TODO_RISK_NATIVE_HISTORY_PROMPT,
-                             'FinalAssemblerWorker': FINAL_ASSEMBLER_PROMPT,
-                             'FinalVerifierWorker': FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT}}
+DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {
+    "native_multimodal_history": {
+        "RequirementConstraintWorker": REQUIREMENT_CONSTRAINT_NATIVE_HISTORY_PROMPT,
+        "ProgressPlanWorker": PROGRESS_PLAN_NATIVE_HISTORY_PROMPT,
+        "CodeArchitectureWorker": CODE_ARCHITECTURE_NATIVE_HISTORY_PROMPT,
+        "ObservationEvidenceWorker": OBSERVATION_EVIDENCE_NATIVE_HISTORY_PROMPT,
+        "DecisionRationaleWorker": DECISION_RATIONALE_NATIVE_HISTORY_PROMPT,
+        "TodoRiskWorker": TODO_RISK_NATIVE_HISTORY_PROMPT,
+        "FinalAssemblerWorker": FINAL_ASSEMBLER_PROMPT,
+        "FinalVerifierWorker": FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT,
+    }
+}
 
 
 CONTEXT_COMPRESSION_WORKER_NAMES: tuple[str, ...] = tuple(
@@ -478,10 +474,12 @@ CONTEXT_COMPRESSION_WORKER_NAMES: tuple[str, ...] = tuple(
 
 
 def get_default_worker_prompt(*, input_mode: str, worker_name: str) -> str:
+    # 产品仅保留 native_multimodal_history；兼容旧调用仍忽略其他 input_mode。
+    del input_mode
     try:
-        return DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS[input_mode][worker_name].strip()
+        return DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS["native_multimodal_history"][worker_name].strip()
     except KeyError as exc:
-        raise KeyError(f"????? Worker prompt ???: {input_mode}/{worker_name}") from exc
+        raise KeyError(f"未知 Worker prompt: native_multimodal_history/{worker_name}") from exc
 
 
 def list_default_worker_prompt_keys() -> tuple[tuple[str, str], ...]:

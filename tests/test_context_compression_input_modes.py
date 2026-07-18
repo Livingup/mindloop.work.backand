@@ -6,8 +6,6 @@ from pathlib import Path
 from agent_runtime.context_compression.compression_service import (
     ContextCompressionService,
     _assembler_input,
-    _required_native_input_modalities,
-    _select_worker_input_mode_and_candidates,
 )
 from agent_runtime.context_compression.conversation_rewriter import rewrite_conversation_with_summary
 from agent_runtime.context_compression.default_prompts import get_default_worker_prompt
@@ -17,25 +15,20 @@ from agent_runtime.context_compression.worker_input import ContextCompressionWor
 from agent_runtime.context_compression.worker_runner import _worker_render_options
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI,
-    ImagePart,
-    PdfPart,
-    PdfPartMeta,
     ROLE_ASSISTANT,
-    ROLE_TOOL,
     TextPart,
     TextPartMeta,
-    ToolResultPart,
     UniMessage,
 )
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.conversation_message.message.tool_result_output import tool_result_output_to_text
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResolvedResource
-from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF, INPUT_MODALITY_TEXT
+from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 from agent_runtime.llm_model_registry.llm_provider_definition import LlmApiKey, LlmRetryPolicy
 
 
-def _job(input_mode: str = "transcript_snapshot") -> CompressionJob:
+def _job(input_mode: str = "native_multimodal_history") -> CompressionJob:
     return CompressionJob(
         job_id="job-1",
         task_id="task-1",
@@ -141,6 +134,15 @@ class ContextCompressionRuntimeSettingsTests(unittest.TestCase):
             self.assertEqual(cleared.llm_policy_group_id, "group-a")
             self.assertIsNone(cleared.input_mode)
 
+    def test_settings_repository_maps_legacy_transcript_to_native(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = ContextCompressionSettingsRepository(lambda: temp_dir)
+            saved = repo.set_settings(
+                llm_policy_group_id="group-a",
+                input_mode="transcript_snapshot",
+            )
+            self.assertEqual(saved.input_mode, "native_multimodal_history")
+
     def test_settings_repository_migrates_legacy_schema_without_input_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "context_compression_worker_prompts.db"
@@ -191,10 +193,12 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_history_worker_input_replays_compressed_range_and_adds_instruction(self) -> None:
         conversation = create_conversation()
         conversation.add_user_message([TextPart("old question")], [TextPartMeta()])
-        conversation.append_message(UniMessage(role=ROLE_ASSISTANT, content=[TextPart("old answer")], source_provider=PROVIDER_OPENAI))
+        conversation.append_message(
+            UniMessage(role=ROLE_ASSISTANT, content=[TextPart("old answer")], source_provider=PROVIDER_OPENAI)
+        )
         conversation.add_user_message([TextPart("retained tail")], [TextPartMeta()])
         conversation.provider_state[PROVIDER_OPENAI] = {"prompt_cache_key": "source-cache-key"}
-        job = _job(input_mode="native_multimodal_history")
+        job = _job()
         range_plan = _range_plan(start=0, end=1)
         service = ContextCompressionService.__new__(ContextCompressionService)
         service._resource_resolver = _ResourceResolver()
@@ -203,7 +207,6 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
             conversation,
             job,
             range_plan,
-            "native_multimodal_history",
         )
 
         self.assertEqual(worker_input.input_mode, "native_multimodal_history")
@@ -223,107 +226,33 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_worker_render_options(_candidate("openai"), worker_input), {})
 
-    async def test_transcript_worker_input_preserves_multimodal_resource_locator_text(self) -> None:
+    async def test_final_review_worker_input_is_native_only(self) -> None:
         conversation = create_conversation()
-        conversation.add_user_message([TextPart("before")], [TextPartMeta()])
-        conversation.add_user_message([ImagePart("image-1")], [TextPartMeta()])
-        job = _job(input_mode="transcript_snapshot")
+        conversation.add_user_message([TextPart("old question")], [TextPartMeta()])
+        conversation.append_message(
+            UniMessage(role=ROLE_ASSISTANT, content=[TextPart("old answer")], source_provider=PROVIDER_OPENAI)
+        )
+        job = _job()
+        job.draft_markdown_lines = ["# Runtime Compressed Task Context", "line-2"]
         range_plan = _range_plan(start=0, end=1)
         service = ContextCompressionService.__new__(ContextCompressionService)
-        service._resource_resolver = _ResourceResolver(
-            {
-                "image-1": ResolvedResource(
-                    resource_id="image-1",
-                    mime_type="image/png",
-                    resource_category="image",
-                    object_storage_url="https://cdn.example.invalid/image-1.png",
-                    base64_content=None,
-                    local_storage_path="C:/local/image-1.png",
-                ),
-            }
-        )
+        service._resource_resolver = _ResourceResolver()
 
-        worker_input = await service._build_worker_input(
+        worker_input = await service._build_final_review_worker_input(
             conversation,
             job,
             range_plan,
-            "transcript_snapshot",
+            "ignored_mode",
         )
 
-        self.assertEqual(worker_input.input_mode, "transcript_snapshot")
-        self.assertFalse(worker_input.uses_history_messages)
-        self.assertIn("[image file] resource_id=image-1 locator=https://cdn.example.invalid/image-1.png", worker_input.user_text)
+        self.assertEqual(worker_input.input_mode, "native_multimodal_history")
+        self.assertTrue(worker_input.uses_history_messages)
+        self.assertEqual(len(worker_input.history_messages), 2)
+        self.assertIn("Final Review/Edit Instruction", worker_input.user_text)
+        self.assertIn("1: # Runtime Compressed Task Context", worker_input.user_text)
 
 
-class ContextCompressionInputModeSelectionTests(unittest.TestCase):
-    def test_native_history_without_multimodal_requirements_keeps_all_candidates(self) -> None:
-        conversation = create_conversation()
-        conversation.add_user_message([TextPart("text only")], [TextPartMeta()])
-        candidates = (_candidate("text"), _candidate("image", modalities=(INPUT_MODALITY_TEXT, INPUT_MODALITY_IMAGE)))
-
-        input_mode, selected = _select_worker_input_mode_and_candidates(
-            requested_input_mode="native_multimodal_history",
-            source_conversation=conversation,
-            range_plan=_range_plan(start=0, end=0),
-            worker_candidates=candidates,
-        )
-
-        self.assertEqual(input_mode, "native_multimodal_history")
-        self.assertEqual(selected, candidates)
-
-    def test_native_history_filters_to_candidates_supporting_image_requirements(self) -> None:
-        conversation = create_conversation()
-        conversation.add_user_message([ImagePart("image-1")], [TextPartMeta()])
-        text_candidate = _candidate("text", modalities=(INPUT_MODALITY_TEXT,))
-        image_candidate = _candidate("image", modalities=(INPUT_MODALITY_TEXT, INPUT_MODALITY_IMAGE))
-
-        input_mode, selected = _select_worker_input_mode_and_candidates(
-            requested_input_mode="native_multimodal_history",
-            source_conversation=conversation,
-            range_plan=_range_plan(start=0, end=0),
-            worker_candidates=(text_candidate, image_candidate),
-        )
-
-        self.assertEqual(input_mode, "native_multimodal_history")
-        self.assertEqual(selected, (image_candidate,))
-
-    def test_native_history_downgrades_when_pdf_requirement_has_no_compatible_candidate(self) -> None:
-        conversation = create_conversation()
-        conversation.add_user_message([PdfPart("pdf-1")], [PdfPartMeta(page_count=2)])
-        candidates = (_candidate("text", modalities=(INPUT_MODALITY_TEXT,)),)
-
-        input_mode, selected = _select_worker_input_mode_and_candidates(
-            requested_input_mode="native_multimodal_history",
-            source_conversation=conversation,
-            range_plan=_range_plan(start=0, end=0),
-            worker_candidates=candidates,
-        )
-
-        self.assertEqual(input_mode, "transcript_snapshot")
-        self.assertEqual(selected, candidates)
-
-    def test_tool_result_media_contributes_to_native_required_modalities(self) -> None:
-        message = UniMessage(
-            role=ROLE_TOOL,
-            content=[
-                ToolResultPart(
-                    tool_use_ref="tool-1",
-                    is_error=False,
-                    output=[
-                        {"kind": "image", "resource_id": "image-1"},
-                        {"kind": "pdf", "resource_id": "pdf-1"},
-                    ],
-                )
-            ],
-        )
-
-        self.assertEqual(
-            _required_native_input_modalities((message,)),
-            {INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF},
-        )
-
-
-class ToolResultTranscriptFallbackTests(unittest.IsolatedAsyncioTestCase):
+class ToolResultLocatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_result_output_to_text_preserves_resource_id_and_locator_states(self) -> None:
         resolver = _ResourceResolver(
             {
@@ -448,18 +377,24 @@ class ContextCompressionVisibilityContractTests(unittest.TestCase):
         self.assertEqual(context_compression_extras["compressed_range"], {"start_index": 0, "end_index": 1})
         self.assertEqual(context_compression_extras["retained_tail_range"]["start_index"], 2)
 
-    def test_final_assembler_default_prompts_use_business_visible_contract(self) -> None:
-        for input_mode in ["transcript_snapshot", "native_multimodal_history"]:
-            with self.subTest(input_mode=input_mode):
-                prompt = get_default_worker_prompt(input_mode=input_mode, worker_name="FinalAssemblerWorker")
+    def test_default_prompts_only_native_and_use_business_visible_contract(self) -> None:
+        prompt = get_default_worker_prompt(
+            input_mode="native_multimodal_history",
+            worker_name="FinalAssemblerWorker",
+        )
+        legacy_mode_prompt = get_default_worker_prompt(
+            input_mode="transcript_snapshot",
+            worker_name="FinalAssemblerWorker",
+        )
 
-                self.assertIn("业务维度", prompt)
-                self.assertIn("最终 Markdown 的读者是继续执行任务的业务 Agent", prompt)
-                self.assertIn("禁止在最终 Markdown 中输出压缩执行角色名称", prompt)
-                self.assertNotIn("Section Worker", prompt)
-                self.assertNotIn("FinalAssemblerWorker", prompt)
-                self.assertNotIn("Provenance", prompt)
-                self.assertNotIn("Usage Contract", prompt)
+        self.assertEqual(prompt, legacy_mode_prompt)
+        self.assertIn("业务维度", prompt)
+        self.assertIn("最终 Markdown 的读者是继续执行任务的业务 Agent", prompt)
+        self.assertIn("禁止在最终 Markdown 中输出压缩执行角色名称", prompt)
+        self.assertNotIn("Section Worker", prompt)
+        self.assertNotIn("FinalAssemblerWorker", prompt)
+        self.assertNotIn("Provenance", prompt)
+        self.assertNotIn("Usage Contract", prompt)
 
 
 if __name__ == "__main__":

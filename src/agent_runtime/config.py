@@ -715,11 +715,15 @@ def _build_llm_http_trace_config(data: dict[str, Any]) -> LlmHttpTraceConfig:
 
 
 def _build_context_compression_config(data: dict[str, Any]) -> ContextCompressionConfig:
+    raw_input_mode = str(data.get("input_mode", "native_multimodal_history")).strip()
+    # 旧配置 transcript_snapshot 一律收敛到 native_multimodal_history。
+    if raw_input_mode in {"", "transcript_snapshot"}:
+        raw_input_mode = "native_multimodal_history"
     return ContextCompressionConfig(
         enabled=bool(data.get("enabled", True)),
         default_threshold_ratio=float(data.get("default_threshold_ratio", 0.75)),
         max_worker_rounds=int(data.get("max_worker_rounds", data.get("section_worker_max_rounds", 128))),
-        input_mode=str(data.get("input_mode", "transcript_snapshot")),
+        input_mode=raw_input_mode,
         verifier_enabled=bool(data.get("verifier_enabled", False)),
         archive_data_dir=str(data.get("archive_data_dir", "~/.spread-ai/context-compression")),
     )

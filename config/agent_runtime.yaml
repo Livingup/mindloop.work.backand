@@ -124,7 +124,7 @@ context_compression:
   enabled: true
   default_threshold_ratio: 0.75
   max_worker_rounds: 128
-  input_mode: "transcript_snapshot"
+  input_mode: "native_multimodal_history"
   verifier_enabled: false
   archive_data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/context-compression"
 

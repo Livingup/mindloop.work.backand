@@ -122,7 +122,7 @@ class CompressionJob:
     source_conversation_id: str
     compression_index: int
     status: str = "created"
-    input_mode: str = "transcript_snapshot"
+    input_mode: str = "native_multimodal_history"
     target_conversation_id: str | None = None
     summary_message_id: str | None = None
     range: CompressionRange | None = None

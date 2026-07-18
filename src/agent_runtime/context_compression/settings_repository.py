@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS context_compression_settings (
 );
 """
 
-_SUPPORTED_INPUT_MODES = frozenset({"transcript_snapshot", "native_multimodal_history"})
+_SUPPORTED_INPUT_MODES = frozenset({"native_multimodal_history"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,8 +247,11 @@ def _normalize_input_mode(value: str | None) -> str | None:
     normalized = _normalize_optional_text(value)
     if normalized is None:
         return None
+    # 历史数据兼容：旧 transcript_snapshot 统一收敛到 native。
+    if normalized == "transcript_snapshot":
+        return "native_multimodal_history"
     if normalized not in _SUPPORTED_INPUT_MODES:
-        raise ValueError("input_mode 必须是 transcript_snapshot 或 native_multimodal_history。")
+        raise ValueError("input_mode 必须是 native_multimodal_history。")
     return normalized
 
 

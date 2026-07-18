@@ -9,8 +9,8 @@ from agent_runtime.conversation_message.message.models import UniMessage
 class ContextCompressionWorkerInput:
     """上下文压缩 Worker 的输入载荷。
 
-    transcript_snapshot 模式只传递一条文本 user 消息；native_multimodal_history
-    模式会把待压缩的原始会话消息作为 Worker 历史消息，再追加一条压缩分析指令。
+    当前仅支持 native_multimodal_history：把待压缩的原始会话消息作为 Worker
+    历史消息，再追加一条压缩分析指令（user_text）。
 
     Worker 每次执行都会创建独立临时 Conversation。OpenAI Responses 协议的
     prompt_cache_key 应保持该 Worker Conversation 自己的默认会话 ID，不从被压缩

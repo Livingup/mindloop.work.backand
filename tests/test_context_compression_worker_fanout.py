@@ -40,7 +40,7 @@ def _job() -> CompressionJob:
         source_conversation_id="conversation-stage8-p12",
         compression_index=8,
         status="running",
-        input_mode="transcript_snapshot",
+        input_mode="native_multimodal_history",
     )
 
 
@@ -171,8 +171,8 @@ class ContextCompressionWorkerFanoutContractTests(unittest.IsolatedAsyncioTestCa
         service._job_store.create_job(job)
         await service._run_section_workers(
             job=job,
-            worker_input=ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text="worker input must not leak"),
-            input_mode="transcript_snapshot",
+            worker_input=ContextCompressionWorkerInput(input_mode="native_multimodal_history", user_text="worker input must not leak"),
+            input_mode="native_multimodal_history",
             resolved_candidates=(),
             max_rounds=1,
             communication_context=None,
@@ -307,7 +307,7 @@ class ContextCompressionWorkerFanoutContractTests(unittest.IsolatedAsyncioTestCa
         sink = _RuntimeEventSink()
         service = ContextCompressionService.__new__(ContextCompressionService)
         service._config_accessor = lambda: ContextCompressionConfig(
-            input_mode="transcript_snapshot",
+            input_mode="native_multimodal_history",
             max_worker_rounds=1,
             verifier_enabled=False,
         )
@@ -333,7 +333,7 @@ class ContextCompressionWorkerFanoutContractTests(unittest.IsolatedAsyncioTestCa
         service._job_store = InMemoryCompressionJobStore()
         service._event_publisher = ContextCompressionEventPublisher(sink)
         service._build_worker_input = _async_return(
-            ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text="secret conversation text")
+            ContextCompressionWorkerInput(input_mode="native_multimodal_history", user_text="secret conversation text")
         )
         service._run_section_workers = _async_raise(LlmRequestCancelled("secret raw cancel text"))
         service._conversation_repository = _ConversationRepository()

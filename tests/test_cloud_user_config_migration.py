@@ -416,11 +416,11 @@ def test_cloud_enabled_shared_domain_repositories_use_postgresql_authority(
         )
         context_settings = context_settings_repository.set_settings(
             llm_policy_group_id="cloud-context-policy",
-            input_mode="transcript_snapshot",
+            input_mode="transcript_snapshot",  # legacy value maps to native
         )
         assert str(context_settings_repository.db_path()).startswith("postgresql:")
         assert context_settings_repository.get_settings().llm_policy_group_id == "cloud-context-policy"
-        assert context_settings.input_mode == "transcript_snapshot"
+        assert context_settings.input_mode == "native_multimodal_history"
 
         context_prompt_repository = create_context_compression_worker_prompt_repository(
             lambda: str(data_root / "context-compression"),

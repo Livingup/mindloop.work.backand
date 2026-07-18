@@ -53,14 +53,11 @@ from agent_runtime.context_compression.summary_tools import (
     REPLACE_DRAFT_LINES,
     REPORT_SECTION_ISSUE,
 )
-from agent_runtime.context_compression.transcript_snapshot import build_transcript_snapshot
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
 from agent_runtime.context_compression.worker_runner import ContextCompressionWorkerRunner
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
-from agent_runtime.conversation_message.message.models import Conversation, ImagePart, PdfPart, ToolResultPart, UniMessage
-from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
+from agent_runtime.conversation_message.message.models import Conversation
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResourceResolver
-from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
@@ -189,9 +186,8 @@ class ContextCompressionService:
         interrupt_checker: Callable[[], bool] | None = None,
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None,
     ) -> CompressionResult:
-        static_config = self._config_accessor()
-        runtime_settings = self._settings_repository.get_settings()
-        config = replace(static_config, input_mode=runtime_settings.input_mode or static_config.input_mode)
+        # 约定大于配置：始终使用 native_multimodal_history，不接受 runtime 模式切换。
+        config = replace(self._config_accessor(), input_mode="native_multimodal_history")
         decision = decide_context_compression(source_conversation, trigger_model, config)
         if not decision.should_compress:
             return CompressionResult(created=False, reason=decision.reason)
@@ -253,16 +249,11 @@ class ContextCompressionService:
                 await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, _base_payload(job, status="skipped", phase="range_planning", reason="insufficient_compressible_range"))
                 return CompressionResult(created=False, job=job, reason="insufficient_compressible_range")
             job.range = range_plan
-            effective_input_mode, worker_candidates = _select_worker_input_mode_and_candidates(
-                requested_input_mode=config.input_mode,
-                source_conversation=source_conversation,
-                range_plan=range_plan,
-                worker_candidates=worker_candidates,
-            )
+            effective_input_mode = "native_multimodal_history"
             job.input_mode = effective_input_mode
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_RANGE_PLANNED, _base_payload(job, status="running", phase="range_planned"))
-            worker_input = await self._build_worker_input(source_conversation, job, range_plan, effective_input_mode)
+            worker_input = await self._build_worker_input(source_conversation, job, range_plan)
             await self._run_section_workers(
                 job=job,
                 worker_input=worker_input,
@@ -703,20 +694,16 @@ class ContextCompressionService:
         source_conversation: Conversation,
         job: CompressionJob,
         range_plan: CompressionRange,
-        input_mode: str,
     ) -> ContextCompressionWorkerInput:
-        if input_mode == "native_multimodal_history":
-            return ContextCompressionWorkerInput(
-                input_mode=input_mode,
-                user_text=_native_history_instruction(job, range_plan),
-                history_messages=tuple(
-                    source_conversation.messages[
-                        range_plan.compressed_start_index:range_plan.compressed_end_index + 1
-                    ]
-                ),
-            )
-        transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
-        return ContextCompressionWorkerInput(input_mode="transcript_snapshot", user_text=transcript)
+        return ContextCompressionWorkerInput(
+            input_mode="native_multimodal_history",
+            user_text=_native_history_instruction(job, range_plan),
+            history_messages=tuple(
+                source_conversation.messages[
+                    range_plan.compressed_start_index:range_plan.compressed_end_index + 1
+                ]
+            ),
+        )
 
     async def _build_final_review_worker_input(
         self,
@@ -725,21 +712,15 @@ class ContextCompressionService:
         range_plan: CompressionRange,
         input_mode: str,
     ) -> ContextCompressionWorkerInput:
-        instruction = _final_review_instruction(job, range_plan)
-        if input_mode == "native_multimodal_history":
-            return ContextCompressionWorkerInput(
-                input_mode=input_mode,
-                user_text=instruction,
-                history_messages=tuple(
-                    source_conversation.messages[
-                        range_plan.compressed_start_index:range_plan.compressed_end_index + 1
-                    ]
-                ),
-            )
-        transcript = await build_transcript_snapshot(source_conversation, job, range_plan, self._resource_resolver)
+        del input_mode  # 固定 native，保留参数兼容调用方
         return ContextCompressionWorkerInput(
-            input_mode="transcript_snapshot",
-            user_text="\n\n".join([transcript, instruction]),
+            input_mode="native_multimodal_history",
+            user_text=_final_review_instruction(job, range_plan),
+            history_messages=tuple(
+                source_conversation.messages[
+                    range_plan.compressed_start_index:range_plan.compressed_end_index + 1
+                ]
+            ),
         )
 
     def _resolve_worker_candidates(self, config: ContextCompressionConfig) -> tuple[ResolvedLlmProviderModel, ...]:
@@ -780,73 +761,6 @@ class ContextCompressionService:
         if error_message is not None:
             payload["error_message"] = error_message
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, payload)
-
-
-def _select_worker_input_mode_and_candidates(
-    *,
-    requested_input_mode: str,
-    source_conversation: Conversation,
-    range_plan: CompressionRange,
-    worker_candidates: tuple[ResolvedLlmProviderModel, ...],
-) -> tuple[str, tuple[ResolvedLlmProviderModel, ...]]:
-    if requested_input_mode != "native_multimodal_history":
-        return "transcript_snapshot", worker_candidates
-
-    required_modalities = _required_native_input_modalities(_compressed_range_messages(source_conversation, range_plan))
-    if not required_modalities:
-        return "native_multimodal_history", worker_candidates
-
-    compatible_candidates = tuple(
-        candidate
-        for candidate in worker_candidates
-        if candidate.supports_tool_calling and not _missing_required_input_modalities(required_modalities, candidate)
-    )
-    if not compatible_candidates:
-        return "transcript_snapshot", worker_candidates
-    return "native_multimodal_history", compatible_candidates
-
-
-def _compressed_range_messages(conversation: Conversation, range_plan: CompressionRange) -> tuple[UniMessage, ...]:
-    return tuple(conversation.messages[range_plan.compressed_start_index:range_plan.compressed_end_index + 1])
-
-
-def _required_native_input_modalities(messages: tuple[UniMessage, ...]) -> set[str]:
-    required: set[str] = set()
-    for message in messages:
-        required.update(_message_required_native_modalities(message))
-    return required
-
-
-def _message_required_native_modalities(message: UniMessage) -> set[str]:
-    required: set[str] = set()
-    for part in message.content:
-        required.update(_part_required_native_modalities(part))
-    return required
-
-
-def _part_required_native_modalities(part: Any) -> set[str]:
-    if isinstance(part, ImagePart):
-        return {INPUT_MODALITY_IMAGE}
-    if isinstance(part, PdfPart):
-        return {INPUT_MODALITY_PDF}
-    if isinstance(part, ToolResultPart):
-        required: set[str] = set()
-        for item in normalize_tool_result_output(part.output):
-            kind = item.get("kind")
-            if kind == INPUT_MODALITY_IMAGE:
-                required.add(INPUT_MODALITY_IMAGE)
-            elif kind == INPUT_MODALITY_PDF:
-                required.add(INPUT_MODALITY_PDF)
-        return required
-    return set()
-
-
-def _missing_required_input_modalities(
-    required_modalities: set[str],
-    resolved_model: ResolvedLlmProviderModel,
-) -> list[str]:
-    supported_modalities = set(resolved_model.supported_input_modalities)
-    return sorted(modality for modality in required_modalities if modality not in supported_modalities)
 
 
 def _native_history_instruction(job: CompressionJob, range_plan: CompressionRange) -> str:

@@ -36,7 +36,7 @@ def _job() -> CompressionJob:
         source_conversation_id="conversation-stage8-p13",
         compression_index=13,
         status="running",
-        input_mode="transcript_snapshot",
+        input_mode="native_multimodal_history",
     )
 
 
@@ -173,10 +173,10 @@ class ContextCompressionWorkerActivityPublishTests(unittest.IsolatedAsyncioTestC
             worker_name="RequirementConstraintWorker",
             worker_role="section_worker",
             output_section="requirements_constraints",
-            input_mode="transcript_snapshot",
+            input_mode="native_multimodal_history",
             system_prompt="system prompt must not leak",
             worker_input=ContextCompressionWorkerInput(
-                input_mode="transcript_snapshot",
+                input_mode="native_multimodal_history",
                 user_text=WORKER_INPUT_SECRET,
             ),
             resolved_candidates=(_resolved_model(),),
@@ -221,7 +221,7 @@ class ContextCompressionWorkerActivityPublishTests(unittest.IsolatedAsyncioTestC
             self.assertEqual(context["worker_name"], "RequirementConstraintWorker")
             self.assertEqual(context["worker_role"], "section_worker")
             self.assertEqual(context["output_section"], "requirements_constraints")
-            self.assertEqual(context["input_mode"], "transcript_snapshot")
+            self.assertEqual(context["input_mode"], "native_multimodal_history")
             self.assertIn(context["phase"], {
                 "context_compression.worker_activity_publish.completed",
                 "context_compression.worker_activity_publish.scheduled",

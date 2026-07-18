@@ -27,7 +27,8 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
 
 
 # Worker 元数据由代码内置，与设计文档 15.10.2 保持一致。
-SUPPORTED_INPUT_MODES: tuple[str, ...] = ("native_multimodal_history", "transcript_snapshot")
+SUPPORTED_INPUT_MODES: tuple[str, ...] = ("native_multimodal_history",)
+NATIVE_INPUT_MODE = "native_multimodal_history"
 
 
 # Worker 分组：UI 列表按这个分组顺序展示。
@@ -230,11 +231,10 @@ def create_context_compression_router(
         repo = _require_settings_repository(settings_repository)
         settings = repo.get_settings()
         policy_id = settings.llm_policy_group_id
-        input_mode = settings.input_mode or config.input_mode
         status, status_message = _evaluate_policy_status(llm_registry_gateway, policy_id)
         return ContextCompressionSettingsResponse(
             enabled=config.enabled,
-            input_mode=input_mode,
+            input_mode=NATIVE_INPUT_MODE,
             llm_policy_group_id=policy_id,
             llm_policy_group_status=status,
             llm_policy_group_status_message=status_message,
@@ -252,16 +252,11 @@ def create_context_compression_router(
             new_policy_id = new_policy_id.strip() or None
         if new_policy_id is not None:
             _require_valid_execution_policy(llm_registry_gateway, new_policy_id)
-        new_input_mode = current_settings.input_mode
-        if "input_mode" in body.model_fields_set:
-            new_input_mode = body.input_mode.strip() if isinstance(body.input_mode, str) else None
-            if new_input_mode == "":
-                new_input_mode = None
-            if new_input_mode is not None:
-                _validate_input_mode(new_input_mode)
+        # 产品不再暴露输入模式切换；持久化固定 native，忽略 body.input_mode。
+        del current_settings
         repo.set_settings(
             llm_policy_group_id=new_policy_id,
-            input_mode=new_input_mode,
+            input_mode=NATIVE_INPUT_MODE,
         )
         return await get_settings()
 
@@ -274,12 +269,11 @@ def create_context_compression_router(
         workers: list[ContextCompressionWorkerResponse] = []
         for metadata in _WORKER_METADATA:
             prompt_status: dict[str, ContextCompressionPromptStatusResponse] = {}
-            for input_mode in SUPPORTED_INPUT_MODES:
-                prompt = prompt_index.get((input_mode, metadata["name"]))
-                prompt_status[input_mode] = ContextCompressionPromptStatusResponse(
-                    use_default=prompt is None,
-                    updated_at=prompt.updated_at if prompt is not None else None,
-                )
+            prompt = prompt_index.get((NATIVE_INPUT_MODE, metadata["name"]))
+            prompt_status[NATIVE_INPUT_MODE] = ContextCompressionPromptStatusResponse(
+                use_default=prompt is None,
+                updated_at=prompt.updated_at if prompt is not None else None,
+            )
             group = metadata["group"]
             workers.append(
                 ContextCompressionWorkerResponse(
