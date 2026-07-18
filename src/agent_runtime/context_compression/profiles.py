@@ -13,6 +13,7 @@ AssemblyStrategy = Literal["structured_priority_sections", "ordered_section_conc
 
 PROFILE_SECTION_PARALLEL_V1 = "section_parallel_v1"
 PROFILE_TASK_RESUME_V2 = "task_resume_v2"
+PROFILE_SINGLE_AGENT_GOAL_V1 = "single_agent_goal_v1"
 DEFAULT_ACTIVE_PROFILE_ID = PROFILE_SECTION_PARALLEL_V1
 NATIVE_INPUT_MODE = "native_multimodal_history"
 
@@ -341,14 +342,58 @@ def _profile_b() -> CompressionPipelineProfile:
     )
 
 
+def _profile_c() -> CompressionPipelineProfile:
+    worker = CompressionWorkerDef(
+        worker_name="SingleAgentCompressorWorker",
+        title="目标导向单 Agent 压缩",
+        description="单 Agent 仅接收压缩目的，由模型自主取舍并增量产出完整可续跑上下文。",
+        role="section_worker",
+        output_section="goal_compressed_context",
+        stage_id="goal_compress",
+        group="section",
+        group_label="单 Agent",
+        input_builder="native_history",
+    )
+    return CompressionPipelineProfile(
+        profile_id=PROFILE_SINGLE_AGENT_GOAL_V1,
+        title="目标导向单 Agent 压缩",
+        description="单 Agent 仅接收压缩目的，由模型自主取舍；系统单段汇编。",
+        version="1.0",
+        stages=(
+            CompressionStage(
+                stage_id="goal_compress",
+                title="目标压缩",
+                mode="serial",
+                worker_names=(worker.worker_name,),
+            ),
+        ),
+        workers=(worker,),
+        assembly=AssemblySpec(
+            strategy="ordered_section_concat",
+            section_order=("goal_compressed_context",),
+            section_headings={"goal_compressed_context": "压缩后的任务上下文"},
+            include_resource_reference_appendix=False,
+        ),
+        verifier=VerifierSpec(enabled_default=False, worker_name=None),
+    )
+
+
 _PROFILES: dict[str, CompressionPipelineProfile] = {
     PROFILE_SECTION_PARALLEL_V1: _profile_a(),
     PROFILE_TASK_RESUME_V2: _profile_b(),
+    PROFILE_SINGLE_AGENT_GOAL_V1: _profile_c(),
 }
 
 
 def list_profiles() -> tuple[CompressionPipelineProfile, ...]:
-    return tuple(_PROFILES[profile_id] for profile_id in (PROFILE_SECTION_PARALLEL_V1, PROFILE_TASK_RESUME_V2))
+    return tuple(
+        _PROFILES[profile_id]
+        for profile_id in (
+            PROFILE_SECTION_PARALLEL_V1,
+            PROFILE_TASK_RESUME_V2,
+            PROFILE_SINGLE_AGENT_GOAL_V1,
+        )
+    )
 
 
 def get_profile(profile_id: str | None) -> CompressionPipelineProfile:

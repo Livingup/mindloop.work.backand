@@ -269,7 +269,12 @@ class ContextCompressionService:
             job.range = range_plan
             effective_input_mode = "native_multimodal_history"
             job.input_mode = effective_input_mode
-            self._archive_repository.upsert_job(job, source_conversation=source_conversation)
+            native_history_messages = tuple(
+                source_conversation.messages[
+                    range_plan.compressed_start_index : range_plan.compressed_end_index + 1
+                ]
+            )
+            self._archive_repository.upsert_job(job, native_history_messages=native_history_messages)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_RANGE_PLANNED, _base_payload(job, status="running", phase="range_planned"))
             await self._run_profile_stages(
                 profile=profile,
@@ -328,13 +333,13 @@ class ContextCompressionService:
             self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, target_conversation.id)
             self._job_store.set_target_conversation(job.job_id, target_conversation_id=target_conversation.id, summary_message_id=summary_message_id)
             self._job_store.update_status(job.job_id, "completed")
-            self._archive_repository.upsert_job(job, source_conversation=source_conversation, target_conversation=target_conversation)
+            self._archive_repository.upsert_job(job)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_CONVERSATION_REBIND_COMPLETED, _completion_payload(job, source_conversation, target_conversation, summary_message_id))
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_COMPLETED, _completion_payload(job, source_conversation, target_conversation, summary_message_id))
             return CompressionResult(created=True, target_conversation=target_conversation, job=job)
         except LlmRequestCancelled:
             self._job_store.update_status(job.job_id, "cancelled")
-            self._archive_repository.upsert_job(job, source_conversation=source_conversation)
+            self._archive_repository.upsert_job(job)
             await self._event_publisher.publish(
                 communication_context,
                 CONTEXT_COMPRESSION_CANCELLED,
@@ -343,12 +348,12 @@ class ContextCompressionService:
             return CompressionResult(created=False, reason="interrupted")
         except asyncio.CancelledError:
             self._job_store.update_status(job.job_id, "cancelled")
-            self._archive_repository.upsert_job(job, source_conversation=source_conversation)
+            self._archive_repository.upsert_job(job)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_CANCELLED, _base_payload(job, status="cancelled", phase="cancelled"))
             raise
         except Exception as exc:
             self._job_store.update_status(job.job_id, "failed")
-            self._archive_repository.upsert_job(job, source_conversation=source_conversation)
+            self._archive_repository.upsert_job(job)
             payload = _base_payload(job, status="failed", phase="failed")
             payload["error_type"] = exc.__class__.__name__
             payload["error_message"] = str(exc)
@@ -887,6 +892,7 @@ def _native_history_instruction(*, worker_title: str | None = None) -> str:
         "前面的 user / assistant / tool 消息是即将被压缩归档的原始历史片段。",
         "这些消息只用于上下文压缩分析，不代表当前用户正在发起新任务，也不要继续执行历史任务。",
         "请基于这些原始历史消息提取你负责的可恢复任务上下文，并只通过 context_summary 工具增量写入结果；写完后 mark_section_complete。",
+        "如果要保留的信息很多，请通过增量工具多次调用以增量追加的方式返回压缩后的完整内容，不要强行一次就返回完整的压缩结果导致压缩质量下降。",
         "不要在 assistant 正文中输出最终压缩结果，也不要关心系统如何汇总其他角色的输出。",
     ]
     if worker_title:

@@ -31,6 +31,7 @@ SECTION_WORKER_TITLES: dict[str, str] = {
     "key_knowledge_findings": "关键知识与发现",
     "agent_collab_stateful_resources": "协作与有状态资源",
     "existing_work_artifacts": "已有工作成果与产物",
+    "goal_compressed_context": "压缩后的任务上下文",
 }
 
 

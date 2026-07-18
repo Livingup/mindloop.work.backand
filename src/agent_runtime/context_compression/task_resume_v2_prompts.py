@@ -60,7 +60,14 @@ def _sanitize_worker_prompt(text: str) -> str:
             f"{cleaned.rstrip()}\n\n"
             "## Runtime 产出协议\n"
             "请只通过 context_summary 工具增量写入你负责的内容，写完后调用 mark_section_complete。\n"
+            "如果要保留的信息很多，请通过增量工具多次调用以增量追加的方式返回压缩后的完整内容，不要强行一次就返回完整的压缩结果导致压缩质量下降。\n"
             "不要在 assistant 正文中输出最终压缩结果，也不要关心系统如何汇总其他角色的输出。\n"
+        )
+    elif "不要强行一次" not in cleaned and "分多次 append" not in cleaned and "多次调用" not in cleaned:
+        cleaned = (
+            f"{cleaned.rstrip()}\n\n"
+            "## Runtime 增量写入护栏\n"
+            "如果要保留的信息很多，请通过增量工具多次调用以增量追加的方式返回压缩后的完整内容，不要强行一次就返回完整的压缩结果导致压缩质量下降。\n"
         )
     return cleaned
 

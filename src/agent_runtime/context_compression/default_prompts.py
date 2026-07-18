@@ -480,7 +480,23 @@ CONTEXT_COMPRESSION_WORKER_NAMES: tuple[str, ...] = tuple(
     "KeyKnowledgeFindingsWorker",
     "AgentCollabStatefulResourcesWorker",
     "ExistingWorkArtifactsWorker",
+    "SingleAgentCompressorWorker",
 )
+
+
+SINGLE_AGENT_GOAL_V1_PROMPT = """你是上下文压缩系统中的单 Agent 压缩器。
+
+目标 Agent 的上下文空间不足了。请去除历史消息中过时、不需要的、对后续未完成任务没有用的噪音内容，保留有用的信息来腾出上下文空间，以便目标 Agent 能继续正确完成剩余任务。
+
+要求：
+1. 历史消息只用于分析，不要继续执行历史任务，不要向用户提问，不要编造事实。
+2. 不要废话，但也不要去除重要信息和有效信息。
+3. 如果要保留的信息很多，请通过增量工具多次调用以增量追加的方式返回压缩后的完整内容，不要强行一次就返回完整的压缩结果导致压缩质量下降。
+4. 目的是让压缩后的新上下文能使 Agent 继续正确完成剩下的任务。
+5. 你的输出必须通过 context_summary.append_section_items 写入 section=goal_compressed_context；写完后调用 context_summary.mark_section_complete。
+6. 不要在 assistant 正文中输出最终压缩结果，也不要关心系统如何拼接标题。
+""".strip()
+
 
 
 def get_default_worker_prompt(
@@ -489,7 +505,11 @@ def get_default_worker_prompt(
     input_mode: str | None = None,
     profile_id: str | None = None,
 ) -> str:
-    from agent_runtime.context_compression.profiles import PROFILE_SECTION_PARALLEL_V1, PROFILE_TASK_RESUME_V2
+    from agent_runtime.context_compression.profiles import (
+        PROFILE_SECTION_PARALLEL_V1,
+        PROFILE_SINGLE_AGENT_GOAL_V1,
+        PROFILE_TASK_RESUME_V2,
+    )
     from agent_runtime.context_compression.task_resume_v2_prompts import load_task_resume_v2_prompt
 
     resolved_profile = profile_id or PROFILE_SECTION_PARALLEL_V1
@@ -497,6 +517,10 @@ def get_default_worker_prompt(
         resolved_profile = PROFILE_SECTION_PARALLEL_V1
     if resolved_profile == PROFILE_TASK_RESUME_V2:
         return load_task_resume_v2_prompt(worker_name)
+    if resolved_profile == PROFILE_SINGLE_AGENT_GOAL_V1:
+        if worker_name != "SingleAgentCompressorWorker":
+            raise KeyError(f"未知 Worker prompt: {resolved_profile}/{worker_name}")
+        return SINGLE_AGENT_GOAL_V1_PROMPT
     try:
         return _PROFILE_A_PROMPTS[worker_name].strip()
     except KeyError as exc:
@@ -504,9 +528,14 @@ def get_default_worker_prompt(
 
 
 def list_default_worker_prompt_keys() -> tuple[tuple[str, str], ...]:
-    from agent_runtime.context_compression.profiles import PROFILE_SECTION_PARALLEL_V1, PROFILE_TASK_RESUME_V2
+    from agent_runtime.context_compression.profiles import (
+        PROFILE_SECTION_PARALLEL_V1,
+        PROFILE_SINGLE_AGENT_GOAL_V1,
+        PROFILE_TASK_RESUME_V2,
+    )
     from agent_runtime.context_compression.task_resume_v2_prompts import list_task_resume_v2_worker_names
 
     keys = [(PROFILE_SECTION_PARALLEL_V1, name) for name in _PROFILE_A_PROMPTS]
     keys.extend((PROFILE_TASK_RESUME_V2, name) for name in list_task_resume_v2_worker_names())
+    keys.append((PROFILE_SINGLE_AGENT_GOAL_V1, "SingleAgentCompressorWorker"))
     return tuple(keys)

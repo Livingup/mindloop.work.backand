@@ -203,6 +203,14 @@ class ContextCompressionWorkerPromptUpdateBody(BaseModel):
     override_text: str
 
 
+class ContextCompressionQualityAnalysisTextResponse(BaseModel):
+    job_id: str
+    status: str
+    text: str
+    native_history_markdown: str
+    final_markdown: str
+
+
 def create_context_compression_router(
     conversation_repository: ConversationRepository,
     *,
@@ -257,14 +265,33 @@ def create_context_compression_router(
         response_model=ContextCompressionWorkerContentsResponse,
     )
     async def get_worker_contents(job_id: str) -> ContextCompressionWorkerContentsResponse:
+        # 归档已收敛为质量分析三件套，不再保存 section 过程明细。
+        _require_archive_repository(archive_repository)
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"上下文压缩归档不再保存 worker 过程内容: {job_id}。"
+                "请使用 GET /jobs/{job_id}/quality-analysis-text 获取可复制质量分析文本。"
+            ),
+        )
+
+    @router.get("/jobs/{job_id}/quality-analysis-text", response_model=ContextCompressionQualityAnalysisTextResponse)
+    async def get_quality_analysis_text(job_id: str) -> ContextCompressionQualityAnalysisTextResponse:
         repository = _require_archive_repository(archive_repository)
         try:
-            section_items = repository.get_section_items(job_id)
-        except KeyError:
-            raise HTTPException(status_code=404, detail=f"上下文压缩 job 不存在: {job_id}")
-        return ContextCompressionWorkerContentsResponse(
-            job_id=job_id,
-            workers=_worker_content_responses(section_items),
+            archive = repository.get_quality_archive(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return ContextCompressionQualityAnalysisTextResponse(
+            job_id=archive.job_id,
+            status=archive.status,
+            text=archive.quality_analysis_text,
+            native_history_markdown=archive.native_history_markdown,
+            final_markdown=archive.final_markdown,
         )
 
     @router.get("/settings", response_model=ContextCompressionSettingsResponse)

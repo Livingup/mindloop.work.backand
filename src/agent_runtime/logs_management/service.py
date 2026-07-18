@@ -482,28 +482,41 @@ class LogsManagementService:
         task_values = sorted(scope.task_ids)
         placeholders = _placeholders(task_values)
 
-        def read_rows() -> list[sqlite3.Row]:
+        path_columns = (
+            "final_summary_path",
+            "before_messages_snapshot_path",
+            "after_messages_snapshot_path",
+            "native_history_path",
+            "final_markdown_path",
+        )
+
+        def read_rows() -> list[tuple[Any, ...]]:
             conn = _connect_existing(db_path)
             if conn is None:
                 return []
             try:
-                return list(
+                existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(context_compression_jobs)").fetchall()}
+                selected = ["job_id"] + [column for column in path_columns if column in existing]
+                select_sql = ", ".join(selected)
+                raw_rows = list(
                     conn.execute(
                         f"""
-                        SELECT job_id, final_summary_path, before_messages_snapshot_path, after_messages_snapshot_path
+                        SELECT {select_sql}
                         FROM context_compression_jobs
                         WHERE task_id IN ({placeholders})
                         """,
                         tuple(task_values),
                     ).fetchall()
                 )
+                # 统一成 (job_id, path1, path2, ...) 供后续 unlink
+                return [tuple(row) for row in raw_rows]
             finally:
                 conn.close()
 
         rows = _with_sqlite_retry(read_rows)
         for row in rows:
-            for column_name in ("final_summary_path", "before_messages_snapshot_path", "after_messages_snapshot_path"):
-                _unlink_archive_file(archive_dir, row[column_name])
+            for value in row[1:]:
+                _unlink_archive_file(archive_dir, value)
 
         def delete_rows() -> int:
             conn = _connect_existing(db_path)

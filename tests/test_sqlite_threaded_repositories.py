@@ -60,6 +60,8 @@ class SqliteThreadedRepositoryTests(unittest.TestCase):
                 root_conversation_id="conversation-root",
             )
             self.assertEqual(compression_index, 1)
+            from agent_runtime.conversation_message.message.models import TextPart, UniMessage
+
             repository.upsert_job(
                 CompressionJob(
                     job_id="job-threaded",
@@ -73,7 +75,10 @@ class SqliteThreadedRepositoryTests(unittest.TestCase):
                     compression_index=compression_index,
                     status="completed",
                     final_markdown_chunks=["# Summary"],
-                )
+                ),
+                native_history_messages=[
+                    UniMessage(role="user", content=[TextPart(text="hello")]),
+                ],
             )
             self.assertEqual(
                 repository.root_conversation_id_for(
