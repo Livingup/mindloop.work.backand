@@ -8,6 +8,14 @@ from pydantic import BaseModel
 from agent_runtime.context_compression.archive_repository import ContextCompressionArchiveRepository
 from agent_runtime.context_compression.config import ContextCompressionConfig
 from agent_runtime.context_compression.models import SECTION_WORKERS, SECTION_WORKER_TITLES
+from agent_runtime.context_compression.profiles import (
+    DEFAULT_ACTIVE_PROFILE_ID,
+    get_profile,
+    list_profiles,
+    normalize_profile_id,
+    prompt_storage_keys_for_profile,
+    worker_to_dict,
+)
 from agent_runtime.context_compression.default_prompts import (
     CONTEXT_COMPRESSION_WORKER_NAMES,
     get_default_worker_prompt,
@@ -131,24 +139,58 @@ class ContextCompressionWorkerResponse(BaseModel):
     description: str
     group: str
     group_label: str
+    stage_id: str | None = None
+    stage_mode: str | None = None
+    input_builder: str | None = None
+    output_section: str | None = None
+    profile_id: str | None = None
     prompt_status: dict[str, ContextCompressionPromptStatusResponse]
 
 
 class ContextCompressionSettingsResponse(BaseModel):
     enabled: bool
     input_mode: str
+    active_profile_id: str
     llm_policy_group_id: str | None
     llm_policy_group_status: str  # ok | unset | missing | disabled | no_candidates
     llm_policy_group_status_message: str | None = None
 
 
 class ContextCompressionSettingsUpdateBody(BaseModel):
-    llm_policy_group_id: str | None
+    llm_policy_group_id: str | None = None
+    active_profile_id: str | None = None
     input_mode: str | None = None
+
+
+class ContextCompressionProfileSummaryResponse(BaseModel):
+    profile_id: str
+    title: str
+    description: str
+    version: str
+    stage_count: int
+    worker_count: int
+    is_active: bool
+    stage_summary: list[dict]
+
+
+class ContextCompressionProfileDetailResponse(BaseModel):
+    profile_id: str
+    title: str
+    description: str
+    version: str
+    stage_count: int
+    worker_count: int
+    is_active: bool
+    stage_summary: list[dict]
+    stages: list[dict]
+    workers: list[dict]
+    assembly: dict
+    verifier: dict
 
 
 class ContextCompressionWorkerPromptDetailResponse(BaseModel):
     worker_name: str
+    profile_id: str
     input_mode: str
     use_default: bool
     default_text: str
@@ -232,9 +274,15 @@ def create_context_compression_router(
         settings = repo.get_settings()
         policy_id = settings.llm_policy_group_id
         status, status_message = _evaluate_policy_status(llm_registry_gateway, policy_id)
+        active_profile_id = settings.active_profile_id or DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active_profile_id = normalize_profile_id(active_profile_id)
+        except ValueError:
+            active_profile_id = DEFAULT_ACTIVE_PROFILE_ID
         return ContextCompressionSettingsResponse(
             enabled=config.enabled,
             input_mode=NATIVE_INPUT_MODE,
+            active_profile_id=active_profile_id,
             llm_policy_group_id=policy_id,
             llm_policy_group_status=status,
             llm_policy_group_status_message=status_message,
@@ -253,39 +301,194 @@ def create_context_compression_router(
         if new_policy_id is not None:
             _require_valid_execution_policy(llm_registry_gateway, new_policy_id)
         # 产品不再暴露输入模式切换；持久化固定 native，忽略 body.input_mode。
-        del current_settings
+        active_profile_id = body.active_profile_id
+        if active_profile_id is None:
+            active_profile_id = current_settings.active_profile_id or DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active_profile_id = normalize_profile_id(active_profile_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if new_policy_id is None and body.llm_policy_group_id is None:
+            # allow profile-only updates; keep current policy when field omitted via null explicit?
+            new_policy_id = current_settings.llm_policy_group_id
+        # body.llm_policy_group_id may be explicitly null to clear; if attribute missing handled by default None
+        if "llm_policy_group_id" not in body.model_fields_set:
+            new_policy_id = current_settings.llm_policy_group_id
         repo.set_settings(
             llm_policy_group_id=new_policy_id,
             input_mode=NATIVE_INPUT_MODE,
+            active_profile_id=active_profile_id,
         )
         return await get_settings()
 
-    @router.get("/workers", response_model=list[ContextCompressionWorkerResponse])
-    async def list_workers() -> list[ContextCompressionWorkerResponse]:
+    @router.get("/profiles", response_model=list[ContextCompressionProfileSummaryResponse])
+    async def list_profile_summaries() -> list[ContextCompressionProfileSummaryResponse]:
+        repo = _require_settings_repository(settings_repository)
+        active = repo.get_active_profile_id() or DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active = normalize_profile_id(active)
+        except ValueError:
+            active = DEFAULT_ACTIVE_PROFILE_ID
+        return [
+            ContextCompressionProfileSummaryResponse(**profile.to_summary_dict(is_active=profile.profile_id == active))
+            for profile in list_profiles()
+        ]
+
+    @router.get("/profiles/{profile_id}", response_model=ContextCompressionProfileDetailResponse)
+    async def get_profile_detail(profile_id: str) -> ContextCompressionProfileDetailResponse:
+        repo = _require_settings_repository(settings_repository)
+        active = repo.get_active_profile_id() or DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active = normalize_profile_id(active)
+            profile = get_profile(profile_id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return ContextCompressionProfileDetailResponse(**profile.to_detail_dict(is_active=profile.profile_id == active))
+
+    @router.get("/profiles/{profile_id}/workers", response_model=list[ContextCompressionWorkerResponse])
+    async def list_profile_workers(profile_id: str) -> list[ContextCompressionWorkerResponse]:
+        try:
+            profile = get_profile(profile_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
         repository = _require_prompt_repository(prompt_repository)
-        prompt_index: dict[tuple[str, str], ContextCompressionWorkerPrompt] = {}
-        for prompt in repository.list_prompts():
-            prompt_index[(prompt.input_mode, prompt.worker_name)] = prompt
+        prompt_index = {(p.input_mode, p.worker_name): p for p in repository.list_prompts()}
+        stage_mode = {stage.stage_id: stage.mode for stage in profile.stages}
         workers: list[ContextCompressionWorkerResponse] = []
-        for metadata in _WORKER_METADATA:
-            prompt_status: dict[str, ContextCompressionPromptStatusResponse] = {}
-            prompt = prompt_index.get((NATIVE_INPUT_MODE, metadata["name"]))
-            prompt_status[NATIVE_INPUT_MODE] = ContextCompressionPromptStatusResponse(
-                use_default=prompt is None,
-                updated_at=prompt.updated_at if prompt is not None else None,
-            )
-            group = metadata["group"]
+        for worker in profile.workers:
+            storage_keys = prompt_storage_keys_for_profile(profile.profile_id)
+            override = None
+            for key in storage_keys:
+                override = prompt_index.get((key, worker.worker_name))
+                if override is not None:
+                    break
+            prompt_status = {
+                profile.profile_id: ContextCompressionPromptStatusResponse(
+                    use_default=override is None,
+                    updated_at=override.updated_at if override is not None else None,
+                )
+            }
             workers.append(
                 ContextCompressionWorkerResponse(
-                    name=metadata["name"],
-                    title=metadata["title"],
-                    description=metadata["description"],
-                    group=group,
-                    group_label=_WORKER_GROUP_LABELS.get(group, group),
+                    name=worker.worker_name,
+                    title=worker.title,
+                    description=worker.description,
+                    group=worker.group,
+                    group_label=worker.group_label,
+                    stage_id=worker.stage_id,
+                    stage_mode=stage_mode.get(worker.stage_id),
+                    input_builder=worker.input_builder,
+                    output_section=worker.output_section,
+                    profile_id=profile.profile_id,
                     prompt_status=prompt_status,
                 )
             )
         return workers
+
+    @router.get(
+        "/profiles/{profile_id}/workers/{worker_name}/prompt",
+        response_model=ContextCompressionWorkerPromptDetailResponse,
+    )
+    async def get_profile_worker_prompt(profile_id: str, worker_name: str) -> ContextCompressionWorkerPromptDetailResponse:
+        profile = _require_profile(profile_id)
+        _validate_profile_worker(profile_id, worker_name)
+        repository = _require_prompt_repository(prompt_repository)
+        default_text = get_default_worker_prompt(profile_id=profile_id, worker_name=worker_name)
+        override = None
+        for key in prompt_storage_keys_for_profile(profile_id):
+            override = repository.get_prompt(input_mode=key, worker_name=worker_name)
+            if override is not None:
+                break
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            profile_id=profile_id,
+            input_mode=NATIVE_INPUT_MODE,
+            default_text=default_text,
+            override=override,
+        )
+
+    @router.put(
+        "/profiles/{profile_id}/workers/{worker_name}/prompt",
+        response_model=ContextCompressionWorkerPromptDetailResponse,
+    )
+    async def update_profile_worker_prompt(
+        profile_id: str,
+        worker_name: str,
+        body: ContextCompressionWorkerPromptUpdateBody,
+    ) -> ContextCompressionWorkerPromptDetailResponse:
+        _require_profile(profile_id)
+        _validate_profile_worker(profile_id, worker_name)
+        repository = _require_prompt_repository(prompt_repository)
+        default_text = get_default_worker_prompt(profile_id=profile_id, worker_name=worker_name)
+        try:
+            prompt = repository.update_prompt(
+                input_mode=profile_id,
+                worker_name=worker_name,
+                prompt_text=body.override_text,
+            )
+        except KeyError:
+            # sqlite legacy path may require insert; postgres upserts
+            if hasattr(repository, "save_prompt_snapshot"):
+                from agent_runtime.context_compression.prompt_repository import ContextCompressionWorkerPrompt
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc).isoformat()
+                prompt = ContextCompressionWorkerPrompt(
+                    input_mode=profile_id,
+                    worker_name=worker_name,
+                    prompt_text=body.override_text,
+                    default_prompt_text="",
+                    is_custom=True,
+                    revision=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+                repository.save_prompt_snapshot(prompt)
+            else:
+                raise HTTPException(status_code=404, detail=f"上下文压缩 Worker prompt 不存在: {profile_id}/{worker_name}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            profile_id=profile_id,
+            input_mode=NATIVE_INPUT_MODE,
+            default_text=default_text,
+            override=prompt,
+        )
+
+    @router.post(
+        "/profiles/{profile_id}/workers/{worker_name}/prompt/reset",
+        response_model=ContextCompressionWorkerPromptDetailResponse,
+    )
+    async def reset_profile_worker_prompt(
+        profile_id: str,
+        worker_name: str,
+    ) -> ContextCompressionWorkerPromptDetailResponse:
+        _require_profile(profile_id)
+        _validate_profile_worker(profile_id, worker_name)
+        repository = _require_prompt_repository(prompt_repository)
+        default_text = get_default_worker_prompt(profile_id=profile_id, worker_name=worker_name)
+        for key in prompt_storage_keys_for_profile(profile_id):
+            try:
+                repository.reset_prompt(input_mode=key, worker_name=worker_name)
+            except KeyError:
+                pass
+        return _prompt_detail_response(
+            worker_name=worker_name,
+            profile_id=profile_id,
+            input_mode=NATIVE_INPUT_MODE,
+            default_text=default_text,
+            override=None,
+        )
+
+    @router.get("/workers", response_model=list[ContextCompressionWorkerResponse])
+    async def list_workers() -> list[ContextCompressionWorkerResponse]:
+        repo = _require_settings_repository(settings_repository)
+        active = repo.get_active_profile_id() or DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active = normalize_profile_id(active)
+        except ValueError:
+            active = DEFAULT_ACTIVE_PROFILE_ID
+        return await list_profile_workers(active)
 
     @router.get(
         "/workers/{worker_name}/prompts/{input_mode}",
@@ -305,6 +508,7 @@ def create_context_compression_router(
         )
         return _prompt_detail_response(
             worker_name=worker_name,
+            profile_id=DEFAULT_ACTIVE_PROFILE_ID,
             input_mode=input_mode,
             default_text=default_text,
             override=override,
@@ -335,6 +539,7 @@ def create_context_compression_router(
             raise HTTPException(status_code=400, detail=str(exc))
         return _prompt_detail_response(
             worker_name=worker_name,
+            profile_id=DEFAULT_ACTIVE_PROFILE_ID,
             input_mode=input_mode,
             default_text=default_text,
             override=prompt,
@@ -358,6 +563,7 @@ def create_context_compression_router(
             pass
         return _prompt_detail_response(
             worker_name=worker_name,
+            profile_id=DEFAULT_ACTIVE_PROFILE_ID,
             input_mode=input_mode,
             default_text=default_text,
             override=None,
@@ -538,9 +744,24 @@ def _validate_input_mode(input_mode: str) -> None:
         )
 
 
+
+def _require_profile(profile_id: str):
+    try:
+        return get_profile(profile_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _validate_profile_worker(profile_id: str, worker_name: str) -> None:
+    profile = _require_profile(profile_id)
+    names = {worker.worker_name for worker in profile.workers}
+    if worker_name not in names:
+        raise HTTPException(status_code=404, detail=f"未知的上下文压缩 Worker: {profile_id}/{worker_name}")
+
 def _prompt_detail_response(
     *,
     worker_name: str,
+    profile_id: str = DEFAULT_ACTIVE_PROFILE_ID,
     input_mode: str,
     default_text: str,
     override: ContextCompressionWorkerPrompt | None,
@@ -548,6 +769,7 @@ def _prompt_detail_response(
     override_text = override.prompt_text if override is not None else None
     return ContextCompressionWorkerPromptDetailResponse(
         worker_name=worker_name,
+        profile_id=profile_id,
         input_mode=input_mode,
         use_default=override is None,
         default_text=default_text,

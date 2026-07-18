@@ -15,18 +15,35 @@ class ContextCompressionPromptLoader:
     ) -> None:
         self._prompt_repository = prompt_repository
 
-    def load_prompt(self, *, input_mode: str, worker_name: str) -> str:
+    def load_prompt(
+        self,
+        *,
+        worker_name: str,
+        input_mode: str | None = None,
+        profile_id: str | None = None,
+    ) -> str:
+        from agent_runtime.context_compression.profiles import (
+            DEFAULT_ACTIVE_PROFILE_ID,
+            prompt_storage_keys_for_profile,
+        )
+
+        resolved_profile = profile_id or DEFAULT_ACTIVE_PROFILE_ID
         default_prompt = load_default_worker_prompt(
             input_mode=input_mode,
+            profile_id=resolved_profile,
             worker_name=worker_name,
         )
         if self._prompt_repository is None:
             prompt = default_prompt
         else:
-            override = self._prompt_repository.get_prompt(
-                input_mode=input_mode,
-                worker_name=worker_name,
-            )
+            override = None
+            for storage_key in prompt_storage_keys_for_profile(resolved_profile):
+                override = self._prompt_repository.get_prompt(
+                    input_mode=storage_key,
+                    worker_name=worker_name,
+                )
+                if override is not None:
+                    break
             prompt = override.prompt_text if override is not None else default_prompt
         return f"{prompt.strip()}\n\n{_TOOL_NAME_COMPATIBILITY_INSTRUCTION}"
 
@@ -40,10 +57,15 @@ def ensure_default_worker_prompts(
 
 def load_default_worker_prompt(
     *,
-    input_mode: str,
     worker_name: str,
+    input_mode: str | None = None,
+    profile_id: str | None = None,
 ) -> str:
-    return get_default_worker_prompt(input_mode=input_mode, worker_name=worker_name)
+    return get_default_worker_prompt(
+        input_mode=input_mode,
+        profile_id=profile_id,
+        worker_name=worker_name,
+    )
 
 
 _TOOL_NAME_COMPATIBILITY_INSTRUCTION = """Runtime 工具名兼容说明：

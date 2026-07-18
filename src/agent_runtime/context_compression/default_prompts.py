@@ -451,17 +451,21 @@ TODO_RISK_NATIVE_HISTORY_PROMPT = (
 )
 
 
+_PROFILE_A_PROMPTS: dict[str, str] = {
+    "RequirementConstraintWorker": REQUIREMENT_CONSTRAINT_NATIVE_HISTORY_PROMPT,
+    "ProgressPlanWorker": PROGRESS_PLAN_NATIVE_HISTORY_PROMPT,
+    "CodeArchitectureWorker": CODE_ARCHITECTURE_NATIVE_HISTORY_PROMPT,
+    "ObservationEvidenceWorker": OBSERVATION_EVIDENCE_NATIVE_HISTORY_PROMPT,
+    "DecisionRationaleWorker": DECISION_RATIONALE_NATIVE_HISTORY_PROMPT,
+    "TodoRiskWorker": TODO_RISK_NATIVE_HISTORY_PROMPT,
+    "FinalAssemblerWorker": FINAL_ASSEMBLER_PROMPT,
+    "FinalVerifierWorker": FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT,
+}
+
+
 DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS: dict[str, dict[str, str]] = {
-    "native_multimodal_history": {
-        "RequirementConstraintWorker": REQUIREMENT_CONSTRAINT_NATIVE_HISTORY_PROMPT,
-        "ProgressPlanWorker": PROGRESS_PLAN_NATIVE_HISTORY_PROMPT,
-        "CodeArchitectureWorker": CODE_ARCHITECTURE_NATIVE_HISTORY_PROMPT,
-        "ObservationEvidenceWorker": OBSERVATION_EVIDENCE_NATIVE_HISTORY_PROMPT,
-        "DecisionRationaleWorker": DECISION_RATIONALE_NATIVE_HISTORY_PROMPT,
-        "TodoRiskWorker": TODO_RISK_NATIVE_HISTORY_PROMPT,
-        "FinalAssemblerWorker": FINAL_ASSEMBLER_PROMPT,
-        "FinalVerifierWorker": FINAL_REVIEW_EDIT_NATIVE_HISTORY_PROMPT,
-    }
+    "native_multimodal_history": _PROFILE_A_PROMPTS,
+    "section_parallel_v1": _PROFILE_A_PROMPTS,
 }
 
 
@@ -470,21 +474,39 @@ CONTEXT_COMPRESSION_WORKER_NAMES: tuple[str, ...] = tuple(
 ) + (
     "FinalAssemblerWorker",
     "FinalVerifierWorker",
+    "TaskRequirementsRemainingGoalsWorker",
+    "TaskStateExecutionPlanWorker",
+    "SolutionDesignDecisionsWorker",
+    "KeyKnowledgeFindingsWorker",
+    "AgentCollabStatefulResourcesWorker",
+    "ExistingWorkArtifactsWorker",
 )
 
 
-def get_default_worker_prompt(*, input_mode: str, worker_name: str) -> str:
-    # 产品仅保留 native_multimodal_history；兼容旧调用仍忽略其他 input_mode。
-    del input_mode
+def get_default_worker_prompt(
+    *,
+    worker_name: str,
+    input_mode: str | None = None,
+    profile_id: str | None = None,
+) -> str:
+    from agent_runtime.context_compression.profiles import PROFILE_SECTION_PARALLEL_V1, PROFILE_TASK_RESUME_V2
+    from agent_runtime.context_compression.task_resume_v2_prompts import load_task_resume_v2_prompt
+
+    resolved_profile = profile_id or PROFILE_SECTION_PARALLEL_V1
+    if profile_id is None and input_mode in {None, "native_multimodal_history", "section_parallel_v1"}:
+        resolved_profile = PROFILE_SECTION_PARALLEL_V1
+    if resolved_profile == PROFILE_TASK_RESUME_V2:
+        return load_task_resume_v2_prompt(worker_name)
     try:
-        return DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS["native_multimodal_history"][worker_name].strip()
+        return _PROFILE_A_PROMPTS[worker_name].strip()
     except KeyError as exc:
-        raise KeyError(f"未知 Worker prompt: native_multimodal_history/{worker_name}") from exc
+        raise KeyError(f"未知 Worker prompt: {resolved_profile}/{worker_name}") from exc
 
 
 def list_default_worker_prompt_keys() -> tuple[tuple[str, str], ...]:
-    return tuple(
-        (input_mode, worker_name)
-        for input_mode in DEFAULT_CONTEXT_COMPRESSION_WORKER_PROMPTS
-        for worker_name in CONTEXT_COMPRESSION_WORKER_NAMES
-    )
+    from agent_runtime.context_compression.profiles import PROFILE_SECTION_PARALLEL_V1, PROFILE_TASK_RESUME_V2
+    from agent_runtime.context_compression.task_resume_v2_prompts import list_task_resume_v2_worker_names
+
+    keys = [(PROFILE_SECTION_PARALLEL_V1, name) for name in _PROFILE_A_PROMPTS]
+    keys.extend((PROFILE_TASK_RESUME_V2, name) for name in list_task_resume_v2_worker_names())
+    return tuple(keys)

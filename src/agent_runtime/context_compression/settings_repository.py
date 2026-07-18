@@ -26,6 +26,7 @@ class ContextCompressionRuntimeSettings:
 
     llm_policy_group_id: str | None
     input_mode: str | None
+    active_profile_id: str | None
     updated_at: str | None
 
 
@@ -46,7 +47,7 @@ class ContextCompressionSettingsRepository:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT llm_policy_group_id, input_mode, updated_at "
+                "SELECT llm_policy_group_id, input_mode, active_profile_id, updated_at "
                 "FROM context_compression_settings WHERE id = 1"
             ).fetchone()
         finally:
@@ -55,6 +56,7 @@ class ContextCompressionSettingsRepository:
             return ContextCompressionRuntimeSettings(
                 llm_policy_group_id=None,
                 input_mode=None,
+                active_profile_id=None,
                 updated_at=None,
             )
         raw_policy_value = row[0]
@@ -65,7 +67,8 @@ class ContextCompressionSettingsRepository:
         return ContextCompressionRuntimeSettings(
             llm_policy_group_id=str(raw_policy_value) if raw_policy_value is not None else None,
             input_mode=input_mode,
-            updated_at=str(row[2]),
+            active_profile_id=_normalize_active_profile_id(row[2] if len(row) > 2 else None),
+            updated_at=str(row[3] if len(row) > 3 else row[2]),
         )
 
     def get_llm_policy_group_id(self) -> str | None:
@@ -79,20 +82,23 @@ class ContextCompressionSettingsRepository:
         *,
         llm_policy_group_id: str | None,
         input_mode: str | None,
+        active_profile_id: str | None = None,
     ) -> ContextCompressionRuntimeSettings:
         normalized_policy = _normalize_optional_text(llm_policy_group_id)
         normalized_input_mode = _normalize_input_mode(input_mode)
+        normalized_profile = _normalize_active_profile_id(active_profile_id)
         now = _utc_now_text()
         conn = self._connect()
         try:
             conn.execute(
-                "INSERT INTO context_compression_settings (id, llm_policy_group_id, input_mode, updated_at) "
-                "VALUES (1, ?, ?, ?) "
+                "INSERT INTO context_compression_settings (id, llm_policy_group_id, input_mode, active_profile_id, updated_at) "
+                "VALUES (1, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 " llm_policy_group_id = excluded.llm_policy_group_id, "
                 " input_mode = excluded.input_mode, "
+                " active_profile_id = excluded.active_profile_id, "
                 " updated_at = excluded.updated_at",
-                (normalized_policy, normalized_input_mode, now),
+                (normalized_policy, normalized_input_mode, normalized_profile, now),
             )
             conn.commit()
         finally:
@@ -104,7 +110,11 @@ class ContextCompressionSettingsRepository:
         return self.set_settings(
             llm_policy_group_id=value,
             input_mode=current.input_mode,
+            active_profile_id=current.active_profile_id,
         )
+
+    def get_active_profile_id(self) -> str | None:
+        return self.get_settings().active_profile_id
 
     def _connect(self) -> sqlite3.Connection:
         data_dir = Path(self._data_dir_accessor()).expanduser()
@@ -136,6 +146,7 @@ class PostgresContextCompressionSettingsRepository:
             return ContextCompressionRuntimeSettings(
                 llm_policy_group_id=None,
                 input_mode=None,
+                active_profile_id=None,
                 updated_at=None,
             )
         return _settings_from_payload(payload)
@@ -146,15 +157,20 @@ class PostgresContextCompressionSettingsRepository:
     def get_input_mode(self) -> str | None:
         return self.get_settings().input_mode
 
+    def get_active_profile_id(self) -> str | None:
+        return self.get_settings().active_profile_id
+
     def set_settings(
         self,
         *,
         llm_policy_group_id: str | None,
         input_mode: str | None,
+        active_profile_id: str | None = None,
     ) -> ContextCompressionRuntimeSettings:
         settings = ContextCompressionRuntimeSettings(
             llm_policy_group_id=_normalize_optional_text(llm_policy_group_id),
             input_mode=_normalize_input_mode(input_mode),
+            active_profile_id=_normalize_active_profile_id(active_profile_id),
             updated_at=_utc_now_text(),
         )
         self._store_accessor().save_payload(
@@ -169,6 +185,7 @@ class PostgresContextCompressionSettingsRepository:
         return self.set_settings(
             llm_policy_group_id=value,
             input_mode=current.input_mode,
+            active_profile_id=current.active_profile_id,
         )
 
     def save_settings_snapshot(
@@ -179,6 +196,7 @@ class PostgresContextCompressionSettingsRepository:
         normalized_settings = ContextCompressionRuntimeSettings(
             llm_policy_group_id=_normalize_optional_text(settings.llm_policy_group_id),
             input_mode=_normalize_input_mode(settings.input_mode),
+            active_profile_id=_normalize_active_profile_id(settings.active_profile_id),
             updated_at=settings.updated_at or _utc_now_text(),
         )
         self._store_accessor().save_payload(
@@ -218,6 +236,7 @@ def _settings_from_payload(payload: dict[str, Any]) -> ContextCompressionRuntime
     return ContextCompressionRuntimeSettings(
         llm_policy_group_id=_normalize_optional_text(payload.get("llm_policy_group_id")),
         input_mode=_normalize_input_mode(payload.get("input_mode") if payload.get("input_mode") is not None else None),
+        active_profile_id=_normalize_active_profile_id(payload.get("active_profile_id")),
         updated_at=str(payload["updated_at"]) if payload.get("updated_at") is not None else None,
     )
 
@@ -226,6 +245,7 @@ def _settings_payload(settings: ContextCompressionRuntimeSettings) -> dict[str, 
     return {
         "llm_policy_group_id": settings.llm_policy_group_id,
         "input_mode": settings.input_mode,
+        "active_profile_id": settings.active_profile_id,
         "updated_at": settings.updated_at,
     }
 
@@ -234,6 +254,8 @@ def _ensure_settings_schema(conn: sqlite3.Connection) -> None:
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(context_compression_settings)").fetchall()}
     if "input_mode" not in columns:
         conn.execute("ALTER TABLE context_compression_settings ADD COLUMN input_mode TEXT")
+    if "active_profile_id" not in columns:
+        conn.execute("ALTER TABLE context_compression_settings ADD COLUMN active_profile_id TEXT")
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -253,6 +275,17 @@ def _normalize_input_mode(value: str | None) -> str | None:
     if normalized not in _SUPPORTED_INPUT_MODES:
         raise ValueError("input_mode 必须是 native_multimodal_history。")
     return normalized
+
+
+def _normalize_active_profile_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = _normalize_optional_text(str(value))
+    if normalized is None:
+        return None
+    from agent_runtime.context_compression.profiles import normalize_profile_id
+
+    return normalize_profile_id(normalized)
 
 
 def _utc_now_text() -> str:

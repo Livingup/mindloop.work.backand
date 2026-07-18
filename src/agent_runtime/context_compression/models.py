@@ -25,6 +25,12 @@ SECTION_WORKER_TITLES: dict[str, str] = {
     "observations_evidence": "工具观察与外部事实",
     "decisions_rationale": "决策与理由",
     "todos_risks": "待办与风险",
+    "task_requirements_remaining_goals": "任务与剩余目标",
+    "task_state_execution_plan": "任务状态与执行计划",
+    "solution_design_decisions": "方案设计与关键决策",
+    "key_knowledge_findings": "关键知识与发现",
+    "agent_collab_stateful_resources": "协作与有状态资源",
+    "existing_work_artifacts": "已有工作成果与产物",
 }
 
 
@@ -123,6 +129,9 @@ class CompressionJob:
     compression_index: int
     status: str = "created"
     input_mode: str = "native_multimodal_history"
+    profile_id: str = "section_parallel_v1"
+    profile_version: str = "1.0"
+    assembly_strategy: str = "structured_priority_sections"
     target_conversation_id: str | None = None
     summary_message_id: str | None = None
     range: CompressionRange | None = None

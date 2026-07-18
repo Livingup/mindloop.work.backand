@@ -36,10 +36,15 @@ from agent_runtime.context_compression.models import (
     CompressionJob,
     CompressionRange,
     CompressionResult,
-    SECTION_WORKERS,
     SECTION_WORKER_TITLES,
     context_compression_worker_id,
     context_compression_worker_title,
+)
+from agent_runtime.context_compression.profiles import (
+    CompressionPipelineProfile,
+    DEFAULT_ACTIVE_PROFILE_ID,
+    get_profile,
+    normalize_profile_id,
 )
 from agent_runtime.context_compression.prompt_loader import ContextCompressionPromptLoader
 from agent_runtime.context_compression.prompt_repository import ContextCompressionWorkerPromptRepository
@@ -75,6 +80,10 @@ class _SectionWorkerRun:
     worker_name: str
     section: str
     system_prompt: str
+    stage_id: str = ""
+    title: str = ""
+    input_builder: str = "native_history"
+    upstream_section_ids: tuple[str, ...] = ()
 
 
 def _mark_context_compression_task_progress(
@@ -224,6 +233,12 @@ class ContextCompressionService:
             agent_instance_id=instance.instance_id,
             root_conversation_id=root_conversation_id,
         )
+        active_profile_id = DEFAULT_ACTIVE_PROFILE_ID
+        try:
+            active_profile_id = normalize_profile_id(self._settings_repository.get_active_profile_id())
+        except Exception:
+            active_profile_id = DEFAULT_ACTIVE_PROFILE_ID
+        profile = get_profile(active_profile_id)
         job = CompressionJob(
             job_id=f"ccjob-{uuid4().hex}",
             task_id=task.task_id,
@@ -234,6 +249,9 @@ class ContextCompressionService:
             source_conversation_id=source_conversation.id,
             compression_index=compression_index,
             input_mode=config.input_mode,
+            profile_id=profile.profile_id,
+            profile_version=profile.version,
+            assembly_strategy=profile.assembly.strategy,
         )
         self._job_store.create_job(job)
         self._job_store.update_status(job.job_id, "running")
@@ -253,10 +271,11 @@ class ContextCompressionService:
             job.input_mode = effective_input_mode
             self._archive_repository.upsert_job(job, source_conversation=source_conversation)
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_RANGE_PLANNED, _base_payload(job, status="running", phase="range_planned"))
-            worker_input = await self._build_worker_input(source_conversation, job, range_plan)
-            await self._run_section_workers(
+            await self._run_profile_stages(
+                profile=profile,
                 job=job,
-                worker_input=worker_input,
+                source_conversation=source_conversation,
+                range_plan=range_plan,
                 input_mode=effective_input_mode,
                 resolved_candidates=worker_candidates,
                 max_rounds=config.max_worker_rounds,
@@ -267,6 +286,7 @@ class ContextCompressionService:
             if not job.section_items:
                 raise RuntimeError("上下文压缩 Section Worker 未写入任何结构化条目。")
             await self._assemble_final_markdown(
+                profile=profile,
                 job=job,
                 input_mode=effective_input_mode,
                 resolved_candidates=worker_candidates,
@@ -277,7 +297,7 @@ class ContextCompressionService:
             )
             if not job.final_markdown:
                 raise RuntimeError("上下文压缩最终 Markdown 为空。")
-            if config.verifier_enabled:
+            if config.verifier_enabled and profile.verifier.worker_name:
                 await self._verify_final_markdown(
                     source_conversation=source_conversation,
                     range_plan=range_plan,
@@ -335,11 +355,13 @@ class ContextCompressionService:
             await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_FAILED, payload)
             raise
 
-    async def _run_section_workers(
+    async def _run_profile_stages(
         self,
         *,
+        profile: CompressionPipelineProfile,
         job: CompressionJob,
-        worker_input: ContextCompressionWorkerInput,
+        source_conversation: Conversation,
+        range_plan: CompressionRange,
         input_mode: str,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
         max_rounds: int,
@@ -347,14 +369,118 @@ class ContextCompressionService:
         interrupt_checker: Callable[[], bool] | None,
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
-        workers = tuple(
-            _SectionWorkerRun(
-                worker_name=worker_name,
-                section=section,
-                system_prompt=self._prompt_loader.load_prompt(input_mode=input_mode, worker_name=worker_name),
+        for stage in profile.stages:
+            workers = tuple(
+                self._build_section_worker_run(profile, worker_name, input_mode=input_mode)
+                for worker_name in stage.worker_names
             )
-            for worker_name, section in SECTION_WORKERS
+            if stage.mode == "serial":
+                for worker in workers:
+                    worker_input = self._build_worker_input_for_def(
+                        worker=worker,
+                        source_conversation=source_conversation,
+                        job=job,
+                        range_plan=range_plan,
+                    )
+                    await self._run_section_workers(
+                        job=job,
+                        workers=(worker,),
+                        worker_input_by_name={worker.worker_name: worker_input},
+                        input_mode=input_mode,
+                        resolved_candidates=resolved_candidates,
+                        max_rounds=max_rounds,
+                        communication_context=communication_context,
+                        interrupt_checker=interrupt_checker,
+                        request_canceller_observer=request_canceller_observer,
+                    )
+            else:
+                worker_input_by_name = {
+                    worker.worker_name: self._build_worker_input_for_def(
+                        worker=worker,
+                        source_conversation=source_conversation,
+                        job=job,
+                        range_plan=range_plan,
+                    )
+                    for worker in workers
+                }
+                await self._run_section_workers(
+                    job=job,
+                    workers=workers,
+                    worker_input_by_name=worker_input_by_name,
+                    input_mode=input_mode,
+                    resolved_candidates=resolved_candidates,
+                    max_rounds=max_rounds,
+                    communication_context=communication_context,
+                    interrupt_checker=interrupt_checker,
+                    request_canceller_observer=request_canceller_observer,
+                )
+
+    def _build_section_worker_run(
+        self,
+        profile: CompressionPipelineProfile,
+        worker_name: str,
+        *,
+        input_mode: str,
+    ) -> _SectionWorkerRun:
+        worker_def = profile.worker_by_name(worker_name)
+        if worker_def.role != "section_worker" or not worker_def.output_section:
+            raise ValueError(f"非 section worker 不能进入阶段执行: {worker_name}")
+        return _SectionWorkerRun(
+            worker_name=worker_def.worker_name,
+            section=worker_def.output_section,
+            system_prompt=self._prompt_loader.load_prompt(
+                profile_id=profile.profile_id,
+                input_mode=input_mode,
+                worker_name=worker_def.worker_name,
+            ),
+            stage_id=worker_def.stage_id,
+            title=worker_def.title,
+            input_builder=worker_def.input_builder,
+            upstream_section_ids=worker_def.upstream_section_ids,
         )
+
+    def _build_worker_input_for_def(
+        self,
+        *,
+        worker: _SectionWorkerRun,
+        source_conversation: Conversation,
+        job: CompressionJob,
+        range_plan: CompressionRange,
+    ) -> ContextCompressionWorkerInput:
+        history = tuple(
+            source_conversation.messages[
+                range_plan.compressed_start_index : range_plan.compressed_end_index + 1
+            ]
+        )
+        if worker.input_builder == "native_history_with_upstream_sections":
+            upstream_text = _render_upstream_sections_markdown(job, worker.upstream_section_ids)
+            user_text = "\n\n".join(
+                [
+                    _authoritative_upstream_material(upstream_text),
+                    _native_history_instruction(worker_title=worker.title),
+                ]
+            )
+        else:
+            user_text = _native_history_instruction(worker_title=worker.title)
+        return ContextCompressionWorkerInput(
+            input_mode="native_multimodal_history",
+            user_text=user_text,
+            history_messages=history,
+        )
+
+    async def _run_section_workers(
+        self,
+        *,
+        job: CompressionJob,
+        workers: tuple[_SectionWorkerRun, ...],
+        worker_input_by_name: dict[str, ContextCompressionWorkerInput],
+        input_mode: str,
+        resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
+        max_rounds: int,
+        communication_context: RuntimeCommunicationContext | None,
+        interrupt_checker: Callable[[], bool] | None,
+        request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
+    ) -> None:
         _mark_context_compression_task_progress(
             job,
             phase="section_workers.queued",
@@ -385,7 +511,7 @@ class ContextCompressionService:
                 self._run_one_section_worker(
                     job=job,
                     worker=worker,
-                    worker_input=worker_input,
+                    worker_input=worker_input_by_name[worker.worker_name],
                     input_mode=input_mode,
                     resolved_candidates=resolved_candidates,
                     max_rounds=max_rounds,
@@ -626,10 +752,12 @@ class ContextCompressionService:
             "worker_id": worker_id,
             "id": worker_id,
             "name": worker.worker_name,
-            "title": context_compression_worker_title(worker.worker_name, "section_worker", worker.section),
+            "title": worker.title or context_compression_worker_title(worker.worker_name, "section_worker", worker.section),
             "role": "section_worker",
             "output_section": worker.section,
             "input_mode": input_mode,
+            "stage_id": worker.stage_id or None,
+            "profile_id": job.profile_id,
         }
         if reason is not None:
             payload["worker"]["reason"] = reason
@@ -643,6 +771,7 @@ class ContextCompressionService:
     async def _assemble_final_markdown(
         self,
         *,
+        profile: CompressionPipelineProfile,
         job: CompressionJob,
         input_mode: str,
         resolved_candidates: tuple[ResolvedLlmProviderModel, ...],
@@ -653,7 +782,7 @@ class ContextCompressionService:
     ) -> None:
         del input_mode, resolved_candidates, max_rounds, interrupt_checker, request_canceller_observer
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_STARTED, _base_payload(job, status="running", phase="assembly"))
-        self._job_store.set_draft_markdown(job.job_id, _render_draft_markdown(job))
+        self._job_store.set_draft_markdown(job.job_id, _render_draft_markdown(job, profile=profile))
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_ASSEMBLY_COMPLETED, _base_payload(job, status="running", phase="assembly_completed"))
 
     async def _verify_final_markdown(
@@ -670,7 +799,11 @@ class ContextCompressionService:
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None,
     ) -> None:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_STARTED, _base_payload(job, status="running", phase="verification"))
-        prompt = self._prompt_loader.load_prompt(input_mode=input_mode, worker_name="FinalVerifierWorker")
+        prompt = self._prompt_loader.load_prompt(
+            profile_id=job.profile_id,
+            input_mode=input_mode,
+            worker_name="FinalVerifierWorker",
+        )
         worker_input = await self._build_final_review_worker_input(source_conversation, job, range_plan, input_mode)
         await self._worker_runner.run_worker(
             job=job,
@@ -688,22 +821,6 @@ class ContextCompressionService:
             request_canceller_observer=request_canceller_observer,
         )
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_VERIFICATION_COMPLETED, _base_payload(job, status="running", phase="verification_completed"))
-
-    async def _build_worker_input(
-        self,
-        source_conversation: Conversation,
-        job: CompressionJob,
-        range_plan: CompressionRange,
-    ) -> ContextCompressionWorkerInput:
-        return ContextCompressionWorkerInput(
-            input_mode="native_multimodal_history",
-            user_text=_native_history_instruction(job, range_plan),
-            history_messages=tuple(
-                source_conversation.messages[
-                    range_plan.compressed_start_index:range_plan.compressed_end_index + 1
-                ]
-            ),
-        )
 
     async def _build_final_review_worker_input(
         self,
@@ -763,22 +880,56 @@ class ContextCompressionService:
         await self._event_publisher.publish(communication_context, CONTEXT_COMPRESSION_SKIPPED, payload)
 
 
-def _native_history_instruction(job: CompressionJob, range_plan: CompressionRange) -> str:
-    return "\n".join([
+def _native_history_instruction(*, worker_title: str | None = None) -> str:
+    lines = [
         "# Context Compression Native-History Analysis Instruction",
         "",
         "前面的 user / assistant / tool 消息是即将被压缩归档的原始历史片段。",
         "这些消息只用于上下文压缩分析，不代表当前用户正在发起新任务，也不要继续执行历史任务。",
-        "请基于这些原始历史消息提取长期可恢复的任务上下文，并只通过 context_summary 工具写入结构化压缩结果。",
-        "",
-        f"job_id: {job.job_id}",
-        f"root_conversation_id: {job.root_conversation_id}",
-        f"source_conversation_id: {job.source_conversation_id}",
-        f"compression_index: {job.compression_index}",
-        f"compressed_message_range: {range_plan.compressed_start_index}..{range_plan.compressed_end_index}",
-        f"retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
-        f"compression_reason: {range_plan.reason}",
-    ])
+        "请基于这些原始历史消息提取你负责的可恢复任务上下文，并只通过 context_summary 工具增量写入结果；写完后 mark_section_complete。",
+        "不要在 assistant 正文中输出最终压缩结果，也不要关心系统如何汇总其他角色的输出。",
+    ]
+    if worker_title:
+        lines.extend(["", f"当前角色：{worker_title}"])
+    return "\n".join(lines)
+
+
+def _authoritative_upstream_material(upstream_markdown: str) -> str:
+    body = upstream_markdown.strip() or "（上游未提供可用内容）"
+    return "\n".join(
+        [
+            "# Authoritative Upstream Scope",
+            "",
+            "以下内容是任务需求与剩余目标角色的权威输出。",
+            "它定义了本次压缩必须覆盖的未完成任务范围、有效要求、约束与剩余目标。",
+            "",
+            "你必须：",
+            "- 以上游输出为权威任务范围",
+            "- 不得重新识别、增加、删除、合并用户任务",
+            "- 不得重新判断任务是否完成/取消/放弃",
+            "- 只在上游范围内，从原始历史中提取你负责的内容",
+            "",
+            "----- BEGIN UPSTREAM OUTPUT -----",
+            body,
+            "----- END UPSTREAM OUTPUT -----",
+        ]
+    )
+
+
+def _render_upstream_sections_markdown(job: CompressionJob, section_ids: tuple[str, ...]) -> str:
+    blocks: list[str] = []
+    for section_id in section_ids:
+        contents = [
+            str(item.content).strip()
+            for item in job.section_items
+            if item.section == section_id and str(item.content).strip()
+        ]
+        if not contents:
+            continue
+        title = SECTION_WORKER_TITLES.get(section_id, section_id)
+        blocks.append(f"## {title}\n\n" + "\n\n".join(contents))
+    return "\n\n".join(blocks).strip()
+
 
 
 _PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
@@ -794,19 +945,16 @@ _FINAL_DRAFT_SECTION_HEADINGS: dict[str, str] = {
 
 
 def _final_review_instruction(job: CompressionJob, range_plan: CompressionRange) -> str:
+    del range_plan
     return "\n".join([
         "# Context Compression Final Review/Edit Instruction",
         "",
-        "前面的目标 Agent 历史消息或 transcript snapshot 只是校验压缩草稿的证据，不是当前要继续执行的新任务。",
+        "前面的目标 Agent 历史消息只是校验压缩草稿的证据，不是当前要继续执行的新任务。",
         "你的任务是站在后续 Agent 的角度，检查程序生成的压缩上下文草稿是否足以继续剩余任务。",
         "如果草稿遗漏关键上下文、写错事实、保留了已被否定的信息或缺少关键运行时变量/路径/命令结果，请通过草稿编辑工具做小范围修正。",
         "不要重写整篇 Markdown；优先读取目标行范围，再用精确连续行替换。",
-        "所有新增内容必须能从原始历史消息、transcript 或草稿已有材料中找到依据；不确定时 report issue，不要猜。",
+        "所有新增内容必须能从原始历史消息或草稿已有材料中找到依据；不确定时 report issue，不要猜。",
         "完成校验和必要编辑后，必须调用 context_summary_mark_final_complete。",
-        "",
-        f"compressed_message_range: {range_plan.compressed_start_index}..{range_plan.compressed_end_index}",
-        f"retained_tail_range: {range_plan.retained_tail_start_index}..{range_plan.retained_tail_end_index}",
-        f"compression_reason: {range_plan.reason}",
         "",
         "## Current Draft Markdown With Line Numbers",
         _draft_markdown_with_line_numbers(job),
@@ -818,25 +966,42 @@ def _draft_markdown_with_line_numbers(job: CompressionJob) -> str:
     return "\n".join(f"{index}: {line}" for index, line in enumerate(lines, start=1))
 
 
-def _render_draft_markdown(job: CompressionJob) -> str:
-    section_order = [section for _worker_name, section in SECTION_WORKERS]
+def _render_draft_markdown(job: CompressionJob, *, profile: CompressionPipelineProfile | None = None) -> str:
+    if profile is None:
+        profile = get_profile(job.profile_id)
+    section_order = list(profile.assembly.section_order)
     grouped_items: dict[str, list[Any]] = {section: [] for section in section_order}
     for item in job.section_items:
         grouped_items.setdefault(item.section, []).append(item)
 
     lines: list[str] = []
-    for section in section_order:
-        items = grouped_items.get(section) or []
-        if not items:
-            continue
-        lines.extend([f"## {_FINAL_DRAFT_SECTION_HEADINGS.get(section, SECTION_WORKER_TITLES.get(section, section))}", ""])
-        for item in sorted(items, key=_section_item_sort_key):
-            lines.extend(_section_item_lines(item))
-        lines.append("")
-    resource_lines = _resource_reference_lines(job)
-    if resource_lines:
-        lines.extend(["## Persistent Resource References", "", *resource_lines])
+    if profile.assembly.strategy == "ordered_section_concat":
+        for section in section_order:
+            items = grouped_items.get(section) or []
+            contents = [str(item.content).strip() for item in items if str(item.content).strip()]
+            if not contents:
+                continue
+            heading = profile.assembly.section_headings.get(section) or SECTION_WORKER_TITLES.get(section, section)
+            lines.extend([f"## {heading}", "", *contents, ""])
+    else:
+        for section in section_order:
+            items = grouped_items.get(section) or []
+            if not items:
+                continue
+            heading = profile.assembly.section_headings.get(
+                section,
+                _FINAL_DRAFT_SECTION_HEADINGS.get(section, SECTION_WORKER_TITLES.get(section, section)),
+            )
+            lines.extend([f"## {heading}", ""])
+            for item in sorted(items, key=_section_item_sort_key):
+                lines.extend(_section_item_lines(item))
+            lines.append("")
+        if profile.assembly.include_resource_reference_appendix:
+            resource_lines = _resource_reference_lines(job)
+            if resource_lines:
+                lines.extend(["## Persistent Resource References", "", *resource_lines])
     return "\n".join(lines).strip()
+
 
 
 def _section_item_sort_key(item: Any) -> tuple[int, int, str]:
@@ -872,7 +1037,7 @@ def _resource_reference_lines(job: CompressionJob) -> list[str]:
 
 
 def _assembler_input(job: CompressionJob) -> str:
-    section_order = [section for _worker_name, section in SECTION_WORKERS]
+    section_order = list(get_profile(job.profile_id).assembly.section_order)
     grouped_items: dict[str, list[Any]] = {section: [] for section in section_order}
     for item in job.section_items:
         grouped_items.setdefault(item.section, []).append(item)
@@ -938,6 +1103,9 @@ def _base_payload(job: CompressionJob, *, status: str, phase: str, reason: str |
         "target_conversation_id": job.target_conversation_id,
         "compression_index": job.compression_index,
         "input_mode": job.input_mode,
+        "profile_id": job.profile_id,
+        "profile_version": job.profile_version,
+        "assembly_strategy": job.assembly_strategy,
         "phase": phase,
         "status": status,
         "reason": reason or (range_plan.reason if range_plan else None),

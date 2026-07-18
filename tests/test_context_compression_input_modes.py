@@ -200,13 +200,23 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
         conversation.provider_state[PROVIDER_OPENAI] = {"prompt_cache_key": "source-cache-key"}
         job = _job()
         range_plan = _range_plan(start=0, end=1)
+        from agent_runtime.context_compression.compression_service import _SectionWorkerRun
+
         service = ContextCompressionService.__new__(ContextCompressionService)
         service._resource_resolver = _ResourceResolver()
+        worker = _SectionWorkerRun(
+            worker_name="RequirementConstraintWorker",
+            section="requirements_constraints",
+            system_prompt="prompt",
+            title="用户需求与硬约束",
+            input_builder="native_history",
+        )
 
-        worker_input = await service._build_worker_input(
-            conversation,
-            job,
-            range_plan,
+        worker_input = service._build_worker_input_for_def(
+            worker=worker,
+            source_conversation=conversation,
+            job=job,
+            range_plan=range_plan,
         )
 
         self.assertEqual(worker_input.input_mode, "native_multimodal_history")
@@ -215,7 +225,8 @@ class ContextCompressionWorkerInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(worker_input, "openai_responses_prompt_cache_key"))
         self.assertNotIn("source-cache-key", worker_input.user_text)
         self.assertIn("只用于上下文压缩分析", worker_input.user_text)
-        self.assertIn("compressed_message_range: 0..1", worker_input.user_text)
+        self.assertNotIn("job_id:", worker_input.user_text)
+        self.assertNotIn("compressed_message_range:", worker_input.user_text)
         self.assertNotIn("retained tail", worker_input.user_text)
 
     def test_worker_render_options_does_not_override_prompt_cache_key(self) -> None:
