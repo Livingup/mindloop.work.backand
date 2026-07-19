@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +48,7 @@ class FileModifyRequest(BaseToolRequest):
     project_root: str = Field(description="项目工作区根目录，所有写入目标必须位于该目录内。")
     file_path: str = Field(description="要修改的文本文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     edits: list[FileModifyEdit] = Field(min_length=1, description="按顺序应用的连续行替换编辑列表；列表长度必须至少 1 个编辑块。")
-    expected_content_sha256: str | None = Field(default=None, description="可选的修改前文件内容 SHA256，用于防止覆盖并行修改。")
+    expected_content_sha256: str | None = Field(default=None, description="可选的修改前文件内容 SHA256，用于防止覆盖并行修改；空白字符串按未提供处理，非法格式会失败。")
     encoding: str | None = Field(default=None, description="可选的文件编码；为空时自动尝试常见文本编码。")
     dry_run: bool = Field(default=False, description="为 true 时只校验并计算是否可修改，不实际写入文件。")
 
@@ -62,7 +63,7 @@ class FileCreateRequest(BaseToolRequest):
     line_ending: LineEndingName = Field(default="LF", description="写入文件时使用的换行风格；可选值仅限 LF、CRLF、CR。")
     final_newline: bool = Field(default=True, description="是否在非空内容末尾追加结尾换行。")
     overwrite: bool = Field(default=False, description="是否允许覆盖已有文件；默认禁止。覆盖时必须提供 expected_content_sha256。")
-    expected_content_sha256: str | None = Field(default=None, description="覆盖已有文件时必须提供的旧文件内容 SHA256。")
+    expected_content_sha256: str | None = Field(default=None, description="覆盖已有文件时必须提供的旧文件内容 SHA256；空白字符串视为未提供，非法格式会失败。")
     create_parent_directories: bool = Field(default=True, description="父目录不存在时是否自动创建。")
     dry_run: bool = Field(default=False, description="为 true 时只校验并计算是否可创建或覆盖，不实际写入文件。")
 
@@ -73,7 +74,7 @@ class FileDeleteRequest(BaseToolRequest):
     project_root: str = Field(description="项目工作区根目录，删除目标必须位于该目录内。")
     file_path: str = Field(description="要删除的文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     reason: str = Field(min_length=1, description="删除文件的业务原因，用于审计和防止误删；长度必须至少 1 个字符。")
-    expected_content_sha256: str | None = Field(default=None, description="可选的删除前文件内容 SHA256，用于防止删除并行修改后的文件。")
+    expected_content_sha256: str | None = Field(default=None, description="可选的删除前文件内容 SHA256，用于防止删除并行修改后的文件；空白字符串按未提供处理，非法格式会失败。")
     dry_run: bool = Field(default=False, description="为 true 时只返回将要删除的文件信息，不实际删除。")
 
 
@@ -88,9 +89,9 @@ class FileMoveRequest(BaseToolRequest):
     source_path: str = Field(description="要移动或重命名的源文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     target_path: str = Field(description="移动或重命名后的目标文件路径；可以是绝对路径，也可以是相对 project_root 的路径。")
     reason: str = Field(min_length=1, description="移动或重命名文件的业务原因，用于审计和防止误操作；长度必须至少 1 个字符。")
-    expected_source_sha256: str | None = Field(default=None, description="可选的源文件内容 SHA256，用于防止移动并行修改后的文件。")
+    expected_source_sha256: str | None = Field(default=None, description="可选的源文件内容 SHA256，用于防止移动并行修改后的文件；空白字符串按未提供处理，非法格式会失败。")
     overwrite: bool = Field(default=False, description="是否允许覆盖目标文件；默认禁止。覆盖时必须提供 expected_target_sha256。")
-    expected_target_sha256: str | None = Field(default=None, description="覆盖目标文件时必须提供的目标文件旧内容 SHA256。")
+    expected_target_sha256: str | None = Field(default=None, description="覆盖目标文件时必须提供的目标文件旧内容 SHA256；空白字符串视为未提供，非法格式会失败。")
     create_parent_directories: bool = Field(default=True, description="目标父目录不存在时是否自动创建。")
     dry_run: bool = Field(default=False, description="为 true 时只返回将要移动的文件信息，不实际移动。")
 
@@ -231,12 +232,55 @@ def _ensure_parent_directory(target: WorkspaceTarget, *, create_parent_directori
     return [str(path) for path in missing_parents]
 
 
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
 def _normalize_sha256(value: str) -> str:
     """标准化调用方传入的 SHA256 字符串，兼容 sha256: 前缀。"""
 
     normalized = value.strip().lower()
     if normalized.startswith("sha256:"):
         normalized = normalized.removeprefix("sha256:")
+    return normalized
+
+
+def _parse_optional_expected_sha256(
+    expected_content_sha256: str | None,
+    *,
+    field_name: str = "expected_content_sha256",
+) -> str | None:
+    """解析可选的期望 SHA256。
+
+    None 与空白字符串统一视为未提供；非空但非法格式返回 InvalidExpectedHash。
+    有效值统一规范为 64 位小写十六进制。
+    """
+
+    if expected_content_sha256 is None:
+        return None
+    if not expected_content_sha256.strip():
+        return None
+
+    normalized = _normalize_sha256(expected_content_sha256)
+    if not _SHA256_HEX_PATTERN.fullmatch(normalized):
+        raise FileEditBusinessError(
+            "InvalidExpectedHash",
+            f"{field_name} 必须是 64 位十六进制 SHA256（可带 sha256: 前缀）: {expected_content_sha256}",
+            output={field_name: expected_content_sha256},
+        )
+    return normalized
+
+
+def _require_expected_sha256(
+    expected_content_sha256: str | None,
+    *,
+    field_name: str,
+    error_message: str,
+) -> str:
+    """解析覆盖场景必需的期望 SHA256；空白视为未提供。"""
+
+    normalized = _parse_optional_expected_sha256(expected_content_sha256, field_name=field_name)
+    if normalized is None:
+        raise FileEditBusinessError("ExpectedHashRequiredForOverwrite", error_message)
     return normalized
 
 
@@ -256,15 +300,25 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_expected_sha256(path: Path, expected_content_sha256: str | None) -> str:
-    """校验文件当前内容是否仍是 Agent 读取时的版本。"""
+def _validate_expected_sha256(
+    path: Path,
+    expected_content_sha256: str | None,
+    *,
+    field_name: str = "expected_content_sha256",
+) -> str:
+    """校验文件当前内容是否仍是 Agent 读取时的版本。
+
+    空白 expected 哈希按未提供处理，不触发 HashMismatch；
+    非法格式返回 InvalidExpectedHash。
+    """
 
     current_sha256 = _sha256_file(path)
-    if expected_content_sha256 is not None and current_sha256 != _normalize_sha256(expected_content_sha256):
+    expected = _parse_optional_expected_sha256(expected_content_sha256, field_name=field_name)
+    if expected is not None and current_sha256 != expected:
         raise FileEditBusinessError(
             "HashMismatch",
             f"文件内容 SHA256 不匹配，说明文件可能已被并行修改，请重新读取后再操作: {path}",
-            output={"current_content_sha256": current_sha256, "expected_content_sha256": expected_content_sha256},
+            output={"current_content_sha256": current_sha256, field_name: expected_content_sha256},
         )
     return current_sha256
 
@@ -462,11 +516,14 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
             _ensure_existing_regular_file(target, directory_error_code="DirectoryOverwriteDenied")
             if not request.overwrite:
                 raise FileEditBusinessError("FileAlreadyExists", f"文件已存在，默认禁止覆盖: {target.path}")
-            if request.expected_content_sha256 is None:
-                raise FileEditBusinessError("ExpectedHashRequiredForOverwrite", f"覆盖已有文件时必须提供 expected_content_sha256: {target.path}")
+            expected_hash = _require_expected_sha256(
+                request.expected_content_sha256,
+                field_name="expected_content_sha256",
+                error_message=f"覆盖已有文件时必须提供 expected_content_sha256: {target.path}",
+            )
             if _is_binary_file(target.path):
                 raise FileEditBusinessError("BinaryFileNotEditable", f"目标文件可能是二进制文件，默认不覆盖: {target.path}")
-            old_sha256 = _validate_expected_sha256(target.path, request.expected_content_sha256)
+            old_sha256 = _validate_expected_sha256(target.path, expected_hash)
 
         parent_directories = _ensure_parent_directory(target, create_parent_directories=request.create_parent_directories, dry_run=request.dry_run)
         new_text = _render_text(request.content_lines, _line_ending_sequence(request.line_ending), final_newline=request.final_newline)
@@ -570,18 +627,33 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
         if source.path == target.path:
             raise FileEditBusinessError("SamePath", f"源路径和目标路径相同，无需移动: {source.path}")
         _ensure_existing_regular_file(source, directory_error_code="DirectoryMoveDenied")
-        source_sha256 = _validate_expected_sha256(source.path, request.expected_source_sha256)
+        source_sha256 = _validate_expected_sha256(
+            source.path,
+            request.expected_source_sha256,
+            field_name="expected_source_sha256",
+        )
 
         target_sha256: str | None = None
         target_exists = target.path.exists()
+        expected_target_hash = _parse_optional_expected_sha256(
+            request.expected_target_sha256,
+            field_name="expected_target_sha256",
+        )
         if target_exists:
             _ensure_existing_regular_file(target, directory_error_code="TargetDirectoryOverwriteDenied")
             if not request.overwrite:
                 raise FileEditBusinessError("FileAlreadyExists", f"目标文件已存在，默认禁止覆盖: {target.path}")
-            if request.expected_target_sha256 is None:
-                raise FileEditBusinessError("ExpectedHashRequiredForOverwrite", f"覆盖目标文件时必须提供 expected_target_sha256: {target.path}")
-            target_sha256 = _validate_expected_sha256(target.path, request.expected_target_sha256)
-        elif request.expected_target_sha256 is not None:
+            if expected_target_hash is None:
+                raise FileEditBusinessError(
+                    "ExpectedHashRequiredForOverwrite",
+                    f"覆盖目标文件时必须提供 expected_target_sha256: {target.path}",
+                )
+            target_sha256 = _validate_expected_sha256(
+                target.path,
+                expected_target_hash,
+                field_name="expected_target_sha256",
+            )
+        elif expected_target_hash is not None:
             raise FileEditBusinessError("TargetHashProvidedButMissing", f"目标文件不存在，不应提供 expected_target_sha256: {target.path}")
 
         parent_directories = _ensure_parent_directory(target, create_parent_directories=request.create_parent_directories, dry_run=request.dry_run)
