@@ -1275,10 +1275,19 @@ def _build_shell_launch(shell: str) -> tuple[list[str], dict[str, str], list[str
     temp_paths: list[str] = []
     env = _process_env()
 
-    if canonical == "pwsh":
+    if canonical == "powershell":
         script_path = _write_temp_script(script_text, suffix=".ps1")
         temp_paths.append(script_path)
-        argv = [executable, "-NoLogo", "-NoProfile", "-NoExit", "-File", script_path]
+        argv = [
+            executable,
+            "-NoLogo",
+            "-NoProfile",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script_path,
+        ]
         return argv, env, temp_paths
 
     if canonical == "bash":

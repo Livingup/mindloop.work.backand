@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final
 
-from agent_runtime.terminal.shell_policy import SHELL_BASH, SHELL_PWSH, SHELL_ZSH
+from agent_runtime.terminal.shell_policy import SHELL_BASH, SHELL_POWERSHELL, SHELL_ZSH
 
 
 class TokenKind(str, Enum):
@@ -110,12 +110,13 @@ def _partial_hold_length(buffer: str) -> int:
     return 0
 
 
-def build_pwsh_integration_script() -> str:
-    # Version gate must run before any Prompt/READY hook is installed so pwsh<7 never emits B.
+def build_powershell_integration_script() -> str:
+    # Reject non-5.1 engines before installing Prompt/READY hooks.
     return (
-        "if (-not $PSVersionTable -or [int]$PSVersionTable.PSVersion.Major -lt 7) {\n"
-        "  $major = if ($PSVersionTable) { $PSVersionTable.PSVersion.Major } else { 'unknown' }\n"
-        "  [Console]::Error.WriteLine(\"PowerShell 7+ is required; found major=$major\")\n"
+        "if (-not $PSVersionTable -or [int]$PSVersionTable.PSVersion.Major -ne 5 "
+        "-or [int]$PSVersionTable.PSVersion.Minor -ne 1) {\n"
+        "  $version = if ($PSVersionTable) { [string]$PSVersionTable.PSVersion } else { 'unknown' }\n"
+        "  [Console]::Error.WriteLine(\"Windows PowerShell 5.1 is required; found version=$version\")\n"
         "  exit 1\n"
         "}\n"
         "$ErrorActionPreference = 'Continue'\n"
@@ -165,8 +166,8 @@ def build_zsh_integration_script() -> str:
 
 
 def integration_script_for_shell(shell: str) -> str:
-    if shell == SHELL_PWSH:
-        return build_pwsh_integration_script()
+    if shell == SHELL_POWERSHELL:
+        return build_powershell_integration_script()
     if shell == SHELL_ZSH:
         return build_zsh_integration_script()
     if shell == SHELL_BASH:

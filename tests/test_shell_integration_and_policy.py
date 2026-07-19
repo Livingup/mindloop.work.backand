@@ -9,10 +9,14 @@ from agent_runtime.terminal.shell_integration import (
     StreamToken,
     TokenKind,
     build_bash_integration_script,
-    build_pwsh_integration_script,
+    build_powershell_integration_script,
     build_zsh_integration_script,
 )
-from agent_runtime.terminal.shell_policy import platform_supported_shell, resolve_supported_shell
+from agent_runtime.terminal.shell_policy import (
+    platform_supported_shell,
+    require_shell_executable,
+    resolve_supported_shell,
+)
 from agent_runtime.terminal.terminal import TerminalInstance
 from agent_runtime.terminal.terminal_command import (
     TERMINAL_COMMAND_STATUS_COMPLETED,
@@ -26,9 +30,10 @@ from agent_runtime.terminal.terminal_service import TerminalRuntimeScope, Termin
 
 def test_resolve_supported_shell_rejects_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("agent_runtime.terminal.shell_policy.sys.platform", "win32")
-    assert resolve_supported_shell(None) == "pwsh"
+    assert resolve_supported_shell(None) == "powershell"
+    assert resolve_supported_shell("powershell.exe") == "powershell"
     with pytest.raises(ValueError):
-        resolve_supported_shell("powershell")
+        resolve_supported_shell("pwsh")
     with pytest.raises(ValueError):
         resolve_supported_shell("cmd")
     monkeypatch.setattr("agent_runtime.terminal.shell_policy.sys.platform", "darwin")
@@ -42,6 +47,41 @@ def test_resolve_supported_shell_rejects_unsupported(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("agent_runtime.terminal.shell_policy.sys.platform", "freebsd")
     with pytest.raises(RuntimeError):
         platform_supported_shell()
+
+
+def test_require_windows_powershell_uses_system_executable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "powershell.exe"
+    executable.write_bytes(b"")
+    monkeypatch.setattr("agent_runtime.terminal.shell_policy.sys.platform", "win32")
+    monkeypatch.setattr("agent_runtime.terminal.shell_policy.os.path.expandvars", lambda _: str(executable))
+    monkeypatch.setattr("agent_runtime.terminal.shell_policy.shutil.which", lambda _: None)
+    assert require_shell_executable("powershell.exe") == str(executable)
+
+
+def test_powershell_launch_uses_managed_51_arguments(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_runtime.terminal.infrastructure import pty_terminal_process as pty
+
+    script_path = tmp_path / "managed.ps1"
+    script_path.write_text("# managed", encoding="utf-8")
+    executable = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    monkeypatch.setattr(pty, "resolve_supported_shell", lambda _: "powershell")
+    monkeypatch.setattr(pty, "require_shell_executable", lambda _: executable)
+    monkeypatch.setattr(pty, "integration_script_for_shell", lambda _: "# managed")
+    monkeypatch.setattr(pty, "_write_temp_script", lambda *_args, **_kwargs: str(script_path))
+    argv, _env, temp_paths = pty._build_shell_launch("powershell")
+    assert argv == [
+        executable,
+        "-NoLogo",
+        "-NoProfile",
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script_path),
+    ]
+    assert temp_paths == [str(script_path)]
 
 
 def test_ordered_parser_preserves_visible_done_ready_order() -> None:
@@ -64,19 +104,21 @@ def test_ordered_parser_handles_split_frames_and_st_terminator() -> None:
 
 
 def test_shell_scripts_contain_done_and_ready_only() -> None:
-    pwsh = build_pwsh_integration_script()
+    powershell = build_powershell_integration_script()
     bash = build_bash_integration_script()
     zsh = build_zsh_integration_script()
-    for script in (pwsh, bash, zsh):
+    for script in (powershell, bash, zsh):
         assert "SAI;D" in script or 'D;' in script or '"D;"' in script
         assert "SAI;B" in script or "'B'" in script
         assert "SAI;C" not in script
         assert "nonce" not in script.lower()
-    # Version gate must hard-exit before Prompt/READY hooks are installed.
-    gate_idx = pwsh.find("PSVersionTable.PSVersion.Major")
-    prompt_idx = pwsh.find("function Global:Prompt")
-    exit_idx = pwsh.find("exit 1")
-    assert 0 <= gate_idx < exit_idx < prompt_idx
+    # The exact Windows PowerShell 5.1 gate must hard-exit before Prompt/READY hooks are installed.
+    gate_idx = powershell.find("PSVersionTable.PSVersion.Major -ne 5")
+    minor_gate_idx = powershell.find("PSVersionTable.PSVersion.Minor -ne 1")
+    prompt_idx = powershell.find("function Global:Prompt")
+    exit_idx = powershell.find("exit 1")
+    assert 0 <= gate_idx < minor_gate_idx < exit_idx < prompt_idx
+    assert "PowerShell 7" not in powershell
 
 
 class _MemoryRepo:
