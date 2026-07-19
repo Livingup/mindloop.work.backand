@@ -826,3 +826,6 @@ class CommunicationService:
             metadata=dict(metadata or {}),
         )
         return self._repository.append_message(message)
+
+
+

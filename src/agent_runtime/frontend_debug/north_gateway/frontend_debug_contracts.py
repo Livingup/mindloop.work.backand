@@ -47,3 +47,6 @@ class FrontendDebugGateway(Protocol):
     def create_session(self, request: CreateFrontendDebugSessionRequest) -> FrontendDebugSessionInfo:
         """创建本机前端调试代理会话。"""
         ...
+
+
+

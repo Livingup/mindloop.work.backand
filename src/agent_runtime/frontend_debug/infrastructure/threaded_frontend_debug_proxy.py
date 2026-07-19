@@ -708,3 +708,6 @@ def _runtime_api_base_url() -> str:
         return f"http://{host}:{runtime_cfg.service_port}"
     except Exception:
         return "http://127.0.0.1:8000"
+
+
+

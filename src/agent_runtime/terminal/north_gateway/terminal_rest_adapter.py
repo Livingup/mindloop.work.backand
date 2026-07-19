@@ -361,3 +361,6 @@ def _read_result_to_response(result: ReadTerminalOutputResult) -> ReadTerminalOu
 
 def _scene_stream_id(scene_id: str) -> str:
     return f"stream-scene-{scene_id}"
+
+
+

@@ -50,3 +50,6 @@ class FrontendDebugSession:
         """校验调试会话仍然可用。"""
         if self.status != FRONTEND_DEBUG_SESSION_STATUS_ACTIVE:
             raise ValueError(f"前端调试会话已关闭: {self.session_id}")
+
+
+
