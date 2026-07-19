@@ -27,6 +27,7 @@ _OSC_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+
 class OrderedSaiStreamParser:
     """Parse PTY text into ordered tokens: visible / DONE / READY."""
 

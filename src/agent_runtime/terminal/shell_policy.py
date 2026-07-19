@@ -10,6 +10,7 @@ SHELL_POWERSHELL: Final[str] = "powershell"
 SHELL_ZSH: Final[str] = "zsh"
 SHELL_BASH: Final[str] = "bash"
 
+
 _ALIAS_TO_CANONICAL: Final[dict[str, str]] = {
     "powershell": SHELL_POWERSHELL,
     "powershell.exe": SHELL_POWERSHELL,

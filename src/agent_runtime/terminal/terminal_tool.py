@@ -18,6 +18,7 @@ from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
 
 
+
 class TerminalCreateToolRequest(BaseToolRequest):
     cwd: str = Field(description="要启动终端的工作目录，必须显式提供。该目录只作为 shell 初始目录；如果你之后在终端内 cd，工具返回的 cwd 不会更新，你需要自己根据对话上下文记住当前目录。")
     shell: str | None = Field(default=None, description="可选 shell；当前平台仅支持唯一可钩子 shell：Windows 10/11=powershell.exe 5.1，macOS=zsh，Linux=bash。不传则使用该平台默认 shell；请求其他 shell 会失败，不会静默切换。")

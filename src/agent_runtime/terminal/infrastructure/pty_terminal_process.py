@@ -40,6 +40,7 @@ _WINDOWS_PTY_CONTROL_SLOW_QUEUE_SECONDS = 0.25
 _SHELL_READY_TIMEOUT_SECONDS = 5.0
 
 
+
 @dataclass(slots=True)
 class _ActiveCommand:
     command_id: str
