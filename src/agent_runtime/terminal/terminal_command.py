@@ -103,6 +103,7 @@ class TerminalCommand:
         self,
         error_message: str,
         *,
+        exit_code: int | None = None,
         stdout_bytes: int | None = None,
         stderr_bytes: int | None = None,
         at: datetime | None = None,
@@ -115,6 +116,57 @@ class TerminalCommand:
             self,
             status=TERMINAL_COMMAND_STATUS_FAILED,
             completed_at=now,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+            stdout_bytes=self.stdout_bytes if stdout_bytes is None else stdout_bytes,
+            stderr_bytes=self.stderr_bytes if stderr_bytes is None else stderr_bytes,
+            error_message=error_message,
+            updated_at=now,
+        )
+
+    def cancel(
+        self,
+        error_message: str,
+        *,
+        exit_code: int | None = None,
+        stdout_bytes: int | None = None,
+        stderr_bytes: int | None = None,
+        at: datetime | None = None,
+    ) -> "TerminalCommand":
+        now = at or utc_now()
+        duration_ms = None
+        if self.started_at is not None:
+            duration_ms = int((now - self.started_at).total_seconds() * 1000)
+        return replace(
+            self,
+            status=TERMINAL_COMMAND_STATUS_CANCELLED,
+            completed_at=now,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+            stdout_bytes=self.stdout_bytes if stdout_bytes is None else stdout_bytes,
+            stderr_bytes=self.stderr_bytes if stderr_bytes is None else stderr_bytes,
+            error_message=error_message,
+            updated_at=now,
+        )
+
+    def timeout(
+        self,
+        error_message: str,
+        *,
+        exit_code: int | None = None,
+        stdout_bytes: int | None = None,
+        stderr_bytes: int | None = None,
+        at: datetime | None = None,
+    ) -> "TerminalCommand":
+        now = at or utc_now()
+        duration_ms = None
+        if self.started_at is not None:
+            duration_ms = int((now - self.started_at).total_seconds() * 1000)
+        return replace(
+            self,
+            status=TERMINAL_COMMAND_STATUS_TIMEOUT,
+            completed_at=now,
+            exit_code=exit_code,
             duration_ms=duration_ms,
             stdout_bytes=self.stdout_bytes if stdout_bytes is None else stdout_bytes,
             stderr_bytes=self.stderr_bytes if stderr_bytes is None else stderr_bytes,

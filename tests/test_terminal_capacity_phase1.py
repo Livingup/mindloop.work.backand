@@ -6,7 +6,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, _default_pool_configs
+from agent_runtime.infrastructure.asyncio_diagnostics import (
+    BlockingPool,
+    _default_pool_configs,
+    configure_blocking_pool,
+)
 from agent_runtime.terminal.terminal import TerminalInstance
 from agent_runtime.terminal.terminal_command import TerminalCommand
 from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
@@ -116,10 +120,19 @@ class _FakeProcessManager:
         self.started: list[str] = []
         self.terminated: list[str] = []
 
-    async def start_terminal(self, request: TerminalSessionStartRequest, *, on_exit) -> bool:
+    async def start_terminal(
+        self,
+        request: TerminalSessionStartRequest,
+        *,
+        on_exit,
+        on_shell_ready=None,
+        on_command_finished=None,
+    ) -> bool:
         if request.terminal_id in self.started:
             return False
         self.started.append(request.terminal_id)
+        if on_shell_ready is not None:
+            await on_shell_ready(request.terminal_id)
         return True
 
     async def start_command(self, request: TerminalProcessStartRequest, *, on_output, on_exit) -> None:
@@ -235,6 +248,13 @@ def test_delete_and_task_cleanup_release_live_slots() -> None:
 
 
 def test_output_coalesce_batches_chunks_before_persist() -> None:
+    configure_blocking_pool(
+        BlockingPool.DB_BLOCKING,
+        max_workers=2,
+        isolated=True,
+        thread_name_prefix="test-terminal-coalesce-db",
+        max_pending=8,
+    )
     service, repo, _process_manager = _service(output_coalesce_interval_ms=50)
     scope = _scope("agent-a")
 
@@ -244,6 +264,8 @@ def test_output_coalesce_batches_chunks_before_persist() -> None:
         await service._handle_output(scope, terminal.terminal_id, "cmd-1", "pty", "world")
         assert repo.chunks == []
         await asyncio.sleep(0.08)
+        # Ensure delayed flush completed even if pool was reconfigured mid-suite.
+        await service._flush_command_outputs(terminal.terminal_id, "cmd-1")
         assert len(repo.chunks) == 1
         assert repo.chunks[0].chunk == "hello world"
 

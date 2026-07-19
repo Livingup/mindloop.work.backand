@@ -107,6 +107,7 @@ Desktop.ini
 !/tests/test_context_compression_worker_activity_publish.py
 !/tests/test_mcp_metadata_cache.py
 !/tests/test_pty_terminal_process_windows_control.py
+!/tests/test_shell_integration_and_policy.py
 !/tests/test_terminal_capacity_phase1.py
 !/tests/test_terminal_read_output_service.py
 !/tests/test_text_search_file_and_directory.py

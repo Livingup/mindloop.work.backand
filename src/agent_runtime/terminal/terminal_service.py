@@ -15,8 +15,13 @@ from agent_runtime.communication.north_gateway.communication_contracts import (
     CommunicationGateway,
     PublishCommunicationMessageRequest,
 )
-from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
+from agent_runtime.infrastructure.asyncio_diagnostics import (
+    BlockingPool,
+    BlockingPoolOverloadedError,
+    monitored_to_thread,
+)
 from agent_runtime.terminal.terminal import (
+    TERMINAL_STATUS_BUSY,
     TERMINAL_STATUS_DELETED,
     TERMINAL_STATUS_ERROR,
     TERMINAL_STATUS_IDLE,
@@ -29,6 +34,7 @@ from agent_runtime.terminal.terminal_command import (
     TERMINAL_COMMAND_STATUS_TIMEOUT,
     TerminalCommand,
 )
+from agent_runtime.terminal.shell_policy import platform_supported_shell, resolve_supported_shell
 from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 from agent_runtime.terminal.terminal_output_ring import TerminalOutputRing
@@ -225,6 +231,13 @@ class TerminalService:
         self._live_slots: dict[str, str | None] = {}
         self._capacity_lock = asyncio.Lock()
         self._pending_outputs: dict[tuple[str, str, str], _PendingTerminalOutput] = {}
+        self._command_finish_events: dict[str, asyncio.Event] = {}
+        self._command_output_events: dict[str, asyncio.Event] = {}
+        self._command_output_versions: dict[str, int] = {}
+        # terminal_id -> active/awaiting wait-state command ids (at most one in normal flow)
+        self._terminal_wait_commands: dict[str, set[str]] = {}
+        # (terminal_id, command_id) -> in-flight flush futures used as completion barriers
+        self._inflight_output_flushes: dict[tuple[str, str], set[asyncio.Future[None]]] = {}
 
     def resolve_scope(
         self,
@@ -350,10 +363,19 @@ class TerminalService:
         lock_key = f"{scope.owner_type}:{scope.owner_id}"
         async with self._lock_for(lock_key):
             terminal = await self._select_terminal(scope, terminal_id=terminal_id, cwd=cwd, shell=shell)
+            if not terminal.is_available:
+                raise ValueError(
+                    f"终端当前不可执行新命令: terminal_id={terminal.terminal_id} status={terminal.status} "
+                    f"current_command_id={terminal.current_command_id}"
+                )
             actual_cwd = self._resolve_cwd(terminal.cwd, scope.default_cwd)
             actual_shell = self._resolve_shell(terminal.shell)
             await self._ensure_terminal_runtime(scope, terminal, cwd=actual_cwd, shell=actual_shell)
             terminal = self._repo.get_terminal(terminal.terminal_id) or terminal
+            if not terminal.is_available:
+                raise ValueError(
+                    f"终端在挂载 runtime 后仍不可执行新命令: terminal_id={terminal.terminal_id} status={terminal.status}"
+                )
             command = TerminalCommand(
                 command_id=_new_id("cmd"),
                 terminal_id=terminal.terminal_id,
@@ -368,6 +390,7 @@ class TerminalService:
             terminal = terminal.mark_busy(command.command_id, cwd=actual_cwd)
             self._repo.save_terminal(terminal)
             self._repo.save_command(command)
+            self._register_command_wait_state(terminal.terminal_id, command.command_id)
             self._byte_offsets[(terminal.terminal_id, command.command_id)] = 0
             self._stream_bytes[(terminal.terminal_id, command.command_id, "stdout")] = 0
             self._stream_bytes[(terminal.terminal_id, command.command_id, "stderr")] = 0
@@ -402,8 +425,7 @@ class TerminalService:
                 on_output=lambda stream, text: self._handle_output(scope, terminal.terminal_id, command.command_id, stream, text),
                 on_exit=lambda exit_code, error_message: self._handle_exit(scope, terminal.terminal_id, command.command_id, exit_code, error_message),
             )
-            terminal = terminal.mark_idle()
-            self._repo.save_terminal(terminal)
+            # Keep terminal busy until shell integration reports command finished.
             logger.info(
                 "Terminal execute accepted: terminal_id=%s command_id=%s actual_cwd=%s shell=%s timeout_ms=%s task_id=%s agent_instance_id=%s duration_ms=%s",
                 terminal.terminal_id,
@@ -415,36 +437,27 @@ class TerminalService:
                 scope.agent_instance_id,
                 int((time.perf_counter() - started_at) * 1000),
             )
-        except Exception as exc:
-            failed = command.fail(str(exc))
-            self._repo.save_command(failed)
-            self._repo.save_terminal(terminal.mark_idle())
-            await self._publish(
+        except asyncio.CancelledError:
+            await self._finalize_failed_execute(
                 scope,
-                "terminal.session.completed",
-                {
-                    "terminal_session_id": command.command_id,
-                    "terminal_id": terminal.terminal_id,
-                    "command_id": command.command_id,
-                    "tool_call_id": scope.tool_call_id or command.command_id,
-                    "exit_code": failed.exit_code,
-                    "duration_ms": failed.duration_ms,
-                    "stdout_bytes": failed.stdout_bytes,
-                    "stderr_bytes": failed.stderr_bytes,
-                    "error_message": failed.error_message,
-                    "completed_at": failed.completed_at.isoformat() if failed.completed_at else None,
-                },
-                correlation_id=scope.tool_call_id,
+                terminal,
+                command,
+                error_message="command start cancelled",
+                finalizer="cancel",
+                definite_no_write=False,
+                started_at=started_at,
             )
-            logger.warning(
-                "Terminal execute failed: terminal_id=%s command_id=%s error_type=%s error=%s task_id=%s agent_instance_id=%s duration_ms=%s",
-                terminal.terminal_id,
-                command.command_id,
-                exc.__class__.__name__,
-                str(exc),
-                scope.task_id,
-                scope.agent_instance_id,
-                int((time.perf_counter() - started_at) * 1000),
+            raise
+        except Exception as exc:
+            await self._finalize_failed_execute(
+                scope,
+                terminal,
+                command,
+                error_message=str(exc),
+                finalizer="fail",
+                definite_no_write=_is_definite_unwritten_command_error(exc),
+                started_at=started_at,
+                error_type=exc.__class__.__name__,
             )
             raise
         return ExecuteCommandAccepted(accepted=True, terminal=terminal, command=command)
@@ -480,14 +493,23 @@ class TerminalService:
         terminal = self._require_terminal(scope, terminal_id)
         read_command = self._get_read_command(terminal_id, command_id)
         effective_limit_chars = min(max(limit_chars, 1000), self._max_output_chars_per_read)
-        if effective_wait_timeout_ms > 0:
-            await asyncio.sleep(effective_wait_timeout_ms / 1000)
+        if mode == "search" and not query:
+            raise ValueError("search 模式必须提供 query。")
+        if effective_wait_timeout_ms > 0 and command_id is not None:
+            await self._wait_for_read(
+                terminal_id=terminal_id,
+                command_id=command_id,
+                mode=mode,
+                after_chunk_index=after_chunk_index,
+                wait_timeout_ms=effective_wait_timeout_ms,
+            )
             terminal = self._require_terminal(scope, terminal_id)
             read_command = self._get_read_command(terminal_id, command_id)
+        elif effective_wait_timeout_ms > 0 and command_id is None:
+            # No command association: never blind-sleep; return immediate snapshot.
+            pass
         result: TerminalOutputReadResult
         if mode == "search":
-            if not query:
-                raise ValueError("search 模式必须提供 query。")
             chunks = await self._read_output_repo_search(
                 terminal_id=terminal_id,
                 command_id=command_id,
@@ -717,20 +739,32 @@ class TerminalService:
     async def close_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
         terminal = self._require_usable_terminal(scope, terminal_id)
         await self._flush_terminal_outputs(terminal_id)
-        self._runtime_tokens.pop(terminal_id, None)
-        await self._process_manager.terminate_terminal(terminal_id)
-        await self._release_live_slot(terminal_id)
+        # Keep runtime_token until terminate so watcher on_exit is not treated as stale.
+        runtime_token_before_close = self._runtime_tokens.get(terminal_id)
+        watcher_handled_detach = False
+        try:
+            await self._process_manager.terminate_terminal(terminal_id)
+        finally:
+            watcher_handled_detach = (
+                runtime_token_before_close is not None
+                and self._runtime_tokens.get(terminal_id) != runtime_token_before_close
+            )
+            self._runtime_tokens.pop(terminal_id, None)
+            await self._release_live_slot(terminal_id)
+            self._wake_and_cleanup_terminal_wait_states(terminal_id)
+            self._discard_terminal_runtime_state(terminal_id)
         detached = terminal.mark_idle()
-        self._repo.save_terminal(detached)
-        await self._publish(
-            scope,
-            "terminal.runtime.detached",
-            {
-                "terminal_id": terminal_id,
-                "status": detached.status,
-            },
-            correlation_id=scope.tool_call_id,
-        )
+        await self._repo_save_terminal(detached)
+        if not watcher_handled_detach:
+            await self._publish(
+                scope,
+                "terminal.runtime.detached",
+                {
+                    "terminal_id": terminal_id,
+                    "status": detached.status,
+                },
+                correlation_id=scope.tool_call_id,
+            )
         return detached
 
     async def delete_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
@@ -875,33 +909,40 @@ class TerminalService:
         shell: str,
     ) -> None:
         runtime_token = _new_id("runtime")
+        # Phase 1: reserve capacity quickly without waiting on shell bootstrap.
         async with self._capacity_lock:
             already_live = terminal.terminal_id in self._live_slots
             if not already_live:
                 self._assert_can_admit_live(scope.agent_instance_id)
-            try:
-                started = await self._process_manager.start_terminal(
-                    TerminalSessionStartRequest(
-                        terminal_id=terminal.terminal_id,
-                        cwd=cwd,
-                        shell=shell,
-                        runtime_token=runtime_token,
-                    ),
-                    on_exit=lambda exit_code, error_message: self._handle_terminal_exit(
-                        scope,
-                        terminal.terminal_id,
-                        runtime_token,
-                        exit_code,
-                        error_message,
-                    ),
-                )
-            except Exception:
-                # start failed before we own a live slot for a new terminal.
-                raise
-            if not already_live:
                 self._live_slots[terminal.terminal_id] = scope.agent_instance_id
-            elif started:
-                # Replaced a stale runtime; keep the existing live slot ownership.
+        # Phase 2: spawn/wait READY outside capacity lock.
+        try:
+            started = await self._process_manager.start_terminal(
+                TerminalSessionStartRequest(
+                    terminal_id=terminal.terminal_id,
+                    cwd=cwd,
+                    shell=shell,
+                    runtime_token=runtime_token,
+                ),
+                on_exit=lambda exit_code, error_message: self._handle_terminal_exit(
+                    scope,
+                    terminal.terminal_id,
+                    runtime_token,
+                    exit_code,
+                    error_message,
+                ),
+                on_shell_ready=lambda terminal_id: self._handle_shell_ready(scope, terminal_id),
+                on_command_finished=lambda command_id, exit_code, error_message, final_status: self._handle_exit(
+                    scope, terminal.terminal_id, command_id, exit_code, error_message, final_status
+                ),
+            )
+        except Exception:
+            if not already_live:
+                async with self._capacity_lock:
+                    self._live_slots.pop(terminal.terminal_id, None)
+            raise
+        async with self._capacity_lock:
+            if already_live and started:
                 self._live_slots[terminal.terminal_id] = scope.agent_instance_id
             if started:
                 self._runtime_tokens[terminal.terminal_id] = runtime_token
@@ -972,33 +1013,68 @@ class TerminalService:
         command_id: str,
         exit_code: int | None,
         error_message: str | None,
+        final_status: str | None = None,
     ) -> None:
+        # Command finished (DONE). Terminal stays busy until shell READY(B).
         await self._flush_command_outputs(terminal_id, command_id)
-        command = self._repo.get_command(command_id)
-        terminal = self._repo.get_terminal(terminal_id)
+        command = await self._repo_get_command(command_id)
+        terminal = await self._repo_get_terminal(terminal_id)
         if command is None or terminal is None:
+            self._signal_command_finished(command_id)
+            return
+        if command.status in TERMINAL_COMMAND_FINISHED_STATUSES:
+            self._signal_command_finished(command_id)
             return
         stdout_bytes = self._stream_bytes.get((terminal_id, command_id, "stdout"), 0)
         stdout_bytes += self._stream_bytes.get((terminal_id, command_id, "pty"), 0)
         stderr_bytes = self._stream_bytes.get((terminal_id, command_id, "stderr"), 0)
-        if error_message:
-            completed = command.fail(
-                error_message,
-                stdout_bytes=stdout_bytes,
-                stderr_bytes=stderr_bytes,
-            )
-        else:
-            completed = command.complete(
+        status = final_status
+        if status is None:
+            if error_message and "interrupted by ctrl_c" in error_message:
+                status = "cancelled"
+            elif error_message:
+                status = "failed"
+            elif exit_code == 0:
+                status = "completed"
+            else:
+                status = "failed"
+        if status == "cancelled":
+            completed = command.cancel(
+                error_message or "command interrupted by ctrl_c",
                 exit_code=exit_code,
                 stdout_bytes=stdout_bytes,
                 stderr_bytes=stderr_bytes,
             )
-        self._repo.save_command(completed)
-        if terminal.current_command_id == command_id and terminal.status != TERMINAL_STATUS_DELETED:
-            try:
-                self._repo.save_terminal(terminal.mark_idle())
-            except ValueError:
-                self._repo.save_terminal(terminal.mark_error())
+        elif status == "timeout":
+            completed = command.timeout(
+                error_message or "command timed out",
+                exit_code=exit_code,
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
+            )
+        elif status == "failed" or (status != "completed" and error_message):
+            if exit_code is not None and not error_message:
+                # DONE;N with N!=0: keep real exit code via complete() failed branch.
+                completed = command.complete(
+                    exit_code=exit_code,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                )
+            else:
+                completed = command.fail(
+                    error_message or f"command failed with exit_code={exit_code}",
+                    exit_code=exit_code,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                )
+        else:
+            completed = command.complete(
+                exit_code=0 if status == "completed" else (exit_code if exit_code is not None else 1),
+                stdout_bytes=stdout_bytes,
+                stderr_bytes=stderr_bytes,
+            )
+        await self._repo_save_command(completed)
+        # NOTE: do not mark terminal idle here; READY(B) does that.
         await self._publish(
             scope,
             "terminal.session.completed",
@@ -1016,6 +1092,23 @@ class TerminalService:
             },
             correlation_id=scope.tool_call_id,
         )
+        self._signal_command_finished(command_id)
+
+    async def _handle_shell_ready(self, scope: TerminalRuntimeScope, terminal_id: str) -> None:
+        terminal = await self._repo_get_terminal(terminal_id)
+        if terminal is None or terminal.status == TERMINAL_STATUS_DELETED:
+            return
+        command_id = terminal.current_command_id
+        # Flush D..B prompt text still bound to the command before idle/registry cleanup.
+        if command_id:
+            await self._flush_command_outputs(terminal_id, command_id)
+        if terminal.status == TERMINAL_STATUS_BUSY:
+            try:
+                await self._repo_save_terminal(terminal.mark_idle())
+            except ValueError:
+                await self._repo_save_terminal(terminal.mark_error())
+        if command_id:
+            self._cleanup_command_wait_state(terminal_id, command_id)
 
     async def _handle_terminal_exit(
         self,
@@ -1025,17 +1118,19 @@ class TerminalService:
         exit_code: int | None,
         error_message: str | None,
     ) -> None:
-        terminal = self._repo.get_terminal(terminal_id)
+        terminal = await self._repo_get_terminal(terminal_id)
         if terminal is None or terminal.status == TERMINAL_STATUS_DELETED:
+            self._wake_and_cleanup_terminal_wait_states(terminal_id)
             await self._release_live_slot(terminal_id)
             return
         if runtime_token is not None and self._runtime_tokens.get(terminal_id) != runtime_token:
             return
         await self._flush_terminal_outputs(terminal_id)
+        self._wake_and_cleanup_terminal_wait_states(terminal_id)
         updated = terminal.mark_error() if error_message else terminal.mark_idle()
         self._runtime_tokens.pop(terminal_id, None)
         await self._release_live_slot(terminal_id)
-        self._repo.save_terminal(updated)
+        await self._repo_save_terminal(updated)
         await self._publish(
             scope,
             "terminal.runtime.detached",
@@ -1111,6 +1206,12 @@ class TerminalService:
         return lock
 
     def _discard_terminal_runtime_state(self, terminal_id: str) -> None:
+        self._wake_and_cleanup_terminal_wait_states(terminal_id)
+        for key in [key for key in list(self._inflight_output_flushes) if key[0] == terminal_id]:
+            futures = self._inflight_output_flushes.pop(key, set())
+            for fut in futures:
+                if not fut.done():
+                    fut.set_result(None)
         for key in [key for key in self._byte_offsets if key[0] == terminal_id]:
             self._byte_offsets.pop(key, None)
         for key in [key for key in self._stream_bytes if key[0] == terminal_id]:
@@ -1168,22 +1269,61 @@ class TerminalService:
             await asyncio.sleep(self._output_coalesce_interval_ms / 1000)
             await self._flush_pending_output(pending_key)
         except asyncio.CancelledError:
-            return
+            # Best-effort flush if cancel interrupted sleep/append after parts were staged.
+            try:
+                await self._flush_pending_output(pending_key)
+            except Exception:
+                logger.exception(
+                    "Failed best-effort flush after coalesce cancel: terminal_id=%s command_id=%s stream=%s",
+                    pending_key[0],
+                    pending_key[1],
+                    pending_key[2],
+                )
+            raise
 
     async def _flush_terminal_outputs(self, terminal_id: str) -> None:
-        keys = [key for key in self._pending_outputs if key[0] == terminal_id]
-        for key in keys:
-            await self._flush_pending_output(key)
+        command_ids = {
+            key[1]
+            for key in list(self._pending_outputs)
+            if key[0] == terminal_id
+        } | {
+            key[1]
+            for key in list(self._inflight_output_flushes)
+            if key[0] == terminal_id
+        }
+        for command_id in command_ids:
+            await self._flush_command_outputs(terminal_id, command_id)
 
     async def _flush_command_outputs(self, terminal_id: str, command_id: str) -> None:
-        keys = [key for key in self._pending_outputs if key[0] == terminal_id and key[1] == command_id]
-        for key in keys:
-            await self._flush_pending_output(key)
+        # Drain pending buckets and wait for any in-flight DB persist barrier.
+        while True:
+            keys = [
+                key
+                for key in list(self._pending_outputs)
+                if key[0] == terminal_id and key[1] == command_id
+            ]
+            for key in keys:
+                await self._flush_pending_output(key)
+            inflight = list(self._inflight_output_flushes.get((terminal_id, command_id), ()))
+            if not inflight:
+                # Re-check pending in case a cancelled flush reinserted parts.
+                if any(
+                    key[0] == terminal_id and key[1] == command_id
+                    for key in self._pending_outputs
+                ):
+                    continue
+                return
+            await asyncio.wait(inflight)
 
     async def _flush_pending_output(self, pending_key: tuple[str, str, str]) -> None:
+        command_key = (pending_key[0], pending_key[1])
+        loop = asyncio.get_running_loop()
+        barrier = loop.create_future()
         async with self._lock_for(f"output:{pending_key[0]}:{pending_key[1]}"):
+            self._inflight_output_flushes.setdefault(command_key, set()).add(barrier)
             pending = self._pending_outputs.pop(pending_key, None)
             if pending is None or not pending.parts:
+                self._complete_inflight_flush_barrier(command_key, barrier)
                 return
             if pending.flush_task is not None and not pending.flush_task.done():
                 if pending.flush_task is not asyncio.current_task():
@@ -1194,12 +1334,51 @@ class TerminalService:
             scope = pending.scope
             terminal_id = pending.terminal_id
             command_id = pending.command_id
-            chunk_index, byte_offset = self._append_output_chunk_locked(
-                terminal_id=terminal_id,
-                command_id=command_id,
-                stream=stream,
-                text=text,
+            byte_offset_hint = pending.byte_offset
+            persist_task = asyncio.create_task(
+                self._append_output_chunk(
+                    terminal_id=terminal_id,
+                    command_id=command_id,
+                    stream=stream,
+                    text=text,
+                )
             )
+            cancelled_during_persist = False
+            persisted = False
+            chunk_index = 0
+            byte_offset = 0
+
+            def restore_pending() -> None:
+                pending.parts = [text]
+                pending.byte_offset = byte_offset_hint
+                pending.chunk_count = source_chunk_count
+                pending.pending_bytes = len(text.encode("utf-8", errors="replace"))
+                pending.flush_task = None
+                self._pending_outputs[pending_key] = pending
+
+            try:
+                # Shield the DB task: cancelling this flush must not cancel an already-running commit.
+                chunk_index, byte_offset = await asyncio.shield(persist_task)
+                persisted = True
+            except asyncio.CancelledError:
+                cancelled_during_persist = True
+                # Defer cancellation until the DB task has a definite committed/failed result.
+                persisted, chunk_index, byte_offset = await self._await_persist_task_result(persist_task)
+                if not persisted:
+                    restore_pending()
+            except BaseException:
+                if not persist_task.done():
+                    persist_task.cancel()
+                    try:
+                        await persist_task
+                    except (Exception, asyncio.CancelledError):
+                        pass
+                restore_pending()
+                raise
+            finally:
+                self._complete_inflight_flush_barrier(command_key, barrier)
+            if cancelled_during_persist and not persisted:
+                raise asyncio.CancelledError()
         await self._publish_output_delta(
             scope,
             terminal_id=terminal_id,
@@ -1210,6 +1389,109 @@ class TerminalService:
             byte_offset=byte_offset,
             coalesced=source_chunk_count > 1,
             source_chunk_count=source_chunk_count,
+        )
+        if cancelled_during_persist:
+            raise asyncio.CancelledError()
+
+    def _complete_inflight_flush_barrier(
+        self,
+        command_key: tuple[str, str],
+        barrier: asyncio.Future[None],
+    ) -> None:
+        if not barrier.done():
+            barrier.set_result(None)
+        inflight = self._inflight_output_flushes.get(command_key)
+        if inflight is None:
+            return
+        inflight.discard(barrier)
+        if not inflight:
+            self._inflight_output_flushes.pop(command_key, None)
+
+    async def _await_persist_task_result(
+        self,
+        persist_task: asyncio.Task[tuple[int, int]],
+    ) -> tuple[bool, int, int]:
+        while True:
+            if persist_task.cancelled():
+                return False, 0, 0
+            if persist_task.done():
+                try:
+                    chunk_index, byte_offset = persist_task.result()
+                except (Exception, asyncio.CancelledError):
+                    return False, 0, 0
+                return True, chunk_index, byte_offset
+            try:
+                chunk_index, byte_offset = await asyncio.shield(persist_task)
+                return True, chunk_index, byte_offset
+            except asyncio.CancelledError:
+                # A repeated cancellation request must not make the DB outcome ambiguous.
+                continue
+            except Exception:
+                return False, 0, 0
+
+    async def _finalize_failed_execute(
+        self,
+        scope: TerminalRuntimeScope,
+        terminal: TerminalInstance,
+        command: TerminalCommand,
+        *,
+        error_message: str,
+        finalizer: str,
+        definite_no_write: bool,
+        started_at: float,
+        error_type: str | None = None,
+    ) -> None:
+        if finalizer == "cancel":
+            completed = command.cancel(error_message)
+        else:
+            completed = command.fail(error_message)
+        await self._repo_save_command(completed)
+        if definite_no_write:
+            await self._repo_save_terminal(terminal.mark_idle())
+        else:
+            try:
+                await self._process_manager.terminate_terminal(terminal.terminal_id)
+            except Exception:
+                logger.exception(
+                    "Failed to terminate terminal after indeterminate command write: terminal_id=%s command_id=%s",
+                    terminal.terminal_id,
+                    command.command_id,
+                )
+            try:
+                await self._repo_save_terminal(terminal.mark_error())
+            except ValueError:
+                await self._repo_save_terminal(terminal.mark_idle())
+            await self._release_live_slot(terminal.terminal_id)
+            self._runtime_tokens.pop(terminal.terminal_id, None)
+        # Order: persist → publish → Event.set → cleanup wait registry.
+        await self._publish(
+            scope,
+            "terminal.session.completed",
+            {
+                "terminal_session_id": command.command_id,
+                "terminal_id": terminal.terminal_id,
+                "command_id": command.command_id,
+                "tool_call_id": scope.tool_call_id or command.command_id,
+                "exit_code": completed.exit_code,
+                "duration_ms": completed.duration_ms,
+                "stdout_bytes": completed.stdout_bytes,
+                "stderr_bytes": completed.stderr_bytes,
+                "error_message": completed.error_message,
+                "completed_at": completed.completed_at.isoformat() if completed.completed_at else None,
+            },
+            correlation_id=scope.tool_call_id,
+        )
+        self._signal_command_finished(command.command_id)
+        self._cleanup_command_wait_state(terminal.terminal_id, command.command_id)
+        logger.warning(
+            "Terminal execute failed: terminal_id=%s command_id=%s error_type=%s error=%s task_id=%s agent_instance_id=%s duration_ms=%s",
+            terminal.terminal_id,
+            command.command_id,
+            error_type or finalizer,
+            error_message,
+            scope.task_id,
+            scope.agent_instance_id,
+            int((time.perf_counter() - started_at) * 1000),
         )
 
     async def _persist_and_publish_output(
@@ -1224,7 +1506,7 @@ class TerminalService:
         source_chunk_count: int,
     ) -> None:
         async with self._lock_for(f"output:{terminal_id}:{command_id}"):
-            chunk_index, byte_offset = self._append_output_chunk_locked(
+            chunk_index, byte_offset = await self._append_output_chunk(
                 terminal_id=terminal_id,
                 command_id=command_id,
                 stream=stream,
@@ -1242,7 +1524,7 @@ class TerminalService:
             source_chunk_count=source_chunk_count,
         )
 
-    def _append_output_chunk_locked(
+    async def _append_output_chunk(
         self,
         *,
         terminal_id: str,
@@ -1253,7 +1535,16 @@ class TerminalService:
         encoded = text.encode("utf-8", errors="replace")
         key = (terminal_id, command_id)
         byte_offset = self._byte_offsets.get(key, 0)
-        chunk_index = self._repo.next_output_chunk_index(terminal_id, command_id)
+        chunk_index = await monitored_to_thread(
+            self._repo.next_output_chunk_index,
+            terminal_id,
+            command_id,
+            operation="terminal.repo.next_output_chunk_index",
+            caller="TerminalService._append_output_chunk",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={"terminal_id": terminal_id, "command_id": command_id},
+        )
         chunk = TerminalOutputChunk(
             terminal_id=terminal_id,
             command_id=command_id,
@@ -1262,7 +1553,20 @@ class TerminalService:
             stream=stream,
             chunk=text,
         )
-        self._repo.append_output_chunk(chunk)
+        await monitored_to_thread(
+            self._repo.append_output_chunk,
+            chunk,
+            operation="terminal.repo.append_output_chunk",
+            caller="TerminalService._append_output_chunk",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={
+                "terminal_id": terminal_id,
+                "command_id": command_id,
+                "chunk_index": chunk_index,
+                "stream": stream,
+            },
+        )
         self._byte_offsets[key] = byte_offset + len(encoded)
         stream_key = (terminal_id, command_id, stream)
         self._stream_bytes[stream_key] = self._stream_bytes.get(stream_key, 0) + len(encoded)
@@ -1302,6 +1606,8 @@ class TerminalService:
             stream=stream,
             chunk=text,
         )
+        # The since contract is persisted-output OR finished; do not wait for a slow event gateway.
+        self._signal_command_output(command_id)
         await self._publish(
             scope,
             "terminal.output.delta",
@@ -1310,10 +1616,172 @@ class TerminalService:
         )
 
     def _resolve_shell(self, shell: str | None) -> str:
-        actual = shell or self._default_shell
-        if actual == "default":
-            return _default_shell_name()
-        return actual
+        return resolve_supported_shell(shell or self._default_shell)
+
+    async def _wait_for_read(
+        self,
+        *,
+        terminal_id: str,
+        command_id: str,
+        mode: ReadMode,
+        after_chunk_index: int | None,
+        wait_timeout_ms: int,
+    ) -> None:
+        deadline = time.perf_counter() + (wait_timeout_ms / 1000)
+        seen_output_version = self._command_output_versions.get(command_id, 0)
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return
+            finish_event = self._command_finish_events.get(command_id)
+            if finish_event is not None and finish_event.is_set():
+                return
+            command = await self._repo_get_command(command_id)
+            if command is not None and command.status in TERMINAL_COMMAND_FINISHED_STATUSES:
+                return
+            if mode == "since" and after_chunk_index is not None:
+                chunks = await self._read_output_repo_list(
+                    terminal_id=terminal_id,
+                    command_id=command_id,
+                    after_chunk_index=after_chunk_index,
+                    limit=1,
+                    mode=mode,
+                    operation="terminal.read_output.wait_since_probe",
+                )
+                if chunks:
+                    return
+                current_version = self._command_output_versions.get(command_id, 0)
+                if current_version > seen_output_version:
+                    # Output was signaled between snapshot and version check; re-probe DB.
+                    seen_output_version = current_version
+                    continue
+                output_event = self._command_output_events.setdefault(command_id, asyncio.Event())
+                finish_event = self._command_finish_events.setdefault(command_id, asyncio.Event())
+                # Re-check after grabbing events to close the register race without shared clear().
+                if finish_event.is_set() or self._command_output_versions.get(command_id, 0) > seen_output_version:
+                    continue
+                wait_finish = asyncio.create_task(finish_event.wait())
+                wait_output = asyncio.create_task(output_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {wait_finish, wait_output},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in (wait_finish, wait_output):
+                        if not task.done():
+                            task.cancel()
+                    for task in (wait_finish, wait_output):
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+                if not done:
+                    return
+                if wait_output in done:
+                    seen_output_version = self._command_output_versions.get(command_id, seen_output_version)
+                continue
+            finish_event = self._command_finish_events.setdefault(command_id, asyncio.Event())
+            if finish_event.is_set():
+                return
+            try:
+                await asyncio.wait_for(finish_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return
+            return
+
+    def _register_command_wait_state(self, terminal_id: str, command_id: str) -> None:
+        self._command_finish_events[command_id] = asyncio.Event()
+        self._command_output_events[command_id] = asyncio.Event()
+        self._command_output_versions[command_id] = 0
+        self._terminal_wait_commands.setdefault(terminal_id, set()).add(command_id)
+
+    def _cleanup_command_wait_state(self, terminal_id: str, command_id: str) -> None:
+        self._command_finish_events.pop(command_id, None)
+        self._command_output_events.pop(command_id, None)
+        self._command_output_versions.pop(command_id, None)
+        command_ids = self._terminal_wait_commands.get(terminal_id)
+        if command_ids is not None:
+            command_ids.discard(command_id)
+            if not command_ids:
+                self._terminal_wait_commands.pop(terminal_id, None)
+
+    def _wake_and_cleanup_terminal_wait_states(self, terminal_id: str) -> None:
+        command_ids = list(self._terminal_wait_commands.get(terminal_id, ()))
+        for command_id in command_ids:
+            self._signal_command_finished(command_id)
+            self._cleanup_command_wait_state(terminal_id, command_id)
+        self._terminal_wait_commands.pop(terminal_id, None)
+
+    def _signal_command_finished(self, command_id: str) -> None:
+        event = self._command_finish_events.get(command_id)
+        if event is None:
+            # Keep a one-shot finished event so late readers can observe completion.
+            event = asyncio.Event()
+            self._command_finish_events[command_id] = event
+        event.set()
+        # Replace output event after set so multi-waiters observe generation without shared clear().
+        old_output = self._command_output_events.get(command_id)
+        if old_output is not None:
+            self._command_output_events[command_id] = asyncio.Event()
+            old_output.set()
+
+    def _signal_command_output(self, command_id: str) -> None:
+        # Do not recreate wait registry after READY/close cleanup.
+        if command_id not in self._command_output_versions and command_id not in self._command_finish_events:
+            return
+        self._command_output_versions[command_id] = self._command_output_versions.get(command_id, 0) + 1
+        old_event = self._command_output_events.get(command_id)
+        self._command_output_events[command_id] = asyncio.Event()
+        if old_event is not None:
+            old_event.set()
+
+    async def _repo_get_command(self, command_id: str) -> TerminalCommand | None:
+        return await monitored_to_thread(
+            self._repo.get_command,
+            command_id,
+            operation="terminal.repo.get_command",
+            caller="TerminalService",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={"command_id": command_id},
+        )
+
+    async def _repo_get_terminal(self, terminal_id: str) -> TerminalInstance | None:
+        return await monitored_to_thread(
+            self._repo.get_terminal,
+            terminal_id,
+            operation="terminal.repo.get_terminal",
+            caller="TerminalService",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={"terminal_id": terminal_id},
+        )
+
+    async def _repo_save_command(self, command: TerminalCommand) -> TerminalCommand:
+        return await monitored_to_thread(
+            self._repo.save_command,
+            command,
+            operation="terminal.repo.save_command",
+            caller="TerminalService",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={"command_id": command.command_id, "terminal_id": command.terminal_id},
+        )
+
+    async def _repo_save_terminal(self, terminal: TerminalInstance) -> TerminalInstance:
+        return await monitored_to_thread(
+            self._repo.save_terminal,
+            terminal,
+            operation="terminal.repo.save_terminal",
+            caller="TerminalService",
+            pool=BlockingPool.DB_BLOCKING,
+            log=logger,
+            diagnostic_context={"terminal_id": terminal.terminal_id, "status": terminal.status},
+        )
 
     @staticmethod
     def _resolve_cwd(cwd: str | None, default_cwd: str) -> str:
@@ -1322,6 +1790,11 @@ class TerminalService:
         if not path.is_absolute():
             path = Path(default_cwd).expanduser() / path
         return str(path)
+
+
+def _is_definite_unwritten_command_error(exc: BaseException) -> bool:
+    """True only when command text is known not to have reached the PTY."""
+    return isinstance(exc, BlockingPoolOverloadedError)
 
 
 def _build_read_result(
@@ -1366,9 +1839,7 @@ def _new_id(prefix: str) -> str:
 
 
 def _default_shell_name() -> str:
-    if sys.platform.startswith("win"):
-        return "powershell"
-    return "bash"
+    return platform_supported_shell()
 
 
 def _control_text(control: str | None) -> str:

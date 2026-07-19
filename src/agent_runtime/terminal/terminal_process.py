@@ -5,6 +5,9 @@ from typing import Awaitable, Callable, Protocol
 
 TerminalOutputHandler = Callable[[str, str], Awaitable[None]]
 TerminalExitHandler = Callable[[int | None, str | None], Awaitable[None]]
+# command_id, exit_code, error_message, final_status
+TerminalCommandFinishedHandler = Callable[[str, int | None, str | None, str], Awaitable[None]]
+TerminalShellReadyHandler = Callable[[str], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +36,8 @@ class TerminalProcessManager(Protocol):
         request: TerminalSessionStartRequest,
         *,
         on_exit: TerminalExitHandler,
+        on_shell_ready: TerminalShellReadyHandler | None = None,
+        on_command_finished: TerminalCommandFinishedHandler | None = None,
     ) -> bool:
         ...
 

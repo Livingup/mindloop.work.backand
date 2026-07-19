@@ -20,7 +20,7 @@ from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolRe
 
 class TerminalCreateToolRequest(BaseToolRequest):
     cwd: str = Field(description="要启动终端的工作目录，必须显式提供。该目录只作为 shell 初始目录；如果你之后在终端内 cd，工具返回的 cwd 不会更新，你需要自己根据对话上下文记住当前目录。")
-    shell: str | None = Field(default=None, description="可选 shell 名称，例如 powershell、pwsh、cmd、bash；不传时使用默认 shell。该值只在创建终端时生效。")
+    shell: str | None = Field(default=None, description="可选 shell；当前平台仅支持唯一可钩子 shell：Windows=pwsh，macOS=zsh，Linux=bash。不传则使用该平台默认 shell；请求其他 shell 会失败，不会静默切换。")
 
 
 class TerminalExecuteCommandToolRequest(BaseToolRequest):
@@ -37,7 +37,7 @@ class TerminalReadOutputToolRequest(BaseToolRequest):
     limit_lines: int = Field(default=200, ge=1, le=2000, description="最多读取多少个输出块；取值范围为 1 到 2000；该值不是最终返回文本的行数。")
     limit_chars: int = Field(default=12000, ge=1000, le=50000, description="最多返回多少个字符，避免一次读取过多内容；取值范围为 1000 到 50000。")
     after_chunk_index: int | None = Field(default=None, ge=0, description="since 模式只读取该输出块序号之后的新内容；如提供则取值必须大于等于 0。可结合上次读取结果中的 end_chunk_index 或 next_chunk_index 继续增量观察。")
-    wait_timeout_ms: int = Field(default=0, ge=0, le=600000, description="等待 wait_timeout_ms 时间后读取终端输出，单位毫秒；应根据目标命令预估合理完成时间设置，不要默认使用最大值；取值范围为 0 到 600000（最多 10 分钟）；0 表示立即读取不等待。")
+    wait_timeout_ms: int = Field(default=0, ge=0, le=600000, description="读取等待预算，单位毫秒，范围 0 到 600000。0 表示立即读取。tail/page/search 在目标命令结束或预算耗尽时返回；since 配合 after_chunk_index 时还会在游标后的新输出持久化后提前返回。该参数不是命令执行超时。")
     query: str | None = Field(default=None, description="search 模式要搜索的关键词；使用 search 模式时必须提供。")
     case_sensitive: bool = Field(default=False, description="search 模式是否区分大小写；true 表示区分大小写，false 表示不区分大小写。")
 
@@ -135,7 +135,7 @@ async def terminal_execute_command(request: TerminalExecuteCommandToolRequest, c
 
 @tool(
     name="terminal_read_output",
-    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式；默认读取最新输出并限制返回字符数。返回结果包含输出文本、分页位置、是否还有更多内容，以及可用时的命令记录状态字段；这些状态字段不代表后端判断当前 shell 命令已经完成。wait_timeout_ms 表示读取前固定等待的时间（毫秒），到达等待时间后读取当前可用输出；短命令使用较小等待时间，构建、测试等长命令可使用更长等待时间，不要默认填最大值。是否需要继续等待或写入输入，应由你结合终端文本自行判断。",
+    description="读取终端输出，用于观察命令进展、错误信息、交互提示或最终结果。必须传入 terminal_id 和 command_id。支持 tail、page、since、search 四种读取方式。返回输出文本、分页位置，以及 command_status/command_exit_code/command_finished 等命令状态字段（由 Shell Integration 完成钩子维护）。wait_timeout_ms 是读取等待预算而不是执行超时：tail/page/search 在命令结束或预算耗尽时返回；since 配合 after_chunk_index 时还会在游标后的新输出持久化后提前返回。永久运行或等待输入的命令到期仍返回 command_finished=false；wait_timeout_ms=0 立即读取。",
     group="terminal",
     category="business",
 )

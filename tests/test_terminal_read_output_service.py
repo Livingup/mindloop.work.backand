@@ -138,7 +138,14 @@ class _FakeTerminalRepository:
 
 
 class _UnusedProcessManager:
-    async def start_terminal(self, request: TerminalSessionStartRequest, *, on_exit):
+    async def start_terminal(
+        self,
+        request: TerminalSessionStartRequest,
+        *,
+        on_exit,
+        on_shell_ready=None,
+        on_command_finished=None,
+    ):
         return True
 
     async def start_command(self, request: TerminalProcessStartRequest, *, on_output, on_exit) -> None:

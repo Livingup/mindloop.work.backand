@@ -103,6 +103,8 @@ def test_start_command_rolls_back_active_command_when_control_pool_rejects(
     monkeypatch.setattr(pty, "monitored_to_thread", reject_control_submission)
     manager = pty.PtyTerminalProcessManager()
     session = _session()
+    session.shell_ready = True
+    session.shell_ready_event.set()
     manager._sessions[session.terminal_id] = session
     exited: list[tuple[int | None, str | None]] = []
 
@@ -125,6 +127,8 @@ def test_start_command_rolls_back_active_command_when_control_pool_rejects(
     asyncio.run(run_case())
 
     assert session.active_command is None
+    assert session.shell_ready is True
+    assert session.shell_ready_event.is_set()
     assert exited == []
 
 
@@ -151,3 +155,25 @@ def test_windows_pty_close_falls_back_to_kill_on_bounded_control_failure(
         "terminal.windows_pty.close",
         "terminal.windows_pty.kill",
     ]
+
+
+
+def test_command_input_only_normalizes_newlines_and_appends_cr() -> None:
+    assert pty._command_input_text("echo hi") == "echo hi\r"
+    assert pty._command_input_text("line1\nline2") == "line1\rline2\r"
+    assert pty._command_input_text("already\r") == "already\r"
+
+
+
+def test_close_terminal_session_cleans_integration_paths(tmp_path) -> None:
+    script = tmp_path / "managed.ps1"
+    script.write_text("write-host hi", encoding="utf-8")
+    nested = tmp_path / "zdot"
+    nested.mkdir()
+    (nested / ".zshrc").write_text("PROMPT=x", encoding="utf-8")
+    session = _session()
+    session.integration_paths = [str(script), str(nested)]
+    asyncio.run(pty._close_terminal_session(session, reason="cleanup-test"))
+    assert session.integration_paths == []
+    assert not script.exists()
+    assert not nested.exists()

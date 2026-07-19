@@ -5,26 +5,39 @@ import codecs
 import locale
 import logging
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
+from agent_runtime.terminal.shell_integration import (
+    OrderedSaiStreamParser,
+    StreamToken,
+    TokenKind,
+    integration_script_for_shell,
+)
+from agent_runtime.terminal.shell_policy import require_shell_executable, resolve_supported_shell
 from agent_runtime.terminal.terminal_process import (
+    TerminalCommandFinishedHandler,
     TerminalExitHandler,
     TerminalOutputHandler,
     TerminalProcessManager,
     TerminalProcessStartRequest,
     TerminalSessionStartRequest,
+    TerminalShellReadyHandler,
 )
 
 logger = logging.getLogger(__name__)
 _PTY_READ_CHUNK_SIZE = 4096
 _WINDOWS_PTY_CONTROL_TIMEOUT_SECONDS = 5.0
 _WINDOWS_PTY_CONTROL_SLOW_QUEUE_SECONDS = 0.25
+_SHELL_READY_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(slots=True)
@@ -33,6 +46,9 @@ class _ActiveCommand:
     on_output: TerminalOutputHandler
     on_exit: TerminalExitHandler
     timeout_task: asyncio.Task[None] | None = None
+    interrupt_requested: bool = False
+    started: bool = False
+    completed: bool = False
 
 
 @dataclass(slots=True)
@@ -46,8 +62,18 @@ class _TerminalSession:
     winpty: Any | None = None
     task: asyncio.Task[None] | None = None
     active_command: _ActiveCommand | None = None
+    awaiting_command: _ActiveCommand | None = None
     closing: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    osc_parser: OrderedSaiStreamParser = field(default_factory=OrderedSaiStreamParser)
+    shell_ready: bool = False
+    integration_ready: bool = False
+    on_shell_ready: TerminalShellReadyHandler | None = None
+    on_command_finished: TerminalCommandFinishedHandler | None = None
+    shell_ready_event: asyncio.Event = field(default_factory=asyncio.Event)
+    ready_watchdog_task: asyncio.Task[None] | None = None
+    exit_notified: bool = False
+    integration_paths: list[str] = field(default_factory=list)
 
 
 class PtyTerminalProcessManager(TerminalProcessManager):
@@ -60,6 +86,8 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         request: TerminalSessionStartRequest,
         *,
         on_exit: TerminalExitHandler,
+        on_shell_ready: TerminalShellReadyHandler | None = None,
+        on_command_finished: TerminalCommandFinishedHandler | None = None,
     ) -> bool:
         started_at = time.perf_counter()
         logger.info(
@@ -90,45 +118,49 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 self._sessions.pop(request.terminal_id, None)
             if sys.platform.startswith("win"):
                 session = await _start_windows_terminal(request, on_exit=on_exit)
-                session.task = get_runtime_task_registry().create_task(
-                    self._watch_windows_terminal(session),
-                    task_name=f"terminal-winpty-watch-{request.terminal_id}",
-                    owner_type="terminal",
-                    owner_id=request.terminal_id,
-                    task_class="watcher",
-                    diagnostic_context={
-                        "terminal_id": request.terminal_id,
-                        "runtime_token": request.runtime_token,
-                        "platform": sys.platform,
-                        "watcher_type": "winpty",
-                    },
-                )
+                watcher = self._watch_windows_terminal
+                watcher_type = "winpty"
+                task_name = f"terminal-winpty-watch-{request.terminal_id}"
             else:
                 session = await _start_unix_terminal(request, on_exit=on_exit)
-                session.task = get_runtime_task_registry().create_task(
-                    self._watch_unix_terminal(session),
-                    task_name=f"terminal-pty-watch-{request.terminal_id}",
-                    owner_type="terminal",
-                    owner_id=request.terminal_id,
-                    task_class="watcher",
-                    diagnostic_context={
-                        "terminal_id": request.terminal_id,
-                        "runtime_token": request.runtime_token,
-                        "platform": sys.platform,
-                        "watcher_type": "pty",
-                    },
-                )
-            self._sessions[request.terminal_id] = session
-            logger.info(
-                "PTY terminal runtime started: terminal_id=%s shell=%s cwd=%s runtime_token=%s watcher_task=%s duration_ms=%s",
-                request.terminal_id,
-                request.shell,
-                request.cwd,
-                request.runtime_token,
-                session.task.get_name() if session.task is not None else None,
-                int((time.perf_counter() - started_at) * 1000),
+                watcher = self._watch_unix_terminal
+                watcher_type = "pty"
+                task_name = f"terminal-pty-watch-{request.terminal_id}"
+            # Both platforms must bind command_finished(D) and shell_ready(B) callbacks.
+            session.on_shell_ready = on_shell_ready
+            session.on_command_finished = on_command_finished
+            session.task = get_runtime_task_registry().create_task(
+                watcher(session),
+                task_name=task_name,
+                owner_type="terminal",
+                owner_id=request.terminal_id,
+                task_class="watcher",
+                diagnostic_context={
+                    "terminal_id": request.terminal_id,
+                    "runtime_token": request.runtime_token,
+                    "platform": sys.platform,
+                    "watcher_type": watcher_type,
+                },
             )
-            return True
+            self._sessions[request.terminal_id] = session
+        try:
+            await asyncio.wait_for(session.shell_ready_event.wait(), timeout=_SHELL_READY_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            await self.terminate_terminal(request.terminal_id)
+            raise RuntimeError(
+                f"Shell Integration 在 {_SHELL_READY_TIMEOUT_SECONDS:.0f}s 内未收到 READY(B): "
+                f"terminal_id={request.terminal_id} shell={request.shell!r}"
+            ) from exc
+        logger.info(
+            "PTY terminal runtime started: terminal_id=%s shell=%s cwd=%s runtime_token=%s watcher_task=%s duration_ms=%s",
+            request.terminal_id,
+            request.shell,
+            request.cwd,
+            request.runtime_token,
+            session.task.get_name() if session.task is not None else None,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return True
 
     async def start_command(
         self,
@@ -148,25 +180,22 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             len(request.command_line),
         )
         session = self._require_session(request.terminal_id)
+        if not session.shell_ready:
+            try:
+                await asyncio.wait_for(session.shell_ready_event.wait(), timeout=_SHELL_READY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"终端尚未 shell-ready，不能执行命令: terminal_id={request.terminal_id}"
+                ) from exc
         async with session.lock:
-            if session.active_command is not None:
-                previous = session.active_command
-                logger.warning(
-                    "PTY command replacing previous active command: terminal_id=%s previous_command_id=%s new_command_id=%s",
-                    request.terminal_id,
-                    previous.command_id,
-                    request.command_id,
+            if session.active_command is not None and not session.active_command.completed:
+                raise RuntimeError(
+                    f"终端仍有未完成的前台命令，禁止并发写入: terminal_id={request.terminal_id} "
+                    f"active_command_id={session.active_command.command_id} new_command_id={request.command_id}"
                 )
-                if previous.timeout_task is not None:
-                    get_runtime_task_registry().cancel(
-                        previous.timeout_task,
-                        message="terminal command replaced",
-                        diagnostic_context={
-                            "terminal_id": request.terminal_id,
-                            "previous_command_id": previous.command_id,
-                            "new_command_id": request.command_id,
-                        },
-                    )
+            # Outstanding command occupies the shell until finished event clears shell_ready.
+            session.shell_ready = False
+            session.shell_ready_event.clear()
             active = _ActiveCommand(
                 command_id=request.command_id,
                 on_output=on_output,
@@ -188,6 +217,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     },
                 )
             try:
+                # Do not rewrite LLM command_line; only normalize newlines for PTY.
                 await _write_terminal(session, _command_input_text(request.command_line), operation="terminal.command.write")
             except asyncio.CancelledError:
                 session.active_command = None
@@ -197,6 +227,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                         message="terminal command start cancelled",
                         diagnostic_context={"terminal_id": request.terminal_id, "command_id": request.command_id},
                     )
+                # Cancel during write is indeterminate on Windows control pool; do not restore ready.
                 logger.warning(
                     "PTY command start cancelled while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
                     request.terminal_id,
@@ -204,7 +235,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     int((time.perf_counter() - started_at) * 1000),
                 )
                 raise
-            except BaseException:
+            except BaseException as exc:
                 session.active_command = None
                 if active.timeout_task is not None:
                     get_runtime_task_registry().cancel(
@@ -212,6 +243,11 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                         message="terminal command start failed",
                         diagnostic_context={"terminal_id": request.terminal_id, "command_id": request.command_id},
                     )
+                if _is_definite_unwritten_error(exc):
+                    # Known not submitted to PTY (e.g. control pool overload).
+                    session.shell_ready = True
+                    session.shell_ready_event.set()
+                # Otherwise leave not-ready; service must terminate runtime to avoid split-brain.
                 logger.exception(
                     "PTY command start failed while writing command input: terminal_id=%s command_id=%s duration_ms=%s",
                     request.terminal_id,
@@ -251,6 +287,9 @@ class PtyTerminalProcessManager(TerminalProcessManager):
     async def interrupt_terminal(self, terminal_id: str) -> None:
         started_at = time.perf_counter()
         session = self._require_session(terminal_id)
+        active = session.active_command
+        if active is not None and not active.completed:
+            active.interrupt_requested = True
         logger.info(
             "PTY terminal interrupt requested: terminal_id=%s active_command_id=%s",
             terminal_id,
@@ -278,6 +317,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
             session.closing,
             session.task.get_name() if session.task is not None else None,
         )
+        self._cancel_ready_watchdog(session, message="terminal terminate")
         await _close_terminal_session(session)
         if session.task is not None:
             try:
@@ -362,14 +402,31 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 raise
             error_message = None if session.closing else str(exc)
         finally:
+            self._cancel_ready_watchdog(session, message="unix watcher exit")
             self._discard_session_if_current(session)
-            await self._fail_active_command(session, error_message or "终端运行时已退出。")
-            await session.on_exit(exit_code, error_message)
-            if session.master_fd is not None:
+            try:
                 try:
-                    os.close(session.master_fd)
-                except OSError:
-                    pass
+                    await self._fail_active_command(session, error_message or "终端运行时已退出。")
+                except Exception:
+                    logger.exception(
+                        "Unix watcher failed while failing active command: terminal_id=%s",
+                        session.terminal_id,
+                    )
+                try:
+                    await self._notify_terminal_exit(session, exit_code, error_message)
+                except Exception:
+                    logger.exception(
+                        "Unix watcher failed while notifying terminal exit: terminal_id=%s",
+                        session.terminal_id,
+                    )
+            finally:
+                if session.master_fd is not None:
+                    try:
+                        os.close(session.master_fd)
+                    except OSError:
+                        pass
+                    session.master_fd = None
+                _cleanup_integration_paths(session)
 
     async def _watch_windows_terminal(self, session: _TerminalSession) -> None:
         exit_code: int | None = None
@@ -448,15 +505,81 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                 error_message,
                 session.closing,
             )
+            self._cancel_ready_watchdog(session, message="windows watcher exit")
             self._discard_session_if_current(session)
-            await self._fail_active_command(session, error_message or "终端运行时已退出。")
-            await session.on_exit(exit_code, error_message)
+            try:
+                try:
+                    await self._fail_active_command(session, error_message or "终端运行时已退出。")
+                except Exception:
+                    logger.exception(
+                        "Windows watcher failed while failing active command: terminal_id=%s",
+                        session.terminal_id,
+                    )
+                try:
+                    await self._notify_terminal_exit(session, exit_code, error_message)
+                except Exception:
+                    logger.exception(
+                        "Windows watcher failed while notifying terminal exit: terminal_id=%s",
+                        session.terminal_id,
+                    )
+            finally:
+                _cleanup_integration_paths(session)
 
     async def _handle_terminal_output(self, session: _TerminalSession, text: str) -> None:
-        active = session.active_command
-        if active is None:
+        tokens = session.osc_parser.feed(text)
+        for token in tokens:
+            await self._handle_stream_token(session, token)
+
+    async def _handle_stream_token(self, session: _TerminalSession, token: StreamToken) -> None:
+        if token.kind == TokenKind.VISIBLE:
+            target = session.active_command or session.awaiting_command
+            # awaiting_command is already marked completed but still owns prompt text until READY.
+            if target is not None and token.text:
+                await target.on_output("pty", token.text)
             return
-        await active.on_output("pty", text)
+        if token.kind == TokenKind.DONE:
+            active = session.active_command
+            if active is None or active.completed:
+                return
+            final_status = "completed"
+            error_message = None
+            exit_code = token.exit_code if token.exit_code_present else None
+            if active.interrupt_requested:
+                final_status = "cancelled"
+                error_message = "command interrupted by ctrl_c"
+            elif not token.exit_code_present:
+                final_status = "failed"
+                error_message = "DONE frame missing status"
+            elif exit_code != 0:
+                final_status = "failed"
+            # Move to awaiting-ready so prompt text after D still binds to this command.
+            active.completed = True
+            session.awaiting_command = active
+            session.active_command = None
+            if active.timeout_task is not None:
+                get_runtime_task_registry().cancel(
+                    active.timeout_task,
+                    message="terminal command completed",
+                    diagnostic_context={"terminal_id": session.terminal_id, "command_id": active.command_id},
+                )
+                active.timeout_task = None
+            if session.on_command_finished is not None:
+                await session.on_command_finished(active.command_id, exit_code, error_message, final_status)
+            else:
+                await active.on_exit(exit_code, error_message)
+            self._arm_ready_watchdog(session, active.command_id)
+            return
+        if token.kind == TokenKind.READY:
+            self._cancel_ready_watchdog(session, message="shell ready received")
+            session.integration_ready = True
+            session.shell_ready = True
+            session.shell_ready_event.set()
+            # Clear awaiting binding only after READY so D..B prompt text is kept.
+            session.awaiting_command = None
+            if session.on_shell_ready is not None:
+                await session.on_shell_ready(session.terminal_id)
+            return
+
 
     async def _complete_active_command(
         self,
@@ -465,31 +588,121 @@ class PtyTerminalProcessManager(TerminalProcessManager):
         *,
         exit_code: int | None,
         error_message: str | None,
+        final_status: str = "completed",
     ) -> None:
         active = session.active_command
-        if active is None or active.command_id != command_id:
+        if active is None or active.command_id != command_id or active.completed:
             return
+        active.completed = True
         session.active_command = None
+        session.awaiting_command = active
         if active.timeout_task is not None:
             get_runtime_task_registry().cancel(
                 active.timeout_task,
                 message="terminal command completed",
                 diagnostic_context={"terminal_id": session.terminal_id, "command_id": command_id},
             )
-        await active.on_exit(exit_code, error_message)
+            active.timeout_task = None
+        if session.on_command_finished is not None:
+            await session.on_command_finished(command_id, exit_code, error_message, final_status)
+        else:
+            await active.on_exit(exit_code, error_message)
 
     async def _fail_active_command(self, session: _TerminalSession, error_message: str) -> None:
         active = session.active_command
-        if active is None:
+        if active is None or active.completed:
             return
+        active.completed = True
         session.active_command = None
+        session.awaiting_command = None
         if active.timeout_task is not None:
             get_runtime_task_registry().cancel(
                 active.timeout_task,
                 message="terminal command failed",
                 diagnostic_context={"terminal_id": session.terminal_id, "command_id": active.command_id},
             )
-        await active.on_exit(None, error_message)
+        if session.on_command_finished is not None:
+            await session.on_command_finished(active.command_id, None, error_message, "failed")
+        else:
+            await active.on_exit(None, error_message)
+
+    def _arm_ready_watchdog(self, session: _TerminalSession, command_id: str) -> None:
+        self._cancel_ready_watchdog(session, message="rearm ready watchdog")
+        session.ready_watchdog_task = get_runtime_task_registry().create_task(
+            self._ready_watchdog(session, command_id),
+            task_name=f"terminal-ready-watchdog-{session.terminal_id}-{command_id}",
+            owner_type="terminal",
+            owner_id=session.terminal_id,
+            task_class="ready_watchdog",
+            diagnostic_context={"terminal_id": session.terminal_id, "command_id": command_id},
+        )
+
+    async def _notify_terminal_exit(
+        self,
+        session: _TerminalSession,
+        exit_code: int | None,
+        error_message: str | None,
+    ) -> None:
+        if session.exit_notified:
+            return
+        session.exit_notified = True
+        await session.on_exit(exit_code, error_message)
+
+    def _cancel_ready_watchdog(self, session: _TerminalSession, *, message: str) -> None:
+        task = session.ready_watchdog_task
+        if task is None:
+            return
+        session.ready_watchdog_task = None
+        current = asyncio.current_task()
+        if task is current:
+            # Watchdog is driving terminate; detach without cancelling self.
+            return
+        if not task.done():
+            get_runtime_task_registry().cancel(
+                task,
+                message=message,
+                diagnostic_context={"terminal_id": session.terminal_id},
+            )
+
+    async def _ready_watchdog(self, session: _TerminalSession, command_id: str) -> None:
+        try:
+            await asyncio.sleep(_SHELL_READY_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if session.closing or session.shell_ready:
+            return
+        # Command already finished at DONE; missing READY must not leave terminal permanently busy.
+        logger.error(
+            "Shell READY(B) missing after DONE: terminal_id=%s command_id=%s timeout_s=%s",
+            session.terminal_id,
+            command_id,
+            _SHELL_READY_TIMEOUT_SECONDS,
+        )
+        session.awaiting_command = None
+        # Detach before terminate so terminate_terminal does not cancel this task.
+        if session.ready_watchdog_task is asyncio.current_task():
+            session.ready_watchdog_task = None
+        error_message = (
+            f"Shell Integration READY(B) missing within {_SHELL_READY_TIMEOUT_SECONDS:.0f}s after DONE; "
+            f"terminal_id={session.terminal_id} command_id={command_id}"
+        )
+        try:
+            await self.terminate_terminal(session.terminal_id)
+        except Exception:
+            logger.exception(
+                "Failed to terminate terminal after missing READY: terminal_id=%s command_id=%s",
+                session.terminal_id,
+                command_id,
+            )
+        # Exactly-once: only notify if watcher did not already fire on_exit during terminate.
+        try:
+            await self._notify_terminal_exit(session, None, error_message)
+        except Exception:
+            logger.exception(
+                "Failed to publish terminal exit after missing READY: terminal_id=%s command_id=%s",
+                session.terminal_id,
+                command_id,
+            )
 
     async def _enforce_timeout(self, session: _TerminalSession, command_id: str, timeout_ms: int) -> None:
         try:
@@ -510,6 +723,7 @@ class PtyTerminalProcessManager(TerminalProcessManager):
                     command_id,
                     exit_code=None,
                     error_message=f"命令执行超时: {timeout_ms}ms",
+                    final_status="timeout",
                 )
                 await _close_terminal_session(session, reason="command_timeout")
         except asyncio.CancelledError:
@@ -521,12 +735,16 @@ async def _start_unix_terminal(request: TerminalSessionStartRequest, *, on_exit:
     import struct
     import termios
 
+    canonical_shell = resolve_supported_shell(request.shell)
+    # openpty first so script temp files are not leaked if PTY allocation fails.
     master_fd, slave_fd = pty.openpty()
+    temp_paths: list[str] = []
+    process = None
     try:
+        argv, env, temp_paths = _build_shell_launch(canonical_shell)
         rows = max(1, request.rows)
         cols = max(1, request.cols)
         fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        argv = _interactive_shell_argv(request.shell)
 
         def preexec() -> None:
             os.setsid()
@@ -538,23 +756,34 @@ async def _start_unix_terminal(request: TerminalSessionStartRequest, *, on_exit:
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=request.cwd,
-            env=_process_env(),
+            env=env,
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             preexec_fn=preexec,
             close_fds=True,
         )
+    except BaseException:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        _cleanup_path_list(temp_paths)
+        raise
     finally:
-        os.close(slave_fd)
+        try:
+            os.close(slave_fd)
+        except OSError:
+            pass
     os.set_blocking(master_fd, False)
     return _TerminalSession(
         terminal_id=request.terminal_id,
-        shell=request.shell,
+        shell=canonical_shell,
         on_exit=on_exit,
         runtime_token=request.runtime_token,
         process=process,
         master_fd=master_fd,
+        integration_paths=temp_paths,
     )
 
 
@@ -563,21 +792,27 @@ async def _start_windows_terminal(request: TerminalSessionStartRequest, *, on_ex
         from winpty import PtyProcess
     except ImportError as exc:
         raise RuntimeError("Windows ConPTY 终端需要安装 pywinpty 依赖。") from exc
-    argv = _interactive_shell_argv(request.shell)
-    winpty = await _spawn_windows_pty_with_recovery(
-        PtyProcess,
-        shell=request.shell,
-        cwd=request.cwd,
-        argv=argv,
-        env=_process_env(),
-        dimensions=(max(1, request.rows), max(1, request.cols)),
-    )
+    canonical_shell = resolve_supported_shell(request.shell)
+    argv, env, temp_paths = _build_shell_launch(canonical_shell)
+    try:
+        winpty = await _spawn_windows_pty_with_recovery(
+            PtyProcess,
+            shell=canonical_shell,
+            cwd=request.cwd,
+            argv=argv,
+            env=env,
+            dimensions=(max(1, request.rows), max(1, request.cols)),
+        )
+    except BaseException:
+        _cleanup_path_list(temp_paths)
+        raise
     return _TerminalSession(
         terminal_id=request.terminal_id,
-        shell=request.shell,
+        shell=canonical_shell,
         on_exit=on_exit,
         runtime_token=request.runtime_token,
         winpty=winpty,
+        integration_paths=temp_paths,
     )
 
 
@@ -788,6 +1023,14 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
             if _is_process_control_exception(exc):
                 raise
             await _kill_windows_pty_after_close_failure(session, reason=reason, exc=exc)
+    if session.master_fd is not None:
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+        session.master_fd = None
+    # Process/PTY closed: safe to delete managed scripts/dirs with retry.
+    _cleanup_integration_paths(session)
     logger.info(
         "PTY terminal close completed: terminal_id=%s runtime_token=%s reason=%s duration_ms=%s",
         session.terminal_id,
@@ -795,6 +1038,44 @@ async def _close_terminal_session(session: _TerminalSession, *, reason: str = "c
         reason,
         int((time.perf_counter() - close_started_at) * 1000),
     )
+
+
+def _cleanup_integration_paths(session: _TerminalSession) -> None:
+    if not session.integration_paths:
+        return
+    remaining = _cleanup_path_list(session.integration_paths)
+    # Retry once after process teardown for Windows file locks.
+    if remaining:
+        remaining = _cleanup_path_list(remaining)
+    session.integration_paths = remaining
+
+
+def _cleanup_path_list(paths: list[str]) -> list[str]:
+    # Reverse order so files inside temp dirs are removed before the dir itself when both listed.
+    remaining: list[str] = []
+    for path in reversed(list(paths)):
+        if not path:
+            continue
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            elif os.path.isfile(path) or os.path.islink(path):
+                os.unlink(path)
+            elif not os.path.exists(path):
+                continue
+            else:
+                remaining.append(path)
+        except OSError:
+            logger.debug("Failed to cleanup integration path: %s", path, exc_info=True)
+            remaining.append(path)
+    remaining.reverse()
+    return remaining
+
+
+def _is_definite_unwritten_error(exc: BaseException) -> bool:
+    from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPoolOverloadedError
+
+    return isinstance(exc, BlockingPoolOverloadedError)
 
 
 async def _run_windows_pty_control(
@@ -850,6 +1131,11 @@ async def _run_windows_pty_control(
         if _is_process_control_exception(exc):
             raise
         if isinstance(exc, TypeError):
+            raise
+        from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPoolOverloadedError
+
+        if isinstance(exc, BlockingPoolOverloadedError):
+            # Keep strong type so callers can prove write was never submitted.
             raise
         raise RuntimeError(str(exc) or exc.__class__.__name__) from exc
 
@@ -981,28 +1267,52 @@ def _windows_oem_encoding() -> str | None:
     return f"cp{code_page}"
 
 
-def _interactive_shell_argv(shell: str) -> list[str]:
-    normalized = shell.strip().lower()
-    if normalized in {"powershell", "powershell.exe"}:
-        return ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass"]
-    if normalized in {"pwsh", "pwsh.exe"}:
-        return ["pwsh", "-NoLogo", "-NoProfile"]
-    if normalized in {"cmd", "cmd.exe"}:
-        return ["cmd", "/d", "/v:on"]
-    if normalized in {"bash", "bash.exe"}:
-        return ["bash"]
-    if normalized in {"sh", "sh.exe"}:
-        return ["sh"]
-    if normalized == "default":
-        return _default_shell_argv()
-    return [shell]
+def _build_shell_launch(shell: str) -> tuple[list[str], dict[str, str], list[str]]:
+    """Build argv/env/temp paths for the platform-supported integrated shell."""
+    canonical = resolve_supported_shell(shell)
+    executable = require_shell_executable(canonical)
+    script_text = integration_script_for_shell(canonical)
+    temp_paths: list[str] = []
+    env = _process_env()
+
+    if canonical == "pwsh":
+        script_path = _write_temp_script(script_text, suffix=".ps1")
+        temp_paths.append(script_path)
+        argv = [executable, "-NoLogo", "-NoProfile", "-NoExit", "-File", script_path]
+        return argv, env, temp_paths
+
+    if canonical == "bash":
+        script_path = _write_temp_script(script_text, suffix=".bash")
+        temp_paths.append(script_path)
+        argv = [executable, "--noprofile", "--rcfile", script_path, "-i"]
+        return argv, env, temp_paths
+
+    if canonical == "zsh":
+        zdotdir = tempfile.mkdtemp(prefix="spread-ai-zsh-")
+        temp_paths.append(zdotdir)
+        zshrc_path = str(Path(zdotdir) / ".zshrc")
+        Path(zshrc_path).write_text(script_text, encoding="utf-8", newline="\n")
+        temp_paths.append(zshrc_path)
+        env = dict(env)
+        env["ZDOTDIR"] = zdotdir
+        argv = [executable, "-i"]
+        return argv, env, temp_paths
+
+    raise RuntimeError(f"未实现 shell={canonical!r} 的 Shell Integration 启动方式。")
 
 
-def _default_shell_argv() -> list[str]:
-    if sys.platform.startswith("win"):
-        return ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass"]
-    shell = os.environ.get("SHELL") or "bash"
-    return [shell]
+def _write_temp_script(script_text: str, *, suffix: str) -> str:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        suffix=suffix,
+        prefix="spread-ai-shell-integration-",
+        delete=False,
+    )
+    with handle:
+        handle.write(script_text)
+    return handle.name
 
 
 def _process_env() -> dict[str, str]:
