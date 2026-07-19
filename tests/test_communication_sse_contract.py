@@ -3,9 +3,12 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+import pytest
+
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_service import CommunicationService
 from agent_runtime.communication.communication_stream import CommunicationStream
+from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
 from agent_runtime.communication.infrastructure.sqlite_communication_repository import SqliteCommunicationRepository
 from agent_runtime.communication.north_gateway import communication_rest_adapter as adapter
 from agent_runtime.communication.north_gateway.communication_contracts import (
@@ -327,5 +330,35 @@ def test_communication_service_fails_when_live_gap_is_not_durable() -> None:
         finally:
             await subscription.aclose()
         assert event_hub.closed is True
+
+    asyncio.run(run_case())
+
+
+def test_sqlite_owner_gate_rejects_before_durable_append(tmp_path) -> None:
+    async def run_case() -> None:
+        repository = SqliteCommunicationRepository(lambda: str(tmp_path))
+        service = CommunicationService(
+            repository,
+            InMemoryCommunicationEventHub(enable_idle_reclaimer=False),
+            storage_mode="sqlite",
+        )
+        service.create_stream(topic="agent.scene", stream_id="stream-owner-sqlite")
+        try:
+            with pytest.raises(ValueError, match="metadata.agent_instance_id"):
+                await service.publish_message(
+                    stream_id="stream-owner-sqlite",
+                    message_type="terminal.output.delta",
+                    payload={"chunk": "ownerless"},
+                )
+            assert service.list_messages("stream-owner-sqlite", after_seq=0, limit=10) == []
+            accepted = await service.publish_message(
+                stream_id="stream-owner-sqlite",
+                message_type="terminal.output.delta",
+                payload={"chunk": "owned"},
+                metadata={"agent_instance_id": "agent-instance-sqlite"},
+            )
+            assert accepted.seq == 1
+        finally:
+            repository.close()
 
     asyncio.run(run_case())

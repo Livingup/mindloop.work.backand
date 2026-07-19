@@ -57,12 +57,14 @@ class TerminalResponse(BaseModel):
 
 class CreateTerminalBody(BaseModel):
     workspace_path: str = Field(description="当前 scene 所属 workspace 绝对路径。")
+    agent_instance_id: str = Field(min_length=1, description="终端所属 Agent 实例 ID。")
     cwd: str | None = Field(default=None, description="可选终端工作目录；为空时使用默认工作目录。")
     shell: str | None = Field(default=None, description="可选 shell；为空时使用服务默认 shell。")
 
 
 class ExecuteTerminalCommandBody(BaseModel):
     workspace_path: str = Field(description="当前 scene 所属 workspace 绝对路径。")
+    agent_instance_id: str = Field(min_length=1, description="终端所属 Agent 实例 ID。")
     command_line: str = Field(description="要执行的命令行。")
     cwd: str | None = Field(default=None, description="可选初始工作目录；仅在自动创建新终端时生效，不能改变已有终端 cwd。")
     shell: str | None = Field(default=None, description="可选初始 shell；仅在自动创建新终端时生效，不能改变已有终端 shell。")
@@ -97,6 +99,7 @@ class ReadTerminalOutputResponse(BaseModel):
 
 class WriteTerminalInputBody(BaseModel):
     workspace_path: str = Field(description="当前 scene 所属 workspace 绝对路径。")
+    agent_instance_id: str = Field(min_length=1, description="终端所属 Agent 实例 ID。")
     text: str | None = Field(default=None, description="要输入的文本。")
     append_newline: bool = Field(default=False, description="是否在文本末尾追加换行。")
     control: Literal["enter", "ctrl_c", "ctrl_d", "escape"] | None = Field(default=None, description="可选控制输入；可选值仅限 enter、ctrl_c、ctrl_d、escape。")
@@ -115,12 +118,14 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
     def list_terminals(
         scene_id: str,
         workspace_path: str = Query(description="当前 scene 所属 workspace 绝对路径。"),
+        agent_instance_id: str = Query(min_length=1, description="仅列出该 Agent 实例所属终端。"),
     ) -> list[TerminalResponse]:
         try:
             terminals = gateway.list_terminals(
                 ListTerminalsRequest(
                     scene_id=scene_id,
                     workspace_path=workspace_path,
+                    agent_instance_id=agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                 )
             )
@@ -135,6 +140,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                 CreateTerminalRequest(
                     scene_id=scene_id,
                     workspace_path=body.workspace_path,
+                    agent_instance_id=body.agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     cwd=body.cwd,
                     shell=body.shell,
@@ -156,6 +162,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                 ExecuteTerminalCommandRequest(
                     scene_id=scene_id,
                     workspace_path=body.workspace_path,
+                    agent_instance_id=body.agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     terminal_id=terminal_id,
                     command_line=body.command_line,
@@ -180,6 +187,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
         scene_id: str,
         terminal_id: str,
         workspace_path: str = Query(description="当前 scene 所属 workspace 绝对路径。"),
+        agent_instance_id: str = Query(min_length=1, description="终端所属 Agent 实例 ID。"),
         command_id: str | None = None,
         mode: ReadMode = "tail",
         tail_lines: int = Query(default=80, ge=1, le=1000),
@@ -196,6 +204,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                 ReadTerminalOutputRequest(
                     scene_id=scene_id,
                     workspace_path=workspace_path,
+                    agent_instance_id=agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     terminal_id=terminal_id,
                     command_id=command_id,
@@ -223,6 +232,7 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
                 WriteTerminalInputRequest(
                     scene_id=scene_id,
                     workspace_path=body.workspace_path,
+                    agent_instance_id=body.agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     terminal_id=terminal_id,
                     text=body.text,
@@ -245,12 +255,14 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
         scene_id: str,
         terminal_id: str,
         workspace_path: str = Query(description="当前 scene 所属 workspace 绝对路径。"),
+        agent_instance_id: str = Query(min_length=1, description="终端所属 Agent 实例 ID。"),
     ) -> TerminalResponse:
         try:
             terminal = await gateway.close_terminal(
                 CloseTerminalRequest(
                     scene_id=scene_id,
                     workspace_path=workspace_path,
+                    agent_instance_id=agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     terminal_id=terminal_id,
                 )
@@ -264,12 +276,14 @@ def create_terminal_router(gateway: TerminalGateway) -> APIRouter:
         scene_id: str,
         terminal_id: str,
         workspace_path: str = Query(description="当前 scene 所属 workspace 绝对路径。"),
+        agent_instance_id: str = Query(min_length=1, description="终端所属 Agent 实例 ID。"),
     ) -> TerminalResponse:
         try:
             terminal = await gateway.delete_terminal(
                 CloseTerminalRequest(
                     scene_id=scene_id,
                     workspace_path=workspace_path,
+                    agent_instance_id=agent_instance_id,
                     communication_stream_id=_scene_stream_id(scene_id),
                     terminal_id=terminal_id,
                 )

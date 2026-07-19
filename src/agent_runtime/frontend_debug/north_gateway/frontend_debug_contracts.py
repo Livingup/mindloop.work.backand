@@ -14,9 +14,9 @@ class CreateFrontendDebugSessionRequest:
     """
 
     target_url: str
+    agent_instance_id: str
     session_name: str | None = None
     task_id: str | None = None
-    agent_instance_id: str | None = None
     communication_stream_id: str | None = None
     request_id: str | None = None
     trace_id: str | None = None
@@ -34,7 +34,7 @@ class FrontendDebugSessionInfo:
     status: str
     session_name: str | None
     task_id: str | None
-    agent_instance_id: str | None
+    agent_instance_id: str
     communication_stream_id: str | None
     created_at: datetime
     updated_at: datetime

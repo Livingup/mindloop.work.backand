@@ -120,14 +120,14 @@ class TerminalRuntimeScopeResolver:
     ) -> TerminalRuntimeScope:
         actual_scene_id: str | None = scene_id
         default_cwd: str | None = workspace_path
-        actual_agent_instance_id = agent_instance_id
+        actual_agent_instance_id = _string_or_none(agent_instance_id)
+        if actual_agent_instance_id is None:
+            raise ValueError("终端操作必须显式提供非空 agent_instance_id，禁止从 task、scene 或 stream 猜测归属。")
 
         if self._agent_runtime_gateway is not None and task_id:
             task = self._agent_runtime_gateway.get_task(task_id)
             actual_scene_id = actual_scene_id or task.scene_id
-            if actual_agent_instance_id is None:
-                actual_agent_instance_id = task.root_agent_instance_id
-        if self._agent_runtime_gateway is not None and actual_agent_instance_id:
+        if self._agent_runtime_gateway is not None:
             instance = self._agent_runtime_gateway.get_agent_instance(actual_agent_instance_id)
             default_cwd = default_cwd or instance.current_working_directory
             trace_id = trace_id or instance.trace_id
@@ -313,7 +313,11 @@ class TerminalService:
         return terminal
 
     def list_terminals(self, scope: TerminalRuntimeScope) -> list[TerminalInstance]:
-        return self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id)
+        return [
+            terminal
+            for terminal in self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id)
+            if _string_or_none((terminal.metadata or {}).get("agent_instance_id")) == scope.agent_instance_id
+        ]
 
     def get_latest_command(self, terminal_id: str) -> TerminalCommand | None:
         commands = self._repo.list_commands_by_terminal(terminal_id, limit=1)
@@ -810,6 +814,8 @@ class TerminalService:
         requested_cwd = self._resolve_cwd(cwd, scope.default_cwd) if cwd is not None else None
         requested_shell = self._resolve_shell(shell) if shell is not None else None
         for terminal in self._repo.list_terminals_by_owner(scope.owner_type, scope.owner_id):
+            if _string_or_none((terminal.metadata or {}).get("agent_instance_id")) != scope.agent_instance_id:
+                continue
             if terminal.status not in {TERMINAL_STATUS_IDLE, TERMINAL_STATUS_ERROR}:
                 continue
             if requested_cwd is not None and self._resolve_cwd(terminal.cwd, scope.default_cwd) != requested_cwd:
@@ -821,7 +827,17 @@ class TerminalService:
 
     def _require_terminal(self, scope: TerminalRuntimeScope, terminal_id: str) -> TerminalInstance:
         terminal = self._repo.get_terminal(terminal_id)
-        if terminal is None or terminal.owner_type != scope.owner_type or terminal.owner_id != scope.owner_id:
+        terminal_agent_instance_id = (
+            _string_or_none((terminal.metadata or {}).get("agent_instance_id"))
+            if terminal is not None
+            else None
+        )
+        if (
+            terminal is None
+            or terminal.owner_type != scope.owner_type
+            or terminal.owner_id != scope.owner_id
+            or terminal_agent_instance_id != scope.agent_instance_id
+        ):
             raise KeyError(f"终端不存在: {terminal_id}")
         return terminal
 
@@ -1042,6 +1058,16 @@ class TerminalService:
     ) -> None:
         if self._communication_gateway is None or scope.communication_stream_id is None:
             return
+        if _string_or_none(scope.agent_instance_id) is None:
+            logger.error(
+                "Terminal Agent-scoped event rejected before publish: event_type=%s terminal_id=%s task_id=%s owner_type=%s owner_id=%s",
+                event_type,
+                payload.get("terminal_id"),
+                scope.task_id,
+                scope.owner_type,
+                scope.owner_id,
+            )
+            return
         try:
             await self._communication_gateway.publish_message(
                 PublishCommunicationMessageRequest(
@@ -1061,7 +1087,13 @@ class TerminalService:
                 )
             )
         except Exception:
-            return
+            logger.exception(
+                "Terminal communication event publish failed: event_type=%s terminal_id=%s task_id=%s agent_instance_id=%s",
+                event_type,
+                payload.get("terminal_id"),
+                scope.task_id,
+                scope.agent_instance_id,
+            )
 
     def _get_read_command(self, terminal_id: str, command_id: str | None) -> TerminalCommand | None:
         if command_id is None:

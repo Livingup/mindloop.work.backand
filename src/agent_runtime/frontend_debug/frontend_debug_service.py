@@ -69,6 +69,7 @@ class FrontendDebugService:
         前端开发地址。debug_url 会保持 target_url 的 path/query/fragment，方便直接打开同一路由。
         """
         target_url = _normalize_target_url(request.target_url)
+        agent_instance_id = _require_agent_instance_id(request.agent_instance_id)
         session_id = f"frontend-debug-{uuid4().hex}"
         proxy_base_url = self._proxy_manager.start_session_proxy(
             session_id=session_id,
@@ -84,7 +85,7 @@ class FrontendDebugService:
             debug_url=debug_url,
             session_name=request.session_name,
             task_id=request.task_id,
-            agent_instance_id=request.agent_instance_id,
+            agent_instance_id=agent_instance_id,
             communication_stream_id=request.communication_stream_id,
             request_id=request.request_id,
             trace_id=request.trace_id,
@@ -134,6 +135,13 @@ class FrontendDebugService:
             session=session,
             payload=payload,
         )
+
+
+def _require_agent_instance_id(agent_instance_id: str) -> str:
+    value = agent_instance_id.strip() if isinstance(agent_instance_id, str) else ""
+    if not value:
+        raise ValueError("前端调试会话必须显式提供非空 agent_instance_id。")
+    return value
 
 
 def _normalize_target_url(target_url: str) -> str:

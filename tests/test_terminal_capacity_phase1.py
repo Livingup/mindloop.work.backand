@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, _default_pool_configs
 from agent_runtime.terminal.terminal import TerminalInstance
@@ -10,6 +12,7 @@ from agent_runtime.terminal.terminal_command import TerminalCommand
 from agent_runtime.terminal.terminal_errors import TerminalCapacityExceededError
 from agent_runtime.terminal.terminal_output import TerminalOutputChunk
 from agent_runtime.terminal.terminal_process import TerminalProcessStartRequest, TerminalSessionStartRequest
+from agent_runtime.terminal.north_gateway.terminal_rest_adapter import create_terminal_router
 from agent_runtime.terminal.terminal_service import TerminalRuntimeScope, TerminalRuntimeScopeResolver, TerminalService
 
 
@@ -254,3 +257,99 @@ def test_terminal_blocking_pool_defaults_align_to_200_capacity() -> None:
     assert configs[BlockingPool.TERMINAL_CONTROL.value].max_workers == 32
     assert configs[BlockingPool.TERMINAL_CONTROL.value].max_pending == 128
     assert configs[BlockingPool.TERMINAL_RENDER.value].max_workers >= 4
+
+
+def test_terminal_scope_requires_explicit_agent_owner() -> None:
+    resolver = TerminalRuntimeScopeResolver()
+    with pytest.raises(ValueError, match="显式提供非空 agent_instance_id"):
+        resolver.resolve(
+            scene_id="scene-1",
+            task_id="task-1",
+            communication_stream_id="stream-scene-1",
+            workspace_path="D:/workspace",
+        )
+    explicit = resolver.resolve(
+        scene_id="scene-1",
+        agent_instance_id="agent-child",
+        communication_stream_id="stream-scene-1",
+        workspace_path="D:/workspace",
+    )
+    assert explicit.agent_instance_id == "agent-child"
+
+
+def test_scene_terminal_listing_and_lookup_are_isolated_by_agent_owner() -> None:
+    service, repo, _process_manager = _service()
+    root_terminal = TerminalInstance(
+        terminal_id="term-root",
+        owner_type="scene",
+        owner_id="scene-1",
+        cwd="D:/workspace",
+        shell="pwsh",
+        metadata={"agent_instance_id": "agent-root"},
+    )
+    child_terminal = TerminalInstance(
+        terminal_id="term-child",
+        owner_type="scene",
+        owner_id="scene-1",
+        cwd="D:/workspace",
+        shell="pwsh",
+        metadata={"agent_instance_id": "agent-child"},
+    )
+    repo.save_terminal(root_terminal)
+    repo.save_terminal(child_terminal)
+    child_scope = _scope("agent-child")
+    assert [terminal.terminal_id for terminal in service.list_terminals(child_scope)] == ["term-child"]
+    assert service._require_terminal(child_scope, "term-child").terminal_id == "term-child"
+    with pytest.raises(KeyError):
+        service._require_terminal(child_scope, "term-root")
+
+
+def test_terminal_rest_requires_owner_and_routes_explicit_owner() -> None:
+    class _RecordingGateway:
+        def __init__(self) -> None:
+            self.list_requests = []
+
+        def list_terminals(self, request):  # noqa: ANN001
+            self.list_requests.append(request)
+            return []
+
+    gateway = _RecordingGateway()
+    app = FastAPI()
+    app.include_router(create_terminal_router(gateway), prefix="/api/scene")
+    client = TestClient(app)
+
+    missing_list_owner = client.get(
+        "/api/scene/scene-1/terminals",
+        params={"workspace_path": "D:/workspace"},
+    )
+    missing_read_owner = client.get(
+        "/api/scene/scene-1/terminals/shared-terminal/output",
+        params={"workspace_path": "D:/workspace"},
+    )
+    missing_delete_owner = client.delete(
+        "/api/scene/scene-1/terminals/shared-terminal",
+        params={"workspace_path": "D:/workspace"},
+    )
+    blank_list_owner = client.get(
+        "/api/scene/scene-1/terminals",
+        params={"workspace_path": "D:/workspace", "agent_instance_id": ""},
+    )
+
+    assert missing_list_owner.status_code == 422
+    assert missing_read_owner.status_code == 422
+    assert missing_delete_owner.status_code == 422
+    assert blank_list_owner.status_code == 422
+    assert gateway.list_requests == []
+
+    explicit_owner = client.get(
+        "/api/scene/scene-1/terminals",
+        params={
+            "workspace_path": "D:/workspace",
+            "agent_instance_id": "agent-child",
+        },
+    )
+    assert explicit_owner.status_code == 200
+    assert len(gateway.list_requests) == 1
+    assert gateway.list_requests[0].scene_id == "scene-1"
+    assert gateway.list_requests[0].agent_instance_id == "agent-child"
+    assert gateway.list_requests[0].communication_stream_id == "stream-scene-scene-1"

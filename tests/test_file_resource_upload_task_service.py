@@ -1,6 +1,12 @@
 import asyncio
+import json
 
-from agent_runtime.file_resource.upload_task_service import FileResourceUploadTask, FileResourceUploadTaskService
+from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import _format_upload_task_sse
+from agent_runtime.file_resource.upload_task_service import (
+    FileResourceUploadTask,
+    FileResourceUploadTaskEvent,
+    FileResourceUploadTaskService,
+)
 
 
 def _upload_task() -> FileResourceUploadTask:
@@ -93,3 +99,19 @@ def test_wait_for_event_async_wakes_on_terminal_status_without_newer_seq_require
         assert task.async_waiters == {}
 
     asyncio.run(run_case())
+
+
+def test_file_upload_task_sse_is_resource_scoped_and_legally_has_no_agent_owner() -> None:
+    event = FileResourceUploadTaskEvent(
+        task_id="file-upload-1",
+        seq=1,
+        status="running",
+        phase="uploading",
+        message="uploading",
+        progress_percent=50,
+    )
+    frame = _format_upload_task_sse(event)
+    assert frame.startswith("id: 1\nevent: file_resource_upload_task\n")
+    payload = json.loads(frame.splitlines()[2].removeprefix("data: "))
+    assert payload["task_id"] == "file-upload-1"
+    assert "agent_instance_id" not in payload

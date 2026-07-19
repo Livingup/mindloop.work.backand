@@ -80,6 +80,8 @@ class HttpFrontendDebugElementSelectionPublisher:
         """发布 frontend.debug.element.selected 事件到调试会话绑定的通信流。"""
         if not session.communication_stream_id:
             raise ValueError("前端调试会话缺少 communication_stream_id，无法回填聊天输入框。")
+        if not session.agent_instance_id.strip():
+            raise ValueError("前端调试会话缺少 agent_instance_id，禁止发布 Agent 实例级事件。")
         api_base_url = _runtime_api_base_url()
         stream_id = urllib.parse.quote(session.communication_stream_id, safe="")
         url = f"{api_base_url}/api/communication/streams/{stream_id}/messages"

@@ -16,6 +16,7 @@ from agent_runtime.communication.communication_message import CommunicationMessa
 from agent_runtime.communication.communication_repository import CommunicationRepository
 from agent_runtime.communication.communication_stream import CommunicationStream
 from agent_runtime.communication.event_hub import InMemoryCommunicationEventHub
+from agent_runtime.communication.message_owner_policy import require_message_agent_instance_id
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread
 
 logger = logging.getLogger(__name__)
@@ -227,6 +228,7 @@ class CommunicationService:
         )
         _require_non_blank(stream_id, "stream_id")
         _require_non_blank(message_type, "message_type")
+        require_message_agent_instance_id(message_type, metadata)
         try:
             if self._is_memory_mode():
                 return await self._publish_message_memory(

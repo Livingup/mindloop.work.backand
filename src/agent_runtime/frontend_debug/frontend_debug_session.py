@@ -27,10 +27,10 @@ class FrontendDebugSession:
     target_url: str
     proxy_base_url: str
     debug_url: str
+    agent_instance_id: str
     status: str = FRONTEND_DEBUG_SESSION_STATUS_ACTIVE
     session_name: str | None = None
     task_id: str | None = None
-    agent_instance_id: str | None = None
     communication_stream_id: str | None = None
     request_id: str | None = None
     trace_id: str | None = None
