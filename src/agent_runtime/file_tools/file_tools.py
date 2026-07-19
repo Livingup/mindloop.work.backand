@@ -85,7 +85,7 @@ class FileNameSearchRequest(BaseToolRequest):
 
 
 class TextSearchRequest(BaseToolRequest):
-    search_root: str = Field(description="文本搜索根目录。")
+    search_root: str = Field(description="文本搜索目标路径：目录或单个普通文件。")
     query: str = Field(description="要搜索的文本或正则表达式。")
     regex: bool = Field(default=False, description="是否按正则表达式搜索。")
     case_sensitive: bool = Field(default=False, description="是否大小写敏感。")
@@ -247,7 +247,12 @@ def _text_from_ripgrep_json_field(value: dict[str, Any]) -> str:
     return ""
 
 
-def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResult | None:
+def _ripgrep_text_search(
+    target: Path,
+    request: TextSearchRequest,
+    *,
+    search_target_type: Literal["file", "directory"],
+) -> BaseToolResult | None:
     rg_path = shutil.which("rg")
     if rg_path is None:
         return None
@@ -258,18 +263,25 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
         "--line-number",
         "--color",
         "never",
-        "--glob",
-        "!.git/**",
     ]
+    if search_target_type == "directory":
+        command.extend(["--glob", "!.git/**"])
     if not request.regex:
         command.append("--fixed-strings")
     if not request.case_sensitive:
         command.append("--ignore-case")
-    if request.include_hidden:
-        command.append("--hidden")
-    if not request.respect_gitignore:
-        command.append("--no-ignore")
-    command.extend(["--", request.query, "."])
+
+    # 文件模式：显式路径优先，目录候选过滤器全部 no-op，避免 gitignore/hidden 静默跳过目标文件。
+    if search_target_type == "file":
+        command.extend(["--no-ignore", "--hidden", "--", request.query, str(target)])
+        cwd = str(target.parent)
+    else:
+        if request.include_hidden:
+            command.append("--hidden")
+        if not request.respect_gitignore:
+            command.append("--no-ignore")
+        command.extend(["--", request.query, "."])
+        cwd = str(target)
 
     extensions = _normalize_extensions(request.extensions)
     exclude_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
@@ -281,7 +293,7 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
     try:
         process = subprocess.Popen(
             command,
-            cwd=str(root),
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -304,9 +316,17 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
         path_text = _text_from_ripgrep_json_field(data.get("path", {}))
         if not path_text:
             continue
-        path = (root / path_text).resolve()
-        if not _matches_text_search_filters(path, root, request, extensions, exclude_names):
-            continue
+        if search_target_type == "file":
+            # 单文件模式只接受目标文件本身；matches.path 始终为 resolve 后绝对路径。
+            path = target
+        else:
+            path = Path(path_text)
+            if not path.is_absolute():
+                path = (target / path).resolve()
+            else:
+                path = path.resolve()
+            if not _matches_text_search_filters(path, target, request, extensions, exclude_names):
+                continue
         seen_count += 1
         if seen_count <= request.offset:
             continue
@@ -336,14 +356,20 @@ def _ripgrep_text_search(root: Path, request: TextSearchRequest) -> BaseToolResu
             execution_status="failed",
             error_code="RipgrepSearchError",
             error_message=stderr or "ripgrep 搜索失败。",
-            output={"search_root": str(root), "query": request.query, "backend": "ripgrep"},
+            output={
+                "search_root": str(target),
+                "query": request.query,
+                "search_target_type": search_target_type,
+                "backend": "ripgrep",
+            },
         )
     if stderr:
         warnings.append(stderr)
 
     return BaseToolResult(
         output={
-            "search_root": str(root),
+            "search_root": str(target),
+            "search_target_type": search_target_type,
             "query": request.query,
             "regex": request.regex,
             "case_sensitive": request.case_sensitive,
@@ -968,54 +994,107 @@ def file_name_search(request: FileNameSearchRequest) -> BaseToolResult:
     )
 
 
-@tool(
-    name="text_search",
-    description="在指定目录内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行和可选上下文行。",
-    group="file",
-    category="business",
-    execution_mode="blocking",
-    blocking_pool=BlockingPool.FILE_RESOURCE,
-    blocking_operation="tool.file.text_search",
-)
-def text_search(request: TextSearchRequest) -> BaseToolResult:
-    root = Path(request.search_root).expanduser().resolve()
-    output_base = {"search_root": str(root), "query": request.query}
+def _python_text_search_file(
+    path: Path,
+    request: TextSearchRequest,
+    compiled_regex: re.Pattern[str] | None,
+) -> BaseToolResult:
+    """单文件 Python fallback：只扫描显式目标文件，目录候选过滤器全部 no-op。"""
+    matches: list[dict[str, Any]] = []
+    skipped_files: list[dict[str, str]] = []
+    skipped_count = 0
+    has_more = False
 
-    if not root.exists():
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="PathNotFound",
-            error_message=f"搜索根目录不存在: {root}",
-            output=output_base,
-        )
-    if not root.is_dir():
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="NotADirectory",
-            error_message=f"搜索根路径不是目录: {root}",
-            output=output_base,
-        )
-
-    ripgrep_result = _ripgrep_text_search(root, request)
-    if ripgrep_result is not None:
-        return ripgrep_result
-
-    compiled_regex = None
-    if request.regex:
-        flags = 0 if request.case_sensitive else re.IGNORECASE
-        try:
-            compiled_regex = re.compile(request.query, flags)
-        except re.error as exc:
+    try:
+        if _is_binary_file(path):
+            skipped_count = 1
+            skipped_files.append({"path": str(path), "reason": "binary_file"})
             return BaseToolResult(
-                success=False,
-                execution_status="failed",
-                error_code="InvalidRegex",
-                error_message=f"文本搜索正则表达式非法: {exc}",
-                output=output_base,
+                output={
+                    "search_root": str(path),
+                    "search_target_type": "file",
+                    "query": request.query,
+                    "regex": request.regex,
+                    "case_sensitive": request.case_sensitive,
+                    "matches": [],
+                    "limit": request.limit,
+                    "offset": request.offset,
+                    "returned_count": 0,
+                    "has_more": False,
+                    "next_offset": None,
+                    "skipped_files": skipped_files,
+                    "skipped_count": skipped_count,
+                    "skipped_truncated": False,
+                    "backend": "python",
+                    "warnings": [],
+                }
             )
+    except OSError as exc:
+        skipped_count = 1
+        skipped_files.append({"path": str(path), "reason": f"read_error: {exc}"})
+        return BaseToolResult(
+            output={
+                "search_root": str(path),
+                "search_target_type": "file",
+                "query": request.query,
+                "regex": request.regex,
+                "case_sensitive": request.case_sensitive,
+                "matches": [],
+                "limit": request.limit,
+                "offset": request.offset,
+                "returned_count": 0,
+                "has_more": False,
+                "next_offset": None,
+                "skipped_files": skipped_files,
+                "skipped_count": skipped_count,
+                "skipped_truncated": False,
+                "backend": "python",
+                "warnings": [],
+            }
+        )
 
+    file_matches, file_skipped_reason = _collect_text_search_matches(
+        path,
+        request=request,
+        compiled_regex=compiled_regex,
+        global_seen_start=0,
+        returned_count=0,
+    )
+    if file_skipped_reason is not None:
+        skipped_count = 1
+        skipped_files.append({"path": str(path), "reason": file_skipped_reason})
+    else:
+        matches = file_matches["matches"]
+        has_more = bool(file_matches["has_more"])
+
+    return BaseToolResult(
+        output={
+            "search_root": str(path),
+            "search_target_type": "file",
+            "query": request.query,
+            "regex": request.regex,
+            "case_sensitive": request.case_sensitive,
+            "matches": matches[: request.limit],
+            "limit": request.limit,
+            "offset": request.offset,
+            "returned_count": min(len(matches), request.limit),
+            "has_more": has_more,
+            "next_offset": request.offset + request.limit if has_more else None,
+            "skipped_files": skipped_files,
+            "skipped_count": skipped_count,
+            "skipped_truncated": skipped_count > len(skipped_files),
+            "backend": "python",
+            "warnings": [],
+        }
+    )
+
+
+def _python_text_search_directory(
+    root: Path,
+    request: TextSearchRequest,
+    compiled_regex: re.Pattern[str] | None,
+) -> BaseToolResult:
+    """目录 Python fallback：保持既有递归过滤与全局分页语义。"""
     extensions = _normalize_extensions(request.extensions)
     excluded_names = ALWAYS_EXCLUDED_NAMES | set(request.exclude_names)
     matches: list[dict[str, Any]] = []
@@ -1072,6 +1151,7 @@ def text_search(request: TextSearchRequest) -> BaseToolResult:
     return BaseToolResult(
         output={
             "search_root": str(root),
+            "search_target_type": "directory",
             "query": request.query,
             "regex": request.regex,
             "case_sensitive": request.case_sensitive,
@@ -1088,3 +1168,60 @@ def text_search(request: TextSearchRequest) -> BaseToolResult:
             "warnings": [],
         }
     )
+
+
+@tool(
+    name="text_search",
+    description="在指定目录或单个文件内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行和可选上下文行。",
+    group="file",
+    category="business",
+    execution_mode="blocking",
+    blocking_pool=BlockingPool.FILE_RESOURCE,
+    blocking_operation="tool.file.text_search",
+)
+def text_search(request: TextSearchRequest) -> BaseToolResult:
+    target = Path(request.search_root).expanduser().resolve()
+    output_base = {"search_root": str(target), "query": request.query}
+
+    if not target.exists():
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="PathNotFound",
+            error_message=f"搜索路径不存在: {target}",
+            output=output_base,
+        )
+    if target.is_file():
+        search_target_type: Literal["file", "directory"] = "file"
+    elif target.is_dir():
+        search_target_type = "directory"
+    else:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="NotSearchablePath",
+            error_message=f"搜索路径既不是普通文件也不是目录: {target}",
+            output=output_base,
+        )
+
+    ripgrep_result = _ripgrep_text_search(target, request, search_target_type=search_target_type)
+    if ripgrep_result is not None:
+        return ripgrep_result
+
+    compiled_regex = None
+    if request.regex:
+        flags = 0 if request.case_sensitive else re.IGNORECASE
+        try:
+            compiled_regex = re.compile(request.query, flags)
+        except re.error as exc:
+            return BaseToolResult(
+                success=False,
+                execution_status="failed",
+                error_code="InvalidRegex",
+                error_message=f"文本搜索正则表达式非法: {exc}",
+                output={**output_base, "search_target_type": search_target_type},
+            )
+
+    if search_target_type == "file":
+        return _python_text_search_file(target, request, compiled_regex)
+    return _python_text_search_directory(target, request, compiled_regex)

@@ -19,7 +19,7 @@
 - `context_document_discover`：发现项目内标准 `AGENTS.md` 上下文文档。
 - `directory_explore`：递进式探索目录结构。
 - `file_name_search`：按文件名、正则、glob、扩展名定位候选文件或目录。
-- `text_search`：优先使用 `ripgrep` 在文件系统中执行文本或正则搜索，环境没有 `rg` 时降级为 Python 标准库扫描。
+- `text_search`：在 `search_root` 指定的目录或单个普通文件内执行文本/正则搜索；目录模式递归并应用 extensions/path_globs/exclude_names/include_hidden/respect_gitignore，文件模式只扫描该文件且这些目录候选过滤器全部 no-op。优先 `ripgrep`，无 `rg` 时降级 Python；成功输出含 `search_target_type`（`file`|`directory`）。
 
 ### 受控写入工具
 
