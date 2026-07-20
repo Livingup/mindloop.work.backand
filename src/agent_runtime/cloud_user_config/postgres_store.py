@@ -297,6 +297,17 @@ class PostgresUserConfigStore:
         self._save_cache_snapshot_to_local_state(snapshot)
         return snapshot
 
+    def read_authoritative_snapshot_without_process_side_effects(self) -> CloudUserConfigCacheSnapshot:
+        """连接目标库并读取权威快照，但不改写进程缓存或本机 shared snapshot。
+
+        Settings 重配置在当前进程仍绑定旧 PostgreSQL 目标时，需要先验证候选连接；
+        不能调用 reload_cache_from_database，否则会污染运行中的进程 cache，并把唯一
+        本机 snapshot 提前覆盖成新 key，导致“已保存待重启”窗口内 readiness 失配。
+        durable snapshot 只能由 local_state.atomic_commit_database_reconfigure 原子写入。
+        """
+
+        return self._read_cache_snapshot_from_database()
+
     def refresh_cache_if_revision_changed(self) -> CloudUserConfigCacheSnapshot:
         """后端轮询入口：版本不一致时才全量刷新本机配置缓存。"""
 

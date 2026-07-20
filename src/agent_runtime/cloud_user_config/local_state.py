@@ -306,3 +306,205 @@ def _items_from_json(value: str) -> dict[tuple[str, str], dict[str, Any]]:
 
 def _utc_now_text() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_BOOTSTRAP_SETTINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cloud_user_config_bootstrap_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL,
+    backend TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    database_name TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password TEXT,
+    sslmode TEXT NOT NULL,
+    pool_min_size INTEGER NOT NULL,
+    pool_max_size INTEGER NOT NULL,
+    connect_timeout_seconds INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+
+def atomic_commit_database_reconfigure(
+    data_dir: str | Path,
+    *,
+    enabled: bool,
+    backend: str,
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password: str | None,
+    sslmode: str,
+    pool_min_size: int,
+    pool_max_size: int,
+    connect_timeout_seconds: int,
+    config_key: tuple[object, ...],
+    revision: int,
+    items: dict[tuple[str, str], dict[str, Any]],
+    object_storage_decision: str | None = None,
+) -> None:
+    """在同一 SQLite 事务中原子提交 bootstrap 凭据、共享快照与可选 OSS 决策。
+
+    Settings 重配置必须保证这三项同进同退：任一写入失败则整体 rollback，
+    避免出现“凭据已切到新目标但 snapshot/decision 仍是旧 key”的 readiness 失配。
+    使用 BEGIN IMMEDIATE 串行化并发写者。
+    """
+
+    expected_key = (
+        host.strip(),
+        int(port),
+        database.strip(),
+        username.strip(),
+        (sslmode or "require").strip() or "require",
+    )
+    if tuple(config_key) != expected_key:
+        raise ValueError("bootstrap credentials 与 shared snapshot config_key 不一致")
+
+    path = Path(data_dir).expanduser() / "cloud_user_config_bootstrap.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = _utc_now_text()
+    password_text = (password or "").strip() or None
+    decision = (
+        _normalize_object_storage_decision(object_storage_decision)
+        if object_storage_decision is not None
+        else None
+    )
+    completed_at = (
+        now
+        if decision in {OBJECT_STORAGE_DECISION_CONFIGURED, OBJECT_STORAGE_DECISION_SKIPPED}
+        else None
+    )
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(_BOOTSTRAP_SETTINGS_SCHEMA)
+        conn.execute(_STATE_SCHEMA)
+        conn.execute(_SNAPSHOT_SCHEMA)
+        conn.execute("BEGIN IMMEDIATE")
+        _tx_write_bootstrap_settings(
+            conn,
+            enabled=enabled,
+            backend=backend,
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            password_text=password_text,
+            sslmode=sslmode,
+            pool_min_size=pool_min_size,
+            pool_max_size=pool_max_size,
+            connect_timeout_seconds=connect_timeout_seconds,
+            updated_at=now,
+        )
+        _tx_write_shared_snapshot(
+            conn,
+            config_key=config_key,
+            revision=revision,
+            items=items,
+            updated_at=now,
+        )
+        if decision is not None:
+            _tx_write_bootstrap_state(
+                conn,
+                object_storage_decision=decision,
+                completed_at=completed_at,
+                updated_at=now,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _tx_write_bootstrap_settings(
+    conn: sqlite3.Connection,
+    *,
+    enabled: bool,
+    backend: str,
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    password_text: str | None,
+    sslmode: str,
+    pool_min_size: int,
+    pool_max_size: int,
+    connect_timeout_seconds: int,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO cloud_user_config_bootstrap_settings ("
+        "id, enabled, backend, host, port, database_name, username, password, sslmode, "
+        "pool_min_size, pool_max_size, connect_timeout_seconds, updated_at"
+        ") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "enabled = excluded.enabled, backend = excluded.backend, host = excluded.host, "
+        "port = excluded.port, database_name = excluded.database_name, username = excluded.username, "
+        "password = excluded.password, sslmode = excluded.sslmode, "
+        "pool_min_size = excluded.pool_min_size, pool_max_size = excluded.pool_max_size, "
+        "connect_timeout_seconds = excluded.connect_timeout_seconds, updated_at = excluded.updated_at",
+        (
+            1 if enabled else 0,
+            (backend or "postgresql").strip() or "postgresql",
+            host.strip(),
+            int(port),
+            database.strip(),
+            username.strip(),
+            password_text,
+            (sslmode or "require").strip() or "require",
+            max(int(pool_min_size), 1),
+            max(int(pool_max_size), 1),
+            max(int(connect_timeout_seconds), 1),
+            updated_at,
+        ),
+    )
+
+
+def _tx_write_shared_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    config_key: tuple[object, ...],
+    revision: int,
+    items: dict[tuple[str, str], dict[str, Any]],
+    updated_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO cloud_user_config_shared_snapshot ("
+        "id, config_key_json, revision, items_json, updated_at"
+        ") VALUES (1, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "config_key_json = excluded.config_key_json, "
+        "revision = excluded.revision, "
+        "items_json = excluded.items_json, "
+        "updated_at = excluded.updated_at",
+        (
+            _config_key_to_json(config_key),
+            int(revision),
+            _items_to_json(items),
+            updated_at,
+        ),
+    )
+
+
+def _tx_write_bootstrap_state(
+    conn: sqlite3.Connection,
+    *,
+    object_storage_decision: str,
+    completed_at: str | None,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO cloud_user_config_bootstrap_state ("
+        "id, object_storage_decision, completed_at, updated_at"
+        ") VALUES (1, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "object_storage_decision = excluded.object_storage_decision, "
+        "completed_at = excluded.completed_at, "
+        "updated_at = excluded.updated_at",
+        (object_storage_decision, completed_at, updated_at),
+    )

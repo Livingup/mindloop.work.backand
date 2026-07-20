@@ -207,8 +207,20 @@ def create_app(
         runtime_network_monitor,
     )
 
+    startup_cloud_user_config_database = ConfigRegistry.instance().cloud_user_config_database
     cloud_user_config_database_active_at_start = (
-        ConfigRegistry.instance().cloud_user_config_database.is_postgresql_enabled
+        startup_cloud_user_config_database.is_postgresql_enabled
+    )
+    active_database_config_key_at_start = (
+        (
+            startup_cloud_user_config_database.host,
+            startup_cloud_user_config_database.port,
+            startup_cloud_user_config_database.database,
+            startup_cloud_user_config_database.username,
+            startup_cloud_user_config_database.sslmode,
+        )
+        if cloud_user_config_database_active_at_start
+        else None
     )
     runtime_full_mode_active = cloud_user_config_database_active_at_start
     runtime_full_mode_lock = RLock()
@@ -992,6 +1004,7 @@ def create_app(
     app.include_router(
         create_runtime_bootstrap_router(
             cloud_user_config_database_active_at_start=cloud_user_config_database_active_at_start,
+            active_database_config_key_at_start=active_database_config_key_at_start,
             on_bootstrap_ready=_activate_runtime_full_mode_if_ready,
         ),
         prefix="/api/runtime-bootstrap",
