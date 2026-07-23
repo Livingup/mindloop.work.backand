@@ -13,7 +13,7 @@ AgentTaskStatus: TypeAlias = str
 # created/running/paused 等历史执行态在读取时都会归一化为 unfinished。
 AGENT_TASK_STATUS_UNFINISHED: Final[str] = "unfinished"
 
-# 任务成功结束。该状态只能由 end_task 生命周期工具驱动的完成语义触发。
+# 任务成功结束。该状态只能由 root Agent end_task 或用户直接完成当前 Task 的成功意图触发。
 AGENT_TASK_STATUS_COMPLETED: Final[str] = "completed"
 
 # 任务失败结束。该状态只能由 fail_task 或用户主动取消任务触发。
@@ -229,6 +229,19 @@ class AgentTask:
             parent_child_relations=(*self.parent_child_relations, relation),
             updated_at=at or _utc_now(),
         )
+
+    def mark_started(
+        self,
+        *,
+        at: datetime | None = None,
+    ) -> "AgentTask":
+        """幂等记录 Task 首次真正进入 Agent 执行循环的审计时间。"""
+        if self.started_at is not None:
+            return self
+        if self.is_terminal:
+            raise ValueError(f"已结束的 Agent Task 不能重新标记为开始: {self.task_id}")
+        now = at or _utc_now()
+        return replace(self, started_at=now, updated_at=now)
 
     def transition_to(
         self,

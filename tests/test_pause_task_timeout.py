@@ -4,10 +4,18 @@ from types import SimpleNamespace
 import pytest
 
 from agent_runtime.agent.agent_execution_engine import AgentExecutionEngine, AgentExecutionRequest, _PauseTimeoutHandle
-from agent_runtime.agent.agent_instance import AGENT_INSTANCE_STATUS_READY, AGENT_INSTANCE_STATUS_RUNNING, AgentInstance
+from agent_runtime.agent.agent_instance import (
+    AGENT_INSTANCE_STATUS_READY,
+    AGENT_INSTANCE_STATUS_RUNNING,
+    AgentInstance,
+    PendingUserMessageAttachment,
+ )
+
 from agent_runtime.agent.agent_runtime_service import AgentRuntimeService
 from agent_runtime.agent.agent_task import AGENT_TASK_STATUS_COMPLETED
 from agent_runtime.agent.infrastructure.in_memory_agent_runtime_repository import InMemoryAgentRuntimeRepository
+from agent_runtime.agent.north_gateway.agent_runtime_gateway_impl import AgentRuntimeGatewayImpl
+from agent_runtime.agent.task_completion import RUNNING_AGENTS_MESSAGE
 from agent_runtime.agent_lifecycle.agent_lifecycle_tool import PauseTaskRequest, pause_task
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_ASSISTANT, TextPart, UniMessage
@@ -152,14 +160,14 @@ class _NoopLocalToolGateway:
         return []
 
 
-def _request(*, task_id: str = "task-timeout", instance_id: str = "agent-instance-timeout", conversation_id: str = "conversation-timeout") -> AgentExecutionRequest:
+def _request(*, task_id: str = "task-timeout", instance_id: str = "agent-instance-timeout", conversation_id: str = "conversation-timeout", user_text: str = "") -> AgentExecutionRequest:
     return AgentExecutionRequest.from_text(
         thread_id="thread-timeout",
         current_working_directory="G:/project/agent",
         agent_definition_id="agent-timeout",
         llm_provider_id="provider",
         llm_model_binding_id="binding",
-        user_text="",
+        user_text=user_text,
         task_id=task_id,
         root_instance_id=instance_id,
         conversation_id=conversation_id,
@@ -509,5 +517,295 @@ def test_timeout_callback_revalidates_task_instance_conversation_and_running_sta
         ]
         assert skip_events[-1]["details"]["reason"] == "already_running"
         assert not engine._background_tasks
+
+    asyncio.run(run_case())
+
+
+def test_timeout_resume_waits_for_task_gate_and_revalidates_terminal_task() -> None:
+    async def run_case() -> None:
+        service = _service_with_ready_instance()
+        service.pause_agent_instance("agent-instance-timeout")
+        logger = _RecordingExecutionLoopLogger()
+        engine = _engine(runtime_gateway=service, execution_loop_logger=logger)
+        handle = engine._schedule_pause_timeout(
+            task_id="task-timeout",
+            instance_id="agent-instance-timeout",
+            conversation_id="conversation-timeout",
+            timeout_seconds=60,
+            request=_request(),
+            communication_context=RuntimeCommunicationContext(stream_id="stream-timeout"),
+        )
+        assert handle is not None
+        task = service.get_task("task-timeout")
+        gate_key = engine._task_operation_gate.key_for_task(task)
+
+        async with engine._task_operation_gate.hold_key(gate_key):
+            resume_attempt = asyncio.create_task(
+                engine._resume_agent_instance_from_pause_timeout(
+                    instance_id="agent-instance-timeout",
+                    token=handle.token,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not resume_attempt.done()
+            service.complete_task("task-timeout")
+
+        await resume_attempt
+        skip_events = [
+            event for event in logger.events
+            if event["stage"] == "pause_timeout.resume" and event["status"] == "skipped"
+        ]
+        assert skip_events[-1]["details"]["reason"] == "task_terminal"
+        assert not engine._background_tasks
+        assert "agent-instance-timeout" not in engine._active_instance_ids
+
+        handle.task.cancel()
+        await asyncio.gather(handle.task, return_exceptions=True)
+
+    asyncio.run(run_case())
+
+
+def test_direct_run_root_agent_reserves_active_handle_until_awaited_execution_finishes() -> None:
+    async def run_case() -> None:
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        engine = _engine(runtime_gateway=AgentRuntimeGatewayImpl(service))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_run(task, instance, request, *, interrupt_state=None):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(task_id=task.task_id, instance_id=instance.instance_id)
+
+        engine._run_agent_instance = fake_run  # type: ignore[method-assign]
+        direct_run = asyncio.create_task(engine.run_root_agent(_request(user_text="root direct input")))
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        assert "agent-instance-timeout" in engine._active_instance_ids
+        assert "agent-instance-timeout" in engine._active_execution_handles
+        assert not direct_run.done()
+
+        release.set()
+        result = await direct_run
+        assert result.task_id == "task-timeout"
+        await asyncio.sleep(0)
+        assert "agent-instance-timeout" not in engine._active_instance_ids
+        assert "agent-instance-timeout" not in engine._active_execution_handles
+        assert not engine._background_tasks
+
+    asyncio.run(run_case())
+
+
+def test_direct_scene_run_releases_gate_after_active_reservation_and_completion_returns_busy() -> None:
+    async def run_case() -> None:
+        scene_id = "scene-direct-gate"
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        service.create_task_with_root_agent_instance(
+            task_id="task-direct-gate",
+            root_instance_id="agent-instance-direct-gate",
+            thread_id="thread-direct-gate",
+            current_working_directory="G:/project/agent",
+            agent_definition_id="agent-timeout",
+            llm_provider_id="provider",
+            llm_model_binding_id="binding",
+            conversation_id="conversation-direct-gate",
+            scene_id=scene_id,
+        )
+        engine = _engine(runtime_gateway=AgentRuntimeGatewayImpl(service))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fake_run(task, instance, request, *, interrupt_state=None):
+            started.set()
+            await release.wait()
+            return SimpleNamespace(task_id=task.task_id, instance_id=instance.instance_id)
+
+        engine._run_agent_instance = fake_run  # type: ignore[method-assign]
+        direct_run = asyncio.create_task(
+            engine.run_agent_instance_message(
+                agent_instance_id="agent-instance-direct-gate",
+                user_text="direct scene input",
+                communication_stream_id=f"stream-scene-{scene_id}",
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        completion = await asyncio.wait_for(
+            engine.complete_current_scene_task(scene_id),
+            timeout=0.5,
+        )
+        assert completion.outcome == "running_agents"
+        assert completion.message == RUNNING_AGENTS_MESSAGE
+
+        release.set()
+        await direct_run
+        await asyncio.sleep(0)
+        assert "agent-instance-direct-gate" not in engine._active_instance_ids
+        assert "agent-instance-direct-gate" not in engine._active_execution_handles
+
+    asyncio.run(run_case())
+
+
+def test_direct_scene_run_does_not_hold_gate_during_file_validation() -> None:
+    async def run_case() -> None:
+        scene_id = "scene-direct-validation"
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        service.create_task_with_root_agent_instance(
+            task_id="task-direct-validation",
+            root_instance_id="agent-instance-direct-validation",
+            thread_id="thread-direct-validation",
+            current_working_directory="G:/project/agent",
+            agent_definition_id="agent-timeout",
+            llm_provider_id="provider",
+            llm_model_binding_id="binding",
+            conversation_id="conversation-direct-validation",
+            scene_id=scene_id,
+        )
+        engine = _engine(runtime_gateway=AgentRuntimeGatewayImpl(service))
+        validation_started = asyncio.Event()
+        release_validation = asyncio.Event()
+        execution_started = asyncio.Event()
+        release_execution = asyncio.Event()
+        original_validate = engine._validate_file_input_before_enqueue
+
+        async def slow_validate(instance, attachments):
+            validation_started.set()
+            await release_validation.wait()
+            await original_validate(instance, attachments)
+
+        async def fake_run(task, instance, request, *, interrupt_state=None):
+            execution_started.set()
+            await release_execution.wait()
+            return SimpleNamespace(task_id=task.task_id, instance_id=instance.instance_id)
+
+        engine._validate_file_input_before_enqueue = slow_validate  # type: ignore[method-assign]
+        engine._run_agent_instance = fake_run  # type: ignore[method-assign]
+        direct_run = asyncio.create_task(
+            engine.run_agent_instance_message(
+                agent_instance_id="agent-instance-direct-validation",
+                user_text="direct validation input",
+                communication_stream_id=f"stream-scene-{scene_id}",
+            )
+        )
+        await asyncio.wait_for(validation_started.wait(), timeout=2)
+
+        completion = await asyncio.wait_for(
+            engine.complete_current_scene_task(scene_id),
+            timeout=0.5,
+        )
+        assert completion.outcome == "completed"
+        assert completion.task_id == "task-direct-validation"
+        assert not direct_run.done()
+
+        release_validation.set()
+        await asyncio.wait_for(execution_started.wait(), timeout=2)
+        next_root = service.get_agent_instance("agent-instance-direct-validation")
+        assert next_root.task_id != "task-direct-validation"
+        assert "agent-instance-direct-validation" in engine._active_instance_ids
+        assert "agent-instance-direct-validation" in engine._active_execution_handles
+
+        release_execution.set()
+        result = await direct_run
+        assert result.task_id == next_root.task_id
+        await asyncio.sleep(0)
+        assert "agent-instance-direct-validation" not in engine._active_instance_ids
+        assert "agent-instance-direct-validation" not in engine._active_execution_handles
+
+    asyncio.run(run_case())
+
+
+def test_direct_run_agent_instance_message_repairs_orphan_running_and_propagates_failure() -> None:
+    async def run_case() -> None:
+        service = _service_with_ready_instance()
+        service.start_agent_instance("agent-instance-timeout")
+        engine = _engine(runtime_gateway=service)
+        started = asyncio.Event()
+
+        async def fake_run(_task, _instance, _request, *, interrupt_state=None):
+            started.set()
+            raise RuntimeError("direct execution failed")
+
+        engine._run_agent_instance = fake_run  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="direct execution failed"):
+            await engine.run_agent_instance_message(
+                agent_instance_id="agent-instance-timeout",
+                user_text="legacy direct input",
+                communication_stream_id="stream-timeout",
+            )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await asyncio.sleep(0)
+
+        repaired = service.get_agent_instance("agent-instance-timeout")
+        assert repaired.status == AGENT_INSTANCE_STATUS_READY
+        assert "持久态为 running" in (repaired.failure_message or "")
+        assert "agent-instance-timeout" not in engine._active_instance_ids
+        assert "agent-instance-timeout" not in engine._active_execution_handles
+        assert not engine._background_tasks
+
+    asyncio.run(run_case())
+
+
+def test_submit_attachment_validation_rechecks_after_concurrent_enqueue() -> None:
+    async def run_case() -> None:
+        scene_id = "scene-submit-attachment-quota"
+        service = AgentRuntimeService(InMemoryAgentRuntimeRepository())
+        service.create_task_with_root_agent_instance(
+            task_id="task-submit-attachment-quota",
+            root_instance_id="agent-instance-submit-attachment-quota",
+            thread_id="thread-submit-attachment-quota",
+            current_working_directory="G:/project/agent",
+            agent_definition_id="agent-timeout",
+            llm_provider_id="provider",
+            llm_model_binding_id="binding",
+            conversation_id="conversation-submit-attachment-quota",
+            scene_id=scene_id,
+        )
+        engine = _engine(runtime_gateway=AgentRuntimeGatewayImpl(service))
+        attachment = PendingUserMessageAttachment(kind="image", resource_id="resource-image")
+        first_two_validations = asyncio.Event()
+        release_validations = asyncio.Event()
+        validation_pending_counts: list[int] = []
+
+        async def validate(instance, _attachments):
+            validation_pending_counts.append(len(instance.pending_user_messages))
+            if len(validation_pending_counts) == 2:
+                first_two_validations.set()
+            if len(validation_pending_counts) <= 2:
+                await release_validations.wait()
+            if instance.pending_user_messages:
+                raise ValueError("attachment quota exceeded")
+
+        def fake_launch(*, task, instance, request, interrupt_state=None):
+            return asyncio.create_task(asyncio.sleep(0))
+
+        engine._validate_file_input_before_enqueue = validate  # type: ignore[method-assign]
+        engine._launch_tracked_execution = fake_launch  # type: ignore[method-assign]
+        submit_kwargs = {
+            "agent_instance_id": "agent-instance-submit-attachment-quota",
+            "attachments": (attachment,),
+        }
+        first = asyncio.create_task(
+            engine.submit_agent_instance_message(
+                **submit_kwargs,
+                user_text="first attachment",
+            )
+        )
+        second = asyncio.create_task(
+            engine.submit_agent_instance_message(
+                **submit_kwargs,
+                user_text="second attachment",
+            )
+        )
+        await asyncio.wait_for(first_two_validations.wait(), timeout=2)
+        release_validations.set()
+
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert sum(isinstance(result, ValueError) for result in results) == 1
+        accepted = [result for result in results if not isinstance(result, BaseException)]
+        assert len(accepted) == 1
+        assert validation_pending_counts[:2] == [0, 0]
+        assert 1 in validation_pending_counts[2:]
+        pending_instance = service.get_agent_instance("agent-instance-submit-attachment-quota")
+        assert len(pending_instance.pending_user_messages) == 1
 
     asyncio.run(run_case())

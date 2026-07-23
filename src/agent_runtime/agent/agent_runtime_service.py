@@ -342,11 +342,17 @@ class AgentRuntimeService:
         return self._get_required_instance(parent_id)
 
     def start_task(self, task_id: str) -> AgentTask:
-        """确认任务仍处于未完成生命周期状态。
+        """记录 Task 首次真正开始执行，同时保持 unfinished 生命周期状态。
 
-        Task 不再表达 running，执行循环是否正在运行由 AgentInstance.status 表达。
+        Task 不表达 running；执行循环是否正在运行仍由 AgentInstance.status 表达。
         """
-        return self._transition_task(task_id, AGENT_TASK_STATUS_UNFINISHED)
+        with self._lock:
+            task = self._get_required_task(task_id)
+            if task.status != AGENT_TASK_STATUS_UNFINISHED:
+                return task.transition_to(AGENT_TASK_STATUS_UNFINISHED)
+            updated = task.mark_started()
+            self._repository.save_task(updated)
+            return updated
 
     def pause_task(self, task_id: str) -> AgentTask:
         """确认任务仍处于未完成生命周期状态。
@@ -370,7 +376,7 @@ class AgentRuntimeService:
     ) -> tuple[AgentTask, AgentInstance]:
         """完成 Scene 当前 task，并把长期复用的 root agent instance 恢复为待命状态。
 
-        end_task 在 Scene 语境下只表示“当前用户任务完成”，不能销毁 Scene 的主 Agent。
+        Scene Task 的成功完成只结束当前用户任务，不能销毁 Scene 的主 Agent。
         该方法在同一服务锁内完成 task 终态保存与 root instance 运行态清理：
         - task 进入 completed，保留历史审计记录；
         - root instance 保留 instance_id、Agent 定义、LLM 策略和工作目录；

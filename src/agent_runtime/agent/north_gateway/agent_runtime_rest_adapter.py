@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent_runtime.agent.agent_instance import (
@@ -20,6 +21,7 @@ from agent_runtime.agent.agent_execution_engine import (
     AgentMessageSubmissionResult,
 )
 from agent_runtime.agent.agent_task import AgentParentChildRelation, AgentTask
+from agent_runtime.agent.task_completion import SceneTaskCompletionOutcome, SceneTaskCompletionResult
 from agent_runtime.agent.file_input_policy import (
     collect_next_request_file_input_stats,
     file_input_limits_payload,
@@ -331,6 +333,22 @@ class DetachSceneResponseModel(BaseModel):
 
     cancelled_task_count: int
     cancelled_instance_count: int
+
+
+class CompleteCurrentSceneTaskBody(BaseModel):
+    """用户主动完成 Scene 当前 Task 的请求。"""
+
+    workspace_path: str
+
+
+class CompleteCurrentSceneTaskResponseModel(BaseModel):
+    """用户主动完成 Scene 当前 Task 的结构化业务结果。"""
+
+    outcome: SceneTaskCompletionOutcome
+    message: str
+    scene_id: str
+    task_id: str | None = None
+    root_agent_instance_id: str | None = None
 
 
 def create_agent_runtime_router(
@@ -696,6 +714,38 @@ def create_agent_runtime_router(
             cancelled_instance_count=response.cancelled_instance_count,
         )
 
+    @router.post(
+        "/scenes/{scene_id}/tasks/current/complete",
+        response_model=CompleteCurrentSceneTaskResponseModel,
+        responses={409: {"model": CompleteCurrentSceneTaskResponseModel}},
+        status_code=200,
+    )
+    async def complete_current_scene_task(
+        scene_id: str,
+        body: CompleteCurrentSceneTaskBody,
+    ) -> CompleteCurrentSceneTaskResponseModel | JSONResponse:
+        """由用户直接成功完成 Scene 当前 Task，不经过 LLM 或伪造 tool call。"""
+        if execution_engine is None:
+            raise HTTPException(status_code=501, detail="Agent 执行引擎未启用。")
+        if scene_gateway is None:
+            raise HTTPException(status_code=501, detail="Scene 网关未启用，Task 完成入口不可用。")
+        try:
+            scene_gateway.get_scene(body.workspace_path, scene_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Scene 不存在: {scene_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        try:
+            result = await execution_engine.complete_current_scene_task(scene_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        response = _complete_current_scene_task_response(result)
+        if result.outcome == "running_agents":
+            return JSONResponse(status_code=409, content=response.model_dump(mode="json"))
+        return response
+
     @router.get("/scenes/{scene_id}/chat-bubbles", response_model=ListChatBubbleMessagesResponse)
     def list_scene_chat_bubbles(
         scene_id: str,
@@ -987,6 +1037,18 @@ async def _next_request_file_stats(
         file_resource_service,
     )
     return FileInputStatsResponse(**file_input_stats_payload(stats))
+
+
+def _complete_current_scene_task_response(
+    result: SceneTaskCompletionResult,
+) -> CompleteCurrentSceneTaskResponseModel:
+    return CompleteCurrentSceneTaskResponseModel(
+        outcome=result.outcome,
+        message=result.message,
+        scene_id=result.scene_id,
+        task_id=result.task_id,
+        root_agent_instance_id=result.root_agent_instance_id,
+    )
 
 
 async def _instance_response(

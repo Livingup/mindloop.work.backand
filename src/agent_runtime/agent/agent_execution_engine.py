@@ -25,6 +25,11 @@ from agent_runtime.agent.agent_instance import (
 )
 from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent.agent_trace_recorder import AgentTraceIdentity, AgentTraceRecorder
+from agent_runtime.agent.task_completion import (
+    AgentTaskCompletionCoordinator,
+    SceneTaskCompletionResult,
+    TaskOperationGate,
+)
 from agent_runtime.agent.file_input_policy import validate_agent_instance_file_input_allowed
 from agent_runtime.agent.execution_loop_logger import (
     AgentExecutionLoopLogger,
@@ -364,6 +369,22 @@ class AgentExecutionEngine:
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
         self._pause_timeout_handles: dict[str, _PauseTimeoutHandle] = {}
         self._execution_progress: dict[str, _AgentExecutionProgressState] = {}
+        self._task_operation_gate = TaskOperationGate()
+        self._task_completion_coordinator = AgentTaskCompletionCoordinator(
+            runtime_gateway=self._runtime_gateway,
+            trace_recorder=self._trace_recorder,
+            event_publisher=self._event_publisher,
+            operation_gate=self._task_operation_gate,
+            delete_task_terminals=self._delete_task_terminals,
+            is_instance_active=lambda instance_id: (
+                instance_id in self._active_instance_ids
+                or instance_id in self._active_execution_handles
+            ),
+            release_pause_timeout=lambda instance_id, reason: self._release_pause_timeout_handle(
+                instance_id,
+                reason=reason,
+            ),
+        )
 
     def _set_execution_phase(
         self,
@@ -639,7 +660,39 @@ class AgentExecutionEngine:
         instance_id: str,
         token: str,
     ) -> None:
-        """超时到期后在不追加用户消息的情况下恢复同一 AgentInstance 执行。"""
+        """超时到期后在 task gate 内恢复同一 AgentInstance 执行。"""
+        handle = self._pause_timeout_handles.get(instance_id)
+        if handle is None or handle.token != token:
+            self._record_pause_timeout_skip(
+                instance_id=instance_id,
+                token=token,
+                reason="handle_missing_or_token_mismatch",
+            )
+            return
+        try:
+            task = self._runtime_gateway.get_task(handle.task_id)
+        except Exception:
+            # 缺失 task 时仍进入既有校验路径，由其释放 handle 并记录精确诊断。
+            await self._resume_agent_instance_from_pause_timeout_within_gate(
+                instance_id=instance_id,
+                token=token,
+            )
+            return
+        async with self._task_operation_gate.hold_key(
+            self._task_operation_gate.key_for_task(task),
+        ):
+            await self._resume_agent_instance_from_pause_timeout_within_gate(
+                instance_id=instance_id,
+                token=token,
+            )
+
+    async def _resume_agent_instance_from_pause_timeout_within_gate(
+        self,
+        *,
+        instance_id: str,
+        token: str,
+    ) -> None:
+        """调用方持有 task gate 后，重读状态并提交 timeout 恢复启动。"""
         handle = self._release_pause_timeout_handle(
             instance_id,
             expected_token=token,
@@ -747,26 +800,12 @@ class AgentExecutionEngine:
             resume_request = replace(resume_request, communication_stream_id=communication_context.stream_id)
         self._runtime_gateway.resume_task(current_task.task_id)
         current_instance = self._runtime_gateway.resume_agent_instance(current_instance.instance_id)
-        self._active_instance_ids.add(current_instance.instance_id)
         interrupt_state = _AgentExecutionInterruptState()
-        task_handle = asyncio.create_task(
-            self._run_agent_instance(
-                current_task,
-                current_instance,
-                resume_request,
-                interrupt_state=interrupt_state,
-            )
-        )
-        self._active_execution_handles[current_instance.instance_id] = _AgentExecutionHandle(
-            task=task_handle,
+        task_handle = self._launch_tracked_execution(
+            task=current_task,
+            instance=current_instance,
+            request=resume_request,
             interrupt_state=interrupt_state,
-        )
-        self._background_tasks.add(task_handle)
-        task_handle.add_done_callback(
-            lambda done_task, instance_id=current_instance.instance_id: self._on_background_task_done(
-                done_task,
-                instance_id,
-            )
         )
         self._record_execution_instance_event(
             instance_id=current_instance.instance_id,
@@ -798,8 +837,61 @@ class AgentExecutionEngine:
             source="agent_execution_engine",
         )
 
+    def _launch_tracked_execution(
+        self,
+        *,
+        task: AgentTask,
+        instance: AgentInstance,
+        request: AgentExecutionRequest,
+        interrupt_state: _AgentExecutionInterruptState | None = None,
+    ) -> asyncio.Task[AgentExecutionResult]:
+        """原子登记执行活动后创建任务；调用方必须持有对应 Scene/Task gate。"""
+        instance_id = instance.instance_id
+        if instance_id in self._active_instance_ids or instance_id in self._active_execution_handles:
+            raise ValueError(f"Agent 实例已有运行中执行，不能重复启动: {instance_id}")
+        actual_interrupt_state = interrupt_state or _AgentExecutionInterruptState()
+        self._active_instance_ids.add(instance_id)
+        execution_coroutine = self._run_agent_instance(
+            task,
+            instance,
+            request,
+            interrupt_state=actual_interrupt_state,
+        )
+        try:
+            task_handle = get_runtime_task_registry().create_task(
+                execution_coroutine,
+                task_name=f"agent-execution-{_safe_runtime_task_label(instance_id)}",
+                owner_type="agent_execution_engine",
+                owner_id=instance_id,
+                task_class="agent_instance_execution",
+                diagnostic_context={
+                    "phase": "execution.launch",
+                    "agent_task_id": task.task_id,
+                    "instance_id": instance_id,
+                    "conversation_id": instance.conversation_id,
+                    "communication_stream_id": request.communication_stream_id,
+                    "agent_definition_id": instance.agent_definition_id,
+                },
+            )
+        except BaseException:
+            self._active_instance_ids.discard(instance_id)
+            execution_coroutine.close()
+            raise
+        self._active_execution_handles[instance_id] = _AgentExecutionHandle(
+            task=task_handle,
+            interrupt_state=actual_interrupt_state,
+        )
+        self._background_tasks.add(task_handle)
+        task_handle.add_done_callback(
+            lambda done_task, active_instance_id=instance_id: self._on_background_task_done(
+                done_task,
+                active_instance_id,
+            )
+        )
+        return task_handle
+
     async def run_root_agent(self, request: AgentExecutionRequest) -> AgentExecutionResult:
-        """创建 task + root Agent 实例并执行完整对话循环。"""
+        """创建 task + root Agent 实例，并在 Task gate 内原子登记执行启动。"""
         task, instance = self._runtime_gateway.create_task_with_root_agent_instance(
             CreateTaskWithRootAgentInstanceRequest(
                 thread_id=request.thread_id,
@@ -814,14 +906,28 @@ class AgentExecutionEngine:
         )
         attachments = _request_user_attachments(request)
         await self._validate_file_input_before_enqueue(instance, attachments)
-        self._runtime_gateway.enqueue_agent_instance_user_message(
-            instance.instance_id,
-            user_text=_request_user_text(request),
-            attachments=attachments,
-            client_message_id=request.client_message_id,
-        )
-        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
-        return await self._run_agent_instance(task, instance, request)
+        async with self._task_operation_gate.hold_key(
+            self._task_operation_gate.key_for_task(task),
+        ):
+            task = self._runtime_gateway.get_task(task.task_id)
+            instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+            if task.is_terminal:
+                raise ValueError(f"Agent 任务已结束，不能启动执行: {task.task_id}")
+            if instance.task_id != task.task_id:
+                raise ValueError(f"Agent 实例与任务绑定不一致，不能启动执行: {instance.instance_id}")
+            self._runtime_gateway.enqueue_agent_instance_user_message(
+                instance.instance_id,
+                user_text=_request_user_text(request),
+                attachments=attachments,
+                client_message_id=request.client_message_id,
+            )
+            instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+            task_handle = self._launch_tracked_execution(
+                task=task,
+                instance=instance,
+                request=request,
+            )
+        return await task_handle
 
     async def run_agent_instance_message(
         self,
@@ -833,41 +939,111 @@ class AgentExecutionEngine:
         request_overrides: dict[str, Any] | None = None,
         communication_stream_id: str | None = None,
     ) -> AgentExecutionResult:
-        instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
-        task = self._runtime_gateway.get_task(instance.task_id)
-        if task.is_terminal:
-            if task.scene_id is None:
-                raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
-            task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
-                instance.instance_id,
+        initial_instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+        initial_task = self._runtime_gateway.get_task(initial_instance.task_id)
+        await self._validate_file_input_before_enqueue(initial_instance, attachments)
+        async with self._task_operation_gate.hold_key(
+            self._task_operation_gate.key_for_task(initial_task),
+        ):
+            instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+            task = self._runtime_gateway.get_task(instance.task_id)
+            if task.is_terminal:
+                if task.scene_id is None:
+                    raise ValueError(f"Agent 任务已结束，不能继续对话: {task.task_id}")
+                task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                    instance.instance_id,
+                )
+            active_in_memory = (
+                instance.instance_id in self._active_instance_ids
+                or instance.instance_id in self._active_execution_handles
             )
-        await self._validate_file_input_before_enqueue(instance, attachments)
-        self._release_pause_timeout_handle(
-            instance.instance_id,
-            reason="external_user_message",
-        )
-        instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
-            instance.instance_id,
-            user_text=user_text,
-            attachments=attachments,
-        )
-        request = AgentExecutionRequest.from_text(
-            thread_id=instance.thread_id,
-            current_working_directory=instance.current_working_directory,
-            agent_definition_id=instance.agent_definition_id,
-            llm_provider_id=instance.llm_provider_id,
-            llm_model_binding_id=instance.llm_model_binding_id,
-            user_text=user_text,
-            task_id=task.task_id,
-            root_instance_id=instance.instance_id,
-            conversation_id=instance.conversation_id,
-            render_options=render_options,
-            request_overrides=request_overrides,
-            communication_stream_id=communication_stream_id,
-        )
-        return await self._run_agent_instance(task, instance, request)
+            if instance.status == AGENT_INSTANCE_STATUS_RUNNING and not active_in_memory:
+                failure_message = "检测到 Agent 实例持久态为 running，但当前进程没有对应执行任务，已恢复为 ready。"
+                instance = self._runtime_gateway.interrupt_agent_instance(
+                    instance.instance_id,
+                    failure_message,
+                )
+            if instance.status == AGENT_INSTANCE_STATUS_RUNNING or active_in_memory:
+                raise ValueError(f"Agent 实例已有运行中执行，不能重复启动: {instance.instance_id}")
+            self._release_pause_timeout_handle(
+                instance.instance_id,
+                reason="external_user_message",
+            )
+            instance, _pending_message = self._runtime_gateway.enqueue_agent_instance_user_message(
+                instance.instance_id,
+                user_text=user_text,
+                attachments=attachments,
+            )
+            request = AgentExecutionRequest.from_text(
+                thread_id=instance.thread_id,
+                current_working_directory=instance.current_working_directory,
+                agent_definition_id=instance.agent_definition_id,
+                llm_provider_id=instance.llm_provider_id,
+                llm_model_binding_id=instance.llm_model_binding_id,
+                user_text=user_text,
+                task_id=task.task_id,
+                root_instance_id=instance.instance_id,
+                conversation_id=instance.conversation_id,
+                render_options=render_options,
+                request_overrides=request_overrides,
+                communication_stream_id=communication_stream_id,
+            )
+            task_handle = self._launch_tracked_execution(
+                task=task,
+                instance=instance,
+                request=request,
+            )
+        return await task_handle
 
     async def submit_agent_instance_message(
+        self,
+        *,
+        agent_instance_id: str,
+        user_text: str,
+        render_options: dict[str, Any] | None = None,
+        request_overrides: dict[str, Any] | None = None,
+        communication_stream_id: str | None = None,
+        client_message_id: str | None = None,
+        attachments: tuple[PendingUserMessageAttachment, ...] = (),
+        message_metadata: dict[str, Any] | None = None,
+    ) -> AgentMessageSubmissionResult:
+        while True:
+            initial_instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+            initial_task = self._runtime_gateway.get_task(initial_instance.task_id)
+            if initial_task.is_terminal:
+                if initial_task.scene_id is None:
+                    raise ValueError(f"Agent 任务已结束，不能继续对话: {initial_task.task_id}")
+                async with self._task_operation_gate.hold_key(
+                    self._task_operation_gate.key_for_task(initial_task),
+                ):
+                    current_instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+                    current_task = self._runtime_gateway.get_task(current_instance.task_id)
+                    if current_task.is_terminal:
+                        self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                            current_instance.instance_id,
+                        )
+                continue
+
+            await self._validate_file_input_before_enqueue(initial_instance, attachments)
+            async with self._task_operation_gate.hold_key(
+                self._task_operation_gate.key_for_task(initial_task),
+            ):
+                current_instance = self._runtime_gateway.get_agent_instance(agent_instance_id)
+                current_task = self._runtime_gateway.get_task(current_instance.task_id)
+                if current_instance != initial_instance or current_task != initial_task:
+                    continue
+                return self._submit_agent_instance_message_within_gate(
+                    agent_instance_id=agent_instance_id,
+                    user_text=user_text,
+                    render_options=render_options,
+                    request_overrides=request_overrides,
+                    communication_stream_id=communication_stream_id,
+                    client_message_id=client_message_id,
+                    attachments=attachments,
+                    message_metadata=message_metadata,
+                )
+
+    def _submit_agent_instance_message_within_gate(
         self,
         *,
         agent_instance_id: str,
@@ -887,7 +1063,6 @@ class AgentExecutionEngine:
             task, instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
                 instance.instance_id,
             )
-        await self._validate_file_input_before_enqueue(instance, attachments)
         released_pause_timeout_handle = self._release_pause_timeout_handle(
             instance.instance_id,
             reason="external_user_message",
@@ -1008,7 +1183,13 @@ class AgentExecutionEngine:
             task.task_id,
             pending_message.message_id,
         )
-        self._active_instance_ids.add(instance.instance_id)
+        interrupt_state = _AgentExecutionInterruptState()
+        task_handle = self._launch_tracked_execution(
+            task=task,
+            instance=instance,
+            request=request,
+            interrupt_state=interrupt_state,
+        )
         self._record_execution_instance_event(
             instance_id=instance.instance_id,
             stage="background_execution.launch",
@@ -1023,33 +1204,6 @@ class AgentExecutionEngine:
             },
             expected_next="run_agent_instance",
         )
-        interrupt_state = _AgentExecutionInterruptState()
-        task_handle = get_runtime_task_registry().create_task(
-            self._run_agent_instance(task, instance, request, interrupt_state=interrupt_state),
-            task_name=f"agent-execution-{_safe_runtime_task_label(instance.instance_id)}",
-            owner_type="agent_execution_engine",
-            owner_id=instance.instance_id,
-            task_class="agent_instance_execution",
-            diagnostic_context={
-                "phase": "background_execution.launch",
-                "agent_task_id": task.task_id,
-                "instance_id": instance.instance_id,
-                "conversation_id": instance.conversation_id,
-                "communication_stream_id": communication_context.stream_id,
-                "agent_definition_id": instance.agent_definition_id,
-                "queued_for_later": False,
-                "active_instance_count": len(self._active_instance_ids),
-                "interrupt_requested": interrupt_state.requested,
-            },
-        )
-        self._active_execution_handles[instance.instance_id] = _AgentExecutionHandle(
-            task=task_handle,
-            interrupt_state=interrupt_state,
-        )
-        self._background_tasks.add(task_handle)
-        task_handle.add_done_callback(
-            lambda done_task, instance_id=instance.instance_id: self._on_background_task_done(done_task, instance_id)
-        )
         return AgentMessageSubmissionResult(
             status="accepted",
             task_id=task.task_id,
@@ -1062,6 +1216,10 @@ class AgentExecutionEngine:
             queued_for_later=False,
             instance=instance,
         )
+
+    async def complete_current_scene_task(self, scene_id: str) -> SceneTaskCompletionResult:
+        """处理用户从 Scene root Agent 面板主动结束当前 Task 会话。"""
+        return await self._task_completion_coordinator.complete_current_scene_task(scene_id)
 
     def interrupt_agent_instance(self, instance_id: str, *, reason: str = "user_requested") -> AgentInterruptResult:
         instance = self._runtime_gateway.get_agent_instance(instance_id)
@@ -2131,19 +2289,26 @@ class AgentExecutionEngine:
             current_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
             if conversation is not None and current_instance.pending_user_messages:
                 current_task = self._runtime_gateway.get_task(current_instance.task_id)
-                next_request = replace(
-                    request,
-                    thread_id=current_instance.thread_id,
-                    current_working_directory=current_instance.current_working_directory,
-                    agent_definition_id=current_instance.agent_definition_id,
-                    llm_provider_id=current_instance.llm_provider_id,
-                    llm_model_binding_id=current_instance.llm_model_binding_id,
-                    task_id=current_task.task_id,
-                    root_instance_id=current_instance.instance_id,
-                    conversation_id=current_instance.conversation_id,
-                    communication_stream_id=communication_context.stream_id,
+                next_execution = await self._resume_from_pending_user_messages(
+                    task=current_task,
+                    instance=current_instance,
+                    request=request,
+                    conversation=conversation,
+                    communication_context=communication_context,
+                    trace_path=trace_path,
                 )
-                return await self._run_agent_instance(current_task, current_instance, next_request)
+                if next_execution is not None:
+                    (
+                        next_task,
+                        next_instance,
+                        next_request,
+                        _next_conversation,
+                        _next_context,
+                        _next_trace_path,
+                    ) = next_execution
+                    # _resume_from_pending_user_messages 已在 gate 内重读并登记 running；
+                    # 当前 tracked execution reservation 仍在，完成入口会观察到 busy。
+                    return await self._run_agent_instance(next_task, next_instance, next_request)
             return AgentExecutionResult(
                 task_id=task.task_id,
                 instance_id=instance.instance_id,
@@ -2270,57 +2435,71 @@ class AgentExecutionEngine:
         当前轮次的 loop_decision 或 interruption 语义必须先完整落地；之后如果 AgentInstance
         队列中还有用户消息，才根据当前 task 生命周期决定继续同 task，或 Scene root 创建新 task。
         """
-        current_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
-        if not current_instance.pending_user_messages:
+        initial_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+        if not initial_instance.pending_user_messages:
             return None
-        current_task = self._runtime_gateway.get_task(current_instance.task_id)
-        if current_task.is_terminal:
-            if current_task.scene_id is None:
-                await self._event_publisher.publish(
-                    communication_context,
-                    "agent.pending_user_messages.blocked",
-                    {
-                        "task_id": current_task.task_id,
-                        "agent_instance_id": current_instance.instance_id,
-                        "pending_message_count": len(current_instance.pending_user_messages),
-                        "reason": "non_scene_terminal_task",
-                    },
-                    source="agent_execution_engine",
-                )
+        initial_task = self._runtime_gateway.get_task(initial_instance.task_id)
+        async with self._task_operation_gate.hold_key(
+            self._task_operation_gate.key_for_task(initial_task),
+        ):
+            current_instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+            if not current_instance.pending_user_messages:
                 return None
-            current_task, current_instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
-                current_instance.instance_id,
+            current_task = self._runtime_gateway.get_task(current_instance.task_id)
+            blocked_non_scene_terminal = current_task.is_terminal and current_task.scene_id is None
+            if blocked_non_scene_terminal:
+                next_request = None
+                next_context = communication_context
+                next_trace_path = trace_path
+            else:
+                if current_task.is_terminal:
+                    current_task, current_instance = self._runtime_gateway.prepare_scene_root_agent_instance_for_new_task(
+                        current_instance.instance_id,
+                    )
+                next_request = replace(
+                    request,
+                    thread_id=current_instance.thread_id,
+                    current_working_directory=current_instance.current_working_directory,
+                    agent_definition_id=current_instance.agent_definition_id,
+                    llm_provider_id=current_instance.llm_provider_id,
+                    llm_model_binding_id=current_instance.llm_model_binding_id,
+                    task_id=current_task.task_id,
+                    root_instance_id=current_instance.instance_id,
+                    conversation_id=current_instance.conversation_id,
+                    communication_stream_id=communication_context.stream_id,
+                )
+                next_context = self._build_communication_context(next_request, current_task, current_instance)
+                if next_request.communication_stream_id != next_context.stream_id:
+                    next_request = replace(next_request, communication_stream_id=next_context.stream_id)
+                next_trace_path = self._trace_recorder.start_trace(_trace_identity(current_instance))
+                self._runtime_gateway.start_task(current_task.task_id)
+                self._runtime_gateway.start_agent_instance(current_instance.instance_id)
+        if blocked_non_scene_terminal:
+            await self._event_publisher.publish(
+                communication_context,
+                "agent.pending_user_messages.blocked",
+                {
+                    "task_id": current_task.task_id,
+                    "agent_instance_id": current_instance.instance_id,
+                    "pending_message_count": len(current_instance.pending_user_messages),
+                    "reason": "non_scene_terminal_task",
+                },
+                source="agent_execution_engine",
             )
-        next_request = replace(
-            request,
-            thread_id=current_instance.thread_id,
-            current_working_directory=current_instance.current_working_directory,
-            agent_definition_id=current_instance.agent_definition_id,
-            llm_provider_id=current_instance.llm_provider_id,
-            llm_model_binding_id=current_instance.llm_model_binding_id,
-            task_id=current_task.task_id,
-            root_instance_id=current_instance.instance_id,
-            conversation_id=current_instance.conversation_id,
-            communication_stream_id=communication_context.stream_id,
-        )
-        next_context = self._build_communication_context(next_request, current_task, current_instance)
-        if next_request.communication_stream_id != next_context.stream_id:
-            next_request = replace(next_request, communication_stream_id=next_context.stream_id)
-        next_trace_path = self._trace_recorder.start_trace(_trace_identity(current_instance))
-        self._runtime_gateway.start_task(current_task.task_id)
-        self._runtime_gateway.start_agent_instance(current_instance.instance_id)
-        await self._publish_task_status(
-            next_context,
-            "agent.task.started",
-            task_id=current_task.task_id,
-            instance_id=current_instance.instance_id,
-        )
+            return None
+        assert next_request is not None
         next_conversation = await self._load_or_create_conversation(current_instance, next_request)
         await self._repair_unmatched_tool_results(
             next_conversation,
             reason="previous_execution_interrupted",
         )
         next_context = next_context.with_metadata(conversation_id=next_conversation.id)
+        await self._publish_task_status(
+            next_context,
+            "agent.task.started",
+            task_id=current_task.task_id,
+            instance_id=current_instance.instance_id,
+        )
         return current_task, current_instance, next_request, next_conversation, next_context, next_trace_path
 
     def _build_communication_context(
@@ -3856,23 +4035,13 @@ class AgentExecutionEngine:
                     extra_payload={"released_agent_instance_ids": released_agent_instance_ids},
                 )
                 return
-            await self._delete_task_terminals(task_id)
-            if task.scene_id is not None:
-                self._runtime_gateway.complete_scene_task_and_reset_root_agent_instance(
-                    task_id,
-                    instance_id,
-                )
-            else:
-                self._runtime_gateway.complete_agent_instance(instance_id)
-                self._runtime_gateway.complete_task(task_id)
-            self._trace_recorder.record_completed(trace_path)
-            await self._publish_loop_decision_event(
-                communication_context,
-                "agent.task.completed",
+            await self._task_completion_coordinator.complete_root_from_lifecycle(
                 task_id=task_id,
-                instance_id=instance_id,
-                loop_decision=loop_decision,
+                root_instance_id=instance_id,
+                trace_path=trace_path,
+                communication_context=communication_context,
                 tool_results=tool_results,
+                completion_summary=_completion_summary_from_tool_results(tool_results),
             )
             return
         if loop_decision == "fail":
@@ -4318,6 +4487,14 @@ def _select_loop_decision(tool_results: list[BaseToolResult]) -> LoopDecision:
         if priority[decision] > priority[selected]:
             selected = decision
     return selected
+
+
+def _completion_summary_from_tool_results(tool_results: list[BaseToolResult]) -> str:
+    """从 complete 工具结果中提取审计摘要。"""
+    for result in tool_results:
+        if result.loop_decision == "complete" and isinstance(result.output, str) and result.output.strip():
+            return result.output.strip()
+    return "Agent lifecycle tool requested task completion."
 
 
 def _failure_message_from_tool_results(tool_results: list[BaseToolResult]) -> str:
