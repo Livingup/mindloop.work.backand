@@ -415,6 +415,11 @@ def create_llm_model_registry_router(
                 + ", ".join(invalid_api_formats),
             )
         try:
+            try:
+                current = gateway.get_provider(provider_id)
+            except KeyError:
+                current = None
+            body = _restore_provider_body(body, current)
             provider = gateway.save_provider(_body_to_provider_request(provider_id, body))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -428,6 +433,7 @@ def create_llm_model_registry_router(
         """部分更新服务商顶层配置；模型接入项通过 /models 子资源维护。"""
         try:
             current = gateway.get_provider(provider_id)
+            body = _restore_provider_patch_body(body, current)
             provider = gateway.save_provider(_patch_provider_request(current, body))
         except KeyError:
             raise HTTPException(status_code=404, detail=f"LLM 服务商不存在: {provider_id}")
@@ -689,6 +695,8 @@ def create_llm_model_registry_router(
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
         try:
             provider = gateway.get_provider(provider_id)
+            current_binding = next((item for item in provider.models if item.id == binding_id), None)
+            body = _restore_binding_body(body, current_binding)
             _get_provider_binding(provider, binding_id)
             replacement = _body_to_binding(body)
             if replacement.id != binding_id and any(item.id == replacement.id for item in provider.models):
@@ -716,6 +724,7 @@ def create_llm_model_registry_router(
         try:
             provider = gateway.get_provider(provider_id)
             current = _get_provider_binding(provider, binding_id)
+            body = _restore_binding_patch_body(body, current)
             replacement = _patch_provider_binding(current, body)
             models = tuple(replacement if item.id == binding_id else item for item in provider.models)
             provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(_provider_with_models(provider, models)))
@@ -1072,8 +1081,12 @@ def _mask_api_keys(api_keys: object) -> list[dict[str, Any]]:
     for item in api_keys:
         if not isinstance(item, dict):
             continue
+        original_key = str(item.get("key", ""))
         masked_item = {key: value for key, value in item.items() if key != "key"}
-        masked_item["key"] = "********"
+        if len(original_key) > 8:
+            masked_item["key"] = f"{original_key[:4]}********{original_key[-4:]}"
+        else:
+            masked_item["key"] = "********"
         masked_item["masked"] = True
         masked.append(masked_item)
     return masked
@@ -1111,6 +1124,100 @@ def _body_to_provider_request(
         retry=_body_to_retry_policy(body.retry),
         models=tuple(_body_to_binding(item) for item in body.models),
     )
+
+
+def _restore_api_keys_from_current(
+    body_keys: list[LlmApiKeyBody] | None,
+    current_keys: tuple[LlmApiKey, ...]
+) -> list[LlmApiKeyBody] | None:
+    if body_keys is None:
+        return None
+    restored: list[LlmApiKeyBody] = []
+    unnamed_current_pool = [k for k in current_keys if not k.name]
+    named_current_map = {k.name: k for k in current_keys if k.name}
+
+    for bk in body_keys:
+        if "********" in bk.key:
+            if bk.name and bk.name in named_current_map:
+                restored.append(LlmApiKeyBody(key=named_current_map[bk.name].key, name=bk.name))
+            elif not bk.name and unnamed_current_pool:
+                original = unnamed_current_pool.pop(0)
+                restored.append(LlmApiKeyBody(key=original.key, name=bk.name))
+            else:
+                restored.append(bk)
+        else:
+            restored.append(bk)
+    return restored
+
+
+def _restore_custom_headers_from_current(
+    body_headers: dict[str, str] | None,
+    current_headers: dict[str, str]
+) -> dict[str, str] | None:
+    if body_headers is None:
+        return None
+    restored: dict[str, str] = {}
+    for k, v in body_headers.items():
+        if "********" in v and k in current_headers:
+            restored[k] = current_headers[k]
+        else:
+            restored[k] = v
+    return restored
+
+
+def _restore_provider_body(
+    body: LlmProviderBody,
+    current: LlmProviderDefinition | None
+) -> LlmProviderBody:
+    if current is None:
+        return body
+    if body.custom_headers is not None:
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers) or {}
+    if body.api_keys is not None:
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
+    for mb in body.models:
+        current_mb = next((m for m in current.models if m.id == mb.id), None)
+        if current_mb:
+            if mb.custom_headers is not None:
+                mb.custom_headers = _restore_custom_headers_from_current(mb.custom_headers, current_mb.custom_headers) or {}
+            if mb.api_keys is not None:
+                mb.api_keys = _restore_api_keys_from_current(mb.api_keys, current_mb.api_keys) or []
+    return body
+
+
+def _restore_provider_patch_body(
+    body: LlmProviderPatchBody,
+    current: LlmProviderDefinition
+) -> LlmProviderPatchBody:
+    if body.custom_headers is not None:
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers)
+    if body.api_keys is not None:
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys)
+    return body
+
+
+def _restore_binding_body(
+    body: LlmProviderModelBindingBody,
+    current: LlmProviderModelBinding | None
+) -> LlmProviderModelBindingBody:
+    if current is None:
+        return body
+    if body.custom_headers is not None:
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers) or {}
+    if body.api_keys is not None:
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
+    return body
+
+
+def _restore_binding_patch_body(
+    body: LlmProviderModelBindingPatchBody,
+    current: LlmProviderModelBinding
+) -> LlmProviderModelBindingPatchBody:
+    if body.custom_headers is not None:
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers)
+    if body.api_keys is not None:
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys)
+    return body
 
 
 def _body_to_execution_policy_request(
