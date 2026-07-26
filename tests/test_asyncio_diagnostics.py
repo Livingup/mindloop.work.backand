@@ -11,7 +11,6 @@ import pytest
 from agent_runtime.infrastructure.asyncio_diagnostics import (
     BlockingPool,
     BlockingPoolConfig,
-    BlockingPoolOverloadedError,
     BlockingScheduler,
     ExecutorRegistry,
     _executor_debug_snapshot,
@@ -283,7 +282,7 @@ def test_scheduler_records_await_cancellation_and_worker_finish(caplog: pytest.L
         scheduler.shutdown(wait=True, cancel_futures=True)
 
 
-def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.LogCaptureFixture) -> None:
+def test_scheduler_waits_over_max_pending_and_runs_after_capacity_releases() -> None:
     scheduler = BlockingScheduler(
         ExecutorRegistry(
             {
@@ -297,13 +296,13 @@ def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.Lo
             }
         )
     )
-    test_logger = logging.getLogger("tests.asyncio_diagnostics.rejected")
+    test_logger = logging.getLogger("tests.asyncio_diagnostics.waiting")
     release_worker = threading.Event()
     first_started = threading.Event()
-    submitted_labels: list[str] = []
+    started_labels: list[str] = []
 
     def slow_work(label: str) -> str:
-        submitted_labels.append(label)
+        started_labels.append(label)
         first_started.set()
         release_worker.wait(timeout=5)
         return label
@@ -313,8 +312,8 @@ def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.Lo
             scheduler.run(
                 slow_work,
                 "first",
-                operation="unit.rejected",
-                caller="test_scheduler_rejects_over_max_pending_without_submitting",
+                operation="unit.waiting",
+                caller="test_scheduler_waits_over_max_pending_and_runs_after_capacity_releases",
                 pool=BlockingPool.COMMUNICATION,
                 log=test_logger,
             )
@@ -325,46 +324,50 @@ def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.Lo
             scheduler.run(
                 slow_work,
                 "queued",
-                operation="unit.rejected",
-                caller="test_scheduler_rejects_over_max_pending_without_submitting",
+                operation="unit.waiting",
+                caller="test_scheduler_waits_over_max_pending_and_runs_after_capacity_releases",
                 pool=BlockingPool.COMMUNICATION,
                 log=test_logger,
             )
         )
         while scheduler.health_snapshot()["pools"][BlockingPool.COMMUNICATION.value]["pending"] < 1:
             await asyncio.sleep(0.01)
-        with caplog.at_level(logging.WARNING, logger=test_logger.name):
-            with pytest.raises(BlockingPoolOverloadedError) as exc_info:
-                await scheduler.run(
-                    slow_work,
-                    "rejected",
-                    operation="unit.rejected",
-                    caller="test_scheduler_rejects_over_max_pending_without_submitting",
-                    pool=BlockingPool.COMMUNICATION,
-                    log=test_logger,
-                )
-        assert exc_info.value.pool_name == BlockingPool.COMMUNICATION.value
-        assert exc_info.value.pending == 1
-        assert exc_info.value.max_pending == 1
+        waiting = asyncio.create_task(
+            scheduler.run(
+                slow_work,
+                "waiting",
+                operation="unit.waiting",
+                caller="test_scheduler_waits_over_max_pending_and_runs_after_capacity_releases",
+                pool=BlockingPool.COMMUNICATION,
+                log=test_logger,
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        assert waiting.done() is False
+        assert started_labels == ["first"]
+        assert scheduler.health_snapshot()["pools"][BlockingPool.COMMUNICATION.value]["pending"] == 1
+
         release_worker.set()
         assert await first == "first"
         assert await queued == "queued"
+        assert await waiting == "waiting"
 
     try:
         asyncio.run(run_case())
         pool_stats = scheduler.health_snapshot()["pools"][BlockingPool.COMMUNICATION.value]
-        op_stats = pool_stats["operations"]["unit.rejected"]
+        op_stats = pool_stats["operations"]["unit.waiting"]
 
-        assert submitted_labels == ["first", "queued"]
+        assert started_labels == ["first", "queued", "waiting"]
         assert pool_stats["max_pending"] == 1
-        assert pool_stats["submitted"] == 2
-        assert pool_stats["completed"] == 2
-        assert pool_stats["rejected"] == 1
-        assert pool_stats["overloaded"] == 1
+        assert pool_stats["submitted"] == 3
+        assert pool_stats["completed"] == 3
+        assert pool_stats["rejected"] == 0
+        assert pool_stats["overloaded"] == 0
         assert pool_stats["pending"] == 0
         assert pool_stats["active"] == 0
-        assert op_stats["rejected"] == 1
-        assert op_stats["overloaded"] == 1
+        assert op_stats["rejected"] == 0
+        assert op_stats["overloaded"] == 0
 
         health = runtime_concurrency_health_snapshot(
             event_loop_snapshot={"monitor_running": True, "status": "ok"},
@@ -381,18 +384,11 @@ def test_scheduler_rejects_over_max_pending_without_submitting(caplog: pytest.Lo
             include_blocking_operations=True,
         )
         blocking_summary = health["blocking_scheduler"]
-        assert health["status"] == "degraded"
-        assert blocking_summary["logical_totals"]["rejected"] == 1
-        assert blocking_summary["logical_totals"]["overloaded"] == 1
-        assert health["signals"]["blocking_scheduler"]["rejected_operations"] == 1
-        assert health["signals"]["blocking_scheduler"]["overloaded_operations"] == 1
-        assert health["signals"]["blocking_scheduler"]["overloaded"] is True
-        assert blocking_summary["top_operations"][0]["rejected"] == 1
-        assert blocking_summary["top_operations"][0]["overloaded"] == 1
-
-        assert "phase=blocking.rejected" in caplog.text
-        assert "pool_rejected=1" in caplog.text
-        assert "operation_overloaded=1" in caplog.text
+        assert blocking_summary["logical_totals"]["rejected"] == 0
+        assert blocking_summary["logical_totals"]["overloaded"] == 0
+        assert health["signals"]["blocking_scheduler"]["rejected_operations"] == 0
+        assert health["signals"]["blocking_scheduler"]["overloaded_operations"] == 0
+        assert health["signals"]["blocking_scheduler"]["overloaded"] is False
     finally:
         release_worker.set()
         scheduler.shutdown(wait=True, cancel_futures=True)

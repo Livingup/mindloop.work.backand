@@ -6,6 +6,7 @@ import pytest
 
 from agent_runtime.infrastructure.asyncio_diagnostics import (
     BlockingPool,
+    blocking_scheduler_health_snapshot,
     configure_blocking_pool,
     monitored_to_thread,
     shutdown_blocking_executors,
@@ -116,7 +117,7 @@ def test_async_tool_remains_await_native_even_when_direct() -> None:
     assert result.output == "async-result"
 
 
-def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
+def test_blocking_pool_overload_waits_and_tool_eventually_executes() -> None:
     pool_name = "unit_local_tool_overload"
     configure_blocking_pool(
         pool_name,
@@ -127,23 +128,25 @@ def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
     )
     release_worker = threading.Event()
     first_started = threading.Event()
+    tool_started = threading.Event()
 
     def slow_work(label: str) -> str:
         first_started.set()
         release_worker.wait(timeout=5)
         return label
 
-    def rejected_tool() -> str:
-        return "should-not-run"
+    def waiting_tool() -> str:
+        tool_started.set()
+        return "executed-after-wait"
 
     service = _service(
         LocalToolDefinition(
-            tool_name="rejected_tool",
-            description="Rejected blocking sync test tool.",
-            fn=rejected_tool,
+            tool_name="waiting_tool",
+            description="Waiting blocking sync test tool.",
+            fn=waiting_tool,
             execution_mode="blocking",
             blocking_pool=pool_name,
-            blocking_operation="unit.local_tool.rejected",
+            blocking_operation="unit.local_tool.waiting",
         )
     )
 
@@ -153,7 +156,7 @@ def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
                 slow_work,
                 "first",
                 operation="unit.local_tool.fill_pool",
-                caller="test_blocking_pool_overload_becomes_structured_tool_error",
+                caller="test_blocking_pool_overload_waits_and_tool_eventually_executes",
                 pool=pool_name,
             )
         )
@@ -164,16 +167,22 @@ def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
                 slow_work,
                 "queued",
                 operation="unit.local_tool.fill_pool",
-                caller="test_blocking_pool_overload_becomes_structured_tool_error",
+                caller="test_blocking_pool_overload_waits_and_tool_eventually_executes",
                 pool=pool_name,
             )
         )
+        while blocking_scheduler_health_snapshot()["pools"][pool_name]["pending"] < 1:
+            await asyncio.sleep(0.01)
+        waiting = asyncio.create_task(service.execute_tool("waiting_tool", {}))
         await asyncio.sleep(0.05)
-        result = await service.execute_tool("rejected_tool", {})
+
+        assert waiting.done() is False
+        assert tool_started.is_set() is False
+
         release_worker.set()
         assert await first == "first"
         assert await queued == "queued"
-        return result
+        return await waiting
 
     try:
         result = asyncio.run(run_case())
@@ -181,9 +190,10 @@ def test_blocking_pool_overload_becomes_structured_tool_error() -> None:
         release_worker.set()
         shutdown_blocking_executors(wait=True, cancel_futures=True)
 
-    assert result.success is False
-    assert result.error_code == "BlockingPoolOverloadedError"
-    assert "unit.local_tool.rejected" in (result.error_message or "")
+    assert tool_started.is_set() is True
+    assert result.success is True
+    assert result.error_code is None
+    assert result.output == "executed-after-wait"
 
 
 def test_actual_file_tools_are_registered_as_explicit_blocking_tools() -> None:

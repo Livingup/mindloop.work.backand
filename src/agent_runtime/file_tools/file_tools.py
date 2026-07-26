@@ -22,6 +22,8 @@ MAX_FILE_READ_LINE_COUNT = 1500
 MAX_FILE_READ_FILES = 5
 MAX_FILE_READ_MAX_CHARS_PER_LINE = 2000
 MAX_LINE_SLICE_CHARS = 50000
+MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS = 500
+TEXT_SEARCH_LINE_NOTICE = "该行为超大行，仅展示行内匹配的片段。"
 
 
 class FileReadRange(BaseModel):
@@ -247,6 +249,60 @@ def _text_from_ripgrep_json_field(value: dict[str, Any]) -> str:
     return ""
 
 
+def _utf8_byte_offset_to_char_index(encoded_text: bytes, byte_offset: int) -> int:
+    bounded_offset = max(0, min(byte_offset, len(encoded_text)))
+    return len(encoded_text[:bounded_offset].decode("utf-8", errors="ignore"))
+
+
+def _ripgrep_match_span(line: str, data: dict[str, Any]) -> tuple[int, int]:
+    submatches = data.get("submatches")
+    if not isinstance(submatches, list) or not submatches:
+        return (0, 0)
+
+    first_submatch = submatches[0]
+    if not isinstance(first_submatch, dict):
+        return (0, 0)
+    start = first_submatch.get("start")
+    end = first_submatch.get("end")
+    if not isinstance(start, int) or not isinstance(end, int):
+        return (0, 0)
+
+    encoded_line = line.encode("utf-8")
+    start_index = _utf8_byte_offset_to_char_index(encoded_line, start)
+    end_index = _utf8_byte_offset_to_char_index(encoded_line, end)
+    return (start_index, max(start_index, end_index))
+
+
+def _text_search_line_fragment(line: str, match_span: tuple[int, int]) -> str:
+    line_length = len(line)
+    match_start = max(0, min(match_span[0], line_length))
+    match_end = max(match_start, min(match_span[1], line_length))
+    match_center = (match_start + match_end) // 2
+    fragment_start = max(0, match_center - MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS // 2)
+    fragment_end = min(line_length, fragment_start + MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS)
+    fragment_start = max(0, fragment_end - MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS)
+    return line[fragment_start:fragment_end]
+
+
+def _build_text_search_match(
+    path: Path,
+    line_number: int,
+    line: str,
+    match_span: tuple[int, int],
+) -> dict[str, Any]:
+    match: dict[str, Any] = {
+        "path": str(path),
+        "line_number": line_number,
+    }
+    if len(line) <= MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS:
+        match["line"] = line
+        return match
+
+    match["line_fragment"] = _text_search_line_fragment(line, match_span)
+    match["line_notice"] = TEXT_SEARCH_LINE_NOTICE
+    return match
+
+
 def _ripgrep_text_search(
     target: Path,
     request: TextSearchRequest,
@@ -338,13 +394,7 @@ def _ripgrep_text_search(
         if not isinstance(line_number, int):
             continue
         line = _text_from_ripgrep_json_field(data.get("lines", {})).rstrip("\r\n")
-        matches.append(
-            {
-                "path": str(path),
-                "line_number": line_number,
-                "line": line,
-            }
-        )
+        matches.append(_build_text_search_match(path, line_number, line, _ripgrep_match_span(line, data)))
 
     stderr = ""
     if process.stderr is not None:
@@ -517,12 +567,54 @@ def _read_line_slice_with_encoding(path: Path, request: FileReadLineSliceRequest
     }
 
 
-def _line_matches(line: str, query: str, compiled_regex: re.Pattern[str] | None, case_sensitive: bool) -> bool:
+def _lowered_match_span_to_original(
+    line: str,
+    lowered_start: int,
+    lowered_end: int,
+) -> tuple[int, int]:
+    if lowered_start == lowered_end:
+        return (0, 0)
+
+    original_start: int | None = None
+    original_end = len(line)
+    lowered_cursor = 0
+    for original_index, char in enumerate(line):
+        next_lowered_cursor = lowered_cursor + len(char.lower())
+        if original_start is None and lowered_start < next_lowered_cursor:
+            original_start = original_index
+        if lowered_end <= next_lowered_cursor:
+            original_end = original_index + 1
+            break
+        lowered_cursor = next_lowered_cursor
+
+    if original_start is None:
+        original_start = len(line)
+    return (original_start, max(original_start, original_end))
+
+
+def _find_line_match_span(
+    line: str,
+    query: str,
+    compiled_regex: re.Pattern[str] | None,
+    case_sensitive: bool,
+) -> tuple[int, int] | None:
     if compiled_regex is not None:
-        return compiled_regex.search(line) is not None
+        match = compiled_regex.search(line)
+        return match.span() if match is not None else None
     if case_sensitive:
-        return query in line
-    return query.lower() in line.lower()
+        start = line.find(query)
+        return None if start < 0 else (start, start + len(query))
+
+    lowered_line = line.lower()
+    lowered_query = query.lower()
+    lowered_start = lowered_line.find(lowered_query)
+    if lowered_start < 0:
+        return None
+    return _lowered_match_span_to_original(
+        line,
+        lowered_start,
+        lowered_start + len(lowered_query),
+    )
 
 
 def _collect_text_search_matches_with_encoding(
@@ -544,7 +636,8 @@ def _collect_text_search_matches_with_encoding(
             if has_more:
                 break
 
-            if _line_matches(line, request.query, compiled_regex, request.case_sensitive):
+            match_span = _find_line_match_span(line, request.query, compiled_regex, request.case_sensitive)
+            if match_span is not None:
                 global_match_index = global_seen_start + seen_count
                 seen_count += 1
                 if global_match_index < request.offset:
@@ -553,12 +646,7 @@ def _collect_text_search_matches_with_encoding(
                     has_more = True
                     break
                 else:
-                    match = {
-                        "path": str(path),
-                        "line_number": line_number,
-                        "line": line,
-                    }
-                    matches.append(match)
+                    matches.append(_build_text_search_match(path, line_number, line, match_span))
 
     return {"seen_count": seen_count, "matches": matches, "has_more": has_more}
 
@@ -1172,7 +1260,7 @@ def _python_text_search_directory(
 
 @tool(
     name="text_search",
-    description="在指定目录或单个文件内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行和可选上下文行。",
+    description=f"在指定目录或单个文件内搜索文本或正则表达式，返回全局 offset/limit 分页控制的命中行。普通命中返回完整 line；单行超过 {MAX_TEXT_SEARCH_LINE_FRAGMENT_CHARS} 字符时省略 line，仅返回围绕命中的 line_fragment 和 line_notice。",
     group="file",
     category="business",
     execution_mode="blocking",

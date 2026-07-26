@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
@@ -86,6 +87,23 @@ class _AdmissionResult:
     snapshot: _StatsSnapshot
     pending: int
     max_pending: int | None
+
+
+@dataclass(slots=True)
+class _AdmissionWaiter:
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[_AdmissionResult]
+    operation: str
+    max_pending: int | None
+    admission: _AdmissionResult | None = None
+
+
+def _complete_admission_waiter(
+    future: asyncio.Future[_AdmissionResult],
+    admission: _AdmissionResult,
+) -> None:
+    if not future.done():
+        future.set_result(admission)
 
 
 class BlockingPoolOverloadedError(RuntimeError):
@@ -616,6 +634,7 @@ class BlockingScheduler:
         self._executor_registry = executor_registry or ExecutorRegistry()
         self._pool_stats: dict[str, _BlockingStats] = {}
         self._operation_stats: dict[tuple[str, str], _BlockingStats] = {}
+        self._admission_waiters: dict[str, deque[_AdmissionWaiter]] = {}
         self._stats_lock = threading.RLock()
 
     @property
@@ -650,7 +669,7 @@ class BlockingScheduler:
         queue_slow_threshold_ms = int(slow_queue_seconds * 1000)
         execution_slow_threshold_ms = int(slow_execution_seconds * 1000)
         context = _sanitize_context(diagnostic_context)
-        admission = self._admit_blocking_call(pool_name, operation, logical_config.max_pending)
+        admission = await self._admit_blocking_call(pool_name, operation, logical_config.max_pending)
         snapshot = admission.snapshot
         call = _SubmittedBlockingCall(
             blocking_call_id=actual_call_id,
@@ -670,20 +689,6 @@ class BlockingScheduler:
             pool_snapshot=snapshot.pool,
             operation_snapshot=snapshot.operation,
         )
-        if not admission.accepted:
-            self._log_blocking_diagnostic(
-                logging.WARNING,
-                "blocking call rejected",
-                call,
-                phase="blocking.rejected",
-                final_state="overloaded",
-            )
-            raise BlockingPoolOverloadedError(
-                pool_name=pool_name,
-                operation=operation,
-                pending=admission.pending,
-                max_pending=admission.max_pending or 0,
-            )
         self._log_blocking_diagnostic(logging.DEBUG, "blocking call submitted", call, phase="blocking.submitted")
         self._log_executor_state(logging.DEBUG, "blocking executor state before submit", call, executor, phase="blocking.executor_before_submit")
 
@@ -900,34 +905,96 @@ class BlockingScheduler:
         pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
         return _StatsSnapshot(pool=pool_stats.to_dict(), operation=op_stats.to_dict())
 
-    def _admit_blocking_call(
+    async def _admit_blocking_call(
         self,
         pool_name: str,
         operation: str,
         max_pending: int | None,
     ) -> _AdmissionResult:
+        loop = asyncio.get_running_loop()
         with self._stats_lock:
-            pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
-            pending = pool_stats.pending
-            if max_pending is not None and pending >= max_pending:
-                for stats in (pool_stats, op_stats):
-                    stats.rejected += 1
-                    stats.overloaded += 1
-                return _AdmissionResult(
-                    accepted=False,
-                    snapshot=self._snapshot_locked(pool_name, operation),
-                    pending=pending,
-                    max_pending=max_pending,
-                )
-            for stats in (pool_stats, op_stats):
-                stats.submitted += 1
-                stats.pending += 1
-            return _AdmissionResult(
-                accepted=True,
-                snapshot=self._snapshot_locked(pool_name, operation),
-                pending=pending + 1,
+            pool_stats, _op_stats = self._stats_for_locked(pool_name, operation)
+            waiters = self._admission_waiters.get(pool_name)
+            if not waiters and (max_pending is None or pool_stats.pending < max_pending):
+                return self._record_admitted_locked(pool_name, operation, max_pending)
+            waiter = _AdmissionWaiter(
+                loop=loop,
+                future=loop.create_future(),
+                operation=operation,
                 max_pending=max_pending,
             )
+            self._admission_waiters.setdefault(pool_name, deque()).append(waiter)
+            self._wake_admission_waiters_locked(pool_name)
+
+        try:
+            return await asyncio.shield(waiter.future)
+        except asyncio.CancelledError:
+            with self._stats_lock:
+                waiters = self._admission_waiters.get(pool_name)
+                if waiter.admission is None:
+                    if waiters is not None:
+                        try:
+                            waiters.remove(waiter)
+                        except ValueError:
+                            pass
+                        if not waiters:
+                            self._admission_waiters.pop(pool_name, None)
+                else:
+                    self._release_admission_locked(pool_name, operation)
+                    waiter.admission = None
+                self._wake_admission_waiters_locked(pool_name)
+            if not waiter.future.done():
+                waiter.future.cancel()
+            raise
+
+    def _record_admitted_locked(
+        self,
+        pool_name: str,
+        operation: str,
+        max_pending: int | None,
+    ) -> _AdmissionResult:
+        pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
+        for stats in (pool_stats, op_stats):
+            stats.submitted += 1
+            stats.pending += 1
+        return _AdmissionResult(
+            accepted=True,
+            snapshot=self._snapshot_locked(pool_name, operation),
+            pending=pool_stats.pending,
+            max_pending=max_pending,
+        )
+
+    def _release_admission_locked(self, pool_name: str, operation: str) -> None:
+        pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
+        for stats in (pool_stats, op_stats):
+            stats.pending = max(0, stats.pending - 1)
+
+    def _wake_admission_waiters_locked(self, pool_name: str) -> None:
+        waiters = self._admission_waiters.get(pool_name)
+        if not waiters:
+            return
+        pool_stats = self._pool_stats.setdefault(pool_name, _BlockingStats())
+        while waiters:
+            waiter = waiters[0]
+            if waiter.future.done():
+                waiters.popleft()
+                continue
+            if waiter.max_pending is not None and pool_stats.pending >= waiter.max_pending:
+                break
+            waiters.popleft()
+            admission = self._record_admitted_locked(pool_name, waiter.operation, waiter.max_pending)
+            waiter.admission = admission
+            try:
+                waiter.loop.call_soon_threadsafe(
+                    _complete_admission_waiter,
+                    waiter.future,
+                    admission,
+                )
+            except RuntimeError:
+                waiter.admission = None
+                self._release_admission_locked(pool_name, waiter.operation)
+        if not waiters:
+            self._admission_waiters.pop(pool_name, None)
 
     def _record_worker_started(self, pool_name: str, operation: str) -> _StatsSnapshot:
         with self._stats_lock:
@@ -935,6 +1002,7 @@ class BlockingScheduler:
             for stats in (pool_stats, op_stats):
                 stats.pending = max(0, stats.pending - 1)
                 stats.active += 1
+            self._wake_admission_waiters_locked(pool_name)
             return self._snapshot_locked(pool_name, operation)
 
     def _record_worker_completed(self, pool_name: str, operation: str) -> _StatsSnapshot:
@@ -959,6 +1027,7 @@ class BlockingScheduler:
             for stats in (pool_stats, op_stats):
                 stats.pending = max(0, stats.pending - 1)
                 stats.failed += 1
+            self._wake_admission_waiters_locked(pool_name)
             return self._snapshot_locked(pool_name, operation)
 
     def _record_await_cancelled(self, pool_name: str, operation: str) -> _StatsSnapshot:
@@ -973,6 +1042,7 @@ class BlockingScheduler:
             pool_stats, op_stats = self._stats_for_locked(pool_name, operation)
             for stats in (pool_stats, op_stats):
                 stats.pending = max(0, stats.pending - 1)
+            self._wake_admission_waiters_locked(pool_name)
             return self._snapshot_locked(pool_name, operation)
 
     def _on_concurrent_future_done(
