@@ -311,7 +311,7 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertNotIn("# 你的专属 Skill 文件内容", prompt_text)
         self.assertNotIn("# 你的专属项目记忆文件内容", prompt_text)
 
-    def test_system_prompt_includes_pause_task_timeout_runtime_lifecycle_guidance(self) -> None:
+    def test_system_prompt_includes_pause_task_checkpoint_and_dormant_wait_guidance(self) -> None:
         engine = self._engine_with_local_tools(
             _local_tool("message_user", category="lifecycle"),
             _local_tool("pause_task", category="lifecycle"),
@@ -326,10 +326,16 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
 
         self.assertIsNotNone(prompt)
         prompt_text = prompt or ""
-        self.assertIn("`timeout_seconds` is the pause duration in seconds", prompt_text)
-        self.assertIn("omitted or `-1` means indefinite external-event-only waiting", prompt_text)
-        self.assertIn("whichever arrives first — external event or timeout expiry", prompt_text)
-        self.assertIn("often roughly 5–50 minutes", prompt_text)
+        self.assertIn("known delegated result from a local child Agent, remote Agent, or definite async job", prompt_text)
+        self.assertIn("choose a positive checkpoint based on expected complexity", prompt_text)
+        self.assertIn("Do not use `-1` for that wait or assume the completion notification is perfectly reliable", prompt_text)
+        self.assertIn("If the checkpoint expires without a result, inspect", prompt_text)
+        self.assertIn("proactively ask whether it is complete and request progress, blockers, and ETA", prompt_text)
+        self.assertIn("this Agent's assigned work is fully complete", prompt_text)
+        self.assertIn("the final result has already been reported to a parent or remote upstream", prompt_text)
+        self.assertIn("no known subtask or result remains outstanding", prompt_text)
+        self.assertIn("indefinite dormant waiting for uncertain future instructions", prompt_text)
+        self.assertIn("Do not use positive timeouts to create meaningless periodic wake loops", prompt_text)
         self.assertIn("For waiting on real user replies use `message_user(action=request_response)`, not `pause_task`", prompt_text)
 
     def test_local_subagent_message_uses_distinct_prefix_and_instance_routing(self) -> None:

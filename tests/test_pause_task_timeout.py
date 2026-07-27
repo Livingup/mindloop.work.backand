@@ -20,6 +20,7 @@ from agent_runtime.agent_lifecycle.agent_lifecycle_tool import PauseTaskRequest,
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.conversation_message.message.models import Conversation, ROLE_ASSISTANT, TextPart, UniMessage
 from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
+from agent_runtime.tool.tool_decorator import get_tool_description
 from agent_runtime.tool.tool_execution_models import BaseToolResult, LoopControl
 
 
@@ -250,6 +251,24 @@ def test_pause_task_timeout_seconds_validation_and_metadata() -> None:
     for invalid_timeout in (0, -2, float("inf"), float("nan")):
         with pytest.raises(ValueError):
             PauseTaskRequest(reason="invalid timeout", timeout_seconds=invalid_timeout)
+
+
+def test_pause_task_usage_descriptions_distinguish_checkpoint_waiting_and_completed_dormancy() -> None:
+    field_description = PauseTaskRequest.model_fields["timeout_seconds"].description or ""
+    tool_description = get_tool_description(pause_task)
+
+    for description in (field_description, tool_description):
+        assert "等待已知的委派任务结果" in description
+        assert "大于 0 的有限检查点超时" in description
+        assert "不要使用 -1" in description
+        assert "检查点到期仍未收到结果" in description
+        assert "主动询问是否已经完成" in description
+        assert "进度、阻塞点和预计完成时间" in description
+        assert "受派工作已经全部完成" in description
+        assert "最终结果已向父 Agent 或远程上游汇报" in description
+        assert "没有仍待返回的已知子任务/结果" in description
+        assert "timeout_seconds=-1" in description
+        assert "无意义的周期性唤醒" in description
 
 
 def test_pause_wake_metadata_defaults_to_legacy_external_only_for_missing_or_invalid_timeout() -> None:

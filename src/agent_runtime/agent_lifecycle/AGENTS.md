@@ -41,9 +41,11 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `reason` | str | 暂停原因，说明在等待什么事件或消息 |
-| `timeout_seconds` | float | 暂停持续时间（秒）；省略或 `-1` 表示无限期静默暂停，只能由外部事件唤醒；`>0` 表示外部事件或时间截止任一先到都可唤醒；`0`、小于 `-1` 和非有限数非法 |
+| `timeout_seconds` | float | 等待已知委派结果或明确异步作业时使用 `>0` 的有限检查点；仅在本 Agent 工作全部完成、最终结果已向父 Agent/远程上游汇报、且没有已知待返回结果时使用 `-1` 无限期休眠；`0`、小于 `-1` 和非有限数非法 |
 
-等待子/本地 Agent 或异步系统工作时，调用方应按任务复杂度动态选择正数超时，常见量级约 5–50 分钟；只有在无法预测完成时间时才使用 `-1` 的无限期外部事件等待。
+等待已知的本地子 Agent、远程 Agent 或明确异步作业结果时，调用方必须按复杂度设置正数检查点超时（常见约 5–50 分钟），不得使用 `-1`，也不得假设完成通知绝对可靠。检查点到期仍未收到结果时，先检查子/远程 Agent 或异步作业状态；若其 paused 或持续静默，主动询问是否完成，并请求进度、阻塞点和预计完成时间。
+
+仅当当前 Agent 的受派工作已经全部完成、最终结果已向父 Agent 或远程上游汇报、且没有仍待返回的已知子任务/结果时，才使用 `timeout_seconds=-1` 进入无限期休眠等待不确定的未来指令；此时不要使用正数超时制造无意义的周期性唤醒。
 
 注册元数据：`name="pause_task"`、`category="lifecycle"`、`always_enabled=True`、`allowed_loop_decisions=("pause",)`；返回 metadata 包含 `lifecycle_action="pause"`、`pause_timeout_seconds` 与 `pause_wake_mode`（`external_only` / `external_or_timeout`）。
 
@@ -93,7 +95,7 @@ Runtime 以 `BaseToolResult.loop_control.decision` 控制循环，不根据工�
 
 1. 面向用户的沟通必须调用 `message_user`，不要依赖普通 assistant 文本。
 2. `message_user(action=notify)` 做非阻塞同步（进度报告、重要发现告知）；`message_user(action=request_response)` 做问题、确认、审核、选择、求助等需要用户回复的交互。不要用 notify 提问或表达“等用户回复”。
-3. `pause_task` 等待其他 Agent 消息、系统事件或 `timeout_seconds>0` 的时间截止（不发消息）；`timeout_seconds=-1` 表示无限期外部事件等待，等待子/本地 Agent 时应按复杂度动态选择正数超时（常见约 5–50 分钟），真实用户回复仍必须用 `message_user(action=request_response)`，不要用 pause_task。
+3. `pause_task` 不发消息。等待已知的本地子 Agent、远程 Agent 或明确异步作业结果时，必须使用正数检查点超时（常见约 5–50 分钟）；检查点到期未收到结果时检查状态，若 paused 或静默则主动询问是否完成，并请求进度、阻塞点和预计完成时间。只有当本 Agent 工作已全部完成、最终结果已向父 Agent/远程上游汇报且没有已知待返回结果时，才使用 `timeout_seconds=-1` 无限期休眠等待未来指令；不要用正数超时制造无意义周期唤醒。真实用户回复仍必须用 `message_user(action=request_response)`，不要用 pause_task。
 4. 任务成功完成后用 `message_user(action=request_response)` 汇报成果并等待用户验收，得到明确肯定后再 `end_task`。未经用户确认不要直接 `end_task`。
 5. 不可恢复失败用 `fail_task` 报告（不是 `end_task`）。推荐先 `message_user(action=notify)` 告知失败原因和已尝试的方案，再 `fail_task`。常规工具异常框架会自动包装，不需要主动 `fail_task`。
 6. 不要在同一 assistant turn 中混用生命周期工具和业务工具，除非用户明确要求。

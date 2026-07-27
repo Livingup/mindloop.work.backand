@@ -168,6 +168,20 @@ def message_user(request: MessageUserRequest) -> BaseToolResult:
 
 # ── Tool 2: pause_task ───────────────────────────────────────────────
 
+_PAUSE_TASK_KNOWN_RESULT_GUIDANCE = (
+    "等待已知的委派任务结果（本地子 Agent、远程 Agent 或明确的异步作业）时，"
+    "必须使用大于 0 的有限检查点超时，并按任务复杂度选择时长；不要使用 -1，"
+    "也不要假设完成通知绝对可靠。检查点到期仍未收到结果时，应先检查子/远程 Agent "
+    "或异步作业状态；若对方处于 paused 或持续静默，主动询问是否已经完成，并请求"
+    "进度、阻塞点和预计完成时间，避免系统永久卡住。"
+)
+_PAUSE_TASK_COMPLETED_UPSTREAM_GUIDANCE = (
+    "仅当当前 Agent 的受派工作已经全部完成、最终结果已向父 Agent 或远程上游汇报，"
+    "且没有仍待返回的已知子任务/结果时，才使用 timeout_seconds=-1 进入无限期休眠，"
+    "等待不确定的未来指令；不要使用大于 0 的超时制造无意义的周期性唤醒。"
+)
+
+
 class PauseTaskRequest(BaseToolRequest):
     """暂停任务工具请求。"""
 
@@ -180,12 +194,11 @@ class PauseTaskRequest(BaseToolRequest):
     timeout_seconds: float = Field(
         default=-1,
         description=(
-            "暂停持续时间（秒）。省略或 -1 表示无限期静默暂停，只等待外部事件唤醒，"
-            "适合无法预测完成时间的外部系统或 Agent 协作；大于 0 表示双通道唤醒："
-            "外部事件先到或时间截止任一先到，Runtime 都会恢复下一次 LLM 循环。"
-            "等待子/本地 Agent 或异步系统工作时应按复杂度动态选择正数，通常可在约 5–50 分钟量级；"
-            "真实用户回复必须使用 message_user(action=request_response)，不要用 pause_task。"
-            "0、小于 -1 和非有限数非法，避免立即自旋或无意义超时。"
+            f"暂停持续时间（秒）。{_PAUSE_TASK_KNOWN_RESULT_GUIDANCE}"
+            f"{_PAUSE_TASK_COMPLETED_UPSTREAM_GUIDANCE}"
+            "大于 0 表示双通道唤醒：外部事件先到或时间截止任一先到，Runtime 都会恢复下一次 LLM 循环；"
+            "-1 表示只等待外部事件。真实用户回复必须使用 message_user(action=request_response)，"
+            "不要用 pause_task。0、小于 -1 和非有限数非法。"
         ),
     )
 
@@ -215,21 +228,22 @@ class PauseTaskRequest(BaseToolRequest):
         "【做什么】触发 loop_decision=pause 让 Runtime 暂停当前 Agent 实例。reason 字段记录在等什么事件，供运维追查；timeout_seconds 是暂停持续时间（秒），用于决定是否注册时间唤醒。\n"
         "\n"
         "【何时使用】\n"
-        "• 多 Agent 协作：等另一个 Agent 把结果推送过来后再继续；等待子/本地 Agent 时应按任务复杂度动态选择 timeout_seconds>0，通常可在约 5–50 分钟量级\n"
-        "• 系统事件等待：等外部 webhook 回调、状态变更通知，或用 timeout_seconds>0 做定时复查\n"
-        "• 周期性检查：传 timeout_seconds>0，让时间截止或外部事件任一先到都唤醒下一次 LLM 循环\n"
-        "• 长耗时异步任务：已发起异步任务，等系统通知任务完成；必要时可用 timeout_seconds>0 兜底复查\n"
+        f"• 已知结果等待：{_PAUSE_TASK_KNOWN_RESULT_GUIDANCE}\n"
+        f"• 已完成后的休眠：{_PAUSE_TASK_COMPLETED_UPSTREAM_GUIDANCE}\n"
+        "• 系统事件等待：等待明确会返回结果的 webhook、状态变更或异步作业时，也使用大于 0 的有限检查点超时\n"
         "\n"
         "【参数语义】\n"
-        "• timeout_seconds=-1（默认）：无限期静默暂停，只能由外部事件唤醒；适合无法预测完成时间的外部工作\n"
-        "• timeout_seconds>0：双通道唤醒，外部事件或时间截止任一先到都可唤醒；0、小于 -1 和非有限数非法，避免自旋\n"
+        "• timeout_seconds=-1（默认）：只在本 Agent 工作已全部完成、最终结果已向父 Agent 或远程上游汇报、且没有已知待返回结果时，用于无限期休眠等待未来指令\n"
+        "• timeout_seconds>0：等待已知委派结果或明确异步作业的检查点；外部事件或时间截止任一先到都可唤醒；0、小于 -1 和非有限数非法\n"
         "\n"
         "【不要用于】\n"
+        "• 等待已知子/远程 Agent 或异步作业结果时使用 -1，或假设完成通知绝对可靠\n"
+        "• 本 Agent 已完成并已向上游汇报、且没有待返回结果后，仍用正数超时制造无意义的周期性唤醒\n"
         "• 等真实用户回复 → 必须用 message_user(action=request_response)。pause_task 不发消息给用户，用户不会看到你在等什么\n"
         "• 不知道下一步怎么做 → 用 message_user(action=request_response) 求助用户\n"
         "• 任务卡住推进不下去 → 用 fail_task 报告失败\n"
         "\n"
-        "【关键区分】pause_task 是“被动等”——Agent 知道一定会有外部事件或已设置的超时时间唤醒。如果不确定有没有唤醒条件，不要用 pause_task；如果是在等用户输入，不论是否需要超时，都不要用 pause_task。"
+        "【关键区分】等待已知结果时使用有限检查点并在超时后主动核查；工作已完成且没有待返回结果时才使用 -1 无限期休眠；等待真实用户输入始终使用 message_user(action=request_response)。"
     ),
     group="agent_lifecycle",
     category="lifecycle",
