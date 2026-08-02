@@ -127,7 +127,26 @@ class SubagentRuntime:
                 try:
                     await self._conversation_repository.delete(seeded_conversation_id)
                 except Exception:  # noqa: BLE001 - creation failure cleanup must not hide root cause
-                    logger.exception("清理子 Agent 预创建会话失败: conversation_id=%s", seeded_conversation_id)
+                    from agent_runtime.codex_oauth.diagnostics import stable_fingerprint
+                    logger.exception(
+                        "清理子 Agent 预创建会话失败: conversation_fingerprint=%s",
+                        stable_fingerprint(seeded_conversation_id),
+                    )
+                else:
+                    try:
+                        from agent_runtime.codex_oauth.factory import CodexOAuthFactory
+                        codex_service = CodexOAuthFactory.create_service()
+                        if codex_service.opened:
+                            await codex_service.delete_session_binding(seeded_conversation_id)
+                    except Exception as cleanup_exc:  # noqa: BLE001 - binding cleanup cannot hide root cause
+                        from agent_runtime.codex_oauth.diagnostics import stable_fingerprint
+                        logger.warning(
+                            "清理已永久删除会话的 Codex session binding 失败: conversation_fingerprint=%s "
+                            "error_type=%s error_code=%s",
+                            stable_fingerprint(seeded_conversation_id),
+                            cleanup_exc.__class__.__name__,
+                            getattr(cleanup_exc, "code", None),
+                        )
             raise
         await self._publish_subagent_created(
             parent_instance_id=parent.instance_id,

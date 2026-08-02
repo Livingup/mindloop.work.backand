@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
@@ -24,6 +25,7 @@ from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
 )
+from agent_runtime.codex_oauth.models import CODEX_PROVIDER_ID
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_CODEX_RESPONSES,
@@ -54,6 +56,18 @@ _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
     "llm.thinking.delta",
     "llm.tool_call.arguments.delta",
     "llm.tool_call.arguments.completed",
+}
+_PROJECTED_OUTPUT_SEMANTIC_EVENTS = {
+    "llm.thinking.started",
+    "llm.thinking.delta",
+    "llm.thinking.completed",
+    "llm.content.started",
+    "llm.content.delta",
+    "llm.content.completed",
+    "llm.tool_call.started",
+    "llm.tool_call.arguments.delta",
+    "llm.tool_call.arguments.completed",
+    "llm.tool_call.completed",
 }
 logger = logging.getLogger(__name__)
 _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
@@ -90,12 +104,29 @@ class LlmRequestService:
 
     async def send_prompt(self, request: LlmPromptRequest) -> LlmPromptResponse:
         """发送一次 LLM 请求，并把 assistant 响应追加到 Conversation。"""
-        resolved = _with_default_relay_session_header(request)
+        resolved = request.resolved_model
+        if resolved.provider_id == CODEX_PROVIDER_ID and resolved.api_format != API_FORMAT_CODEX_RESPONSES:
+            logger.warning(
+                "Managed Codex binding protocol normalized to SDK bridge: provider_id=%s binding_id=%s configured_api_format=%s",
+                resolved.provider_id,
+                resolved.binding_id,
+                resolved.api_format,
+            )
+            resolved = replace(resolved, api_format=API_FORMAT_CODEX_RESPONSES)
+        if resolved.api_format == API_FORMAT_CODEX_RESPONSES and resolved.provider_id != CODEX_PROVIDER_ID:
+            raise ValueError(
+                f"api_format={API_FORMAT_CODEX_RESPONSES} 仅保留给托管 Provider {CODEX_PROVIDER_ID}。"
+            )
         client = self._protocol_clients.get(resolved.api_format)
         if client is None:
             raise ValueError(
                 f"当前 LLM 请求客户端不支持 api_format={resolved.api_format}。"
             )
+        owns_credentials_and_retries = bool(
+            getattr(client, "owns_credentials_and_retries", False)
+        )
+        if not owns_credentials_and_retries:
+            resolved = _with_default_relay_session_header(request)
 
         request_params = _merge_request_params(request)
         render_options = {
@@ -110,9 +141,9 @@ class LlmRequestService:
             render_options,
         )
         tool_schemas = tuple(tool.schema for tool in request.tools)
-        api_key_items = list(resolved.api_keys)
+        api_key_items = [] if owns_credentials_and_retries else list(resolved.api_keys)
         api_keys: list[str | None] = [item.key for item in api_key_items]
-        if not api_keys:
+        if owns_credentials_and_retries or not api_keys:
             api_keys = [None]
 
         llm_call_id = request.llm_call_id or f"llm-call-{uuid.uuid4().hex}"
@@ -131,10 +162,12 @@ class LlmRequestService:
                 api_key_index=key_index,
                 retry_index=retry_index,
             )
-            api_key_label = _api_key_label(raw_api_key, api_key_name)
+            api_key_label = None if owns_credentials_and_retries else _api_key_label(raw_api_key, api_key_name)
             try:
-                api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
-                api_key_label = _api_key_label(api_key, api_key_name)
+                api_key = None if owns_credentials_and_retries else (
+                    _resolve_api_key(raw_api_key) if raw_api_key is not None else None
+                )
+                api_key_label = None if owns_credentials_and_retries else _api_key_label(api_key, api_key_name)
             except Exception as exc:
                 last_error = exc
                 request_payload = _build_request_attempt_payload(
@@ -210,7 +243,7 @@ class LlmRequestService:
             _notify_request_event(request, "llm.request.started", request_payload)
             if request.request_attempt_observer is not None:
                 request.request_attempt_observer(dict(request_payload))
-            max_retries = resolved.retry.max_retries_per_key
+            max_retries = 0 if owns_credentials_and_retries else resolved.retry.max_retries_per_key
             for retry_index in range(max_retries + 1):
                 if retry_index > 0:
                     request_attempt_started_at = time.perf_counter()
@@ -243,7 +276,11 @@ class LlmRequestService:
                     _notify_request_event(request, "llm.request.started", request_payload)
                     if request.request_attempt_observer is not None:
                         request.request_attempt_observer(dict(request_payload))
-                stream_state: dict[str, bool] = {"response_started": False, "response_failed": False}
+                stream_state: dict[str, bool] = {
+                    "response_started": False,
+                    "response_failed": False,
+                    "output_projected": False,
+                }
                 api_response_received = False
                 messages_snapshot = len(request.conversation.messages)
                 provider_state_snapshot = copy.deepcopy(request.conversation.provider_state)
@@ -268,27 +305,30 @@ class LlmRequestService:
                         attempt_count=attempt_count,
                         stream_state=stream_state,
                     )
-                    raw_response = await _await_client_request(
-                        client.request(
-                            resolved_model=resolved,
-                            rendered_messages=rendered_messages,
-                            system_prompt=request.system_prompt,
-                            tools=tool_schemas,
-                            request_params=request_params,
-                            api_key=api_key,
-                            stream_event_handler=stream_event_handler,
-                            http_trace_service=self._http_trace_service,
-                            http_trace_context=_build_http_trace_context(
-                                request=request,
-                                resolved=resolved,
-                                llm_call_id=llm_call_id,
-                                llm_request_id=llm_request_id,
-                                api_key_index=key_index,
-                                retry_index=retry_index,
-                                attempt_count=attempt_count,
-                            ),
-                            cancellation_checker=request.cancellation_checker,
+                    client_request_kwargs: dict[str, Any] = {
+                        "resolved_model": resolved,
+                        "rendered_messages": rendered_messages,
+                        "system_prompt": request.system_prompt,
+                        "tools": tool_schemas,
+                        "request_params": request_params,
+                        "api_key": api_key,
+                        "stream_event_handler": stream_event_handler,
+                        "http_trace_service": self._http_trace_service,
+                        "http_trace_context": _build_http_trace_context(
+                            request=request,
+                            resolved=resolved,
+                            llm_call_id=llm_call_id,
+                            llm_request_id=llm_request_id,
+                            api_key_index=key_index,
+                            retry_index=retry_index,
+                            attempt_count=attempt_count,
                         ),
+                        "cancellation_checker": request.cancellation_checker,
+                    }
+                    if owns_credentials_and_retries:
+                        client_request_kwargs["conversation_id"] = request.conversation.id
+                    raw_response = await _await_client_request(
+                        client.request(**client_request_kwargs),
                         request,
                     )
                     if request.cancellation_checker is not None and request.cancellation_checker():
@@ -330,7 +370,7 @@ class LlmRequestService:
                         "attempt_count": attempt_count,
                         "cancelled_by": "user",
                         "cancelled_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                        "partial_response": stream_state.get("response_started") is True,
+                        "partial_response": stream_state.get("output_projected") is True,
                         "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                         "reason": str(exc) or "LLM request cancelled.",
                     }
@@ -360,6 +400,12 @@ class LlmRequestService:
                     service_error = _as_llm_service_failure(exc)
                     last_error = service_error
                     last_service_call_error = service_error
+                    partial_output = bool(
+                        getattr(service_error, "partial_output", False)
+                        or (owns_credentials_and_retries and stream_state.get("output_projected") is True)
+                    )
+                    if partial_output and not bool(getattr(service_error, "partial_output", False)):
+                        setattr(service_error, "partial_output", True)
                     retry_target = _build_retry_target_payload(
                         resolved=resolved,
                         candidate_index=request.candidate_index,
@@ -367,8 +413,12 @@ class LlmRequestService:
                         retry_index=retry_index,
                         max_retries=max_retries,
                         api_key_count=len(api_keys),
-                        next_resolved_model=request.next_resolved_model,
-                        retryable=_should_retry(service_error, resolved.retry.retryable_status_codes),
+                        next_resolved_model=None if partial_output else request.next_resolved_model,
+                        retryable=(
+                            False
+                            if partial_output or owns_credentials_and_retries
+                            else _should_retry(service_error, resolved.retry.retryable_status_codes)
+                        ),
                     )
                     failed_payload = {
                         **request_payload,
@@ -376,7 +426,7 @@ class LlmRequestService:
                         "error_type": service_error.__class__.__name__,
                         "error_message": str(service_error),
                         "failed_stage": "response_stream" if stream_state.get("response_started") else "before_response",
-                        "partial_response": stream_state.get("response_started") is True,
+                        "partial_response": partial_output,
                         "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                         **retry_target,
                     }
@@ -388,7 +438,7 @@ class LlmRequestService:
                         metadata={"conversation_id": request.conversation.id},
                     )
                     _notify_request_event(request, "llm.request.failed", failed_payload)
-                    if not _should_retry(service_error, resolved.retry.retryable_status_codes):
+                    if partial_output or not _should_retry(service_error, resolved.retry.retryable_status_codes):
                         break
                     if retry_index >= max_retries:
                         break
@@ -440,6 +490,9 @@ class LlmRequestService:
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
                 )
+            partial_output_error = bool(getattr(last_error, "partial_output", False))
+            if partial_output_error:
+                raise last_error
             if last_service_call_error is not None or request.next_resolved_model is not None:
                 cause = last_service_call_error or last_error
                 raise LlmProviderModelServiceUnavailable(
@@ -504,6 +557,63 @@ def _notify_request_observer(
         observer(event_type, dict(payload))
     except Exception:
         return
+
+
+def _response_payload_projects_output(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if isinstance(response.get("output_text"), str) and response["output_text"]:
+        return True
+    output = response.get("output")
+    if not isinstance(output, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("type") in {"message", "reasoning", "function_call", "custom_tool_call"}
+        for item in output
+    )
+
+
+def _provider_event_projects_output(
+    api_format: str,
+    event_name: str,
+    data: dict[str, Any] | None,
+) -> bool:
+    if api_format not in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
+        return False
+    if not isinstance(data, dict):
+        return False
+    event_type = str(data.get("type") or event_name)
+    if _response_payload_projects_output(data.get("response")):
+        return True
+    if event_type in {
+        "response.output_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+        "response.refusal.delta",
+        "response.function_call_arguments.delta",
+        "response.custom_tool_call_input.delta",
+    }:
+        return bool(data.get("delta"))
+    if event_type in {"response.function_call_arguments.done", "response.custom_tool_call_input.done"}:
+        return bool(data.get("arguments") or data.get("input"))
+    if event_type in {
+        "response.output_text.done",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_text.done",
+    }:
+        return bool(data.get("text"))
+    if event_type == "response.refusal.done":
+        return bool(data.get("refusal"))
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = data.get("item")
+        return isinstance(item, dict) and item.get("type") in {
+            "message",
+            "reasoning",
+            "function_call",
+            "custom_tool_call",
+        }
+    return False
 
 
 def _with_default_relay_session_header(request: LlmPromptRequest):
@@ -717,11 +827,17 @@ def _build_stream_event_handler(
                 stream_state["response_started"] = True
                 events_to_publish.append(("llm.response.started", {**base_payload, "content_type": event_payload.get("content_type")}))
         elif event_type == "llm.response.stream.event":
+            provider_event_name = str(event_payload.get("event") or "message")
+            provider_event_data = event_payload.get("data") if isinstance(event_payload.get("data"), dict) else None
+            if _provider_event_projects_output(api_format, provider_event_name, provider_event_data):
+                stream_state["output_projected"] = True
             semantic_events = semantic_parser.parse_provider_event(
-                event_name=str(event_payload.get("event") or "message"),
-                data=event_payload.get("data") if isinstance(event_payload.get("data"), dict) else None,
+                event_name=provider_event_name,
+                data=provider_event_data,
                 done=event_payload.get("done") is True,
             )
+            if any(semantic.event_type in _PROJECTED_OUTPUT_SEMANTIC_EVENTS for semantic in semantic_events):
+                stream_state["output_projected"] = True
             events_to_publish.extend(
                 (semantic.event_type, {**base_payload, **semantic.payload})
                 for semantic in semantic_events
@@ -845,6 +961,9 @@ async def _await_client_request(
             pass
         raise LlmRequestTimeoutError(timeout_seconds=attempt_timeout_seconds)
     except asyncio.CancelledError:
+        task.cancel()
+        with suppress(Exception, asyncio.CancelledError):
+            await task
         if request.cancellation_checker is not None and request.cancellation_checker():
             raise LlmRequestCancelled("LLM request cancelled.") from None
         raise

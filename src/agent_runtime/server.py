@@ -183,9 +183,6 @@ def create_app(
     from agent_runtime.codex_oauth.north_gateway.codex_oauth_rest_adapter import (
         create_codex_oauth_router,
     )
-    from agent_runtime.codex_oauth.north_gateway.local_callback_server import (
-        CodexOAuthLocalCallbackServer,
-    )
     from agent_runtime.auth.factory import RuntimeAuthFactory
     from agent_runtime.auth.north_gateway.auth_rest_adapter import create_runtime_auth_router
     from agent_runtime.cloud_user_config.north_gateway.bootstrap_rest_adapter import (
@@ -282,7 +279,6 @@ def create_app(
     codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     if not cloud_user_config_database_active_at_start:
         logger.info("Runtime 处于 bootstrap 限制模式，跳过内置 Codex Provider 写入以避免本地 LLM Registry 成为共享配置权威。")
-    codex_oauth_callback_server = CodexOAuthLocalCallbackServer(codex_oauth_service)
     runtime_auth_service = RuntimeAuthFactory.create_service()
     llm_http_trace_service = LlmHttpTraceFactory.create()
     agent_execution_engine = _SwitchableRuntimeComponent(
@@ -312,7 +308,8 @@ def create_app(
     lacp_start_task: asyncio.Task | None = None
     config_cache_poll_task: asyncio.Task | None = None
     codex_provider_task: asyncio.Task | None = None
-    codex_oauth_callback_server_started = False
+    codex_provider_ready = False
+    codex_provider_lock = asyncio.Lock()
 
     async def auto_connect_mcp_services() -> None:
         logger.info("正在调度已启用 MCP 服务的后台连接…")
@@ -340,22 +337,27 @@ def create_app(
         mcp_metadata_management_started = True
 
     async def ensure_codex_builtin_provider() -> None:
-        try:
-            await monitored_to_thread(
-                codex_oauth_service.ensure_builtin_provider,
-                operation="server.ensure_codex_builtin_provider",
-                caller="create_app.ensure_codex_builtin_provider",
-                pool=BlockingPool.MAINTENANCE,
-                log=logger,
-                diagnostic_context={
-                    "component": "codex_oauth_service",
-                },
-            )
-        except (Exception, asyncio.CancelledError) as e:
-            logger.warning("内置 Codex Provider 后台同步失败，Runtime 将继续运行：%s", e, exc_info=True)
+        nonlocal codex_provider_ready
+        if codex_provider_ready:
+            return
+        async with codex_provider_lock:
+            if codex_provider_ready:
+                return
+            try:
+                await codex_oauth_service.ensure_builtin_provider()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "内置 Codex Provider 同步失败，已阻止托管 Provider 流量: error_type=%s error_code=%s",
+                    exc.__class__.__name__,
+                    getattr(exc, "code", None),
+                )
+                raise RuntimeError("内置 Codex Provider 同步失败，托管 Provider 尚未就绪。") from None
+            codex_provider_ready = True
 
     def _rebuild_full_mode_components() -> None:
-        nonlocal lacp_client, mcp_metadata_management_started
+        nonlocal lacp_client, mcp_metadata_management_started, codex_provider_ready
 
         reset_file_resource_services_for_runtime_mode_change()
         LacpFactory.reset_for_runtime_mode_change()
@@ -403,6 +405,7 @@ def create_app(
         )
         lacp_settings_repository.set_target(LacpFactory.create_settings_repository())
         mcp_metadata_management_started = False
+        codex_provider_ready = False
 
     def _activate_runtime_full_mode_if_ready() -> bool:
         nonlocal runtime_full_mode_active
@@ -433,7 +436,7 @@ def create_app(
 
     def _start_full_mode_background_services_on_loop() -> None:
         nonlocal auto_connect_task, mcp_metadata_start_task, lacp_start_task, config_cache_poll_task
-        nonlocal codex_provider_task, codex_oauth_callback_server_started
+        nonlocal codex_provider_task
 
         if (
             not mcp_metadata_management_started
@@ -450,10 +453,7 @@ def create_app(
             config_cache_poll_task = PostgresUserConfigStore.start_background_revision_polling(
                 lambda: ConfigRegistry.instance().cloud_user_config_database,
             )
-        if not codex_oauth_callback_server_started:
-            codex_oauth_callback_server.start()
-            codex_oauth_callback_server_started = True
-        if codex_provider_task is None or codex_provider_task.done():
+        if not codex_provider_ready and (codex_provider_task is None or codex_provider_task.done()):
             codex_provider_task = get_runtime_task_registry().create_task(
                 ensure_codex_builtin_provider(),
                 task_name="codex-oauth-builtin-provider-sync",
@@ -621,30 +621,32 @@ def create_app(
             0,
             None,
         )
-        execution_loop_logger.start()
-        event_loop_monitor.start()
-        runtime_network_monitor.start()
-        scene_session_registry.start()
-        if runtime_full_mode_active:
-            await start_mcp_metadata_management()
-            _start_full_mode_background_services_on_loop()
-        else:
-            logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接、LACP 启动与 Codex OAuth 回调服务。")
-        logger.info(
-            "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
-            "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
-            None,
-            None,
-            "runtime.lifespan",
-            None,
-            "runtime.lifespan",
-            "startup.completed",
-            _current_task_name(),
-            int((time.perf_counter() - lifespan_started_at) * 1000),
-            None,
-            event_loop_monitor.snapshot().get("status"),
-        )
         try:
+            execution_loop_logger.start()
+            event_loop_monitor.start()
+            runtime_network_monitor.start()
+            scene_session_registry.start()
+            await codex_oauth_service.open()
+            if runtime_full_mode_active:
+                await ensure_codex_builtin_provider()
+                await start_mcp_metadata_management()
+                _start_full_mode_background_services_on_loop()
+            else:
+                logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接与 LACP 启动。")
+            logger.info(
+                "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
+                None,
+                None,
+                "runtime.lifespan",
+                None,
+                "runtime.lifespan",
+                "startup.completed",
+                _current_task_name(),
+                int((time.perf_counter() - lifespan_started_at) * 1000),
+                None,
+                event_loop_monitor.snapshot().get("status"),
+            )
             yield
         finally:
             shutdown_started_at = time.perf_counter()
@@ -715,10 +717,22 @@ def create_app(
                 )
                 with suppress(Exception, asyncio.CancelledError):
                     await codex_provider_task
-            await lacp_client.shutdown()
-            await mcp_gateway.shutdown()
-            if codex_oauth_callback_server_started:
-                codex_oauth_callback_server.stop()
+            try:
+                await lacp_client.shutdown()
+            except (Exception, asyncio.CancelledError):
+                logger.exception("LACP client 关闭失败。")
+            try:
+                await mcp_gateway.shutdown()
+            except (Exception, asyncio.CancelledError):
+                logger.exception("MCP gateway 关闭失败。")
+            try:
+                await codex_oauth_service.close()
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.error(
+                    "louyi-codex SDK 关闭失败: error_type=%s error_code=%s",
+                    exc.__class__.__name__,
+                    getattr(exc, "code", None),
+                )
             await event_loop_monitor.stop()
             runtime_network_monitor.stop()
             with suppress(Exception, asyncio.CancelledError):
@@ -809,10 +823,13 @@ def create_app(
             try:
                 full_mode_ready = _activate_runtime_full_mode_if_ready()
             except Exception as exc:  # noqa: BLE001 - 请求守卫需要把同进程激活失败稳定暴露给前端
-                logger.exception("Runtime bootstrap 已完成但完整模式激活失败。")
+                logger.error(
+                    "Runtime bootstrap 已完成但完整模式激活失败: error_type=%s",
+                    exc.__class__.__name__,
+                )
                 return JSONResponse(
                     {
-                        "detail": f"Runtime bootstrap 已完成，但当前进程切换完整模式失败：{exc}",
+                        "detail": "Runtime bootstrap 已完成，但当前进程切换完整模式失败，请稍后重试。",
                         "bootstrap_required": False,
                         "restricted": True,
                     },
@@ -823,6 +840,19 @@ def create_app(
                     {
                         "detail": "Runtime 尚未完成本机 bootstrap durable readiness；请先完成 /api/runtime-bootstrap 引导。",
                         "bootstrap_required": True,
+                        "restricted": True,
+                    },
+                    status_code=503,
+                )
+            try:
+                await ensure_codex_builtin_provider()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return JSONResponse(
+                    {
+                        "detail": "内置 Codex Provider 尚未完成安全投影，请稍后重试。",
+                        "bootstrap_required": False,
                         "restricted": True,
                     },
                     status_code=503,
@@ -854,6 +884,7 @@ def create_app(
             active_after = runtime_network_monitor.end_http_request()
             duration_ms = round((time.perf_counter() - started_at) * 1000)
             event_loop_snapshot = event_loop_monitor.snapshot()
+            is_codex_oauth_request = request.url.path.startswith("/api/codex-oauth")
             runtime_network_monitor.record({
                 "layer": "backend",
                 "type": "http.request.error",
@@ -864,9 +895,9 @@ def create_app(
                 "active_http_requests": active_after,
                 "event_loop": event_loop_snapshot,
                 "error_type": exc.__class__.__name__,
-                "error_message": str(exc),
+                "error_message": exc.__class__.__name__ if is_codex_oauth_request else str(exc),
             })
-            logger.exception(
+            logger.error(
                 "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
                 "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
                 "method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
@@ -888,7 +919,8 @@ def create_app(
                 event_loop_snapshot.get("max_lag_ms"),
                 event_loop_snapshot.get("blocked_tick_count"),
                 exc.__class__.__name__,
-                exc,
+                exc.__class__.__name__ if is_codex_oauth_request else exc,
+                exc_info=not is_codex_oauth_request,
             )
             raise
         active_after = runtime_network_monitor.end_http_request()
@@ -1149,6 +1181,7 @@ def create_app(
 
 
 def _safe_network_path(path: str, query_params: dict[str, object]) -> str:
+    path = _redact_codex_network_path(path)
     allowed_keys = ("after_seq", "limit", "latest", "network_trace_id")
     safe_params = []
     for key in allowed_keys:
@@ -1156,6 +1189,22 @@ def _safe_network_path(path: str, query_params: dict[str, object]) -> str:
         if value is not None:
             safe_params.append(f"{key}={value}")
     return f"{path}?{'&'.join(safe_params)}" if safe_params else path
+
+
+def _redact_codex_network_path(path: str) -> str:
+    if not path.startswith("/api/codex-oauth/"):
+        return path
+    segments = path.split("/")
+    if len(segments) > 5 and segments[3] == "auth":
+        if segments[4] == "attempts":
+            segments[5] = "<attempt>"
+        elif segments[4] in {"browser", "device"} and segments[5] != "start":
+            segments[5] = "<attempt>"
+    elif len(segments) > 4 and segments[3] == "accounts" and segments[4] != "reorder":
+        segments[4] = "<account>"
+    elif len(segments) > 4 and segments[3] == "operations":
+        segments[4] = "<operation>"
+    return "/".join(segments)
 
 
 def _is_key_network_path(path: str) -> bool:

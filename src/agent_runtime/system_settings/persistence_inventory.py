@@ -78,7 +78,7 @@ def build_persistence_inventory(
         raw_config, "scene", "recent_workspaces_path", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/recent-workspaces.json"
     )
     codex_oauth_data_dir = _config_value(
-        raw_config, "codex_oauth", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/codex-oauth"
+        raw_config, "codex_oauth", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/louyi-codex"
     )
     trace_data_dir = _config_value(
         raw_config, "llm_http_trace", "data_dir", default="${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-http-traces"
@@ -385,19 +385,20 @@ def build_persistence_inventory(
         ),
         PersistenceInventoryItem(
             item_id="auth_and_oauth_state",
-            title="Runtime Auth 与 Codex OAuth 凭据",
+            title="Runtime Auth 与 louyi-codex SDK 本机状态",
             scope=RUNTIME_HISTORY_DIAGNOSTIC_STATE,
             storage_medium="SQLite databases",
-            storage_location=f"runtime_auth=${{SPREAD_AI_DATA_ROOT:-~/.spread-ai}}/auth/runtime_auth.sqlite3; codex_oauth={_join_location(codex_oauth_data_dir, 'codex_oauth.sqlite3')}",
+            storage_location=f"runtime_auth=${{SPREAD_AI_DATA_ROOT:-~/.spread-ai}}/auth/runtime_auth.sqlite3; louyi_codex={_join_location(codex_oauth_data_dir, 'louyi.sqlite3')}",
             config_sections=["codex_oauth"],
             persisted_data=[
                 "当前 Runtime 的本地账号、密码哈希与设备会话 token 哈希",
-                "Codex OAuth pending login、access token、refresh token、账号信息",
+                "louyi-codex SDK 管理的账号凭据、enabled/health、alias、priority/order、账号代理与额度",
+                "louyi-codex SDK 管理的 OAuth attempt、routing、session binding 与活动 lease",
             ],
             server_sync_candidate=False,
             sync_recommendation="security_local_or_dedicated_identity",
-            rationale="Runtime Auth 是访问当前本机后端的安全边界；OAuth token 是高敏认证材料，不能混入普通用户全局配置同步。",
-            secret_handling="如需跨设备身份体系，应设计独立云账号、授权和 token 托管方案，而不是同步本机 auth SQLite。",
+            rationale="Runtime Auth 是访问当前本机后端的安全边界；louyi-codex 凭据和账号运行态由 SDK 本机数据库独占管理，不能混入普通用户全局配置同步。",
+            secret_handling="如需跨设备身份体系，应设计独立云账号、授权和凭据托管方案；不得复制或二次保存 louyi.sqlite3 中的 SDK 凭据。",
         ),
         PersistenceInventoryItem(
             item_id="diagnostic_archives",

@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_CODEX_RESPONSES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_RESPONSES,
     API_FORMAT_ZHIPU_CHAT_COMPLETIONS,
@@ -130,6 +131,7 @@ class WebNativeToolAdapterRegistry:
                 adapters
                 or (
                     OpenAIWebNativeToolAdapter(),
+                    OpenAIWebNativeToolAdapter(api_format=API_FORMAT_CODEX_RESPONSES),
                     ClaudeWebNativeToolAdapter(),
                     GeminiWebNativeToolAdapter(),
                     ZhipuWebNativeToolAdapter(),

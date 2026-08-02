@@ -787,22 +787,7 @@ def _build_terminal_config(data: dict[str, Any]) -> TerminalConfig:
 
 def _build_codex_oauth_config(data: dict[str, Any]) -> CodexOAuthConfig:
     return CodexOAuthConfig(
-        data_dir=str(data.get("data_dir", "~/.spread-ai/codex-oauth")),
-        client_id=str(data.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")),
-        issuer=str(data.get("issuer", "https://auth.openai.com")),
-        codex_api_base_url=str(data.get("codex_api_base_url", "https://chatgpt.com/backend-api/codex")),
-        client_originator=str(data.get("client_originator", "mindloop.spread-ai")),
-        oauth_originator=str(data.get("oauth_originator", "opencode")),
-        oauth_callback_host=str(data.get("oauth_callback_host", "localhost")),
-        oauth_callback_port=int(data.get("oauth_callback_port", 1455)),
-        oauth_callback_path=str(data.get("oauth_callback_path", "/auth/callback")),
-        user_agent=str(data.get("user_agent", data.get("client_originator", "mindloop.spread-ai"))),
-        oauth_redirect_base_url=(
-            str(data["oauth_redirect_base_url"])
-            if data.get("oauth_redirect_base_url") is not None
-            else None
-        ),
-        login_timeout_seconds=int(data.get("login_timeout_seconds", 300)),
+        data_dir=str(data.get("data_dir", "~/.spread-ai/louyi-codex")),
     )
 
 

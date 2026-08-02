@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from agent_runtime.codex_oauth.models import CODEX_DISPLAY_API_BASE_URL, CODEX_PROVIDER_ID
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
 from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, LlmApiFormat, SUPPORTED_LLM_API_FORMATS
 from agent_runtime.llm_model_registry.llm_execution_policy import (
@@ -37,7 +38,9 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
     LlmProviderSaveRequest,
 )
 
-_BUILTIN_PROVIDER_IDS = {"openai_codex"}
+_MANAGED_CODEX_PROVIDER_ID = CODEX_PROVIDER_ID
+_MANAGED_CODEX_DISPLAY_API_BASE_URL = CODEX_DISPLAY_API_BASE_URL
+_BUILTIN_PROVIDER_IDS = {_MANAGED_CODEX_PROVIDER_ID}
 
 
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
@@ -403,10 +406,16 @@ def create_llm_model_registry_router(
         body: LlmProviderBody,
     ) -> LlmProviderResponse:
         """新增或覆盖保存 LLM 服务商定义。"""
+        managed_codex = _is_managed_codex_provider(provider_id, readonly_provider_ids)
+        if not managed_codex and any(item.api_format == API_FORMAT_CODEX_RESPONSES for item in body.models):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+            )
         invalid_api_formats = sorted({
             item.api_format
             for item in body.models
-            if item.api_format not in supported_api_formats
+            if not managed_codex and item.api_format not in supported_api_formats
         })
         if invalid_api_formats:
             raise HTTPException(
@@ -420,7 +429,10 @@ def create_llm_model_registry_router(
             except KeyError:
                 current = None
             body = _restore_provider_body(body, current)
-            provider = gateway.save_provider(_body_to_provider_request(provider_id, body))
+            request = _body_to_provider_request(provider_id, body)
+            provider = gateway.save_provider(
+                _normalize_managed_codex_save_request(request, readonly_provider_ids)
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return _provider_to_response(provider, readonly_provider_ids)
@@ -434,7 +446,10 @@ def create_llm_model_registry_router(
         try:
             current = gateway.get_provider(provider_id)
             body = _restore_provider_patch_body(body, current)
-            provider = gateway.save_provider(_patch_provider_request(current, body))
+            request = _patch_provider_request(current, body)
+            provider = gateway.save_provider(
+                _normalize_managed_codex_save_request(request, readonly_provider_ids)
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail=f"LLM 服务商不存在: {provider_id}")
         except ValueError as e:
@@ -666,7 +681,13 @@ def create_llm_model_registry_router(
         include_secrets: bool = False,
     ) -> dict[str, Any]:
         """为服务商新增模型接入项。"""
-        if body.api_format not in supported_api_formats:
+        managed_codex = _is_managed_codex_provider(provider_id, readonly_provider_ids)
+        if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+            )
+        if not managed_codex and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
         try:
             provider = gateway.get_provider(provider_id)
@@ -674,6 +695,7 @@ def create_llm_model_registry_router(
                 raise HTTPException(status_code=409, detail=f"LLM 服务商模型接入项已存在: {provider_id}/{body.id}")
             binding = _body_to_binding(body)
             updated = _provider_with_models(provider, provider.models + (binding,))
+            updated = _normalize_managed_codex_provider(updated, readonly_provider_ids)
             provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(updated))
             created = _get_provider_binding(provider, binding.id)
         except KeyError:
@@ -691,7 +713,13 @@ def create_llm_model_registry_router(
         include_secrets: bool = False,
     ) -> dict[str, Any]:
         """整体替换服务商模型接入项，路径 binding_id 为被替换项 ID。"""
-        if body.api_format not in supported_api_formats:
+        managed_codex = _is_managed_codex_provider(provider_id, readonly_provider_ids)
+        if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+            )
+        if not managed_codex and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
         try:
             provider = gateway.get_provider(provider_id)
@@ -702,7 +730,10 @@ def create_llm_model_registry_router(
             if replacement.id != binding_id and any(item.id == replacement.id for item in provider.models):
                 raise HTTPException(status_code=409, detail=f"LLM 服务商模型接入项已存在: {provider_id}/{replacement.id}")
             models = tuple(replacement if item.id == binding_id else item for item in provider.models)
-            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(_provider_with_models(provider, models)))
+            updated = _normalize_managed_codex_provider(
+                _provider_with_models(provider, models), readonly_provider_ids
+            )
+            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(updated))
             binding = _get_provider_binding(provider, replacement.id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -719,7 +750,13 @@ def create_llm_model_registry_router(
         include_secrets: bool = False,
     ) -> dict[str, Any]:
         """部分更新服务商模型接入项。"""
-        if body.api_format is not None and body.api_format not in supported_api_formats:
+        managed_codex = _is_managed_codex_provider(provider_id, readonly_provider_ids)
+        if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+            )
+        if not managed_codex and body.api_format is not None and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
         try:
             provider = gateway.get_provider(provider_id)
@@ -727,7 +764,10 @@ def create_llm_model_registry_router(
             body = _restore_binding_patch_body(body, current)
             replacement = _patch_provider_binding(current, body)
             models = tuple(replacement if item.id == binding_id else item for item in provider.models)
-            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(_provider_with_models(provider, models)))
+            updated = _normalize_managed_codex_provider(
+                _provider_with_models(provider, models), readonly_provider_ids
+            )
+            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(updated))
             binding = _get_provider_binding(provider, binding_id)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -743,7 +783,10 @@ def create_llm_model_registry_router(
             provider = gateway.get_provider(provider_id)
             _get_provider_binding(provider, binding_id)
             models = tuple(item for item in provider.models if item.id != binding_id)
-            gateway.save_provider(LlmProviderSaveRequest.from_provider(_provider_with_models(provider, models)))
+            updated = _normalize_managed_codex_provider(
+                _provider_with_models(provider, models), readonly_provider_ids
+            )
+            gateway.save_provider(LlmProviderSaveRequest.from_provider(updated))
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -759,7 +802,10 @@ def create_llm_model_registry_router(
         try:
             provider = gateway.get_provider(provider_id)
             models = _reorder_by_ids(provider.models, body.ids, "provider_model.id")
-            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(_provider_with_models(provider, models)))
+            updated = _normalize_managed_codex_provider(
+                _provider_with_models(provider, models), readonly_provider_ids
+            )
+            provider = gateway.save_provider(LlmProviderSaveRequest.from_provider(updated))
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except ValueError as e:
@@ -821,6 +867,74 @@ def _provider_runtime_metadata(provider: LlmProviderDefinition, builtin_provider
 
 def _is_builtin_provider_id(provider_id: str, builtin_provider_ids: set[str] | None = None) -> bool:
     return provider_id in (_BUILTIN_PROVIDER_IDS if builtin_provider_ids is None else builtin_provider_ids)
+
+
+def _is_managed_codex_provider(
+    provider_id: str,
+    builtin_provider_ids: set[str] | None = None,
+ ) -> bool:
+    return (
+        provider_id == _MANAGED_CODEX_PROVIDER_ID
+        and _is_builtin_provider_id(provider_id, builtin_provider_ids)
+    )
+
+
+def _managed_codex_retry_policy() -> LlmRetryPolicy:
+    return LlmRetryPolicy(
+        max_retries_per_key=0,
+        initial_delay_seconds=0,
+        max_delay_seconds=0,
+        retryable_status_codes=(),
+    )
+
+
+def _managed_codex_binding(binding: LlmProviderModelBinding) -> LlmProviderModelBinding:
+    return LlmProviderModelBinding(
+        id=binding.id,
+        model_id=binding.model_id,
+        model_alias=binding.model_alias,
+        api_format=API_FORMAT_CODEX_RESPONSES,
+        tool_choice=binding.tool_choice,
+        thinking=binding.thinking,
+        custom_request_params=binding.custom_request_params,
+        api_base_url=None,
+        custom_headers={},
+        api_keys=(),
+    )
+
+
+def _normalize_managed_codex_provider(
+    provider: LlmProviderDefinition,
+    builtin_provider_ids: set[str] | None = None,
+ ) -> LlmProviderDefinition:
+    if not _is_managed_codex_provider(provider.provider_id, builtin_provider_ids):
+        return provider
+    return LlmProviderDefinition(
+        provider_id=provider.provider_id,
+        group=provider.group,
+        api_base_url=_MANAGED_CODEX_DISPLAY_API_BASE_URL,
+        custom_headers={},
+        api_keys=(),
+        retry=_managed_codex_retry_policy(),
+        models=tuple(_managed_codex_binding(binding) for binding in provider.models),
+    )
+
+
+def _normalize_managed_codex_save_request(
+    request: LlmProviderSaveRequest,
+    builtin_provider_ids: set[str] | None = None,
+ ) -> LlmProviderSaveRequest:
+    if not _is_managed_codex_provider(request.provider_id, builtin_provider_ids):
+        return request
+    return LlmProviderSaveRequest(
+        provider_id=request.provider_id,
+        group=request.group,
+        api_base_url=_MANAGED_CODEX_DISPLAY_API_BASE_URL,
+        custom_headers={},
+        api_keys=(),
+        retry=_managed_codex_retry_policy(),
+        models=tuple(_managed_codex_binding(binding) for binding in request.models),
+    )
 
 
 def _body_fields_set(body: BaseModel) -> set[str]:

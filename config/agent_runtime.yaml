@@ -104,17 +104,8 @@ cloud_user_config_database:
     connect_timeout_seconds: 10
 
 codex_oauth:
-  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/codex-oauth"
-  client_id: "${CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}"
-  issuer: "https://auth.openai.com"
-  codex_api_base_url: "https://chatgpt.com/backend-api/codex"
-  client_originator: "mindloop.spread-ai"
-  oauth_originator: "mindloop.spread-ai"
-  oauth_callback_host: "localhost"
-  oauth_callback_port: 1455
-  oauth_callback_path: "/auth/callback"
-  user_agent: "mindloop.spread-ai"
-  login_timeout_seconds: 300
+  # louyi-codex SDK 的本机权威存储目录；旧 codex_oauth.sqlite3 不再读取或迁移。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/louyi-codex"
 
 llm_http_trace:
   enabled: true

@@ -1,46 +1,43 @@
 # -*- coding: utf-8 -*-
+"""louyi-codex application service used by the managed openai_codex provider."""
 from __future__ import annotations
 
-import base64
-import hashlib
-import json
-import secrets
+import asyncio
+import logging
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from contextlib import suppress
+from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 from agent_runtime.codex_oauth.config import CodexOAuthConfig
-from agent_runtime.codex_oauth.infrastructure.sqlite_codex_oauth_repository import (
-    SqliteCodexOAuthRepository,
-)
+from agent_runtime.codex_oauth.diagnostics import (
+    CodexSdkRawEventSink,
+    proxy_diagnostic,
+    sdk_error_diagnostic,
+    short_identifier,
+    stable_fingerprint,
+ )
 from agent_runtime.codex_oauth.models import (
+    CODEX_DISPLAY_API_BASE_URL,
     CODEX_PROVIDER_ID,
-    CodexOAuthAccount,
-    CodexOAuthLoginStart,
-    CodexPendingOAuthLogin,
-    CodexResolvedToken,
-    codex_api_key_ref,
-    parse_codex_api_key_ref,
-)
+    CODEX_SESSION_HEADER_NAME,
+    CODEX_SESSION_NAMESPACE,
+ )
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES
 from agent_runtime.llm_model_registry.llm_model_metadata import LlmModelMetadata
 from agent_runtime.llm_model_registry.llm_provider_definition import (
-    LlmApiKey,
     LlmProviderDefinition,
     LlmProviderModelBinding,
     LlmRetryPolicy,
-)
+ )
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import (
     LlmModelMetadataSaveRequest,
     LlmModelRegistryGateway,
     LlmProviderSaveRequest,
-)
+ )
+
+logger = logging.getLogger("agent_runtime.codex_sdk")
 
 _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
     "gpt-5.5",
@@ -49,141 +46,98 @@ _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
     "gpt-5.3-codex-spark",
     "gpt-5.4",
     "gpt-5.4-mini",
-)
+ )
 
 
-class CodexOAuthError(OSError):
-    pass
+class CodexOAuthError(RuntimeError):
+    """Stable Runtime-facing error for SDK management and lifecycle failures."""
 
 
 class CodexOAuthService:
+    """Owns the process-wide AsyncCodexClient and projects its Stable resources."""
+
     def __init__(
         self,
-        repository: SqliteCodexOAuthRepository,
         config_accessor: Any,
         llm_registry_gateway: LlmModelRegistryGateway | None = None,
     ) -> None:
-        self._repository = repository
         self._config_accessor = config_accessor
         self._llm_registry_gateway = llm_registry_gateway
+        self._client: Any | None = None
+        self._storage_dir: Path | None = None
 
-    def start_login(self, redirect_uri: str) -> CodexOAuthLoginStart:
+    @property
+    def opened(self) -> bool:
+        return self._client is not None
+
+    @property
+    def client(self) -> Any:
+        if self._client is None:
+            raise CodexOAuthError("louyi-codex SDK 尚未打开。")
+        return self._client
+
+    def set_llm_registry_gateway(self, gateway: LlmModelRegistryGateway | None) -> None:
+        if gateway is not None:
+            self._llm_registry_gateway = gateway
+
+    async def open(self) -> None:
+        if self._client is not None:
+            return
+        sdk = _sdk_module()
         config = self._config()
-        now = _utc_now()
-        expires_at = now + timedelta(seconds=config.login_timeout_seconds)
-        code_verifier = _generate_code_verifier()
-        code_challenge = _code_challenge(code_verifier)
-        state = _generate_state()
-        pending = CodexPendingOAuthLogin(
-            state=state,
-            code_verifier=code_verifier,
-            code_challenge=code_challenge,
-            redirect_uri=redirect_uri,
-            originator=config.client_originator,
-            created_at=_iso(now),
-            expires_at=_iso(expires_at),
+        storage_dir = Path(config.data_dir).expanduser().resolve()
+        sdk_config = sdk.SDKConfig(
+            storage_dir=storage_dir,
+            session_header_name=CODEX_SESSION_HEADER_NAME,
+            session_namespace=CODEX_SESSION_NAMESPACE,
         )
-        self._repository.delete_expired_pending_logins(_iso(now))
-        self._repository.save_pending_login(pending)
-        params = urllib.parse.urlencode({
-            "response_type": "code",
-            "client_id": config.client_id,
-            "redirect_uri": redirect_uri,
-            "scope": "openid profile email offline_access",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "id_token_add_organizations": "true",
-            "codex_cli_simplified_flow": "true",
-            "state": state,
-            "originator": config.oauth_originator,
-        })
-        return CodexOAuthLoginStart(
-            authorization_url=f"{config.issuer.rstrip('/')}/oauth/authorize?{params}",
-            state=state,
-            redirect_uri=redirect_uri,
-            expires_at=_iso(expires_at),
-        )
-
-    def default_redirect_uri(self, request_base_url: str) -> str:
-        config = self._config()
-        if not config.oauth_redirect_base_url:
-            return self.local_callback_redirect_uri()
-        base_url = (config.oauth_redirect_base_url or request_base_url).rstrip("/")
-        return f"{base_url}/api/codex-oauth/login/callback"
-
-    def local_callback_redirect_uri(self) -> str:
-        config = self._config()
-        path = _normalize_callback_path(config.oauth_callback_path)
-        return f"http://{config.oauth_callback_host}:{config.oauth_callback_port}{path}"
-
-    def local_callback_bind_address(self) -> tuple[str, int, str]:
-        config = self._config()
-        return (
-            config.oauth_callback_host,
-            config.oauth_callback_port,
-            _normalize_callback_path(config.oauth_callback_path),
+        client = sdk.AsyncCodexClient(sdk_config, event_sink=CodexSdkRawEventSink())
+        started_at = time.perf_counter()
+        try:
+            await client.open()
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.lifecycle.open_failed storage=%s details=%s",
+                storage_dir,
+                sdk_error_diagnostic(exc),
+            )
+            with suppress(Exception, asyncio.CancelledError):
+                await client.close()
+            raise CodexOAuthError(
+                _safe_service_failure_message("startup", exc)
+            ) from None
+        self._client = client
+        self._storage_dir = storage_dir
+        logger.info(
+            "codex_sdk.lifecycle.opened version=%s storage=%s namespace=%s duration_ms=%d",
+            getattr(sdk, "__version__", "unknown"),
+            storage_dir,
+            CODEX_SESSION_NAMESPACE,
+            int((time.perf_counter() - started_at) * 1000),
         )
 
-    def complete_login(self, *, state: str, code: str) -> CodexOAuthAccount:
-        pending = self._repository.find_pending_login(state)
-        if pending is None:
-            raise CodexOAuthError("Codex OAuth 登录状态不存在或已过期。")
-        if _parse_iso(pending.expires_at) <= _utc_now():
-            self._repository.delete_pending_login(state)
-            raise CodexOAuthError("Codex OAuth 登录已超时，请重新发起授权。")
-        self._repository.delete_pending_login(state)
-        tokens = self._exchange_code_for_tokens(code, pending.redirect_uri, pending.code_verifier)
-        account = self._account_from_tokens(tokens, pending.originator)
-        self._repository.save_account(account)
-        self.ensure_builtin_provider()
-        return account
-
-    def list_accounts(self) -> list[CodexOAuthAccount]:
-        return self._repository.find_all_accounts()
-
-    def refresh_account(self, credential_id: str) -> CodexOAuthAccount:
-        account = self._repository.find_account_by_id(credential_id)
-        if account is None:
-            raise KeyError(f"Codex 授权账号不存在: {credential_id}")
-        refreshed = self._refresh_account(account)
-        self.ensure_builtin_provider()
-        return refreshed
-
-    def delete_account(self, credential_id: str) -> bool:
-        deleted = self._repository.delete_account(credential_id)
-        if deleted:
-            self.ensure_builtin_provider()
-        return deleted
-
-    def resolve_api_key_ref(self, api_key_ref: str | None) -> CodexResolvedToken:
-        credential_id = parse_codex_api_key_ref(api_key_ref)
-        if credential_id is None:
-            raise CodexOAuthError("Codex provider 的 API Key 必须是 codex-oauth-ref:<credential_id>。")
-        account = self._repository.find_account_by_id(credential_id)
-        if account is None:
-            raise CodexOAuthError(f"Codex 授权账号不存在: {credential_id}")
-        if account.disabled:
-            raise CodexOAuthError(f"Codex 授权账号已禁用: {credential_id}")
-        if account.expires_at <= int(time.time()) + 60:
-            account = self._refresh_account(account)
-        now = _iso(_utc_now())
-        account = replace(account, last_used_at=now, updated_at=now)
-        self._repository.save_account(account)
-        config = self._config()
-        return CodexResolvedToken(
-            credential_id=account.credential_id,
-            access_token=account.access_token,
-            account_id=account.account_id,
-            session_id=account.session_id,
-            originator=account.originator or config.client_originator,
-            user_agent=config.user_agent,
+    async def close(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        started_at = time.perf_counter()
+        try:
+            await client.close()
+        except Exception as exc:
+            logger.error("codex_sdk.lifecycle.close_failed details=%s", sdk_error_diagnostic(exc))
+            raise CodexOAuthError(_safe_service_failure_message("shutdown", exc)) from None
+        finally:
+            self._client = None
+            self._storage_dir = None
+        logger.info(
+            "codex_sdk.lifecycle.closed duration_ms=%d",
+            int((time.perf_counter() - started_at) * 1000),
         )
 
-    def ensure_builtin_provider(self) -> None:
+    async def ensure_builtin_provider(self) -> None:
         gateway = self._llm_registry_gateway
         if gateway is None:
             return
-        config = self._config()
         for model_id in _DEFAULT_CODEX_MODELS:
             try:
                 gateway.get_model_metadata(model_id)
@@ -191,123 +145,371 @@ class CodexOAuthService:
                 gateway.save_model_metadata(
                     LlmModelMetadataSaveRequest.from_metadata(_default_model_metadata(model_id))
                 )
-        accounts = [account for account in self.list_accounts() if not account.disabled]
-        account_by_ref = {
-            codex_api_key_ref(account.credential_id): account
-            for account in accounts
-        }
         default_bindings = tuple(_default_binding(model_id) for model_id in _DEFAULT_CODEX_MODELS)
         try:
             existing = gateway.get_provider(CODEX_PROVIDER_ID)
         except KeyError:
-            account_keys = tuple(
-                LlmApiKey(key=codex_api_key_ref(account.credential_id), name=account.label)
-                for account in accounts
-            )
             provider = LlmProviderDefinition(
                 provider_id=CODEX_PROVIDER_ID,
                 group="official",
-                api_base_url=config.codex_api_base_url,
+                api_base_url=CODEX_DISPLAY_API_BASE_URL,
                 custom_headers={},
-                api_keys=account_keys,
-                retry=LlmRetryPolicy(max_retries_per_key=1),
+                api_keys=(),
+                retry=_sdk_owned_retry_policy(),
                 models=default_bindings,
             )
         else:
-            ordered_refs: list[str] = []
-            for item in existing.api_keys:
-                if item.key in account_by_ref and item.key not in ordered_refs:
-                    ordered_refs.append(item.key)
-            for account in accounts:
-                item_ref = codex_api_key_ref(account.credential_id)
-                if item_ref not in ordered_refs:
-                    ordered_refs.append(item_ref)
-            account_keys = tuple(
-                LlmApiKey(key=item_ref, name=account_by_ref[item_ref].label)
-                for item_ref in ordered_refs
-                if item_ref in account_by_ref
-            )
+            existing_by_id = {binding.id: binding for binding in existing.models}
             default_ids = {binding.id for binding in default_bindings}
+            managed_default_bindings = tuple(
+                _sdk_owned_binding(existing_by_id[binding.id])
+                if binding.id in existing_by_id
+                else binding
+                for binding in default_bindings
+            )
             custom_bindings = tuple(
-                binding for binding in existing.models if binding.id not in default_ids
+                _sdk_owned_binding(binding)
+                for binding in existing.models
+                if binding.id not in default_ids
             )
             provider = LlmProviderDefinition(
                 provider_id=existing.provider_id,
                 group=existing.group or "official",
-                api_base_url=config.codex_api_base_url,
-                custom_headers=existing.custom_headers,
-                api_keys=account_keys,
-                retry=existing.retry,
-                models=default_bindings + custom_bindings,
+                api_base_url=CODEX_DISPLAY_API_BASE_URL,
+                custom_headers={},
+                api_keys=(),
+                retry=_sdk_owned_retry_policy(),
+                models=managed_default_bindings + custom_bindings,
             )
         gateway.save_provider(LlmProviderSaveRequest.from_provider(provider))
-
-    def _refresh_account(self, account: CodexOAuthAccount) -> CodexOAuthAccount:
-        tokens = self._refresh_tokens(account.refresh_token)
-        now = _utc_now()
-        claims = _combined_claims(tokens)
-        refreshed = replace(
-            account,
-            account_id=_extract_account_id(claims) or account.account_id,
-            email=_extract_email(claims) or account.email,
-            display_name=_extract_display_name(claims) or account.display_name,
-            access_token=str(tokens.get("access_token") or account.access_token),
-            refresh_token=str(tokens.get("refresh_token") or account.refresh_token),
-            id_token=(str(tokens["id_token"]) if tokens.get("id_token") else account.id_token),
-            expires_at=int(time.time()) + int(tokens.get("expires_in") or 3600),
-            scopes=str(tokens.get("scope") or account.scopes or "openid profile email offline_access"),
-            updated_at=_iso(now),
-        )
-        self._repository.save_account(refreshed)
-        return refreshed
-
-    def _account_from_tokens(self, tokens: dict[str, Any], originator: str) -> CodexOAuthAccount:
-        now = _utc_now()
-        claims = _combined_claims(tokens)
-        credential_id = f"codex-{uuid.uuid4().hex}"
-        return CodexOAuthAccount(
-            credential_id=credential_id,
-            account_id=_extract_account_id(claims),
-            email=_extract_email(claims),
-            display_name=_extract_display_name(claims),
-            access_token=str(tokens.get("access_token") or ""),
-            refresh_token=str(tokens.get("refresh_token") or ""),
-            id_token=(str(tokens["id_token"]) if tokens.get("id_token") else None),
-            expires_at=int(time.time()) + int(tokens.get("expires_in") or 3600),
-            scopes=str(tokens.get("scope") or "openid profile email offline_access"),
-            originator=originator,
-            session_id=str(uuid.uuid4()),
-            disabled=False,
-            created_at=_iso(now),
-            updated_at=_iso(now),
+        logger.info(
+            "codex_sdk.provider.synced provider_id=%s model_count=%d api_key_count=0",
+            CODEX_PROVIDER_ID,
+            len(provider.models),
         )
 
-    def _exchange_code_for_tokens(self, code: str, redirect_uri: str, code_verifier: str) -> dict[str, Any]:
-        config = self._config()
-        return _post_form(
-            f"{config.issuer.rstrip('/')}/oauth/token",
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": config.client_id,
-                "code_verifier": code_verifier,
-            },
+    async def begin_browser_auth(self, proxy_url: str | None = None) -> Any:
+        sdk = _sdk_module()
+        proxy = _proxy_config(sdk, proxy_url)
+        started_at = time.perf_counter()
+        try:
+            result = await self.client.auth.begin_browser_pkce(
+                auth_proxy=proxy,
+                account_defaults=sdk.NewAccountDefaults(proxy=proxy),
+            )
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.oauth.browser_start_failed proxy=%s details=%s",
+                proxy_diagnostic(proxy),
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.oauth.browser_started attempt_id=%s expires_at=%s proxy=%s duration_ms=%d",
+            short_identifier(result.attempt_id),
+            result.expires_at,
+            proxy_diagnostic(proxy),
+            int((time.perf_counter() - started_at) * 1000),
         )
+        return result
 
-    def _refresh_tokens(self, refresh_token: str) -> dict[str, Any]:
-        config = self._config()
-        return _post_form(
-            f"{config.issuer.rstrip('/')}/oauth/token",
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": config.client_id,
-            },
+    async def begin_device_auth(self, proxy_url: str | None = None) -> Any:
+        sdk = _sdk_module()
+        proxy = _proxy_config(sdk, proxy_url)
+        started_at = time.perf_counter()
+        try:
+            result = await self.client.auth.begin_device_code(
+                auth_proxy=proxy,
+                account_defaults=sdk.NewAccountDefaults(proxy=proxy),
+            )
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.oauth.device_start_failed proxy=%s details=%s",
+                proxy_diagnostic(proxy),
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.oauth.device_started attempt_id=%s expires_at=%s poll_interval=%s proxy=%s duration_ms=%d",
+            short_identifier(result.attempt_id),
+            result.expires_at,
+            result.interval_seconds,
+            proxy_diagnostic(proxy),
+            int((time.perf_counter() - started_at) * 1000),
         )
+        return result
+
+    async def get_auth_attempt(self, attempt_id: str) -> Any:
+        result = await self.client.auth.get_attempt(attempt_id)
+        logger.info(
+            "codex_sdk.oauth.attempt_loaded attempt_id=%s kind=%s status=%s completed_account=%s",
+            short_identifier(attempt_id),
+            _enum_value(result.kind),
+            _enum_value(result.status),
+            short_identifier(getattr(getattr(result, "result", None), "account", None).account_id)
+            if getattr(getattr(result, "result", None), "account", None) is not None
+            else None,
+        )
+        return result
+
+    async def poll_device_auth(self, attempt_id: str) -> Any:
+        started_at = time.perf_counter()
+        try:
+            result = await self.client.auth.poll_device_code_once(attempt_id)
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.oauth.device_poll_failed attempt_id=%s details=%s",
+                short_identifier(attempt_id),
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.oauth.device_polled attempt_id=%s status=%s next_poll_at=%s account_id=%s duration_ms=%d",
+            short_identifier(attempt_id),
+            _enum_value(result.status),
+            result.next_poll_at,
+            short_identifier(getattr(getattr(result.auth_result, "account", None), "account_id", None)),
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return result
+
+    async def complete_browser_callback(self, attempt_id: str, callback_url: str) -> Any:
+        started_at = time.perf_counter()
+        try:
+            result = await self.client.auth.complete_browser_callback_url(attempt_id, callback_url)
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.oauth.browser_callback_failed attempt_id=%s callback_origin=%s details=%s",
+                short_identifier(attempt_id),
+                _callback_origin(callback_url),
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.oauth.browser_completed attempt_id=%s account_id=%s created=%s duration_ms=%d",
+            short_identifier(attempt_id),
+            short_identifier(result.account.account_id),
+            result.created,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return result
+
+    async def cancel_auth_attempt(self, attempt_id: str) -> Any:
+        result = await self.client.auth.cancel_attempt(attempt_id)
+        logger.info(
+            "codex_sdk.oauth.cancelled attempt_id=%s kind=%s status=%s",
+            short_identifier(attempt_id),
+            _enum_value(result.kind),
+            _enum_value(result.status),
+        )
+        return result
+
+    async def list_accounts(self, *, include_disabled: bool = True) -> list[Any]:
+        accounts = await self.client.accounts.list(include_disabled=include_disabled)
+        logger.info(
+            "codex_sdk.accounts.listed count=%d include_disabled=%s health=%s",
+            len(accounts),
+            include_disabled,
+            _health_counts(accounts),
+        )
+        return accounts
+
+    async def get_account(self, account_id: str) -> Any:
+        account = await self.client.accounts.get(account_id)
+        logger.info(
+            "codex_sdk.account.loaded account_id=%s enabled=%s health=%s version=%s proxy=%s",
+            short_identifier(account_id),
+            account.enabled,
+            _enum_value(account.status.health),
+            account.version,
+            proxy_diagnostic(account.proxy),
+        )
+        return account
+
+    async def update_account(
+        self,
+        account_id: str,
+        *,
+        alias_present: bool = False,
+        alias: str | None = None,
+        priority_present: bool = False,
+        priority: int | None = None,
+        proxy_present: bool = False,
+        proxy_url: str | None = None,
+        expected_version: int | None = None,
+    ) -> Any:
+        sdk = _sdk_module()
+        patch_kwargs: dict[str, Any] = {}
+        changed_fields: list[str] = []
+        if alias_present:
+            patch_kwargs["alias"] = alias
+            changed_fields.append("alias")
+        if priority_present:
+            if priority is None:
+                raise ValueError("priority 不能为 null。")
+            patch_kwargs["priority"] = priority
+            changed_fields.append("priority")
+        if proxy_present:
+            patch_kwargs["proxy"] = _proxy_config(sdk, proxy_url)
+            changed_fields.append("proxy")
+        try:
+            account = await self.client.accounts.update(
+                account_id,
+                sdk.AccountPatch(**patch_kwargs),
+                expected_version=expected_version,
+            )
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.account.update_failed account_id=%s expected_version=%s fields=%s proxy=%s details=%s",
+                short_identifier(account_id),
+                expected_version,
+                changed_fields,
+                proxy_diagnostic(patch_kwargs.get("proxy")) if proxy_present else {"proxy_unchanged": True},
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.account.updated account_id=%s version=%s fields=%s enabled=%s health=%s proxy=%s",
+            short_identifier(account_id),
+            account.version,
+            changed_fields,
+            account.enabled,
+            _enum_value(account.status.health),
+            proxy_diagnostic(account.proxy),
+        )
+        return account
+
+    async def reorder_accounts(
+        self,
+        account_ids: Sequence[str],
+        *,
+        expected_versions: Mapping[str, int] | None = None,
+    ) -> list[Any]:
+        accounts = await self.client.accounts.reorder(account_ids, expected_versions=expected_versions)
+        logger.info(
+            "codex_sdk.accounts.reordered account_ids=%s versions_checked=%s",
+            [short_identifier(item) for item in account_ids],
+            bool(expected_versions),
+        )
+        return accounts
+
+    async def enable_account(self, account_id: str) -> Any:
+        account = await self.client.accounts.enable(account_id)
+        logger.info(
+            "codex_sdk.account.enabled account_id=%s version=%s health=%s",
+            short_identifier(account_id),
+            account.version,
+            _enum_value(account.status.health),
+        )
+        return account
+
+    async def disable_account(self, account_id: str, *, force: bool = False) -> Any:
+        result = await self.client.accounts.disable(account_id, force=force)
+        _log_operation("disable", result)
+        return result
+
+    async def recover_account(self, account_id: str) -> Any:
+        started_at = time.perf_counter()
+        result = await self.client.accounts.recover(account_id)
+        logger.info(
+            "codex_sdk.account.recovered account_id=%s recovered=%s health=%s checks=%s duration_ms=%d",
+            short_identifier(account_id),
+            result.recovered,
+            _enum_value(result.account.status.health),
+            [{"kind": _enum_value(check.kind), "passed": check.passed, "error_code": getattr(check.error, "code", None)} for check in result.checks],
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return result
+
+    async def delete_account(self, account_id: str, *, force: bool = False) -> Any:
+        result = await self.client.accounts.delete(account_id, force=force)
+        _log_operation("delete", result)
+        return result
+
+    async def get_operation(self, operation_id: str) -> Any:
+        result = await self.client.operations.get(operation_id)
+        _log_operation("get", result)
+        return result
+
+    async def wait_operation(self, operation_id: str, *, timeout_seconds: float) -> Any:
+        result = await self.client.operations.wait(operation_id, timeout=timeout_seconds)
+        _log_operation("wait", result)
+        return result
+
+    async def get_cached_quota(self, account_id: str) -> Any | None:
+        snapshot = await self.client.quotas.get_cached(account_id)
+        logger.info(
+            "codex_sdk.quota.cached account_id=%s present=%s",
+            short_identifier(account_id),
+            snapshot is not None,
+        )
+        return snapshot
+
+    async def refresh_quota(self, account_id: str) -> Any:
+        started_at = time.perf_counter()
+        try:
+            snapshot = await self.client.quotas.refresh(account_id)
+        except Exception as exc:
+            logger.error(
+                "codex_sdk.quota.refresh_failed account_id=%s details=%s",
+                short_identifier(account_id),
+                sdk_error_diagnostic(exc),
+            )
+            raise
+        logger.info(
+            "codex_sdk.quota.refreshed account_id=%s source=%s five_hour=%s weekly=%s duration_ms=%d",
+            short_identifier(account_id),
+            snapshot.source,
+            _quota_window_diagnostic(snapshot.five_hour),
+            _quota_window_diagnostic(snapshot.weekly),
+            int((time.perf_counter() - started_at) * 1000),
+        )
+        return snapshot
+
+    async def get_routing_strategy(self) -> Any:
+        strategy = await self.client.accounts.get_routing_strategy()
+        logger.info("codex_sdk.routing.loaded strategy=%s", _enum_value(strategy))
+        return strategy
+
+    async def set_routing_strategy(self, strategy: str) -> Any:
+        sdk = _sdk_module()
+        updated = await self.client.accounts.set_routing_strategy(sdk.RoutingStrategy(strategy))
+        logger.info("codex_sdk.routing.updated strategy=%s", _enum_value(updated))
+        return updated
+
+    async def delete_session_binding(self, conversation_id: str) -> bool:
+        deleted = await self.client.sessions.delete_binding(conversation_id)
+        logger.info(
+            "codex_sdk.session.binding_deleted session_fingerprint=%s deleted=%s",
+            stable_fingerprint(conversation_id),
+            deleted,
+        )
+        return deleted
 
     def _config(self) -> CodexOAuthConfig:
         return self._config_accessor()
+
+
+def _sdk_module() -> Any:
+    try:
+        import louyi_codex
+    except ImportError:
+        raise CodexOAuthError(
+            "未安装 louyi-codex SDK。请先从当前 SDK 源码构建并安装 wheel。"
+        ) from None
+    return louyi_codex
+
+
+def _proxy_config(sdk: Any, proxy_url: str | None) -> Any | None:
+    from urllib.parse import urlsplit
+    text = (proxy_url or "").strip()
+    if not text:
+        return None
+    try:
+        urlsplit(text).port
+    except ValueError:
+        raise ValueError("proxy_url 端口无效。") from None
+    return sdk.ProxyConfig(text)
 
 
 def _default_model_metadata(model_id: str) -> LlmModelMetadata:
@@ -324,6 +526,7 @@ def _default_model_metadata(model_id: str) -> LlmModelMetadata:
 
 
 def _default_binding(model_id: str) -> LlmProviderModelBinding:
+    import json
     return LlmProviderModelBinding(
         id=model_id,
         model_id=model_id,
@@ -338,117 +541,84 @@ def _default_binding(model_id: str) -> LlmProviderModelBinding:
     )
 
 
-def _post_form(url: str, form: dict[str, str]) -> dict[str, Any]:
-    payload = urllib.parse.urlencode(form).encode("utf-8")
-    request = urllib.request.Request(
-        url=url,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
+def _sdk_owned_retry_policy() -> LlmRetryPolicy:
+    return LlmRetryPolicy(
+        max_retries_per_key=0,
+        initial_delay_seconds=0,
+        max_delay_seconds=0,
+        retryable_status_codes=(),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            text = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise CodexOAuthError(f"Codex OAuth HTTP {exc.code}: {body[:500]}") from exc
-    except Exception as exc:
-        raise CodexOAuthError(f"Codex OAuth 请求失败: {exc.__class__.__name__}: {exc}") from exc
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise CodexOAuthError("Codex OAuth token 响应不是合法 JSON。") from exc
-    if not isinstance(data, dict):
-        raise CodexOAuthError("Codex OAuth token 响应结构无效。")
-    if not data.get("access_token"):
-        raise CodexOAuthError("Codex OAuth token 响应缺少 access_token。")
-    if form.get("grant_type") == "authorization_code" and not data.get("refresh_token"):
-        raise CodexOAuthError("Codex OAuth token 响应缺少 refresh_token。")
-    return data
 
 
-def _combined_claims(tokens: dict[str, Any]) -> dict[str, Any]:
-    claims: dict[str, Any] = {}
-    for key in ("id_token", "access_token"):
-        token = tokens.get(key)
-        if isinstance(token, str):
-            parsed = _parse_jwt_claims(token)
-            if parsed:
-                claims.update(parsed)
-    return claims
+def _sdk_owned_binding(binding: LlmProviderModelBinding) -> LlmProviderModelBinding:
+    return LlmProviderModelBinding(
+        id=binding.id,
+        model_id=binding.model_id,
+        model_alias=binding.model_alias,
+        api_format=API_FORMAT_CODEX_RESPONSES,
+        tool_choice=binding.tool_choice,
+        thinking=binding.thinking,
+        custom_request_params=binding.custom_request_params,
+        api_base_url=None,
+        custom_headers={},
+        api_keys=(),
+    )
 
 
-def _parse_jwt_claims(token: str) -> dict[str, Any] | None:
-    parts = token.split(".")
-    if len(parts) != 3:
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _health_counts(accounts: Sequence[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for account in accounts:
+        health = str(_enum_value(account.status.health))
+        counts[health] = counts.get(health, 0) + 1
+    return counts
+
+
+def _quota_window_diagnostic(window: Any | None) -> dict[str, Any] | None:
+    if window is None:
         return None
-    payload = parts[1]
-    padding = "=" * (-len(payload) % 4)
+    return {
+        "used_percent": window.used_percent,
+        "remaining_percent": window.remaining_percent,
+        "resets_at": window.resets_at,
+        "exhausted": window.exhausted,
+    }
+
+
+def _log_operation(action: str, result: Any) -> None:
+    logger.info(
+        "codex_sdk.account.operation action=%s operation_id=%s account_id=%s kind=%s status=%s force=%s remaining_active_requests=%s error_code=%s",
+        action,
+        short_identifier(result.operation_id),
+        short_identifier(result.account_id),
+        _enum_value(result.kind),
+        _enum_value(result.status),
+        result.force,
+        result.remaining_active_requests,
+        getattr(result.error, "code", None),
+    )
+
+
+def _safe_service_failure_message(operation: str, error: BaseException) -> str:
+    code = getattr(error, "code", None) or error.__class__.__name__
+    status = getattr(error, "http_status", None)
+    return f"louyi-codex {operation} failed code={code} http_status={status!r}"
+
+
+def _callback_origin(callback_url: str) -> str | None:
+    from urllib.parse import urlsplit
     try:
-        decoded = base64.urlsafe_b64decode((payload + padding).encode("ascii"))
-        data = json.loads(decoded.decode("utf-8"))
-    except Exception:
+        parsed = urlsplit(callback_url)
+    except ValueError:
         return None
-    return data if isinstance(data, dict) else None
-
-
-def _extract_account_id(claims: dict[str, Any]) -> str | None:
-    direct = claims.get("chatgpt_account_id")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-    auth_claims = claims.get("https://api.openai.com/auth")
-    if isinstance(auth_claims, dict):
-        nested = auth_claims.get("chatgpt_account_id")
-        if isinstance(nested, str) and nested.strip():
-            return nested.strip()
-    organizations = claims.get("organizations")
-    if isinstance(organizations, list) and organizations:
-        first = organizations[0]
-        if isinstance(first, dict):
-            org_id = first.get("id")
-            if isinstance(org_id, str) and org_id.strip():
-                return org_id.strip()
-    return None
-
-
-def _extract_email(claims: dict[str, Any]) -> str | None:
-    value = claims.get("email")
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _extract_display_name(claims: dict[str, Any]) -> str | None:
-    value = claims.get("name") or claims.get("preferred_username")
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _generate_code_verifier() -> str:
-    return _base64_url(secrets.token_bytes(32))
-
-
-def _code_challenge(verifier: str) -> str:
-    return _base64_url(hashlib.sha256(verifier.encode("ascii")).digest())
-
-
-def _generate_state() -> str:
-    return _base64_url(secrets.token_bytes(32))
-
-
-def _base64_url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
-
-
-def _normalize_callback_path(value: str) -> str:
-    text = value.strip().replace("\\", "/") or "/auth/callback"
-    return text if text.startswith("/") else f"/{text}"
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso(value: datetime) -> str:
-    return value.isoformat()
-
-
-def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        return None
+    port = f":{parsed_port}" if parsed_port is not None else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}{parsed.path}"

@@ -6,8 +6,6 @@ import asyncio
 import copy
 import inspect
 import json
-import platform
-import sys
 import time
 import urllib.parse
 from dataclasses import asdict, is_dataclass
@@ -19,10 +17,8 @@ from agent_runtime.conversation_message.message.claude_protocol import ClaudeRen
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiRenderResult
 from agent_runtime.conversation_message.message.openai_chat_protocol import OpenAIChatRenderResult
 from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
-from agent_runtime.codex_oauth.service import CodexOAuthService
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
-    API_FORMAT_CODEX_RESPONSES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
@@ -37,7 +33,6 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 StreamEventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 CancellationChecker = Callable[[], bool]
-_DEFAULT_USER_AGENT = "mindloop.ai"
 _DEFAULT_LLM_HTTP_TIMEOUT_SECONDS = 300.0
 _DEFAULT_LLM_HTTP_CONNECT_TIMEOUT_SECONDS = 30.0
 
@@ -117,77 +112,6 @@ class OpenAIResponsesProtocolClient:
         headers = _json_headers(resolved_model.custom_headers)
         if api_key:
             headers.setdefault("Authorization", f"Bearer {api_key}")
-        return await _post_json(
-            url,
-            headers,
-            body,
-            sse_aggregator=_aggregate_openai_responses_sse,
-            stream_event_handler=stream_event_handler,
-            http_trace_service=http_trace_service,
-            http_trace_context=http_trace_context,
-            cancellation_checker=cancellation_checker,
-        )
-
-
-class CodexResponsesProtocolClient:
-    def __init__(self, oauth_service: CodexOAuthService) -> None:
-        self._oauth_service = oauth_service
-
-    @property
-    def api_format(self) -> str:
-        return API_FORMAT_CODEX_RESPONSES
-
-    async def request(
-        self,
-        *,
-        resolved_model: ResolvedLlmProviderModel,
-        rendered_messages: Any,
-        system_prompt: str | None,
-        tools: tuple[dict[str, Any], ...],
-        request_params: dict[str, Any],
-        api_key: str | None,
-        stream_event_handler: StreamEventHandler | None = None,
-        http_trace_service: LlmHttpTraceService | None = None,
-        http_trace_context: LlmHttpTraceContext | None = None,
-        cancellation_checker: CancellationChecker | None = None,
-    ) -> Any:
-        if not isinstance(rendered_messages, OpenAIRenderResult):
-            raise TypeError("codex_responses 渲染结果类型不正确。")
-        token = self._oauth_service.resolve_api_key_ref(api_key)
-        codex_model, codex_fast_mode = _codex_model_request_name(resolved_model.model_alias)
-        body: dict[str, Any] = {
-            "model": codex_model,
-            "input": rendered_messages.input,
-            "include": rendered_messages.include,
-            **request_params,
-        }
-        body_model, body_fast_mode = _codex_model_request_name(str(body.get("model") or codex_model))
-        body["model"] = body_model
-        codex_fast_mode = codex_fast_mode or body_fast_mode
-        body["store"] = False
-        body["include"] = _ensure_include_item(body.get("include"), "reasoning.encrypted_content")
-        if system_prompt:
-            body.setdefault("instructions", system_prompt)
-        body.pop("previous_response_id", None)
-        body.pop("max_output_tokens", None)
-        if codex_fast_mode:
-            body["service_tier"] = "priority"
-        if rendered_messages.prompt_cache_key:
-            body["prompt_cache_key"] = rendered_messages.prompt_cache_key
-        if tools:
-            body.setdefault("tools", list(tools))
-            body.setdefault("parallel_tool_calls", True)
-        url = _join_url(resolved_model.api_base_url, "responses")
-        headers = _json_headers(resolved_model.custom_headers)
-        codex_session_id = _header_value(headers, "x-relay-session-id") or token.session_id
-        if not _has_header(resolved_model.custom_headers, "User-Agent"):
-            headers["User-Agent"] = _codex_user_agent(token.user_agent)
-        headers["Authorization"] = f"Bearer {token.access_token}"
-        if token.account_id:
-            headers["ChatGPT-Account-Id"] = token.account_id
-        headers["originator"] = token.originator
-        headers["session_id"] = codex_session_id
-        headers["x-session-affinity"] = codex_session_id
         return await _post_json(
             url,
             headers,
@@ -491,23 +415,6 @@ def _header_value(headers: dict[str, str], name: str) -> str | None:
         if key.lower() == name.lower():
             return value
     return None
-
-
-def _codex_user_agent(product: str) -> str:
-    product_name = (product or _DEFAULT_USER_AGENT).strip() or _DEFAULT_USER_AGENT
-    if "/" in product_name:
-        prefix = product_name
-    else:
-        prefix = f"{product_name}/local"
-    return f"{prefix} ({sys.platform} {platform.release()}; {platform.machine()})"
-
-
-def _codex_model_request_name(model_alias: str) -> tuple[str, bool]:
-    if model_alias.endswith("-fast"):
-        base_model = model_alias[:-5]
-        if base_model:
-            return base_model, True
-    return model_alias, False
 
 
 def _join_url(base_url: str, path: str) -> str:

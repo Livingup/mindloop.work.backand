@@ -8,8 +8,12 @@ from typing import Any
 
 from agent_runtime.conversation_message.message.models import TextPart, TextPartMeta
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
-from agent_runtime.llm_client.llm_request_service import LlmRequestService
+from agent_runtime.llm_client.llm_request_service import (
+    LlmProviderModelServiceUnavailable,
+    LlmRequestService,
+ )
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
 from agent_runtime.web_tools.adapters import (
@@ -159,6 +163,11 @@ class WebToolsService:
                 return await self._execute_single(operation, item)
 
         outputs = await asyncio.gather(*(run_one(item) for item in requests), return_exceptions=True)
+        for output in outputs:
+            if isinstance(output, (LlmRequestCancelled, asyncio.CancelledError)) or bool(
+                getattr(output, "partial_output", False)
+            ):
+                raise output
         return _merge_batch_results(operation, batch_request, requests, outputs)
 
     async def _execute_single(
@@ -212,6 +221,10 @@ class WebToolsService:
                     api_key_index=response.api_key_index,
                 )
             except Exception as exc:
+                if isinstance(exc, LlmRequestCancelled) or bool(getattr(exc, "partial_output", False)):
+                    raise
+                if not isinstance(exc, LlmProviderModelServiceUnavailable):
+                    raise
                 last_error = exc
                 continue
         if last_error is not None:

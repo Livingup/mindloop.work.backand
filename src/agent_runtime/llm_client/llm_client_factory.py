@@ -10,9 +10,9 @@ from agent_runtime.conversation_message.south_gateway.resource_resolver.contract
 )
 from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
 from agent_runtime.codex_oauth.factory import CodexOAuthFactory
+from agent_runtime.llm_client.codex_sdk_protocol_client import CodexResponsesProtocolClient
 from agent_runtime.llm_client.llm_protocol_clients import (
     AnthropicMessagesProtocolClient,
-    CodexResponsesProtocolClient,
     GeminiGenerateContentProtocolClient,
     OpenAIChatCompletionsProtocolClient,
     OpenAIResponsesProtocolClient,
@@ -46,7 +46,7 @@ class LlmClientFactory:
     """通用 LLM 请求客户端工厂。
 
     工厂装配当前已支持的 API 协议客户端：OpenAI Responses、OpenAI Chat Completions、
-    Anthropic Messages、Gemini generateContent、智谱 Chat Completions。
+    louyi-codex Responses、Anthropic Messages、Gemini generateContent、智谱 Chat Completions。
     """
 
     @staticmethod
