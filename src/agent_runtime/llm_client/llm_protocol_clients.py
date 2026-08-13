@@ -33,6 +33,7 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 
 StreamEventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 CancellationChecker = Callable[[], bool]
+_DEFAULT_USER_AGENT = "mindloop.ai"
 _DEFAULT_LLM_HTTP_TIMEOUT_SECONDS = 300.0
 _DEFAULT_LLM_HTTP_CONNECT_TIMEOUT_SECONDS = 30.0
 

@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import replace
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,7 @@ from agent_runtime.conversation_message.message.operations import (
     render_messages,
 )
 from agent_runtime.conversation_message.message.models import ThinkingPart, ToolUsePart
+from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
 from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
@@ -101,6 +103,58 @@ class LlmRequestService:
         self._event_publisher = event_publisher or NoopRuntimeEventPublisher()
 
         self._http_trace_service = http_trace_service
+
+    async def request_standard_responses(
+        self,
+        *,
+        resolved_model: Any,
+        conversation_id: str,
+        input_items: list[Any],
+        system_prompt: str | None,
+        tools: tuple[dict[str, Any], ...],
+        request_params: dict[str, Any],
+        api_key: str | None,
+    ) -> Any:
+        """Dispatch a raw standard Responses request through the configured protocol client."""
+        resolved = resolved_model
+        if resolved.api_format not in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
+            raise ValueError(
+                "Standard Responses dispatch only supports "
+                f"{API_FORMAT_OPENAI_RESPONSES} or {API_FORMAT_CODEX_RESPONSES}; "
+                f"received {resolved.api_format}."
+            )
+        if resolved.api_format == API_FORMAT_CODEX_RESPONSES and resolved.provider_id != CODEX_PROVIDER_ID:
+            raise ValueError(
+                f"api_format={API_FORMAT_CODEX_RESPONSES} 仅保留给托管 Provider {CODEX_PROVIDER_ID}。"
+            )
+        client = self._protocol_clients.get(resolved.api_format)
+        if client is None:
+            raise ValueError(
+                f"当前 LLM 请求客户端不支持 api_format={resolved.api_format}。"
+            )
+        owns_credentials_and_retries = bool(
+            getattr(client, "owns_credentials_and_retries", False)
+        )
+        if not owns_credentials_and_retries:
+            headers = dict(resolved.custom_headers)
+            if not any(key.lower() == "x-relay-session-id" for key in headers):
+                headers["x-relay-session-id"] = conversation_id
+            resolved = replace(resolved, custom_headers=headers)
+        client_request_kwargs: dict[str, Any] = {
+            "resolved_model": resolved,
+            "rendered_messages": OpenAIRenderResult(
+                input=copy.deepcopy(input_items),
+                prompt_cache_key=conversation_id,
+            ),
+            "system_prompt": system_prompt,
+            "tools": tools,
+            "request_params": dict(request_params),
+            "api_key": None if owns_credentials_and_retries else api_key,
+            "http_trace_service": self._http_trace_service,
+        }
+        if owns_credentials_and_retries:
+            client_request_kwargs["conversation_id"] = conversation_id
+        return await client.request(**client_request_kwargs)
 
     async def send_prompt(self, request: LlmPromptRequest) -> LlmPromptResponse:
         """发送一次 LLM 请求，并把 assistant 响应追加到 Conversation。"""
@@ -430,6 +484,13 @@ class LlmRequestService:
                         "duration_ms": int((time.perf_counter() - request_attempt_started_at) * 1000),
                         **retry_target,
                     }
+                    diagnostic = _explicit_error_diagnostic(
+                        service_error,
+                        provider_id=resolved.provider_id,
+                        api_format=resolved.api_format,
+                    )
+                    if diagnostic is not None:
+                        failed_payload["diagnostic"] = diagnostic
                     await self._event_publisher.publish(
                         request.communication_context,
                         "llm.request.failed",
@@ -476,17 +537,25 @@ class LlmRequestService:
                     )
         if last_error is not None:
             if request.next_resolved_model is None:
+                call_failed_payload = {
+                    "llm_call_id": llm_call_id,
+                    "candidate_index": request.candidate_index,
+                    "attempt_count": attempt_count,
+                    "error_type": last_error.__class__.__name__,
+                    "error_message": str(last_error),
+                    "duration_ms": int((time.perf_counter() - call_started_at) * 1000),
+                }
+                diagnostic = _explicit_error_diagnostic(
+                    last_error,
+                    provider_id=resolved.provider_id,
+                    api_format=resolved.api_format,
+                )
+                if diagnostic is not None:
+                    call_failed_payload["diagnostic"] = diagnostic
                 await self._event_publisher.publish(
                     request.communication_context,
                     "llm.call.failed",
-                    {
-                        "llm_call_id": llm_call_id,
-                        "candidate_index": request.candidate_index,
-                        "attempt_count": attempt_count,
-                        "error_type": last_error.__class__.__name__,
-                        "error_message": str(last_error),
-                        "duration_ms": int((time.perf_counter() - call_started_at) * 1000),
-                    },
+                    call_failed_payload,
                     source="llm_client",
                     metadata={"conversation_id": request.conversation.id},
                 )
@@ -511,6 +580,12 @@ class LlmProviderModelServiceUnavailable(RuntimeError):
         self.binding_id = binding_id
         self.attempt_count = attempt_count
         self.cause = cause
+        diagnostic = _explicit_error_diagnostic(
+            cause,
+            provider_id=provider_id,
+        )
+        if diagnostic is not None:
+            self.diagnostic = diagnostic
         super().__init__(
             f"LLM 服务商模型调用未成功响应: provider={provider_id}, binding={binding_id}, "
             f"attempt_count={attempt_count}, cause={cause.__class__.__name__}: {cause}"
@@ -927,6 +1002,30 @@ def _as_llm_service_failure(exc: Exception) -> Exception:
     )
     service_error.__cause__ = exc
     return service_error
+
+
+def _explicit_error_diagnostic(
+    exc: BaseException,
+    *,
+    provider_id: str,
+    api_format: str | None = None,
+) -> dict[str, Any] | None:
+    if provider_id != CODEX_PROVIDER_ID:
+        return None
+    if api_format is not None and api_format != API_FORMAT_CODEX_RESPONSES:
+        return None
+    from agent_runtime.codex_oauth.diagnostics import sdk_error_projection
+    from agent_runtime.llm_client.codex_sdk_protocol_client import CodexSdkResponseError
+
+    if not isinstance(exc, CodexSdkResponseError):
+        return None
+    if not isinstance(getattr(exc, "diagnostic", None), Mapping):
+        return None
+    return sdk_error_projection(
+        exc,
+        stage="responses_request",
+        partial_output=bool(getattr(exc, "partial_output", False)),
+    )
 
 
 async def _await_client_request(

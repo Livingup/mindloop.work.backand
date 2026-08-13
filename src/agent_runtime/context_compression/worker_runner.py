@@ -23,11 +23,25 @@ from agent_runtime.context_compression.models import (
 )
 from agent_runtime.context_compression.summary_tools import ContextSummaryToolExecutor
 from agent_runtime.context_compression.worker_input import ContextCompressionWorkerInput
-from agent_runtime.conversation_message.message.models import Conversation, ROLE_TOOL, TextPart, TextPartMeta, ToolUsePart, UniMessage
+from agent_runtime.conversation_message.message.models import (
+    Conversation,
+    ROLE_TOOL,
+    TextPart,
+    TextPartMeta,
+    ToolResultPart,
+    ToolUsePart,
+    UniMessage,
+ )
 from agent_runtime.conversation_message.message.operations import create_conversation
+from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
+from agent_runtime.input_modality import (
+    INPUT_MODALITY_IMAGE,
+    INPUT_MODALITY_PDF,
+    INPUT_MODALITY_TEXT,
+ )
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
-from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
+from agent_runtime.llm_client.llm_request_models import LlmPromptRequest, LlmToolDefinition
 from agent_runtime.llm_client.llm_request_service import LlmProviderModelServiceUnavailable, LlmRequestService
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
@@ -68,13 +82,59 @@ class ContextCompressionWorkerRunner:
         interrupt_checker: Callable[[], bool] | None = None,
         request_canceller_observer: Callable[[Callable[[], None]], Callable[[], None] | None] | None = None,
     ) -> None:
-        last_error: Exception | None = None
-        skipped_tool_calling = False
+        required_modalities = _required_input_modalities(worker_input)
+        eligible_candidates: list[tuple[int, ResolvedLlmProviderModel, tuple[LlmToolDefinition, ...]]] = []
+        candidate_rejections: list[str] = []
         for candidate_index, resolved_model in enumerate(resolved_candidates):
-            if not resolved_model.supports_tool_calling:
-                skipped_tool_calling = True
+            rejection_reasons = list(
+                _candidate_capability_rejections(
+                    resolved_model,
+                    required_modalities=required_modalities,
+                )
+            )
+            summary_tools: tuple[LlmToolDefinition, ...] = ()
+            if not rejection_reasons:
+                try:
+                    summary_tools = self._summary_tools.build_tools(
+                        resolved_model.api_format,
+                        allowed_tool_names=allowed_tool_names,
+                    )
+                except ValueError:
+                    rejection_reasons.append(
+                        f"unsupported_summary_tool_schema={resolved_model.api_format}"
+                    )
+                if not summary_tools and not rejection_reasons:
+                    rejection_reasons.append("no_allowed_summary_tools")
+            if rejection_reasons:
+                rejection = ",".join(rejection_reasons)
+                candidate_rejections.append(f"candidate-{candidate_index}[{rejection}]")
+                logger.info(
+                    "Context compression candidate skipped: worker=%s candidate_index=%d provider_id=%s binding_id=%s model_id=%s reasons=%s",
+                    worker_name,
+                    candidate_index,
+                    resolved_model.provider_id,
+                    resolved_model.binding_id,
+                    resolved_model.model_id,
+                    rejection,
+                )
                 continue
-            next_resolved_model = _next_tool_calling_candidate(resolved_candidates, candidate_index)
+            eligible_candidates.append((candidate_index, resolved_model, summary_tools))
+
+        if not eligible_candidates:
+            required = ",".join(required_modalities)
+            rejections = ";".join(candidate_rejections) or "no_candidates"
+            raise RuntimeError(
+                "上下文压缩流水线没有满足 Worker 工具协议和输入模态能力的可用候选: "
+                f"required_input_modalities={required}; candidate_rejections={rejections}"
+            )
+
+        last_error: Exception | None = None
+        for eligible_index, (_candidate_index, resolved_model, summary_tools) in enumerate(eligible_candidates):
+            next_resolved_model = (
+                eligible_candidates[eligible_index + 1][1]
+                if eligible_index + 1 < len(eligible_candidates)
+                else None
+            )
             try:
                 await self._run_worker_with_model(
                     job=job,
@@ -86,6 +146,7 @@ class ContextCompressionWorkerRunner:
                     worker_input=worker_input,
                     resolved_model=resolved_model,
                     next_resolved_model=next_resolved_model,
+                    summary_tools=summary_tools,
                     max_rounds=max_rounds,
                     communication_context=communication_context,
                     allowed_tool_names=allowed_tool_names,
@@ -105,9 +166,7 @@ class ContextCompressionWorkerRunner:
                     raise
         if last_error is not None:
             raise last_error
-        if skipped_tool_calling:
-            raise RuntimeError("上下文压缩流水线绑定的 LLM 执行策略组没有支持 tool calling 的可用候选。")
-        raise RuntimeError("上下文压缩流水线绑定的 LLM 执行策略组没有可用候选。")
+        raise RuntimeError("上下文压缩流水线没有可用候选。")
 
     async def _run_worker_with_model(
         self,
@@ -121,6 +180,7 @@ class ContextCompressionWorkerRunner:
         worker_input: ContextCompressionWorkerInput,
         resolved_model: ResolvedLlmProviderModel,
         next_resolved_model: ResolvedLlmProviderModel | None,
+        summary_tools: tuple[LlmToolDefinition, ...],
         max_rounds: int,
         communication_context: RuntimeCommunicationContext | None,
         allowed_tool_names: set[str] | None,
@@ -203,10 +263,7 @@ class ContextCompressionWorkerRunner:
                         conversation=conversation,
                         resolved_model=resolved_model,
                         system_prompt=system_prompt,
-                        tools=self._summary_tools.build_tools(
-                            resolved_model.api_format,
-                            allowed_tool_names=allowed_tool_names,
-                        ),
+                        tools=summary_tools,
                         render_options=_worker_render_options(resolved_model, worker_input),
                         communication_context=None,
                         next_resolved_model=next_resolved_model,
@@ -558,14 +615,46 @@ def _assistant_text(message: UniMessage) -> str:
     return "\n".join(part.text for part in message.content if isinstance(part, TextPart)).strip()
 
 
-def _next_tool_calling_candidate(
-    candidates: tuple[ResolvedLlmProviderModel, ...],
-    current_index: int,
-) -> ResolvedLlmProviderModel | None:
-    for candidate in candidates[current_index + 1:]:
-        if candidate.supports_tool_calling:
-            return candidate
-    return None
+def _required_input_modalities(
+    worker_input: ContextCompressionWorkerInput,
+) -> tuple[str, ...]:
+    required = {INPUT_MODALITY_TEXT}
+    for message in worker_input.history_messages:
+        for part in message.content:
+            kind = str(getattr(part, "kind", ""))
+            if kind in {INPUT_MODALITY_TEXT, INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF}:
+                required.add(kind)
+            if not isinstance(part, ToolResultPart):
+                continue
+            for output_part in normalize_tool_result_output(part.output):
+                output_kind = str(output_part.get("kind") or "")
+                if output_kind in {INPUT_MODALITY_TEXT, INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF}:
+                    required.add(output_kind)
+    return tuple(
+        modality
+        for modality in (INPUT_MODALITY_TEXT, INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF)
+        if modality in required
+    )
+
+
+def _candidate_capability_rejections(
+    resolved_model: ResolvedLlmProviderModel,
+    *,
+    required_modalities: tuple[str, ...],
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if not resolved_model.supports_tool_calling:
+        reasons.append("tool_calling_not_supported")
+    supported_modalities = {
+        str(modality).strip().lower()
+        for modality in resolved_model.supported_input_modalities
+    }
+    missing_modalities = [
+        modality for modality in required_modalities if modality not in supported_modalities
+    ]
+    if missing_modalities:
+        reasons.append("missing_input_modalities=" + "+".join(missing_modalities))
+    return tuple(reasons)
 
 
 def _activity_from_llm_event(event_type: str, payload: dict[str, Any]) -> tuple[str, str] | None:

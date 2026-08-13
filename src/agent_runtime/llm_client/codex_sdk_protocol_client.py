@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 import time
 from contextlib import suppress
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from agent_runtime.codex_oauth.diagnostics import (
-    sdk_error_diagnostic,
+    safe_sdk_error_message,
+    sdk_error_projection,
     short_identifier,
     stable_fingerprint,
  )
@@ -25,6 +25,7 @@ from agent_runtime.llm_client.llm_protocol_clients import (
     LlmRequestCancelled,
     StreamEventHandler,
  )
+from agent_runtime.llm_http_trace.codex_sdk import CodexSdkHttpTraceSink
 from agent_runtime.llm_http_trace.models import LlmHttpTraceContext
 from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
@@ -33,44 +34,78 @@ from agent_runtime.llm_model_registry.llm_model_registry_service import (
 
 logger = logging.getLogger("agent_runtime.codex_sdk")
 
-_SUPPORTED_STANDARD_PARAMS = frozenset({
-    "metadata",
-    "top_logprobs",
-    "temperature",
-    "top_p",
-    "user",
-    "safety_identifier",
-    "prompt_cache_key",
-    "service_tier",
-    "prompt_cache_retention",
-    "prompt_cache_options",
-    "background",
-    "max_tool_calls",
-    "text",
-    "tools",
-    "tool_choice",
-    "prompt",
-    "truncation",
-    "reasoning",
-    "include",
-    "parallel_tool_calls",
-    "store",
-    "instructions",
-    "moderation",
-    "stream_options",
-    "conversation",
-    "context_management",
- })
+_RUNTIME_OWNED_OR_PRIVATE_PARAMS = frozenset({
+    "request_options",
+    "extra_body",
+    "account",
+    "account_id",
+    "accounts",
+    "account_ids",
+    "account_list",
+    "account_pool",
+    "candidate",
+    "candidates",
+    "route",
+    "route_id",
+    "routing",
+    "routing_strategy",
+    "proxy",
+    "proxy_url",
+    "proxy_config",
+    "auth_proxy",
+    "auth_proxy_url",
+    "account_defaults",
+    "authorization",
+    "authorization_header",
+    "chatgpt_account",
+    "chatgpt_account_id",
+    "headers",
+    "header",
+    "custom_headers",
+    "request_headers",
+    "http_headers",
+    "private_headers",
+    "private_request_headers",
+    "body",
+    "request_body",
+    "private_body",
+    "private_request_body",
+    "api_key",
+    "api_keys",
+    "access_token",
+    "refresh_token",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "client_metadata",
+})
 
 
 class CodexSdkResponseError(LlmProviderResponseError):
-    def __init__(self, message: str, *, sdk_error: BaseException | None = None, partial_output: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        sdk_error: BaseException | None = None,
+        partial_output: bool = False,
+        stage: str = "responses_request",
+        code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.sdk_error = sdk_error
         self.partial_output = partial_output or bool(getattr(sdk_error, "partial_output", False))
         self.retryable = bool(getattr(sdk_error, "retryable", False))
         self.status_code = getattr(sdk_error, "http_status", None)
-        self.code = getattr(sdk_error, "code", "codex_sdk_response_error")
+        self.code = code or getattr(sdk_error, "code", "codex_sdk_response_error")
+        self.details = details
+        self.diagnostic = sdk_error_projection(
+            self,
+            stage=stage,
+            partial_output=self.partial_output,
+        )
+        self.args = (_with_safe_validation_context(message, self.diagnostic),)
 
 
 class CodexResponsesProtocolClient:
@@ -101,28 +136,67 @@ class CodexResponsesProtocolClient:
         cancellation_checker: CancellationChecker | None = None,
     ) -> Any:
         del api_key
-        if resolved_model.provider_id != CODEX_PROVIDER_ID:
-            raise CodexSdkResponseError(
-                f"codex_responses 仅保留给托管 Provider {CODEX_PROVIDER_ID}。"
+        try:
+            if resolved_model.provider_id != CODEX_PROVIDER_ID:
+                raise CodexSdkResponseError(
+                    f"codex_responses 仅保留给托管 Provider {CODEX_PROVIDER_ID}。",
+                    stage="responses_preflight",
+                )
+            if not isinstance(rendered_messages, OpenAIRenderResult):
+                raise TypeError("codex_responses 渲染结果类型不正确。")
+            if not conversation_id:
+                raise ValueError("Codex SDK 请求必须提供稳定的 Conversation.id。")
+            sdk = _sdk_module()
+            model, params = _build_standard_params(
+                resolved_model=resolved_model,
+                rendered_messages=rendered_messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                request_params=request_params,
             )
-        if not isinstance(rendered_messages, OpenAIRenderResult):
-            raise TypeError("codex_responses 渲染结果类型不正确。")
-        if not conversation_id:
-            raise ValueError("Codex SDK 请求必须提供稳定的 Conversation.id。")
-
-        sdk = _sdk_module()
-        model, params = _build_standard_params(
-            resolved_model=resolved_model,
-            rendered_messages=rendered_messages,
-            system_prompt=system_prompt,
-            tools=tools,
-            request_params=request_params,
-        )
-        cancellation_source = sdk.CancellationSource()
-        options = sdk.RequestOptions(
-            headers={CODEX_SESSION_HEADER_NAME: conversation_id},
-            cancel_token=cancellation_source.token,
-        )
+            cancellation_source = sdk.CancellationSource()
+            trace_sink = (
+                CodexSdkHttpTraceSink(
+                    service=http_trace_service,
+                    context=http_trace_context,
+                )
+                if (
+                    http_trace_service is not None
+                    and http_trace_context is not None
+                    and http_trace_service.enabled
+                )
+                else None
+            )
+            options_kwargs: dict[str, Any] = {
+                "headers": _codex_request_headers(resolved_model.custom_headers, conversation_id),
+                "cancel_token": cancellation_source.token,
+            }
+            if trace_sink is not None:
+                options_kwargs.update({
+                    "raw_event_sink": trace_sink,
+                    "raw_event_mode": sdk.RawEventMode.ENABLED,
+                })
+            options = sdk.RequestOptions(**options_kwargs)
+        except Exception as exc:
+            wrapped = exc if isinstance(exc, CodexSdkResponseError) else CodexSdkResponseError(
+                _safe_sdk_failure_message(exc),
+                sdk_error=exc,
+                stage="responses_preflight",
+            )
+            diagnostic = sdk_error_projection(wrapped, stage="responses_preflight")
+            wrapped.diagnostic = diagnostic
+            await _emit_stream_event(
+                stream_event_handler,
+                "llm.response.stream.failed",
+                {
+                    "event_count": 0,
+                    "error_type": diagnostic["error_type"],
+                    "error_code": diagnostic["code"],
+                    "partial_output": False,
+                    "diagnostic": diagnostic,
+                },
+            )
+            raise wrapped from None
         started_at = time.perf_counter()
         event_count = 0
         output_projected = False
@@ -130,15 +204,6 @@ class CodexResponsesProtocolClient:
         response_body: dict[str, Any] | None = None
         stream: Any | None = None
         cancellation_task: asyncio.Task[None] | None = None
-        trace_record = _trace_started(
-            http_trace_service,
-            http_trace_context,
-            model=model,
-            params=params,
-            rendered_messages=rendered_messages,
-            conversation_id=conversation_id,
-            tools=tools,
-        )
         logger.info(
             "codex_sdk.responses.request_started llm_request_id=%s model=%s session_fingerprint=%s standard_fields=%s input_items=%d tool_count=%d",
             short_identifier(getattr(http_trace_context, "llm_request_id", None)),
@@ -207,15 +272,21 @@ class CodexResponsesProtocolClient:
                             response_body["output"] = output_items
                     elif event_type in {"response.failed", "response.incomplete", "error"}:
                         raise CodexSdkResponseError(
-                            f"louyi-codex Responses 流终止: event={event_type}",
+                            safe_sdk_error_message("protocol_error"),
                             partial_output=output_projected,
+                            stage="responses_stream",
+                            code="protocol_error",
+                            details={"reason_code": event_type},
                         )
             outcome = await stream.wait_closed()
             metadata = stream.metadata
             if outcome.status != "completed" or response_body is None:
                 raise CodexSdkResponseError(
-                    f"louyi-codex Responses 未生成 completed 终态: status={outcome.status}",
+                    safe_sdk_error_message("protocol_error"),
                     partial_output=output_projected,
+                    stage="responses_stream",
+                    code="protocol_error",
+                    details={"reason_code": str(outcome.status)},
                 )
             await _emit_stream_event(
                 stream_event_handler,
@@ -237,14 +308,6 @@ class CodexResponsesProtocolClient:
                 _attempt_diagnostics(metadata.attempts),
                 duration_ms,
             )
-            _trace_completed(
-                http_trace_service,
-                http_trace_context,
-                trace_record,
-                metadata=metadata,
-                event_count=event_count,
-                duration_ms=duration_ms,
-            )
             return response_body
         except asyncio.CancelledError:
             cancellation_source.cancel("Runtime LLM request task cancelled")
@@ -252,12 +315,6 @@ class CodexResponsesProtocolClient:
                 with suppress(Exception, asyncio.CancelledError):
                     await stream.cancel("Runtime LLM request task cancelled")
             if cancellation_checker is not None and cancellation_checker():
-                with suppress(Exception):
-                    _trace_failed(
-                        http_trace_service, http_trace_context, trace_record,
-                        error=LlmRequestCancelled("LLM request cancelled."),
-                        event_count=event_count, started_at=started_at,
-                    )
                 raise LlmRequestCancelled("LLM request cancelled.") from None
             raise
         except Exception as exc:
@@ -265,47 +322,84 @@ class CodexResponsesProtocolClient:
                 if cancellation_checker is not None and cancellation_checker():
                     exc = LlmRequestCancelled("LLM request cancelled.")
             if isinstance(exc, LlmRequestCancelled):
-                with suppress(Exception):
-                    _trace_failed(
-                        http_trace_service, http_trace_context, trace_record,
-                        error=exc, event_count=event_count, started_at=started_at,
-                    )
                 raise exc
             wrapped = exc if isinstance(exc, CodexSdkResponseError) else CodexSdkResponseError(
                 _safe_sdk_failure_message(exc),
                 sdk_error=exc,
                 partial_output=output_projected or bool(getattr(exc, "partial_output", False)),
+                stage="responses_request",
             )
             metadata = getattr(stream, "metadata", None)
+            attempts = tuple(getattr(metadata, "attempts", ()) or ())
+            last_attempt = attempts[-1] if attempts else None
+            diagnostic = sdk_error_projection(
+                wrapped,
+                stage="responses_request",
+                request_id=getattr(metadata, "request_id", None),
+                attempt_id=getattr(last_attempt, "attempt_id", None),
+                account_id=getattr(metadata, "current_account_id", None),
+                upstream_request_id=getattr(last_attempt, "upstream_request_id", None),
+                partial_output=wrapped.partial_output,
+            )
+            wrapped.diagnostic = diagnostic
             logger.error(
                 "codex_sdk.responses.failed request_id=%s session_fingerprint=%s account_id=%s event_count=%d attempts=%s duration_ms=%d details=%s",
                 short_identifier(getattr(metadata, "request_id", None)),
                 getattr(metadata, "session_fingerprint", stable_fingerprint(conversation_id)),
                 short_identifier(getattr(metadata, "current_account_id", None)),
                 event_count,
-                _attempt_diagnostics(getattr(metadata, "attempts", ())),
+                _attempt_diagnostics(attempts),
                 int((time.perf_counter() - started_at) * 1000),
-                sdk_error_diagnostic(getattr(wrapped, "sdk_error", None) or wrapped),
+                diagnostic,
             )
             await _emit_stream_event(
                 stream_event_handler,
                 "llm.response.stream.failed",
                 {
                     "event_count": event_count,
-                    "error_type": wrapped.__class__.__name__,
-                    "error_code": wrapped.code,
+                    "error_type": diagnostic["error_type"],
+                    "error_code": diagnostic["code"],
                     "partial_output": wrapped.partial_output,
+                    "diagnostic": diagnostic,
                 },
-            )
-            _trace_failed(
-                http_trace_service, http_trace_context, trace_record,
-                error=wrapped, event_count=event_count, started_at=started_at,
             )
             raise wrapped from None
         finally:
             if cancellation_task is not None:
                 cancellation_task.cancel()
                 await asyncio.gather(cancellation_task, return_exceptions=True)
+            if trace_sink is not None:
+                try:
+                    trace_sink.flush()
+                except Exception:
+                    logger.exception(
+                        "codex_sdk.http_trace_final_flush_unhandled request_id=%s",
+                        getattr(http_trace_context, "llm_request_id", None),
+                    )
+
+
+def _codex_request_headers(custom_headers: Mapping[str, str] | None, conversation_id: str) -> dict[str, str]:
+    """Merge user headers while keeping the Runtime-owned session header authoritative."""
+    headers: dict[str, str] = {}
+    for name, value in (custom_headers or {}).items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("validation_error"),
+                stage="responses_preflight",
+                code="validation_error",
+                details={"field": "custom_headers", "reason_code": "header_name_and_value_must_be_text"},
+            )
+        if name.strip().lower() == CODEX_SESSION_HEADER_NAME.lower():
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("reserved_response_field"),
+                stage="responses_preflight",
+                code="reserved_response_field",
+                details={"field": name, "reason_code": "runtime_owned_session_header"},
+            )
+        headers[name] = value
+    headers[CODEX_SESSION_HEADER_NAME] = conversation_id
+    return headers
+
 
 
 def _build_standard_params(
@@ -316,35 +410,77 @@ def _build_standard_params(
     tools: tuple[dict[str, Any], ...],
     request_params: dict[str, Any],
 ) -> tuple[str, dict[str, Any]]:
-    raw_params = dict(request_params)
-    raw_model = str(raw_params.pop("model", resolved_model.model_alias) or resolved_model.model_alias)
-    raw_params.pop("input", None)
-    raw_params.pop("stream", None)
-    unsupported = sorted(
-        key for key, value in raw_params.items()
-        if value is not None and key not in _SUPPORTED_STANDARD_PARAMS
-    )
-    if unsupported:
-        raise CodexSdkResponseError(
-            f"当前 louyi-codex 版本不支持这些标准 Responses 参数: {', '.join(unsupported)}"
-        )
-    params = {key: value for key, value in raw_params.items() if key in _SUPPORTED_STANDARD_PARAMS}
+    params = {"max_output_tokens": resolved_model.max_output_tokens, **request_params}
+    for field_name in ("model", "input"):
+        if field_name in params:
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("reserved_response_field"),
+                stage="responses_request",
+                code="reserved_response_field",
+                details={"field": field_name},
+            )
+    if "stream" in params:
+        stream = params.pop("stream")
+        if stream is not True:
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("unsupported_response_parameter"),
+                stage="responses_request",
+                code="unsupported_response_parameter",
+                details={"parameter": "stream", "reason_code": "stream_required"},
+            )
+    for field_name in params:
+        if not isinstance(field_name, str):
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("unsupported_response_parameter"),
+                stage="responses_request",
+                code="unsupported_response_parameter",
+                details={"reason_code": "parameter_name_must_be_string"},
+            )
+        normalized = field_name.strip().lower().replace("-", "_")
+        if normalized in _RUNTIME_OWNED_OR_PRIVATE_PARAMS:
+            raise CodexSdkResponseError(
+                safe_sdk_error_message("reserved_response_field"),
+                stage="responses_request",
+                code="reserved_response_field",
+                details={"field": normalized},
+            )
     params["store"] = False
-    model = raw_model
-    if model.endswith("-fast") and len(model) > len("-fast"):
-        model = model[:-5]
-        params.setdefault("service_tier", "priority")
-    if rendered_messages.include:
-        params.setdefault("include", rendered_messages.include)
+    params.pop("previous_response_id", None)
+    params["include"] = _merge_stateless_include(
+        rendered_messages.include,
+        params.get("include"),
+    )
     if rendered_messages.prompt_cache_key:
-        params.setdefault("prompt_cache_key", rendered_messages.prompt_cache_key)
+        params["prompt_cache_key"] = rendered_messages.prompt_cache_key
     if system_prompt:
         params.setdefault("instructions", system_prompt)
     if tools:
         params.setdefault("tools", list(tools))
         params.setdefault("parallel_tool_calls", True)
-    params.setdefault("store", False)
-    return model, params
+    return str(resolved_model.model_alias), params
+
+
+def _merge_stateless_include(rendered_value: Any, requested_value: Any) -> list[Any]:
+    """Merge include values without splitting strings and retain stateless reasoning metadata."""
+    def normalize(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    items = normalize(rendered_value)
+    required_item = "reasoning.encrypted_content"
+    if required_item not in items:
+        items.append(required_item)
+    for item in normalize(requested_value):
+        if item not in items:
+            items.append(item)
+    return items
 
 
 async def _watch_cancellation(
@@ -452,96 +588,6 @@ async def _emit_stream_event(
         await result
 
 
-def _trace_started(
-    service: LlmHttpTraceService | None,
-    context: LlmHttpTraceContext | None,
-    *,
-    model: str,
-    params: dict[str, Any],
-    rendered_messages: OpenAIRenderResult,
-    conversation_id: str,
-    tools: tuple[dict[str, Any], ...],
-) -> Any:
-    if service is None or context is None:
-        return None
-    shape = {
-        "model": model,
-        "stream": True,
-        "standard_fields": sorted(params.keys()),
-        "input_items": _item_count(rendered_messages.input),
-        "tool_count": len(tools),
-        "session_fingerprint": stable_fingerprint(conversation_id),
-    }
-    return service.record_started(
-        context=context,
-        method="PYTHON",
-        url="louyi-codex://python-sdk/responses",
-        request_headers={"session-id-fingerprint": stable_fingerprint(conversation_id) or ""},
-        request_body_bytes=json.dumps(shape, ensure_ascii=False).encode("utf-8"),
-        is_stream=True,
-    )
-
-
-def _trace_completed(
-    service: LlmHttpTraceService | None,
-    context: LlmHttpTraceContext | None,
-    record: Any,
-    *,
-    metadata: Any,
-    event_count: int,
-    duration_ms: int,
-) -> None:
-    if service is None or context is None:
-        return
-    shape = {
-        "status": "completed",
-        "sdk_request_id": short_identifier(metadata.request_id),
-        "account_id": short_identifier(metadata.current_account_id),
-        "attempt_count": len(metadata.attempts),
-        "event_count": event_count,
-        "terminal_event_type": metadata.terminal_event_type,
-    }
-    service.record_completed(
-        started_record=record,
-        context=context,
-        status_code=200,
-        response_headers={},
-        response_body_bytes=json.dumps(shape, ensure_ascii=False).encode("utf-8"),
-        response_content_type="application/vnd.louyi-codex.diagnostic+json",
-        duration_ms=duration_ms,
-        sse_event_count=event_count,
-    )
-
-
-def _trace_failed(
-    service: LlmHttpTraceService | None,
-    context: LlmHttpTraceContext | None,
-    record: Any,
-    *,
-    error: BaseException,
-    event_count: int,
-    started_at: float,
-) -> None:
-    if service is None or context is None:
-        return
-    service.record_failed(
-        started_record=record,
-        context=context,
-        error_type=error.__class__.__name__,
-        error_message=_safe_sdk_failure_message(error),
-        duration_ms=int((time.perf_counter() - started_at) * 1000),
-        status_code=getattr(error, "status_code", None),
-        response_headers={},
-        response_body_bytes=json.dumps({
-            "error_code": getattr(error, "code", None),
-            "partial_output": bool(getattr(error, "partial_output", False)),
-            "event_count": event_count,
-        }, ensure_ascii=False).encode("utf-8"),
-        response_content_type="application/vnd.louyi-codex.diagnostic+json",
-        sse_event_count=event_count,
-    )
-
-
 def _item_count(value: Any) -> int:
     if value is None:
         return 0
@@ -550,14 +596,35 @@ def _item_count(value: Any) -> int:
     return 1
 
 
+def _with_safe_validation_context(message: str, diagnostic: dict[str, Any]) -> str:
+    if diagnostic.get("code") != "validation_error":
+        return message
+    details = diagnostic.get("details")
+    if not isinstance(details, dict):
+        return message
+    parts: list[str] = []
+    field = details.get("field")
+    if isinstance(field, str) and field:
+        parts.append(f"field={field}")
+    path = details.get("path")
+    if isinstance(path, list) and path:
+        path_text = ".".join(str(item) for item in path if isinstance(item, (str, int)) and not isinstance(item, bool))
+        if path_text:
+            parts.append(f"path={path_text}")
+    validator = details.get("validator")
+    if isinstance(validator, str) and validator:
+        parts.append(f"validator={validator}")
+    if not parts:
+        return message
+    return f"{message} Validation context: {', '.join(parts)}."
+
+
 def _safe_sdk_failure_message(error: BaseException) -> str:
-    code = getattr(error, "code", None)
-    status = getattr(error, "http_status", None)
-    partial = bool(getattr(error, "partial_output", False))
-    return (
-        f"louyi-codex request failed code={code or 'unknown'} "
-        f"http_status={status!r} partial_output={partial}"
-    )
+    return sdk_error_projection(
+        error,
+        stage="responses_request",
+        partial_output=bool(getattr(error, "partial_output", False)),
+    )["message"]
 
 
 def _sdk_module() -> Any:

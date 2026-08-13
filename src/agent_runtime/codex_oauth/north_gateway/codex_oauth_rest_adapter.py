@@ -7,7 +7,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from agent_runtime.codex_oauth.diagnostics import proxy_diagnostic
+from agent_runtime.codex_oauth.diagnostics import proxy_diagnostic, sdk_error_projection
 from agent_runtime.codex_oauth.service import CodexOAuthService
 
 
@@ -47,6 +47,16 @@ class CodexErrorSummaryResponse(BaseModel):
     retryable: bool = False
     http_status: int | None = None
     retry_at: datetime | None = None
+    stage: str | None = None
+    error_type: str | None = None
+    details: dict[str, Any] | None = None
+    transport_subtype: str | None = None
+    request_id: str | None = None
+    attempt_id: str | None = None
+    account_id: str | None = None
+    upstream_request_id: str | None = None
+    partial_output: bool = False
+    proxy: CodexProxySummaryResponse | None = None
 
 
 class CodexQuotaWindowResponse(BaseModel):
@@ -57,12 +67,60 @@ class CodexQuotaWindowResponse(BaseModel):
     exhausted: bool
 
 
+class CodexQuotaRateLimitWindowResponse(BaseModel):
+    used_percent: float | None
+    limit_window_seconds: int | None
+    window_minutes: int | None
+    reset_after_seconds: float | None
+    resets_at: datetime | None
+
+
+class CodexQuotaRateLimitBucketResponse(BaseModel):
+    limit_id: str
+    limit_name: str | None
+    allowed: bool | None
+    limit_reached: bool | None
+    primary: CodexQuotaRateLimitWindowResponse | None
+    secondary: CodexQuotaRateLimitWindowResponse | None
+
+
+class CodexQuotaCreditsResponse(BaseModel):
+    has_credits: bool | None
+    unlimited: bool | None
+    balance: str | None
+
+
+class CodexQuotaSpendControlLimitResponse(BaseModel):
+    source: str | None
+    limit: str
+    used: str
+    remaining: str
+    used_percent: float
+    remaining_percent: float
+    reset_after_seconds: float
+    resets_at: datetime | None
+
+
+class CodexQuotaSpendControlResponse(BaseModel):
+    reached: bool
+    individual_limit: CodexQuotaSpendControlLimitResponse | None
+
+
 class CodexQuotaResponse(BaseModel):
     account_id: str
     five_hour: CodexQuotaWindowResponse | None
     weekly: CodexQuotaWindowResponse | None
     fetched_at: datetime
     source: str
+    plan_type: str | None = None
+    rate_limit: CodexQuotaRateLimitBucketResponse | None = None
+    additional_rate_limits: list[CodexQuotaRateLimitBucketResponse] = Field(default_factory=list)
+    credits: CodexQuotaCreditsResponse | None = None
+    spend_control: CodexQuotaSpendControlResponse | None = None
+    rate_limit_reached_type: str | None = None
+    active_fetched_at: datetime | None = None
+    passive_observed_at: datetime | None = None
+    rate_limits_by_limit_id: dict[str, CodexQuotaRateLimitBucketResponse] = Field(default_factory=dict)
 
 
 class CodexAccountStatusResponse(BaseModel):
@@ -81,6 +139,7 @@ class CodexAccountResponse(BaseModel):
     account_id: str
     display_label: str
     alias: str | None
+    email: str | None = None
     enabled: bool
     status: CodexAccountStatusResponse
     priority: int
@@ -187,7 +246,7 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 expires_at=result.expires_at,
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_browser_start") from None
 
     @router.post("/auth/device/start", response_model=CodexDeviceAuthStartResponse)
     async def start_device_auth(body: CodexProxyInput | None = None) -> CodexDeviceAuthStartResponse:
@@ -207,14 +266,14 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 expires_at=result.expires_at,
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_device_start") from None
 
     @router.get("/auth/attempts/{attempt_id}", response_model=CodexAuthAttemptResponse)
     async def get_auth_attempt(attempt_id: str) -> CodexAuthAttemptResponse:
         try:
             return _attempt_response(await service.get_auth_attempt(attempt_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_attempt_get") from None
 
     @router.post("/auth/device/{attempt_id}/poll", response_model=CodexDevicePollResponse)
     async def poll_device_auth(attempt_id: str) -> CodexDevicePollResponse:
@@ -225,10 +284,10 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 status=_enum_value(result.status),
                 next_poll_at=result.next_poll_at,
                 auth_result=_auth_result_response(result.auth_result),
-                error=_error_response(result.error),
+                error=_error_response(result.error, stage="oauth_device_poll"),
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_device_poll") from None
 
     @router.post("/auth/browser/{attempt_id}/callback", response_model=CodexAuthResultResponse)
     async def complete_browser_callback(
@@ -246,28 +305,28 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 await service.complete_browser_callback(attempt_id, callback_url)
             )  # type: ignore[return-value]
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_browser_callback") from None
 
     @router.post("/auth/attempts/{attempt_id}/cancel", response_model=CodexAuthAttemptResponse)
     async def cancel_auth_attempt(attempt_id: str) -> CodexAuthAttemptResponse:
         try:
             return _attempt_response(await service.cancel_auth_attempt(attempt_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="oauth_attempt_cancel") from None
 
     @router.get("/accounts", response_model=list[CodexAccountResponse])
     async def list_accounts(include_disabled: bool = True) -> list[CodexAccountResponse]:
         try:
             return [_account_response(item) for item in await service.list_accounts(include_disabled=include_disabled)]
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_list") from None
 
     @router.get("/accounts/{account_id}", response_model=CodexAccountResponse)
     async def get_account(account_id: str) -> CodexAccountResponse:
         try:
             return _account_response(await service.get_account(account_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_get") from None
 
     @router.patch("/accounts/{account_id}", response_model=CodexAccountResponse)
     async def update_account(account_id: str, body: CodexAccountPatchBody) -> CodexAccountResponse:
@@ -295,7 +354,7 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
             )
             return _account_response(account)
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_update") from None
 
     @router.post("/accounts/reorder", response_model=list[CodexAccountResponse])
     async def reorder_accounts(body: CodexAccountsReorderBody) -> list[CodexAccountResponse]:
@@ -307,14 +366,14 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 )
             ]
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_reorder") from None
 
     @router.post("/accounts/{account_id}/enable", response_model=CodexAccountResponse)
     async def enable_account(account_id: str) -> CodexAccountResponse:
         try:
             return _account_response(await service.enable_account(account_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_enable") from None
 
     @router.post("/accounts/{account_id}/disable", response_model=CodexOperationResponse)
     async def disable_account(
@@ -325,7 +384,7 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 await service.disable_account(account_id, force=bool(body and body.force))
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_disable") from None
 
     @router.post("/accounts/{account_id}/recover", response_model=CodexRecoveryResponse)
     async def recover_account(account_id: str) -> CodexRecoveryResponse:
@@ -338,41 +397,41 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                     CodexRecoveryCheckResponse(
                         kind=_enum_value(check.kind),
                         passed=check.passed,
-                        error=_error_response(check.error),
+                        error=_error_response(check.error, stage="account_recover"),
                     )
                     for check in result.checks
                 ],
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_recover") from None
 
     @router.get("/accounts/{account_id}/quota", response_model=CodexQuotaResponse | None)
     async def get_cached_quota(account_id: str) -> CodexQuotaResponse | None:
         try:
             return _quota_response(await service.get_cached_quota(account_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="quota_cached_get") from None
 
     @router.post("/accounts/{account_id}/quota/refresh", response_model=CodexQuotaResponse)
     async def refresh_quota(account_id: str) -> CodexQuotaResponse:
         try:
             return _quota_response(await service.refresh_quota(account_id))  # type: ignore[return-value]
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="quota_refresh") from None
 
     @router.delete("/accounts/{account_id}", response_model=CodexOperationResponse)
     async def delete_account(account_id: str, force: bool = False) -> CodexOperationResponse:
         try:
             return _operation_response(await service.delete_account(account_id, force=force))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="account_delete") from None
 
     @router.get("/operations/{operation_id}", response_model=CodexOperationResponse)
     async def get_operation(operation_id: str) -> CodexOperationResponse:
         try:
             return _operation_response(await service.get_operation(operation_id))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="operation_get") from None
 
     @router.post("/operations/{operation_id}/wait", response_model=CodexOperationResponse)
     async def wait_operation(operation_id: str, timeout_seconds: float = 30.0) -> CodexOperationResponse:
@@ -383,28 +442,28 @@ def create_codex_oauth_router(service: CodexOAuthService) -> APIRouter:
                 await service.wait_operation(operation_id, timeout_seconds=timeout_seconds)
             )
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="operation_wait") from None
 
     @router.get("/routing", response_model=CodexRoutingResponse)
     async def get_routing() -> CodexRoutingResponse:
         try:
             return CodexRoutingResponse(strategy=_enum_value(await service.get_routing_strategy()))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="routing_get") from None
 
     @router.put("/routing", response_model=CodexRoutingResponse)
     async def update_routing(body: CodexRoutingResponse) -> CodexRoutingResponse:
         try:
             return CodexRoutingResponse(strategy=_enum_value(await service.set_routing_strategy(body.strategy)))
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="routing_set") from None
 
     @router.post("/provider/ensure", status_code=204)
     async def ensure_provider() -> None:
         try:
             await service.ensure_builtin_provider()
         except Exception as exc:
-            raise _http_error(exc) from None
+            raise _http_error(exc, stage="provider_ensure") from None
 
     return router
 
@@ -414,6 +473,7 @@ def _account_response(account: Any) -> CodexAccountResponse:
         account_id=account.account_id,
         display_label=_account_display_label(account),
         alias=account.alias,
+        email=account.email,
         enabled=account.enabled,
         status=CodexAccountStatusResponse(
             health=_enum_value(account.status.health),
@@ -421,7 +481,7 @@ def _account_response(account: Any) -> CodexAccountResponse:
             reason_message=_account_reason_message(account.status),
             since=account.status.since,
             retry_at=account.status.retry_at,
-            last_error=_error_response(account.status.last_error),
+            last_error=_error_response(account.status.last_error, stage="account_status"),
             exhausted_windows=sorted(account.status.exhausted_windows),
             failure_count=account.status.failure_count,
             last_http_status=account.status.last_http_status,
@@ -441,16 +501,9 @@ def _account_response(account: Any) -> CodexAccountResponse:
 def _account_display_label(account: Any) -> str:
     if isinstance(account.alias, str) and account.alias.strip():
         return account.alias.strip()
-    masked = _masked_account_id(str(account.account_id))
-    return f"{masked} · {account.plan_type}" if account.plan_type else masked
-
-
-def _masked_account_id(account_id: str) -> str:
-    if len(account_id) <= 4:
-        return "••••"
-    if len(account_id) <= 8:
-        return f"{account_id[:2]}…{account_id[-2:]}"
-    return f"{account_id[:6]}…{account_id[-4:]}"
+    if isinstance(account.email, str) and account.email.strip():
+        return account.email.strip()
+    return "Codex 账号"
 
 
 def _proxy_response(proxy: Any) -> CodexProxySummaryResponse:
@@ -472,6 +525,25 @@ def _quota_response(quota: Any | None) -> CodexQuotaResponse | None:
         weekly=_quota_window_response(quota.weekly),
         fetched_at=quota.fetched_at,
         source=quota.source,
+        plan_type=quota.plan_type,
+        rate_limit=_quota_rate_limit_bucket_response(quota.rate_limit),
+        additional_rate_limits=[
+            _quota_rate_limit_bucket_response(bucket)
+            for bucket in quota.additional_rate_limits
+        ],
+        credits=_quota_credits_response(quota.credits),
+        spend_control=_quota_spend_control_response(quota.spend_control),
+        rate_limit_reached_type=(
+            None
+            if quota.rate_limit_reached_type is None
+            else _enum_value(quota.rate_limit_reached_type)
+        ),
+        active_fetched_at=quota.active_fetched_at,
+        passive_observed_at=quota.passive_observed_at,
+        rate_limits_by_limit_id={
+            str(limit_id): _quota_rate_limit_bucket_response(bucket)
+            for limit_id, bucket in quota.rate_limits_by_limit_id.items()
+        },
     )
 
 
@@ -487,16 +559,84 @@ def _quota_window_response(window: Any | None) -> CodexQuotaWindowResponse | Non
     )
 
 
-def _error_response(error: Any | None) -> CodexErrorSummaryResponse | None:
+def _quota_rate_limit_window_response(
+    window: Any | None,
+ ) -> CodexQuotaRateLimitWindowResponse | None:
+    if window is None:
+        return None
+    return CodexQuotaRateLimitWindowResponse(
+        used_percent=window.used_percent,
+        limit_window_seconds=window.limit_window_seconds,
+        window_minutes=window.window_minutes,
+        reset_after_seconds=window.reset_after_seconds,
+        resets_at=window.resets_at,
+    )
+
+
+def _quota_rate_limit_bucket_response(
+    bucket: Any | None,
+ ) -> CodexQuotaRateLimitBucketResponse | None:
+    if bucket is None:
+        return None
+    return CodexQuotaRateLimitBucketResponse(
+        limit_id=bucket.limit_id,
+        limit_name=bucket.limit_name,
+        allowed=bucket.allowed,
+        limit_reached=bucket.limit_reached,
+        primary=_quota_rate_limit_window_response(bucket.primary),
+        secondary=_quota_rate_limit_window_response(bucket.secondary),
+    )
+
+
+def _quota_credits_response(credits: Any | None) -> CodexQuotaCreditsResponse | None:
+    if credits is None:
+        return None
+    return CodexQuotaCreditsResponse(
+        has_credits=credits.has_credits,
+        unlimited=credits.unlimited,
+        balance=credits.balance,
+    )
+
+
+def _quota_spend_control_limit_response(
+    limit: Any | None,
+ ) -> CodexQuotaSpendControlLimitResponse | None:
+    if limit is None:
+        return None
+    return CodexQuotaSpendControlLimitResponse(
+        source=limit.source,
+        limit=limit.limit,
+        used=limit.used,
+        remaining=limit.remaining,
+        used_percent=limit.used_percent,
+        remaining_percent=limit.remaining_percent,
+        reset_after_seconds=limit.reset_after_seconds,
+        resets_at=limit.resets_at,
+    )
+
+
+def _quota_spend_control_response(
+    spend_control: Any | None,
+ ) -> CodexQuotaSpendControlResponse | None:
+    if spend_control is None:
+        return None
+    return CodexQuotaSpendControlResponse(
+        reached=spend_control.reached,
+        individual_limit=_quota_spend_control_limit_response(
+            spend_control.individual_limit
+        ),
+    )
+
+
+def _error_response(
+    error: Any | None,
+    *,
+    stage: str = "sdk_error_summary",
+) -> CodexErrorSummaryResponse | None:
     if error is None:
         return None
-    code = str(_enum_value(error.code))
     return CodexErrorSummaryResponse(
-        code=code,
-        message=_safe_error_message(code),
-        retryable=error.retryable,
-        http_status=error.http_status,
-        retry_at=error.retry_at,
+        **sdk_error_projection(error, stage=stage)
     )
 
 
@@ -518,7 +658,7 @@ def _attempt_response(attempt: Any) -> CodexAuthAttemptResponse:
         created_at=attempt.created_at,
         expires_at=attempt.expires_at,
         result=_auth_result_response(attempt.result),
-        last_error=_error_response(attempt.last_error),
+        last_error=_error_response(attempt.last_error, stage="oauth_attempt"),
     )
 
 
@@ -532,12 +672,13 @@ def _operation_response(result: Any) -> CodexOperationResponse:
         started_at=result.started_at,
         completed_at=result.completed_at,
         remaining_active_requests=result.remaining_active_requests,
-        error=_error_response(result.error),
+        error=_error_response(result.error, stage="operation_status"),
     )
 
 
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
+
 
 
 def _sensitive_text(
@@ -560,8 +701,9 @@ def _sensitive_text(
     return text or None
 
 
-def _http_error(exc: Exception) -> HTTPException:
-    code = str(_enum_value(getattr(exc, "code", exc.__class__.__name__)))
+def _http_error(exc: Exception, *, stage: str) -> HTTPException:
+    diagnostic = sdk_error_projection(exc, stage=stage)
+    code = str(diagnostic["code"])
     if code in {"account_not_found", "auth_attempt_not_found", "operation_not_found"}:
         status = 404
     elif code in {
@@ -586,19 +728,18 @@ def _http_error(exc: Exception) -> HTTPException:
         status = 408
     elif code in {"no_available_account", "account_disabled"}:
         status = 503
-    elif code in {"proxy_error", "connect_error", "request_timeout", "oauth_exchange", "upstream_http_error"}:
+    elif code in {
+        "transport_error",
+        "proxy_error",
+        "connect_error",
+        "request_timeout",
+        "oauth_exchange",
+        "upstream_http_error",
+    }:
         status = 502
     else:
         status = 500
-    return HTTPException(
-        status_code=status,
-        detail={
-            "code": code,
-            "message": _safe_error_message(code),
-            "retryable": bool(getattr(exc, "retryable", False)),
-            "http_status": getattr(exc, "http_status", None),
-        },
-    )
+    return HTTPException(status_code=status, detail=diagnostic)
 
 
 def _account_reason_message(status: Any) -> str | None:

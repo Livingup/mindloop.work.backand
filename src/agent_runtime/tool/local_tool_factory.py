@@ -14,6 +14,7 @@ from agent_runtime.tool.infrastructure.gemini_schema_generator import (
     GeminiSchemaGenerator,
 )
 from agent_runtime.tool.infrastructure.openai_responses_schema_generator import (
+    CodexResponsesSchemaGenerator,
     OpenAIResponsesSchemaGenerator,
 )
 from agent_runtime.tool.infrastructure.openai_schema_generator import (
@@ -65,6 +66,7 @@ class LocalToolFactory:
             schema_cache = ToolSchemaCache()
             # 注册各协议格式的 Schema 生成器。
             schema_cache.register_generator(OpenAIResponsesSchemaGenerator())
+            schema_cache.register_generator(CodexResponsesSchemaGenerator())
             schema_cache.register_generator(OpenAIChatCompletionsSchemaGenerator())
             schema_cache.register_generator(ClaudeSchemaGenerator())
             schema_cache.register_generator(GeminiSchemaGenerator())

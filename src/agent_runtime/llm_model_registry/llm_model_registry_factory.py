@@ -76,16 +76,31 @@ class LlmModelRegistryFactory:
             GPT_IMAGE_AGENT_MODEL_ID,
             ImageGenerationLlmRegistryGateway,
         )
-        from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
+        from agent_runtime.codex_oauth.models import CODEX_PROVIDER_ID
+        from agent_runtime.llm_api_protocol import (
+            API_FORMAT_CODEX_RESPONSES,
+            API_FORMAT_OPENAI_RESPONSES,
+        )
 
         llm_registry_gateway = LlmModelRegistryFactory.create()
+        image_model_metadata = builtin_image_generation_model_metadata()
 
         def external_provider_model_resolver(provider_id: str, binding_id: str):
             try:
                 resolved = llm_registry_gateway.resolve_provider_model(provider_id, binding_id)
             except Exception:
                 return None
-            if resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID and resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
+            if resolved.model_id != GPT_IMAGE_AGENT_MODEL_ID:
+                return None
+            if (
+                resolved.provider_id == CODEX_PROVIDER_ID
+                and resolved.api_format == API_FORMAT_CODEX_RESPONSES
+            ):
+                return resolved
+            if (
+                resolved.provider_id != CODEX_PROVIDER_ID
+                and resolved.api_format == API_FORMAT_OPENAI_RESPONSES
+            ):
                 return resolved
             return None
 
@@ -96,7 +111,7 @@ class LlmModelRegistryFactory:
         service = LlmModelRegistryService(
             repository,
             external_provider_model_resolver=external_provider_model_resolver,
-            builtin_model_metadata=builtin_image_generation_model_metadata(),
+            builtin_model_metadata=image_model_metadata,
         )
         return ImageGenerationLlmRegistryGateway(
             image_registry_gateway=LlmModelRegistryGatewayImpl(service),

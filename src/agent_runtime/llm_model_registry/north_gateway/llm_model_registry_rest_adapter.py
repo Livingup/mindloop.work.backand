@@ -13,7 +13,11 @@ from pydantic import BaseModel, Field
 
 from agent_runtime.codex_oauth.models import CODEX_DISPLAY_API_BASE_URL, CODEX_PROVIDER_ID
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT, SUPPORTED_INPUT_MODALITIES
-from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, LlmApiFormat, SUPPORTED_LLM_API_FORMATS
+from agent_runtime.llm_api_protocol import (
+    API_FORMAT_CODEX_RESPONSES,
+    LlmApiFormat,
+    SUPPORTED_LLM_API_FORMATS,
+)
 from agent_runtime.llm_model_registry.llm_execution_policy import (
     LlmExecutionPolicy,
     LlmExecutionPolicyCandidate,
@@ -41,6 +45,7 @@ from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts
 _MANAGED_CODEX_PROVIDER_ID = CODEX_PROVIDER_ID
 _MANAGED_CODEX_DISPLAY_API_BASE_URL = CODEX_DISPLAY_API_BASE_URL
 _BUILTIN_PROVIDER_IDS = {_MANAGED_CODEX_PROVIDER_ID}
+_MASKED_CUSTOM_HEADER_VALUE = "********"
 
 
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
@@ -685,7 +690,7 @@ def create_llm_model_registry_router(
         if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
             raise HTTPException(
                 status_code=400,
-                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+                detail=f"{body.api_format} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
             )
         if not managed_codex and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
@@ -693,6 +698,7 @@ def create_llm_model_registry_router(
             provider = gateway.get_provider(provider_id)
             if any(item.id == body.id for item in provider.models):
                 raise HTTPException(status_code=409, detail=f"LLM 服务商模型接入项已存在: {provider_id}/{body.id}")
+            body = _restore_binding_body(body, None)
             binding = _body_to_binding(body)
             updated = _provider_with_models(provider, provider.models + (binding,))
             updated = _normalize_managed_codex_provider(updated, readonly_provider_ids)
@@ -717,7 +723,7 @@ def create_llm_model_registry_router(
         if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
             raise HTTPException(
                 status_code=400,
-                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+                detail=f"{body.api_format} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
             )
         if not managed_codex and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
@@ -751,10 +757,14 @@ def create_llm_model_registry_router(
     ) -> dict[str, Any]:
         """部分更新服务商模型接入项。"""
         managed_codex = _is_managed_codex_provider(provider_id, readonly_provider_ids)
-        if not managed_codex and body.api_format == API_FORMAT_CODEX_RESPONSES:
+        if (
+            not managed_codex
+            and body.api_format is not None
+            and body.api_format == API_FORMAT_CODEX_RESPONSES
+        ):
             raise HTTPException(
                 status_code=400,
-                detail=f"{API_FORMAT_CODEX_RESPONSES} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
+                detail=f"{body.api_format} 仅保留给托管服务商 {_MANAGED_CODEX_PROVIDER_ID}。",
             )
         if not managed_codex and body.api_format is not None and body.api_format not in supported_api_formats:
             raise HTTPException(status_code=400, detail="服务商模型接入项包含当前 Registry 不支持的 API 协议: " + body.api_format)
@@ -898,7 +908,7 @@ def _managed_codex_binding(binding: LlmProviderModelBinding) -> LlmProviderModel
         thinking=binding.thinking,
         custom_request_params=binding.custom_request_params,
         api_base_url=None,
-        custom_headers={},
+        custom_headers=dict(binding.custom_headers),
         api_keys=(),
     )
 
@@ -913,7 +923,7 @@ def _normalize_managed_codex_provider(
         provider_id=provider.provider_id,
         group=provider.group,
         api_base_url=_MANAGED_CODEX_DISPLAY_API_BASE_URL,
-        custom_headers={},
+        custom_headers=dict(provider.custom_headers),
         api_keys=(),
         retry=_managed_codex_retry_policy(),
         models=tuple(_managed_codex_binding(binding) for binding in provider.models),
@@ -930,7 +940,7 @@ def _normalize_managed_codex_save_request(
         provider_id=request.provider_id,
         group=request.group,
         api_base_url=_MANAGED_CODEX_DISPLAY_API_BASE_URL,
-        custom_headers={},
+        custom_headers=dict(request.custom_headers),
         api_keys=(),
         retry=_managed_codex_retry_policy(),
         models=tuple(_managed_codex_binding(binding) for binding in request.models),
@@ -1182,7 +1192,7 @@ def _mask_custom_headers(headers: object) -> dict[str, str]:
     for key, value in headers.items():
         header_name = str(key)
         if any(marker in header_name.lower() for marker in sensitive_markers):
-            masked[header_name] = "********"
+            masked[header_name] = _MASKED_CUSTOM_HEADER_VALUE
         else:
             masked[header_name] = str(value)
     return masked
@@ -1272,7 +1282,15 @@ def _restore_custom_headers_from_current(
         return None
     restored: dict[str, str] = {}
     for k, v in body_headers.items():
-        if "********" in v and k in current_headers:
+        if v == _MASKED_CUSTOM_HEADER_VALUE:
+            if (
+                k not in current_headers
+                or current_headers[k] == _MASKED_CUSTOM_HEADER_VALUE
+            ):
+                raise ValueError(
+                    f"custom_headers[{k!r}] 的 {_MASKED_CUSTOM_HEADER_VALUE} 占位符只能保留已有敏感 header；"
+                    "当前无可恢复真实旧值。"
+                )
             restored[k] = current_headers[k]
         else:
             restored[k] = v
@@ -1283,19 +1301,22 @@ def _restore_provider_body(
     body: LlmProviderBody,
     current: LlmProviderDefinition | None
 ) -> LlmProviderBody:
-    if current is None:
-        return body
+    current_headers = current.custom_headers if current is not None else {}
     if body.custom_headers is not None:
-        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers) or {}
-    if body.api_keys is not None:
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current_headers) or {}
+    if current is not None and body.api_keys is not None:
         body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
     for mb in body.models:
-        current_mb = next((m for m in current.models if m.id == mb.id), None)
-        if current_mb:
-            if mb.custom_headers is not None:
-                mb.custom_headers = _restore_custom_headers_from_current(mb.custom_headers, current_mb.custom_headers) or {}
-            if mb.api_keys is not None:
-                mb.api_keys = _restore_api_keys_from_current(mb.api_keys, current_mb.api_keys) or []
+        current_mb = (
+            next((model for model in current.models if model.id == mb.id), None)
+            if current is not None
+            else None
+        )
+        if mb.custom_headers is not None:
+            binding_headers = current_mb.custom_headers if current_mb is not None else {}
+            mb.custom_headers = _restore_custom_headers_from_current(mb.custom_headers, binding_headers) or {}
+        if current_mb is not None and mb.api_keys is not None:
+            mb.api_keys = _restore_api_keys_from_current(mb.api_keys, current_mb.api_keys) or []
     return body
 
 
@@ -1314,11 +1335,10 @@ def _restore_binding_body(
     body: LlmProviderModelBindingBody,
     current: LlmProviderModelBinding | None
 ) -> LlmProviderModelBindingBody:
-    if current is None:
-        return body
     if body.custom_headers is not None:
-        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current.custom_headers) or {}
-    if body.api_keys is not None:
+        current_headers = current.custom_headers if current is not None else {}
+        body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current_headers) or {}
+    if current is not None and body.api_keys is not None:
         body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
     return body
 

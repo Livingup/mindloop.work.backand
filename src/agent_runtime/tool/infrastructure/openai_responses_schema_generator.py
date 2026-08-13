@@ -10,7 +10,7 @@ from typing import Any
 
 from openai import pydantic_function_tool
 
-from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
+from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, API_FORMAT_OPENAI_RESPONSES
 from agent_runtime.tool.infrastructure._pydantic_model_builder import (
     build_pydantic_model,
 )
@@ -61,3 +61,16 @@ class OpenAIResponsesSchemaGenerator:
             "parameters": fn.get("parameters", {}),
             "strict": False,
         }
+
+
+class CodexResponsesSchemaGenerator(OpenAIResponsesSchemaGenerator):
+    """Codex Responses 独立协议的工具 Schema 生成器。
+
+    Codex Responses 当前与 OpenAI Responses 使用相同的工具参数结构，
+    但以独立 api_format 注册和缓存，不降级为 openai_responses 别名。
+    """
+
+    @property
+    def platform(self) -> str:
+        """Codex Responses 协议格式标识。"""
+        return API_FORMAT_CODEX_RESPONSES

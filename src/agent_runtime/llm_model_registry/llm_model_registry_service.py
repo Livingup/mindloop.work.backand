@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from agent_runtime.llm_api_protocol import get_sdk_platform_for_api_format
+from agent_runtime.llm_api_protocol import API_FORMAT_CODEX_RESPONSES, get_sdk_platform_for_api_format
 from agent_runtime.llm_model_registry.llm_execution_policy import LlmExecutionPolicy
 from agent_runtime.llm_model_registry.llm_model_metadata import (
     LLM_MODEL_SOURCE_BUILTIN,
@@ -386,17 +386,36 @@ class LlmModelRegistryService:
         metadata = self.get_model_metadata(binding.model_id)
         merged_headers = dict(provider.custom_headers)
         merged_headers.update(binding.custom_headers)
+        from agent_runtime.codex_oauth.models import CODEX_DISPLAY_API_BASE_URL, CODEX_PROVIDER_ID
+        managed_codex = provider.provider_id == CODEX_PROVIDER_ID
+        resolved_api_format = API_FORMAT_CODEX_RESPONSES if managed_codex else binding.api_format
+        resolved_api_base_url = (
+            CODEX_DISPLAY_API_BASE_URL
+            if managed_codex
+            else binding.api_base_url or provider.api_base_url
+        )
+        resolved_api_keys = () if managed_codex else binding.api_keys or provider.api_keys
+        resolved_retry = (
+            LlmRetryPolicy(
+                max_retries_per_key=0,
+                initial_delay_seconds=0,
+                max_delay_seconds=0,
+                retryable_status_codes=(),
+            )
+            if managed_codex
+            else provider.retry
+        )
         return ResolvedLlmProviderModel(
             provider_id=provider.provider_id,
             binding_id=binding.id,
             model_id=metadata.model_id,
             model_alias=binding.model_alias,
-            api_format=binding.api_format,
-            sdk_platform=get_sdk_platform_for_api_format(binding.api_format),
-            api_base_url=binding.api_base_url or provider.api_base_url,
-            api_keys=binding.api_keys or provider.api_keys,
+            api_format=resolved_api_format,
+            sdk_platform=get_sdk_platform_for_api_format(resolved_api_format),
+            api_base_url=resolved_api_base_url,
+            api_keys=resolved_api_keys,
             custom_headers=merged_headers,
-            retry=provider.retry,
+            retry=resolved_retry,
             tool_choice=binding.tool_choice,
             thinking=binding.thinking,
             custom_request_params=binding.custom_request_params,

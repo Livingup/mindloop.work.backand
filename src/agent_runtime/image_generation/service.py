@@ -9,7 +9,6 @@ import mimetypes
 import os
 import re
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,13 +22,12 @@ from agent_runtime.image_generation.models import (
 from agent_runtime.image_generation.llm_registry_gateway import GPT_IMAGE_AGENT_MODEL_ID
 from agent_runtime.image_generation.openai_images_client import OpenAIImagesGenerationClient
 from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
-from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES
-from agent_runtime.llm_client.llm_protocol_clients import (
-    _aggregate_openai_responses_sse,
-    _join_url,
-    _json_headers,
-    _post_json,
+from agent_runtime.llm_api_protocol import (
+    API_FORMAT_CODEX_RESPONSES,
+    API_FORMAT_OPENAI_IMAGES_GENERATIONS,
+    API_FORMAT_OPENAI_RESPONSES,
 )
+from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
 
@@ -69,11 +67,13 @@ class ImageGenerationService:
         settings_repository: ImageGenerationSettingsRepository,
         llm_registry_gateway: LlmModelRegistryGateway,
         file_resource_service: FileResourceService,
+        llm_request_service: LlmRequestService,
         images_client: OpenAIImagesGenerationClient | None = None,
     ) -> None:
         self._settings_repository = settings_repository
         self._llm_registry_gateway = llm_registry_gateway
         self._file_resource_service = file_resource_service
+        self._llm_request_service = llm_request_service
         self._images_client = images_client or OpenAIImagesGenerationClient()
 
     def get_settings(self):
@@ -110,6 +110,7 @@ class ImageGenerationService:
         for candidate_index, candidate in enumerate(policy.candidates):
             resolved = candidate.resolved_model
             self._assert_supported_model(resolved)
+
             api_key_items = list(resolved.api_keys)
             api_keys: list[str | None] = [item.key for item in api_key_items] or [None]
             max_retries = max(0, int(resolved.retry.max_retries_per_key))
@@ -142,7 +143,12 @@ class ImageGenerationService:
                                 api_key=api_key,
                                 body=request_body,
                             )
-                        images = self._ingest_images(response, output_format=str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT))
+                        images = self._ingest_images(
+                            response,
+                            output_format=str(
+                                request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT
+                            ),
+                        )
                         if not images:
                             raise RuntimeError("OpenAI Images API returned no image data.")
                         logger.info(
@@ -185,7 +191,11 @@ class ImageGenerationService:
                             exc,
                         )
                         if retry_index < max_retries:
-                            await _sleep_before_retry(resolved.retry.initial_delay_seconds, resolved.retry.max_delay_seconds, retry_index)
+                            await _sleep_before_retry(
+                                resolved.retry.initial_delay_seconds,
+                                resolved.retry.max_delay_seconds,
+                                retry_index,
+                            )
                             continue
                         break
         if last_error is not None:
@@ -269,14 +279,18 @@ class ImageGenerationService:
             return
         if _is_gpt_image_agent_model(resolved):
             return
-        if resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
+        if resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
             raise ImageGenerationConfigurationError(
-                f"Image generation only supports model_id={GPT_IMAGE_AGENT_MODEL_ID} for api_format={API_FORMAT_OPENAI_RESPONSES}: {resolved.provider_id}/{resolved.binding_id}"
+                f"Image generation only supports model_id={GPT_IMAGE_AGENT_MODEL_ID} for standard Responses: "
+                f"{resolved.provider_id}/{resolved.binding_id}/{resolved.api_format}"
             )
-        else:
-            raise ImageGenerationConfigurationError(
-                f"Image generation only supports api_format={API_FORMAT_OPENAI_IMAGES_GENERATIONS} or {API_FORMAT_OPENAI_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}: {resolved.provider_id}/{resolved.binding_id}"
-            )
+        raise ImageGenerationConfigurationError(
+            "Image generation only supports "
+            f"{API_FORMAT_OPENAI_IMAGES_GENERATIONS}, "
+            f"{API_FORMAT_OPENAI_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}, or "
+            f"{API_FORMAT_CODEX_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}: "
+            f"{resolved.provider_id}/{resolved.binding_id}"
+        )
 
     async def _run_gpt_image_agent(
         self,
@@ -286,37 +300,39 @@ class ImageGenerationService:
         request: ImageGenerationRequest,
         request_body: dict[str, Any],
     ) -> dict[str, Any]:
-        resolved_model = _with_gpt_image_agent_relay_session_header(
-            resolved_model,
-            request.relay_session_id,
+        conversation_id = (
+            _normalize_relay_session_id(request.relay_session_id)
+            or _fallback_gpt_image_agent_relay_session_id(resolved_model)
         )
         input_items = _build_gpt_image_agent_initial_input(request, request_body)
         request_params = _merge_gpt_image_agent_request_params(resolved_model)
+        for fixed_field in ("model", "input", "instructions", "tools"):
+            request_params.pop(fixed_field, None)
+        request_params.update({
+            "tool_choice": {"type": "image_generation"},
+            "store": False,
+            "stream": True,
+        })
         output_format = str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT)
         for round_index in range(_GPT_IMAGE_AGENT_MAX_ROUNDS):
-            body: dict[str, Any] = {
-                **request_params,
-                "model": resolved_model.model_alias,
-                "input": input_items,
-                "instructions": _GPT_IMAGE_AGENT_SYSTEM_PROMPT,
-                "tools": [{"type": "image_generation"}],
-                "tool_choice": {"type": "image_generation"},
-                "store": False,
-                "stream": True,
-            }
-            if resolved_model.max_output_tokens:
-                body.setdefault("max_output_tokens", resolved_model.max_output_tokens)
-            raw_response = await _post_openai_responses_json(
+            raw_response = await self._llm_request_service.request_standard_responses(
                 resolved_model=resolved_model,
+                conversation_id=conversation_id,
+                input_items=input_items,
+                system_prompt=_GPT_IMAGE_AGENT_SYSTEM_PROMPT,
+                tools=({"type": "image_generation"},),
+                request_params=request_params,
                 api_key=api_key,
-                body=body,
             )
+            if not isinstance(raw_response, dict):
+                raise RuntimeError("Standard Responses image agent response must be a JSON object.")
             data = _extract_gpt_image_agent_image_data(raw_response, output_format=output_format)
             if data:
                 return {"data": data}
             input_items.extend(_replayable_gpt_image_agent_output_items(raw_response))
             input_items.append(_build_gpt_image_agent_continue_input(round_index))
         raise RuntimeError(f"gpt-5.5 image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
+
 
 
 def _bounded_count(value: int) -> int:
@@ -426,19 +442,10 @@ def _sanitize_image_reference(value: Any) -> Any:
 
 
 def _is_gpt_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
-    return resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID and resolved.api_format == API_FORMAT_OPENAI_RESPONSES
-
-
-def _with_gpt_image_agent_relay_session_header(
-    resolved_model: ResolvedLlmProviderModel,
-    relay_session_id: str | None,
-) -> ResolvedLlmProviderModel:
-    headers = dict(resolved_model.custom_headers)
-    if any(key.lower() == "x-relay-session-id" for key in headers):
-        return resolved_model
-    session_id = _normalize_relay_session_id(relay_session_id) or _fallback_gpt_image_agent_relay_session_id(resolved_model)
-    headers["x-relay-session-id"] = session_id
-    return replace(resolved_model, custom_headers=headers)
+    return (
+        resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID
+        and resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}
+    )
 
 
 def _normalize_relay_session_id(value: str | None) -> str | None:
@@ -450,27 +457,6 @@ def _normalize_relay_session_id(value: str | None) -> str | None:
 
 def _fallback_gpt_image_agent_relay_session_id(resolved_model: ResolvedLlmProviderModel) -> str:
     return f"image-generation:{resolved_model.provider_id}:{resolved_model.binding_id}"
-
-
-async def _post_openai_responses_json(
-    *,
-    resolved_model: ResolvedLlmProviderModel,
-    api_key: str | None,
-    body: dict[str, Any],
-) -> dict[str, Any]:
-    url = _join_url(resolved_model.api_base_url, "responses")
-    headers = _json_headers(resolved_model.custom_headers)
-    if api_key:
-        headers.setdefault("Authorization", f"Bearer {api_key}")
-    response = await _post_json(
-        url,
-        headers,
-        body,
-        sse_aggregator=_aggregate_openai_responses_sse,
-    )
-    if not isinstance(response, dict):
-        raise RuntimeError("OpenAI Responses image agent response must be a JSON object.")
-    return response
 
 
 def _merge_gpt_image_agent_request_params(resolved_model: ResolvedLlmProviderModel) -> dict[str, Any]:

@@ -7,13 +7,13 @@ import logging
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, NoReturn, Sequence
 
 from agent_runtime.codex_oauth.config import CodexOAuthConfig
 from agent_runtime.codex_oauth.diagnostics import (
     CodexSdkRawEventSink,
     proxy_diagnostic,
-    sdk_error_diagnostic,
+    sdk_error_projection,
     short_identifier,
     stable_fingerprint,
  )
@@ -51,6 +51,22 @@ _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
 
 class CodexOAuthError(RuntimeError):
     """Stable Runtime-facing error for SDK management and lifecycle failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sdk_error: BaseException | None = None,
+        diagnostic: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.sdk_error = sdk_error
+        self.diagnostic = diagnostic or {}
+        self.code = self.diagnostic.get("code", "codex_sdk_error")
+        self.http_status = self.diagnostic.get("http_status")
+        self.retryable = bool(self.diagnostic.get("retryable", False))
+        self.retry_at = self.diagnostic.get("retry_at")
+        self.partial_output = bool(self.diagnostic.get("partial_output", False))
 
 
 class CodexOAuthService:
@@ -96,15 +112,18 @@ class CodexOAuthService:
         try:
             await client.open()
         except Exception as exc:
+            diagnostic = sdk_error_projection(exc, stage="lifecycle_open")
             logger.error(
                 "codex_sdk.lifecycle.open_failed storage=%s details=%s",
                 storage_dir,
-                sdk_error_diagnostic(exc),
+                diagnostic,
             )
             with suppress(Exception, asyncio.CancelledError):
                 await client.close()
             raise CodexOAuthError(
-                _safe_service_failure_message("startup", exc)
+                diagnostic["message"],
+                sdk_error=exc,
+                diagnostic=diagnostic,
             ) from None
         self._client = client
         self._storage_dir = storage_dir
@@ -124,8 +143,13 @@ class CodexOAuthService:
         try:
             await client.close()
         except Exception as exc:
-            logger.error("codex_sdk.lifecycle.close_failed details=%s", sdk_error_diagnostic(exc))
-            raise CodexOAuthError(_safe_service_failure_message("shutdown", exc)) from None
+            diagnostic = sdk_error_projection(exc, stage="lifecycle_close")
+            logger.error("codex_sdk.lifecycle.close_failed details=%s", diagnostic)
+            raise CodexOAuthError(
+                diagnostic["message"],
+                sdk_error=exc,
+                diagnostic=diagnostic,
+            ) from None
         finally:
             self._client = None
             self._storage_dir = None
@@ -176,7 +200,7 @@ class CodexOAuthService:
                 provider_id=existing.provider_id,
                 group=existing.group or "official",
                 api_base_url=CODEX_DISPLAY_API_BASE_URL,
-                custom_headers={},
+                custom_headers=dict(existing.custom_headers),
                 api_keys=(),
                 retry=_sdk_owned_retry_policy(),
                 models=managed_default_bindings + custom_bindings,
@@ -189,58 +213,64 @@ class CodexOAuthService:
         )
 
     async def begin_browser_auth(self, proxy_url: str | None = None) -> Any:
+        """Start new-account browser authorization with one account proxy.
+
+        louyi exposes separate technical parameters for authorization transport and
+        successful-account defaults; both receive the same parsed product proxy.
+        """
         sdk = _sdk_module()
-        proxy = _proxy_config(sdk, proxy_url)
+        account_proxy = _proxy_config(sdk, proxy_url)
         started_at = time.perf_counter()
-        try:
-            result = await self.client.auth.begin_browser_pkce(
-                auth_proxy=proxy,
-                account_defaults=sdk.NewAccountDefaults(proxy=proxy),
-            )
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.oauth.browser_start_failed proxy=%s details=%s",
-                proxy_diagnostic(proxy),
-                sdk_error_diagnostic(exc),
-            )
-            raise
+        result = await self._management_call(
+            stage="oauth_browser_start",
+            operation=lambda: self.client.auth.begin_browser_pkce(
+                auth_proxy=account_proxy,
+                account_defaults=sdk.NewAccountDefaults(proxy=account_proxy),
+            ),
+            proxy=account_proxy,
+        )
         logger.info(
             "codex_sdk.oauth.browser_started attempt_id=%s expires_at=%s proxy=%s duration_ms=%d",
             short_identifier(result.attempt_id),
             result.expires_at,
-            proxy_diagnostic(proxy),
+            proxy_diagnostic(account_proxy),
             int((time.perf_counter() - started_at) * 1000),
         )
         return result
 
     async def begin_device_auth(self, proxy_url: str | None = None) -> Any:
+        """Start new-account device authorization with one account proxy.
+
+        The SDK parameter split is an implementation detail; the Runtime passes
+        one identical parsed proxy to both technical stages of this account flow.
+        """
         sdk = _sdk_module()
-        proxy = _proxy_config(sdk, proxy_url)
+        account_proxy = _proxy_config(sdk, proxy_url)
         started_at = time.perf_counter()
-        try:
-            result = await self.client.auth.begin_device_code(
-                auth_proxy=proxy,
-                account_defaults=sdk.NewAccountDefaults(proxy=proxy),
-            )
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.oauth.device_start_failed proxy=%s details=%s",
-                proxy_diagnostic(proxy),
-                sdk_error_diagnostic(exc),
-            )
-            raise
+        result = await self._management_call(
+            stage="oauth_device_start",
+            operation=lambda: self.client.auth.begin_device_code(
+                auth_proxy=account_proxy,
+                account_defaults=sdk.NewAccountDefaults(proxy=account_proxy),
+            ),
+            proxy=account_proxy,
+        )
         logger.info(
             "codex_sdk.oauth.device_started attempt_id=%s expires_at=%s poll_interval=%s proxy=%s duration_ms=%d",
             short_identifier(result.attempt_id),
             result.expires_at,
             result.interval_seconds,
-            proxy_diagnostic(proxy),
+            proxy_diagnostic(account_proxy),
             int((time.perf_counter() - started_at) * 1000),
         )
         return result
 
     async def get_auth_attempt(self, attempt_id: str) -> Any:
-        result = await self.client.auth.get_attempt(attempt_id)
+        result = await self._management_call(
+            stage="oauth_attempt_get",
+            operation=lambda: self.client.auth.get_attempt(attempt_id),
+            attempt_id=attempt_id,
+        )
         logger.info(
             "codex_sdk.oauth.attempt_loaded attempt_id=%s kind=%s status=%s completed_account=%s",
             short_identifier(attempt_id),
@@ -254,15 +284,11 @@ class CodexOAuthService:
 
     async def poll_device_auth(self, attempt_id: str) -> Any:
         started_at = time.perf_counter()
-        try:
-            result = await self.client.auth.poll_device_code_once(attempt_id)
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.oauth.device_poll_failed attempt_id=%s details=%s",
-                short_identifier(attempt_id),
-                sdk_error_diagnostic(exc),
-            )
-            raise
+        result = await self._management_call(
+            stage="oauth_device_poll",
+            operation=lambda: self.client.auth.poll_device_code_once(attempt_id),
+            attempt_id=attempt_id,
+        )
         logger.info(
             "codex_sdk.oauth.device_polled attempt_id=%s status=%s next_poll_at=%s account_id=%s duration_ms=%d",
             short_identifier(attempt_id),
@@ -275,16 +301,14 @@ class CodexOAuthService:
 
     async def complete_browser_callback(self, attempt_id: str, callback_url: str) -> Any:
         started_at = time.perf_counter()
-        try:
-            result = await self.client.auth.complete_browser_callback_url(attempt_id, callback_url)
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.oauth.browser_callback_failed attempt_id=%s callback_origin=%s details=%s",
-                short_identifier(attempt_id),
-                _callback_origin(callback_url),
-                sdk_error_diagnostic(exc),
-            )
-            raise
+        result = await self._management_call(
+            stage="oauth_browser_callback",
+            operation=lambda: self.client.auth.complete_browser_callback_url(
+                attempt_id,
+                callback_url,
+            ),
+            attempt_id=attempt_id,
+        )
         logger.info(
             "codex_sdk.oauth.browser_completed attempt_id=%s account_id=%s created=%s duration_ms=%d",
             short_identifier(attempt_id),
@@ -295,7 +319,11 @@ class CodexOAuthService:
         return result
 
     async def cancel_auth_attempt(self, attempt_id: str) -> Any:
-        result = await self.client.auth.cancel_attempt(attempt_id)
+        result = await self._management_call(
+            stage="oauth_attempt_cancel",
+            operation=lambda: self.client.auth.cancel_attempt(attempt_id),
+            attempt_id=attempt_id,
+        )
         logger.info(
             "codex_sdk.oauth.cancelled attempt_id=%s kind=%s status=%s",
             short_identifier(attempt_id),
@@ -305,7 +333,10 @@ class CodexOAuthService:
         return result
 
     async def list_accounts(self, *, include_disabled: bool = True) -> list[Any]:
-        accounts = await self.client.accounts.list(include_disabled=include_disabled)
+        accounts = await self._management_call(
+            stage="account_list",
+            operation=lambda: self.client.accounts.list(include_disabled=include_disabled),
+        )
         logger.info(
             "codex_sdk.accounts.listed count=%d include_disabled=%s health=%s",
             len(accounts),
@@ -315,7 +346,11 @@ class CodexOAuthService:
         return accounts
 
     async def get_account(self, account_id: str) -> Any:
-        account = await self.client.accounts.get(account_id)
+        account = await self._management_call(
+            stage="account_get",
+            operation=lambda: self.client.accounts.get(account_id),
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.account.loaded account_id=%s enabled=%s health=%s version=%s proxy=%s",
             short_identifier(account_id),
@@ -352,22 +387,16 @@ class CodexOAuthService:
         if proxy_present:
             patch_kwargs["proxy"] = _proxy_config(sdk, proxy_url)
             changed_fields.append("proxy")
-        try:
-            account = await self.client.accounts.update(
+        account = await self._management_call(
+            stage="account_update",
+            operation=lambda: self.client.accounts.update(
                 account_id,
                 sdk.AccountPatch(**patch_kwargs),
                 expected_version=expected_version,
-            )
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.account.update_failed account_id=%s expected_version=%s fields=%s proxy=%s details=%s",
-                short_identifier(account_id),
-                expected_version,
-                changed_fields,
-                proxy_diagnostic(patch_kwargs.get("proxy")) if proxy_present else {"proxy_unchanged": True},
-                sdk_error_diagnostic(exc),
-            )
-            raise
+            ),
+            proxy=patch_kwargs.get("proxy") if proxy_present else None,
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.account.updated account_id=%s version=%s fields=%s enabled=%s health=%s proxy=%s",
             short_identifier(account_id),
@@ -385,7 +414,13 @@ class CodexOAuthService:
         *,
         expected_versions: Mapping[str, int] | None = None,
     ) -> list[Any]:
-        accounts = await self.client.accounts.reorder(account_ids, expected_versions=expected_versions)
+        accounts = await self._management_call(
+            stage="account_reorder",
+            operation=lambda: self.client.accounts.reorder(
+                account_ids,
+                expected_versions=expected_versions,
+            ),
+        )
         logger.info(
             "codex_sdk.accounts.reordered account_ids=%s versions_checked=%s",
             [short_identifier(item) for item in account_ids],
@@ -394,7 +429,11 @@ class CodexOAuthService:
         return accounts
 
     async def enable_account(self, account_id: str) -> Any:
-        account = await self.client.accounts.enable(account_id)
+        account = await self._management_call(
+            stage="account_enable",
+            operation=lambda: self.client.accounts.enable(account_id),
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.account.enabled account_id=%s version=%s health=%s",
             short_identifier(account_id),
@@ -404,13 +443,21 @@ class CodexOAuthService:
         return account
 
     async def disable_account(self, account_id: str, *, force: bool = False) -> Any:
-        result = await self.client.accounts.disable(account_id, force=force)
+        result = await self._management_call(
+            stage="account_disable",
+            operation=lambda: self.client.accounts.disable(account_id, force=force),
+            account_id=account_id,
+        )
         _log_operation("disable", result)
         return result
 
     async def recover_account(self, account_id: str) -> Any:
         started_at = time.perf_counter()
-        result = await self.client.accounts.recover(account_id)
+        result = await self._management_call(
+            stage="account_recover",
+            operation=lambda: self.client.accounts.recover(account_id),
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.account.recovered account_id=%s recovered=%s health=%s checks=%s duration_ms=%d",
             short_identifier(account_id),
@@ -422,22 +469,39 @@ class CodexOAuthService:
         return result
 
     async def delete_account(self, account_id: str, *, force: bool = False) -> Any:
-        result = await self.client.accounts.delete(account_id, force=force)
+        result = await self._management_call(
+            stage="account_delete",
+            operation=lambda: self.client.accounts.delete(account_id, force=force),
+            account_id=account_id,
+        )
         _log_operation("delete", result)
         return result
 
     async def get_operation(self, operation_id: str) -> Any:
-        result = await self.client.operations.get(operation_id)
+        result = await self._management_call(
+            stage="operation_get",
+            operation=lambda: self.client.operations.get(operation_id),
+        )
         _log_operation("get", result)
         return result
 
     async def wait_operation(self, operation_id: str, *, timeout_seconds: float) -> Any:
-        result = await self.client.operations.wait(operation_id, timeout=timeout_seconds)
+        result = await self._management_call(
+            stage="operation_wait",
+            operation=lambda: self.client.operations.wait(
+                operation_id,
+                timeout=timeout_seconds,
+            ),
+        )
         _log_operation("wait", result)
         return result
 
     async def get_cached_quota(self, account_id: str) -> Any | None:
-        snapshot = await self.client.quotas.get_cached(account_id)
+        snapshot = await self._management_call(
+            stage="quota_cached_get",
+            operation=lambda: self.client.quotas.get_cached(account_id),
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.quota.cached account_id=%s present=%s",
             short_identifier(account_id),
@@ -447,15 +511,18 @@ class CodexOAuthService:
 
     async def refresh_quota(self, account_id: str) -> Any:
         started_at = time.perf_counter()
-        try:
-            snapshot = await self.client.quotas.refresh(account_id)
-        except Exception as exc:
-            logger.error(
-                "codex_sdk.quota.refresh_failed account_id=%s details=%s",
-                short_identifier(account_id),
-                sdk_error_diagnostic(exc),
-            )
-            raise
+        account = await self._management_call(
+            stage="quota_refresh_account_get",
+            operation=lambda: self.client.accounts.get(account_id),
+            account_id=account_id,
+        )
+        account_proxy = getattr(account, "proxy", None)
+        snapshot = await self._management_call(
+            stage="quota_refresh",
+            operation=lambda: self.client.quotas.refresh(account_id),
+            proxy=account_proxy if account_proxy is not None else {"configured": False},
+            account_id=account_id,
+        )
         logger.info(
             "codex_sdk.quota.refreshed account_id=%s source=%s five_hour=%s weekly=%s duration_ms=%d",
             short_identifier(account_id),
@@ -467,24 +534,80 @@ class CodexOAuthService:
         return snapshot
 
     async def get_routing_strategy(self) -> Any:
-        strategy = await self.client.accounts.get_routing_strategy()
+        strategy = await self._management_call(
+            stage="routing_get",
+            operation=lambda: self.client.accounts.get_routing_strategy(),
+        )
         logger.info("codex_sdk.routing.loaded strategy=%s", _enum_value(strategy))
         return strategy
 
     async def set_routing_strategy(self, strategy: str) -> Any:
         sdk = _sdk_module()
-        updated = await self.client.accounts.set_routing_strategy(sdk.RoutingStrategy(strategy))
+        updated = await self._management_call(
+            stage="routing_set",
+            operation=lambda: self.client.accounts.set_routing_strategy(
+                sdk.RoutingStrategy(strategy)
+            ),
+        )
         logger.info("codex_sdk.routing.updated strategy=%s", _enum_value(updated))
         return updated
 
     async def delete_session_binding(self, conversation_id: str) -> bool:
-        deleted = await self.client.sessions.delete_binding(conversation_id)
+        deleted = await self._management_call(
+            stage="session_binding_delete",
+            operation=lambda: self.client.sessions.delete_binding(conversation_id),
+        )
         logger.info(
             "codex_sdk.session.binding_deleted session_fingerprint=%s deleted=%s",
             stable_fingerprint(conversation_id),
             deleted,
         )
         return deleted
+
+    async def _management_call(
+        self,
+        *,
+        stage: str,
+        operation: Callable[[], Awaitable[Any]],
+        proxy: Any = None,
+        account_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> Any:
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._raise_management_error(
+                exc,
+                stage=stage,
+                proxy=proxy,
+                account_id=account_id,
+                attempt_id=attempt_id,
+            )
+
+    @staticmethod
+    def _raise_management_error(
+        exc: BaseException,
+        *,
+        stage: str,
+        proxy: Any = None,
+        account_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> NoReturn:
+        diagnostic = sdk_error_projection(
+            exc,
+            stage=stage,
+            proxy=proxy,
+            account_id=account_id,
+            attempt_id=attempt_id,
+        )
+        logger.error("codex_sdk.management.failed details=%s", diagnostic)
+        raise CodexOAuthError(
+            diagnostic["message"],
+            sdk_error=exc,
+            diagnostic=diagnostic,
+        ) from None
 
     def _config(self) -> CodexOAuthConfig:
         return self._config_accessor()
@@ -510,6 +633,7 @@ def _proxy_config(sdk: Any, proxy_url: str | None) -> Any | None:
     except ValueError:
         raise ValueError("proxy_url 端口无效。") from None
     return sdk.ProxyConfig(text)
+
 
 
 def _default_model_metadata(model_id: str) -> LlmModelMetadata:
@@ -560,7 +684,7 @@ def _sdk_owned_binding(binding: LlmProviderModelBinding) -> LlmProviderModelBind
         thinking=binding.thinking,
         custom_request_params=binding.custom_request_params,
         api_base_url=None,
-        custom_headers={},
+        custom_headers=dict(binding.custom_headers),
         api_keys=(),
     )
 
@@ -600,25 +724,3 @@ def _log_operation(action: str, result: Any) -> None:
         result.remaining_active_requests,
         getattr(result.error, "code", None),
     )
-
-
-def _safe_service_failure_message(operation: str, error: BaseException) -> str:
-    code = getattr(error, "code", None) or error.__class__.__name__
-    status = getattr(error, "http_status", None)
-    return f"louyi-codex {operation} failed code={code} http_status={status!r}"
-
-
-def _callback_origin(callback_url: str) -> str | None:
-    from urllib.parse import urlsplit
-    try:
-        parsed = urlsplit(callback_url)
-    except ValueError:
-        return None
-    if not parsed.scheme or not parsed.hostname:
-        return None
-    try:
-        parsed_port = parsed.port
-    except ValueError:
-        return None
-    port = f":{parsed_port}" if parsed_port is not None else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}{parsed.path}"

@@ -17,6 +17,7 @@ def get_image_generation_service() -> ImageGenerationService:
             from agent_runtime.config import ConfigRegistry
             from agent_runtime.file_resource.shared_service import get_file_resource_service
             from agent_runtime.image_generation.settings_repository import create_image_generation_settings_repository
+            from agent_runtime.llm_client import LlmClientFactory
             from agent_runtime.llm_model_registry.llm_model_registry_factory import LlmModelRegistryFactory
 
             _image_generation_service = ImageGenerationService(
@@ -25,5 +26,6 @@ def get_image_generation_service() -> ImageGenerationService:
                 ),
                 llm_registry_gateway=LlmModelRegistryFactory.create_image_generation_registry(),
                 file_resource_service=get_file_resource_service(),
+                llm_request_service=LlmClientFactory.create(),
             )
         return _image_generation_service

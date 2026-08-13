@@ -34,6 +34,69 @@ class LlmHttpTraceContext:
 
 
 @dataclass(frozen=True, slots=True)
+class LlmHttpTraceLifecycleEvent:
+    sequence: int
+    kind: str
+    timestamp: datetime
+    redacted: bool = False
+    byte_count: int | None = None
+    data_byte_count: int | None = None
+    status: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LlmHttpTraceUpstreamAttempt:
+    sdk_request_id: str
+    attempt_id: str
+    attempt_index: int
+    attempt_kind: str
+    account_fingerprint: str | None
+    status: str
+    method: str
+    url: str
+    request_headers: dict[str, str]
+    request_body_text: str
+    request_body_bytes: int
+    request_body_truncated: bool
+    request_body_redacted: bool
+    status_code: int | None
+    response_headers: dict[str, str]
+    response_body_text: str | None
+    response_body_bytes: int
+    response_body_truncated: bool
+    response_body_redacted: bool
+    response_content_type: str | None
+    is_stream: bool
+    sse_event_count: int
+    error_type: str | None
+    error_message: str | None
+    started_at: datetime
+    completed_at: datetime | None
+    duration_ms: int | None
+    raw_request_text: str | None
+    raw_response_text: str | None
+    lifecycle_events: tuple[LlmHttpTraceLifecycleEvent, ...]
+    lifecycle_event_count: int
+    lifecycle_truncated: bool
+    account_id: str | None = None
+    request_header_pairs: tuple[tuple[str, str], ...] = ()
+    request_body_base64: str | None = None
+    response_header_pairs: tuple[tuple[str, str], ...] = ()
+    response_body_chunks_base64: tuple[str, ...] = ()
+    sse_frames_base64: tuple[str, ...] = ()
+    sse_data_base64: tuple[str | None, ...] = ()
+    sse_frame_bytes: int = 0
+    sse_data_bytes: int = 0
+    terminal_error: dict[str, Any] | None = None
+    callback_events: tuple[dict[str, Any], ...] = ()
+    capture_complete: bool = False
+    capture_error: str | None = None
+    capture_source: str = "unknown"
+    socket_level_wire: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LlmHttpTraceRecord:
     llm_request_id: str
     llm_call_id: str
@@ -72,6 +135,9 @@ class LlmHttpTraceRecord:
     duration_ms: int | None = None
     raw_request_text: str | None = None
     raw_response_text: str | None = None
+    request_body_redacted: bool = False
+    response_body_redacted: bool = False
+    upstream_attempts: tuple[LlmHttpTraceUpstreamAttempt, ...] = ()
 
     @property
     def truncated(self) -> bool:

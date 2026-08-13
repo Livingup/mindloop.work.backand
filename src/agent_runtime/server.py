@@ -119,7 +119,11 @@ def create_app(
     from agent_runtime.llm_model_registry.llm_execution_policy import (
         UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
     )
-    from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES
+    from agent_runtime.llm_api_protocol import (
+        API_FORMAT_CODEX_RESPONSES,
+        API_FORMAT_OPENAI_IMAGES_GENERATIONS,
+        API_FORMAT_OPENAI_RESPONSES,
+    )
     from agent_runtime.llm_http_trace.llm_http_trace_factory import (
         LlmHttpTraceFactory,
     )
@@ -180,6 +184,7 @@ def create_app(
     from agent_runtime.lacp.lacp_factory import LacpFactory
     from agent_runtime.lacp.north_gateway.lacp_rest_adapter import create_lacp_router
     from agent_runtime.codex_oauth.factory import CodexOAuthFactory
+    from agent_runtime.codex_oauth.models import CODEX_PROVIDER_ID
     from agent_runtime.codex_oauth.north_gateway.codex_oauth_rest_adapter import (
         create_codex_oauth_router,
     )
@@ -258,6 +263,7 @@ def create_app(
         LlmModelRegistryFactory.create_image_generation_registry()
     )
     file_resource_service = _SwitchableRuntimeComponent(get_file_resource_service())
+    codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     image_generation_service = _SwitchableRuntimeComponent(
         ImageGenerationService(
             settings_repository=create_image_generation_settings_repository(
@@ -265,6 +271,7 @@ def create_app(
             ),
             llm_registry_gateway=image_generation_registry_gateway,
             file_resource_service=file_resource_service,
+            llm_request_service=LlmClientFactory.create(),
         )
     )
     web_tools_service = _SwitchableRuntimeComponent(
@@ -276,7 +283,6 @@ def create_app(
             llm_request_service=LlmClientFactory.create(),
         )
     )
-    codex_oauth_service = CodexOAuthFactory.create_service(llm_model_registry_gateway)
     if not cloud_user_config_database_active_at_start:
         logger.info("Runtime 处于 bootstrap 限制模式，跳过内置 Codex Provider 写入以避免本地 LLM Registry 成为共享配置权威。")
     runtime_auth_service = RuntimeAuthFactory.create_service()
@@ -378,6 +384,7 @@ def create_app(
                 ),
                 llm_registry_gateway=image_generation_registry_gateway,
                 file_resource_service=file_resource_service,
+                llm_request_service=LlmClientFactory.create(),
             )
         )
         web_tools_service.set_target(
@@ -1100,8 +1107,12 @@ def create_app(
     app.include_router(
         create_llm_model_registry_router(
             image_generation_registry_gateway,
-            builtin_provider_ids=set(),
-            api_formats=(API_FORMAT_OPENAI_IMAGES_GENERATIONS, API_FORMAT_OPENAI_RESPONSES),
+            builtin_provider_ids={CODEX_PROVIDER_ID},
+            api_formats=(
+                API_FORMAT_OPENAI_IMAGES_GENERATIONS,
+                API_FORMAT_OPENAI_RESPONSES,
+                API_FORMAT_CODEX_RESPONSES,
+            ),
             unsupported_input_modality_strategies=(
                 UNSUPPORTED_INPUT_MODALITY_STRATEGY_SKIP_CANDIDATE,
             ),

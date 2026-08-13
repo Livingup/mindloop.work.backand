@@ -8,6 +8,7 @@ from agent_runtime.conversation_message.message.models import ToolResultPart, To
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
+    API_FORMAT_CODEX_RESPONSES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
     API_FORMAT_OPENAI_CHAT_COMPLETIONS,
     API_FORMAT_OPENAI_RESPONSES,
@@ -171,7 +172,7 @@ _TOOL_DEFINITIONS: tuple[tuple[str, str, dict[str, Any]], ...] = (
 
 
 def _schema_for(api_format: str, name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
-    if api_format == API_FORMAT_OPENAI_RESPONSES:
+    if api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
         return {"type": "function", "name": name, "description": description, "parameters": parameters, "strict": False}
     if api_format in {API_FORMAT_OPENAI_CHAT_COMPLETIONS, API_FORMAT_ZHIPU_CHAT_COMPLETIONS}:
         return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
