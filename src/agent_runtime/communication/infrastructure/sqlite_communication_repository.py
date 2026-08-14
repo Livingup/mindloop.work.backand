@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from agent_runtime.communication.communication_message import CommunicationMessage
 from agent_runtime.communication.communication_stream import CommunicationStream
+from agent_runtime.infrastructure.sqlite_maintenance import coordinated_sqlite_repository
 
 logger = logging.getLogger(__name__)
 _SQLITE_COMMUNICATION_SLOW_PHASE_SECONDS = 1.0
@@ -110,6 +111,9 @@ CREATE INDEX IF NOT EXISTS idx_communication_messages_correlation ON communicati
 """
 
 
+@coordinated_sqlite_repository(
+    lambda repository: Path(repository._data_dir_accessor()).expanduser() / "communication.db",
+ )
 class SqliteCommunicationRepository:
     """通用通信 SQLite 仓储。
 

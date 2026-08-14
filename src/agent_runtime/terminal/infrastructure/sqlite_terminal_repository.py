@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from agent_runtime.infrastructure.sqlite_maintenance import coordinated_sqlite_repository
 from agent_runtime.terminal.terminal import (
     TERMINAL_STATUS_BUSY,
     TERMINAL_STATUS_DELETED,
@@ -89,6 +90,9 @@ CREATE INDEX IF NOT EXISTS idx_terminal_output_command ON terminal_output_chunks
 """
 
 
+@coordinated_sqlite_repository(
+    lambda repository: Path(repository._data_dir_accessor()).expanduser() / "terminal.db",
+ )
 class SqliteTerminalRepository:
     def __init__(self, data_dir_accessor: Callable[[], str]) -> None:
         self._data_dir_accessor = data_dir_accessor

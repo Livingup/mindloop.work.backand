@@ -15,6 +15,7 @@ from agent_runtime.context_compression.history_markdown import (
 )
 from agent_runtime.context_compression.models import CompressionJob
 from agent_runtime.conversation_message.message.models import UniMessage
+from agent_runtime.infrastructure.sqlite_maintenance import coordinated_sqlite_repository
 
 
 _SCHEMA = """
@@ -55,6 +56,9 @@ class ContextCompressionQualityArchive:
     quality_analysis_text: str
 
 
+@coordinated_sqlite_repository(
+    lambda repository: repository._data_dir / "context_compression.db",
+ )
 class ContextCompressionArchiveRepository:
     """上下文压缩归档仓储。
 

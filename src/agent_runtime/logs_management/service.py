@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.infrastructure.sqlite_maintenance import (
+    SafeSqliteStoreMaintenanceGateway,
+    SqliteStoreMaintenanceGateway,
+    measure_sqlite_store,
+    sqlite_operation_lease,
+ )
+
+
+logger = logging.getLogger(__name__)
 
 
 LIFECYCLE_ENDED_TASKS = "ended_tasks"
@@ -18,6 +29,19 @@ LIFECYCLE_ARCHIVED_SCENES = "archived_scenes"
 
 CLEANUP_MODE_PREVIEW = "preview"
 CLEANUP_MODE_EXECUTE = "execute"
+
+SPACE_RELEASE_MODE_LOGICAL_ONLY = "logical_only"
+SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE = "safe_physical_release"
+SUPPORTED_SPACE_RELEASE_MODES: frozenset[str] = frozenset({
+    SPACE_RELEASE_MODE_LOGICAL_ONLY,
+    SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE,
+})
+
+CLEANUP_PHASE_RESOLVING_SCOPE = "resolving_scope"
+CLEANUP_PHASE_DELETING_DATA = "deleting_data"
+CLEANUP_PHASE_RELEASING_SPACE = "releasing_space"
+CLEANUP_PHASE_COMPLETED = "completed"
+CLEANUP_PHASE_FAILED = "failed"
 
 CLEANUP_JOB_STATUS_QUEUED = "queued"
 CLEANUP_JOB_STATUS_RUNNING = "running"
@@ -45,6 +69,16 @@ CATEGORY_LABELS: dict[str, str] = {
     CATEGORY_CONTEXT_COMPRESSION_ARCHIVE: "Context Compression archive",
     CATEGORY_TERMINAL_HISTORY: "Terminal history",
 }
+
+MAINTENANCE_CATEGORY_ORDER: tuple[str, ...] = (
+    CATEGORY_COMMUNICATION_MESSAGES,
+    CATEGORY_CHAT_BUBBLES,
+    CATEGORY_LLM_HTTP_TRACE,
+    CATEGORY_CONTEXT_COMPRESSION_ARCHIVE,
+    CATEGORY_TERMINAL_HISTORY,
+ )
+
+_UNSET = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +109,12 @@ class CleanupJobState:
     job_id: str
     mode: str
     status: str
+    space_release_mode: str
+    phase: str
+    active_store_id: str | None
     lifecycle_filters: tuple[str, ...]
     categories: tuple[str, ...]
+    release_only: bool
     created_at: datetime
     updated_at: datetime
     started_at: datetime | None = None
@@ -89,6 +127,10 @@ class CleanupJobState:
             "job_id": self.job_id,
             "mode": self.mode,
             "status": self.status,
+            "space_release_mode": self.space_release_mode,
+            "phase": self.phase,
+            "active_store_id": self.active_store_id,
+            "release_only": self.release_only,
             "lifecycle_filters": list(self.lifecycle_filters),
             "categories": list(self.categories),
             "created_at": _datetime_to_iso(self.created_at),
@@ -110,10 +152,16 @@ class LogsManagementService:
     persistence_inventory 元数据来计算大小或删除范围。
     """
 
-    def __init__(self, paths_accessor: Callable[[], LogsStorePaths] | None = None) -> None:
+    def __init__(
+        self,
+        paths_accessor: Callable[[], LogsStorePaths] | None = None,
+        maintenance_gateway: SqliteStoreMaintenanceGateway | None = None,
+    ) -> None:
         self._paths_accessor = paths_accessor or _paths_from_config
+        self._maintenance_gateway = maintenance_gateway or SafeSqliteStoreMaintenanceGateway()
         self._jobs_lock = threading.RLock()
         self._cleanup_lock = threading.Lock()
+        self._cleanup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="logs-cleanup-maintenance")
         self._jobs: dict[str, CleanupJobState] = {}
 
     def create_cleanup_job(
@@ -122,30 +170,39 @@ class LogsManagementService:
         mode: str,
         lifecycle_filters: Iterable[str],
         categories: Iterable[str],
+        space_release_mode: str = SPACE_RELEASE_MODE_LOGICAL_ONLY,
+        release_only: bool = False,
     ) -> dict[str, Any]:
         normalized_mode = _normalize_cleanup_mode(mode)
         normalized_lifecycle = _normalize_lifecycle_filters(lifecycle_filters)
         normalized_categories = _normalize_categories(categories)
+        normalized_space_release_mode = _normalize_space_release_mode(space_release_mode)
+        if release_only and (
+            normalized_mode != CLEANUP_MODE_EXECUTE
+            or normalized_space_release_mode != SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE
+        ):
+            raise ValueError("仅空间释放重试必须使用 execute + safe_physical_release。")
         now = _utc_now()
         job = CleanupJobState(
             job_id=uuid.uuid4().hex,
             mode=normalized_mode,
             status=CLEANUP_JOB_STATUS_QUEUED,
+            space_release_mode=normalized_space_release_mode,
+            phase=CLEANUP_PHASE_RESOLVING_SCOPE,
+            active_store_id=None,
             lifecycle_filters=normalized_lifecycle,
             categories=normalized_categories,
             created_at=now,
             updated_at=now,
+            release_only=release_only,
         )
         with self._jobs_lock:
             self._jobs[job.job_id] = job
-        worker = threading.Thread(
-            target=self._run_cleanup_job,
-            args=(job.job_id,),
-            name=f"logs-cleanup-{normalized_mode}-{job.job_id[:8]}",
-            daemon=True,
-        )
-        worker.start()
+        self._cleanup_executor.submit(self._run_cleanup_job, job.job_id)
         return job.to_dict()
+
+    def close(self) -> None:
+        self._cleanup_executor.shutdown(wait=False, cancel_futures=False)
 
     def get_cleanup_job(self, job_id: str) -> dict[str, Any] | None:
         with self._jobs_lock:
@@ -176,26 +233,44 @@ class LogsManagementService:
 
     def _run_cleanup_job(self, job_id: str) -> None:
         with self._cleanup_lock:
-            self._update_job(job_id, status=CLEANUP_JOB_STATUS_RUNNING, started_at=_utc_now())
+            self._update_job(
+                job_id,
+                status=CLEANUP_JOB_STATUS_RUNNING,
+                phase=CLEANUP_PHASE_RESOLVING_SCOPE,
+                active_store_id=None,
+                started_at=_utc_now(),
+            )
             try:
                 job = self._get_job_state(job_id)
                 result = self._build_cleanup_result(
                     lifecycle_filters=job.lifecycle_filters,
                     categories=job.categories,
                     execute=job.mode == CLEANUP_MODE_EXECUTE,
+                    space_release_mode=job.space_release_mode,
+                    release_only=job.release_only,
+                    progress_callback=lambda phase, store_id=None: self._update_job(
+                        job_id,
+                        phase=phase,
+                        active_store_id=store_id,
+                    ),
                 )
                 self._update_job(
                     job_id,
                     status=CLEANUP_JOB_STATUS_SUCCEEDED,
+                    phase=CLEANUP_PHASE_COMPLETED,
+                    active_store_id=None,
                     completed_at=_utc_now(),
                     result=result,
                 )
-            except Exception as exc:
+            except Exception:
+                logger.exception("日志清理任务执行失败: job_id=%s", job_id)
                 self._update_job(
                     job_id,
                     status=CLEANUP_JOB_STATUS_FAILED,
+                    phase=CLEANUP_PHASE_FAILED,
+                    active_store_id=None,
                     completed_at=_utc_now(),
-                    error_message=str(exc),
+                    error_message="日志清理任务未完成；请稍后重试或查看各日志库的安全维护结果。",
                 )
 
     def _get_job_state(self, job_id: str) -> CleanupJobState:
@@ -208,6 +283,8 @@ class LogsManagementService:
         job_id: str,
         *,
         status: str | None = None,
+        phase: str | None = None,
+        active_store_id: str | None | object = _UNSET,
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
         result: dict[str, Any] | None = None,
@@ -219,8 +296,16 @@ class LogsManagementService:
                 job_id=current.job_id,
                 mode=current.mode,
                 status=status or current.status,
+                space_release_mode=current.space_release_mode,
+                phase=phase if phase is not None else current.phase,
+                active_store_id=(
+                    current.active_store_id
+                    if active_store_id is _UNSET
+                    else active_store_id
+                ),
                 lifecycle_filters=current.lifecycle_filters,
                 categories=current.categories,
+                release_only=current.release_only,
                 created_at=current.created_at,
                 updated_at=_utc_now(),
                 started_at=started_at if started_at is not None else current.started_at,
@@ -228,6 +313,12 @@ class LogsManagementService:
                 result=result if result is not None else current.result,
                 error_message=error_message if error_message is not None else current.error_message,
             )
+
+    def get_capabilities(self) -> dict[str, Any]:
+        return {
+            "supported_space_release_modes": sorted(SUPPORTED_SPACE_RELEASE_MODES),
+            "release_only_retry_supported": True,
+        }
 
     def get_overview(self) -> dict[str, Any]:
         paths = self._paths_accessor()
@@ -268,12 +359,14 @@ class LogsManagementService:
         *,
         lifecycle_filters: Iterable[str],
         categories: Iterable[str],
+        space_release_mode: str = SPACE_RELEASE_MODE_LOGICAL_ONLY,
     ) -> dict[str, Any]:
         with self._cleanup_lock:
             return self._build_cleanup_result(
                 lifecycle_filters=tuple(lifecycle_filters),
                 categories=tuple(categories),
                 execute=False,
+                space_release_mode=space_release_mode,
             )
 
     def execute_cleanup(
@@ -281,12 +374,16 @@ class LogsManagementService:
         *,
         lifecycle_filters: Iterable[str],
         categories: Iterable[str],
+        space_release_mode: str = SPACE_RELEASE_MODE_LOGICAL_ONLY,
+        release_only: bool = False,
     ) -> dict[str, Any]:
         with self._cleanup_lock:
             return self._build_cleanup_result(
                 lifecycle_filters=tuple(lifecycle_filters),
                 categories=tuple(categories),
                 execute=True,
+                space_release_mode=space_release_mode,
+                release_only=release_only,
             )
 
     def _build_cleanup_result(
@@ -295,16 +392,45 @@ class LogsManagementService:
         lifecycle_filters: tuple[str, ...],
         categories: tuple[str, ...],
         execute: bool,
+        space_release_mode: str = SPACE_RELEASE_MODE_LOGICAL_ONLY,
+        release_only: bool = False,
+        progress_callback: Callable[[str, str | None], None] | None = None,
     ) -> dict[str, Any]:
         selected_categories = _normalize_categories(categories)
+        normalized_space_release_mode = _normalize_space_release_mode(space_release_mode)
+        if release_only and (
+            not execute or normalized_space_release_mode != SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE
+        ):
+            raise ValueError("仅空间释放重试必须使用 execute + safe_physical_release。")
+        if progress_callback is not None:
+            progress_callback(CLEANUP_PHASE_RESOLVING_SCOPE, None)
         scope = self._resolve_scope(lifecycle_filters)
         paths = self._paths_accessor()
+        if execute and not release_only and progress_callback is not None:
+            progress_callback(CLEANUP_PHASE_DELETING_DATA, None)
         category_results = [
-            self._category_result(paths, scope, category, execute=execute)
+            self._category_result(
+                paths,
+                scope,
+                category,
+                execute=execute and not release_only,
+            )
             for category in selected_categories
         ]
+        if normalized_space_release_mode == SPACE_RELEASE_MODE_LOGICAL_ONLY:
+            space_release = _logical_only_space_release_result()
+        elif not execute:
+            space_release = self._preview_space_release(paths, selected_categories)
+        else:
+            space_release = self._execute_space_release(
+                paths,
+                selected_categories,
+                progress_callback=progress_callback,
+            )
         return {
             "mode": "execute" if execute else "preview",
+            "space_release_mode": normalized_space_release_mode,
+            "release_only": release_only,
             "lifecycle_filters": list(scope.lifecycle_filters),
             "categories": list(selected_categories),
             "scope": {
@@ -314,7 +440,76 @@ class LogsManagementService:
             "category_results": category_results,
             "total_matched_count": sum(int(item["matched_count"]) for item in category_results),
             "total_deleted_count": sum(int(item["deleted_count"]) for item in category_results),
+            "space_release": space_release,
         }
+
+    def _preview_space_release(
+        self,
+        paths: LogsStorePaths,
+        selected_categories: tuple[str, ...],
+    ) -> dict[str, Any]:
+        stores: list[dict[str, Any]] = []
+        for category in MAINTENANCE_CATEGORY_ORDER:
+            if category not in selected_categories:
+                continue
+            db_path = _category_db_path(paths, category)
+            measurement = measure_sqlite_store(db_path)
+            stores.append({
+                "store_id": category,
+                "eligible": db_path.exists(),
+                "status": "preview_only" if db_path.exists() else "not_available",
+                "before_size_bytes": measurement.total_size_bytes,
+                "after_size_bytes": None,
+                "reclaimed_size_bytes": 0,
+                "net_size_change_bytes": 0,
+                "before_db_size_bytes": measurement.db_size_bytes,
+                "after_db_size_bytes": None,
+                "before_wal_size_bytes": measurement.wal_size_bytes,
+                "after_wal_size_bytes": None,
+                "before_shm_size_bytes": measurement.shm_size_bytes,
+                "after_shm_size_bytes": None,
+                "error_code": None if db_path.exists() else "database_not_available",
+                "message": (
+                    "执行阶段将尝试安全 checkpoint + VACUUM；实际释放量以完成后测量为准。"
+                    if db_path.exists()
+                    else "数据库文件当前不存在。"
+                ),
+            })
+        eligible = [item for item in stores if item["eligible"]]
+        return {
+            "requested_mode": SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE,
+            "status": "preview_only",
+            "eligible_store_count": len(eligible),
+            "before_total_size_bytes": sum(int(item["before_size_bytes"]) for item in eligible),
+            "after_total_size_bytes": None,
+            "reclaimed_size_bytes": 0,
+            "net_size_change_bytes": 0,
+            "stores": stores,
+            "warnings": ["预览不执行 DELETE、checkpoint 或 VACUUM，也不估算可释放字节。"],
+        }
+
+    def _execute_space_release(
+        self,
+        paths: LogsStorePaths,
+        selected_categories: tuple[str, ...],
+        *,
+        progress_callback: Callable[[str, str | None], None] | None,
+    ) -> dict[str, Any]:
+        stores: list[dict[str, Any]] = []
+        for category in MAINTENANCE_CATEGORY_ORDER:
+            if category not in selected_categories:
+                continue
+            if progress_callback is not None:
+                progress_callback(CLEANUP_PHASE_RELEASING_SPACE, category)
+            stores.append(
+                self._maintenance_gateway.maintain_store(
+                    store_id=category,
+                    db_path=_category_db_path(paths, category),
+                )
+            )
+        if progress_callback is not None:
+            progress_callback(CLEANUP_PHASE_RELEASING_SPACE, None)
+        return _aggregate_space_release_results(stores)
 
     def _resolve_scope(self, lifecycle_filters: tuple[str, ...]) -> CleanupScope:
         filters = _normalize_lifecycle_filters(lifecycle_filters)
@@ -344,6 +539,7 @@ class LogsManagementService:
         *,
         execute: bool,
     ) -> dict[str, Any]:
+        archive_files_deleted_count = 0
         if category == CATEGORY_COMMUNICATION_MESSAGES:
             matched = self._count_communication_messages(paths.communication_db, scope)
             deleted = self._delete_communication_messages(paths.communication_db, scope) if execute else 0
@@ -360,7 +556,14 @@ class LogsManagementService:
                 "task_id",
                 scope,
             )
-            deleted = self._delete_context_compression_archive(paths.context_compression_dir, paths.context_compression_db, scope) if execute else 0
+            if execute:
+                deleted, archive_files_deleted_count = self._delete_context_compression_archive(
+                    paths.context_compression_dir,
+                    paths.context_compression_db,
+                    scope,
+                )
+            else:
+                deleted = 0
         elif category == CATEGORY_TERMINAL_HISTORY:
             matched = self._count_terminal_history(paths.terminal_db, scope)
             deleted = self._delete_terminal_history(paths.terminal_db, scope) if execute else 0
@@ -371,6 +574,7 @@ class LogsManagementService:
             "label": CATEGORY_LABELS[category],
             "matched_count": matched,
             "deleted_count": deleted,
+            "archive_files_deleted_count": archive_files_deleted_count,
         }
 
     def _sqlite_store_overview(
@@ -396,7 +600,12 @@ class LogsManagementService:
         return {
             "store_id": CATEGORY_CONTEXT_COMPRESSION_ARCHIVE,
             "title": CATEGORY_LABELS[CATEGORY_CONTEXT_COMPRESSION_ARCHIVE],
-            "size_bytes": _sqlite_store_size(db_path) + _directory_size(archive_dir / "snapshots") + _directory_size(archive_dir / "summaries"),
+            "size_bytes": (
+                _sqlite_store_size(db_path)
+                + _directory_size(archive_dir / "histories")
+                + _directory_size(archive_dir / "snapshots")
+                + _directory_size(archive_dir / "summaries")
+            ),
             "record_count": _count_rows(db_path, "context_compression_jobs"),
             "path": str(archive_dir),
             "available": archive_dir.exists() or db_path.exists(),
@@ -476,9 +685,9 @@ class LogsManagementService:
         where_sql, params = self._terminal_history_where(scope)
         return _delete_where(db_path, "terminals", where_sql, params, foreign_keys=True)
 
-    def _delete_context_compression_archive(self, archive_dir: Path, db_path: Path, scope: CleanupScope) -> int:
+    def _delete_context_compression_archive(self, archive_dir: Path, db_path: Path, scope: CleanupScope) -> tuple[int, int]:
         if not db_path.exists() or not scope.task_ids:
-            return 0
+            return 0, 0
         task_values = sorted(scope.task_ids)
         placeholders = _placeholders(task_values)
 
@@ -491,48 +700,122 @@ class LogsManagementService:
         )
 
         def read_rows() -> list[tuple[Any, ...]]:
-            conn = _connect_existing(db_path)
-            if conn is None:
-                return []
-            try:
-                existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(context_compression_jobs)").fetchall()}
-                selected = ["job_id"] + [column for column in path_columns if column in existing]
-                select_sql = ", ".join(selected)
-                raw_rows = list(
-                    conn.execute(
-                        f"""
-                        SELECT {select_sql}
-                        FROM context_compression_jobs
-                        WHERE task_id IN ({placeholders})
-                        """,
-                        tuple(task_values),
-                    ).fetchall()
-                )
-                # 统一成 (job_id, path1, path2, ...) 供后续 unlink
-                return [tuple(row) for row in raw_rows]
-            finally:
-                conn.close()
+            with sqlite_operation_lease(db_path):
+                conn = _connect_existing(db_path)
+                if conn is None:
+                    return []
+                try:
+                    existing = {str(row[1]) for row in conn.execute("PRAGMA table_info(context_compression_jobs)").fetchall()}
+                    if "job_id" not in existing:
+                        return []
+                    selected = ["job_id"] + [column for column in path_columns if column in existing]
+                    select_sql = ", ".join(selected)
+                    raw_rows = list(
+                        conn.execute(
+                            f"""
+                            SELECT {select_sql}
+                            FROM context_compression_jobs
+                            WHERE task_id IN ({placeholders})
+                            """,
+                            tuple(task_values),
+                        ).fetchall()
+                    )
+                    # 统一成 (job_id, path1, path2, ...) 供后续 unlink
+                    return [tuple(row) for row in raw_rows]
+                finally:
+                    conn.close()
 
-        rows = _with_sqlite_retry(read_rows)
-        for row in rows:
-            for value in row[1:]:
-                _unlink_archive_file(archive_dir, value)
+        with sqlite_operation_lease(db_path):
+            rows = _with_sqlite_retry(read_rows)
 
-        def delete_rows() -> int:
-            conn = _connect_existing(db_path)
-            if conn is None:
-                return 0
-            try:
-                result = conn.execute(
-                    f"DELETE FROM context_compression_jobs WHERE task_id IN ({placeholders})",
-                    tuple(task_values),
-                )
-                conn.commit()
-                return int(result.rowcount or 0)
-            finally:
-                conn.close()
+            def delete_rows() -> int:
+                with sqlite_operation_lease(db_path):
+                    conn = _connect_existing(db_path)
+                    if conn is None:
+                        return 0
+                    try:
+                        result = conn.execute(
+                            f"DELETE FROM context_compression_jobs WHERE task_id IN ({placeholders})",
+                            tuple(task_values),
+                        )
+                        conn.commit()
+                        return int(result.rowcount or 0)
+                    finally:
+                        conn.close()
 
-        return _with_sqlite_retry(delete_rows)
+            deleted_count = _with_sqlite_retry(delete_rows)
+            archive_files_deleted_count = 0
+            if deleted_count > 0:
+                for row in rows:
+                    for value in row[1:]:
+                        archive_files_deleted_count += int(_unlink_archive_file(archive_dir, value))
+            return deleted_count, archive_files_deleted_count
+
+
+def _category_db_path(paths: LogsStorePaths, category: str) -> Path:
+    mapping = {
+        CATEGORY_COMMUNICATION_MESSAGES: paths.communication_db,
+        CATEGORY_CHAT_BUBBLES: paths.chat_bubbles_db,
+        CATEGORY_LLM_HTTP_TRACE: paths.llm_http_trace_db,
+        CATEGORY_CONTEXT_COMPRESSION_ARCHIVE: paths.context_compression_db,
+        CATEGORY_TERMINAL_HISTORY: paths.terminal_db,
+    }
+    try:
+        return mapping[category]
+    except KeyError as exc:
+        raise ValueError(f"不支持的日志清理类别: {category}") from exc
+
+
+def _logical_only_space_release_result() -> dict[str, Any]:
+    return {
+        "requested_mode": SPACE_RELEASE_MODE_LOGICAL_ONLY,
+        "status": "not_requested",
+        "eligible_store_count": 0,
+        "before_total_size_bytes": 0,
+        "after_total_size_bytes": 0,
+        "reclaimed_size_bytes": 0,
+        "net_size_change_bytes": 0,
+        "stores": [],
+        "warnings": ["SQLite 文件未执行 checkpoint/VACUUM；已删除行形成的空闲页可供后续写入复用。"],
+    }
+
+
+def _aggregate_space_release_results(stores: list[dict[str, Any]]) -> dict[str, Any]:
+    eligible = [item for item in stores if item.get("eligible")]
+    successful_statuses = {"released", "skipped_no_changes"}
+    deferred_statuses = {"busy", "timeout"}
+    failed_statuses = {"insufficient_disk_space", "permission_denied", "io_error", "failed"}
+    statuses = {str(item.get("status")) for item in eligible}
+    if not eligible:
+        status = "skipped_no_changes"
+    elif statuses <= {"skipped_no_changes"}:
+        status = "skipped_no_changes"
+    elif statuses <= successful_statuses:
+        status = "completed"
+    elif statuses and statuses <= deferred_statuses:
+        status = "deferred_busy"
+    elif statuses & successful_statuses:
+        status = "partial"
+    elif statuses & failed_statuses:
+        status = "failed"
+    else:
+        status = "partial"
+    warnings = [
+        f"{CATEGORY_LABELS.get(str(item.get('store_id')), str(item.get('store_id')))}：{item.get('message')}"
+        for item in stores
+        if item.get("status") not in successful_statuses and item.get("message")
+    ]
+    return {
+        "requested_mode": SPACE_RELEASE_MODE_SAFE_PHYSICAL_RELEASE,
+        "status": status,
+        "eligible_store_count": len(eligible),
+        "before_total_size_bytes": sum(int(item.get("before_size_bytes") or 0) for item in eligible),
+        "after_total_size_bytes": sum(int(item.get("after_size_bytes") or 0) for item in eligible),
+        "reclaimed_size_bytes": sum(int(item.get("reclaimed_size_bytes") or 0) for item in eligible),
+        "net_size_change_bytes": sum(int(item.get("net_size_change_bytes") or 0) for item in eligible),
+        "stores": stores,
+        "warnings": warnings,
+    }
 
 
 def _paths_from_config() -> LogsStorePaths:
@@ -578,6 +861,13 @@ def _normalize_cleanup_mode(mode: str) -> str:
     normalized = str(mode).strip()
     if normalized not in {CLEANUP_MODE_PREVIEW, CLEANUP_MODE_EXECUTE}:
         raise ValueError(f"不支持的日志清理任务模式: {mode}")
+    return normalized
+
+
+def _normalize_space_release_mode(mode: str | None) -> str:
+    normalized = str(mode or SPACE_RELEASE_MODE_LOGICAL_ONLY).strip()
+    if normalized not in SUPPORTED_SPACE_RELEASE_MODES:
+        raise ValueError(f"不支持的数据删除空间释放模式: {mode}")
     return normalized
 
 
@@ -631,44 +921,46 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
 
 def _count_rows(db_path: Path, table_name: str) -> int:
     def operation() -> int:
-        conn = _connect_existing(db_path)
-        if conn is None:
-            return 0
-        try:
-            if not _table_exists(conn, table_name):
+        with sqlite_operation_lease(db_path):
+            conn = _connect_existing(db_path)
+            if conn is None:
                 return 0
-            row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-            return int(row[0] if row else 0)
-        except sqlite3.OperationalError as exc:
-            if _is_sqlite_locked(exc):
-                raise
-            return 0
-        except sqlite3.Error:
-            return 0
-        finally:
-            conn.close()
+            try:
+                if not _table_exists(conn, table_name):
+                    return 0
+                row = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+                return int(row[0] if row else 0)
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_locked(exc):
+                    raise
+                return 0
+            except sqlite3.Error:
+                return 0
+            finally:
+                conn.close()
 
     return _with_sqlite_retry(operation)
 
 
 def _count_where(db_path: Path, table_name: str, where_sql: str, params: list[Any]) -> int:
     def operation() -> int:
-        conn = _connect_existing(db_path)
-        if conn is None:
-            return 0
-        try:
-            if not _table_exists(conn, table_name):
+        with sqlite_operation_lease(db_path):
+            conn = _connect_existing(db_path)
+            if conn is None:
                 return 0
-            row = conn.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {where_sql}", tuple(params)).fetchone()
-            return int(row[0] if row else 0)
-        except sqlite3.OperationalError as exc:
-            if _is_sqlite_locked(exc):
-                raise
-            return 0
-        except sqlite3.Error:
-            return 0
-        finally:
-            conn.close()
+            try:
+                if not _table_exists(conn, table_name):
+                    return 0
+                row = conn.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {where_sql}", tuple(params)).fetchone()
+                return int(row[0] if row else 0)
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_locked(exc):
+                    raise
+                return 0
+            except sqlite3.Error:
+                return 0
+            finally:
+                conn.close()
 
     return _with_sqlite_retry(operation)
 
@@ -682,19 +974,20 @@ def _delete_where(
     foreign_keys: bool = False,
  ) -> int:
     def operation() -> int:
-        conn = _connect_existing(db_path)
-        if conn is None:
-            return 0
-        try:
-            if foreign_keys:
-                conn.execute("PRAGMA foreign_keys=ON")
-            if not _table_exists(conn, table_name):
+        with sqlite_operation_lease(db_path):
+            conn = _connect_existing(db_path)
+            if conn is None:
                 return 0
-            result = conn.execute(f"DELETE FROM {table_name} WHERE {where_sql}", tuple(params))
-            conn.commit()
-            return int(result.rowcount or 0)
-        finally:
-            conn.close()
+            try:
+                if foreign_keys:
+                    conn.execute("PRAGMA foreign_keys=ON")
+                if not _table_exists(conn, table_name):
+                    return 0
+                result = conn.execute(f"DELETE FROM {table_name} WHERE {where_sql}", tuple(params))
+                conn.commit()
+                return int(result.rowcount or 0)
+            finally:
+                conn.close()
 
     return _with_sqlite_retry(operation)
 
@@ -811,18 +1104,20 @@ def _directory_size(path: Path) -> int:
     return total
 
 
-def _unlink_archive_file(archive_dir: Path, raw_path: Any) -> None:
+def _unlink_archive_file(archive_dir: Path, raw_path: Any) -> bool:
     if not raw_path:
-        return
+        return False
     try:
         path = Path(str(raw_path)).expanduser()
         archive_root = archive_dir.expanduser().resolve()
         resolved = path.resolve()
         resolved.relative_to(archive_root)
     except (OSError, ValueError):
-        return
+        return False
     try:
         if resolved.exists() and resolved.is_file():
             resolved.unlink()
+            return True
     except OSError:
-        return
+        return False
+    return False

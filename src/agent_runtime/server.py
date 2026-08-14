@@ -751,6 +751,8 @@ def create_app(
                     cancel=True,
                     diagnostic_context={"component": "runtime_lifespan", "phase": "shutdown.final_registry_sweep"},
                 )
+            with suppress(Exception, asyncio.CancelledError):
+                logs_management_service.close()
             shutdown_blocking_executors(wait=False, cancel_futures=False)
             logger.info(
                 "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "

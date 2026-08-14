@@ -14,6 +14,7 @@ from agent_runtime.chat_bubble.chat_bubble_message import (
     ChatBubbleInteractionOption,
     ChatBubbleMessage,
 )
+from agent_runtime.infrastructure.sqlite_maintenance import coordinated_sqlite_repository
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS chat_bubble_messages (
@@ -46,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_bubble_scene_pending_message ON chat_bubble_
 """
 
 
+@coordinated_sqlite_repository(
+    lambda repository: Path(repository._data_dir_accessor()).expanduser() / "chat_bubbles.db",
+)
 class SqliteChatBubbleRepository:
     """Chat Bubble SQLite 仓储。
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from agent_runtime.infrastructure.sqlite_maintenance import coordinated_sqlite_repository
 from agent_runtime.llm_http_trace.models import (
     LlmHttpTraceLifecycleEvent,
     LlmHttpTraceRecord,
@@ -63,6 +64,9 @@ CREATE INDEX IF NOT EXISTS idx_llm_http_traces_status ON llm_http_traces(status)
 """
 
 
+@coordinated_sqlite_repository(
+    lambda repository: Path(repository._data_dir_accessor()).expanduser() / "llm_http_traces.db",
+)
 class SqliteLlmHttpTraceRepository:
     def __init__(self, data_dir_accessor: Callable[[], str]) -> None:
         self._data_dir_accessor = data_dir_accessor
