@@ -52,6 +52,12 @@ class LogsCleanupStoreSpaceReleaseResponse(BaseModel):
     store_id: str
     eligible: bool = False
     status: str
+    vacuum_started: bool = False
+    required_working_bytes: int | None = None
+    available_bytes: int | None = None
+    page_size_bytes: int | None = None
+    page_count: int | None = None
+    freelist_count: int | None = None
     before_size_bytes: int | None = None
     after_size_bytes: int | None = None
     reclaimed_size_bytes: int = 0
