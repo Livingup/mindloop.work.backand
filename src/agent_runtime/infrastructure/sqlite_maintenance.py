@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Iterator, Protocol, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Protocol, TypeVar
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS = 2_000
 SQLITE_MAINTENANCE_LEASE_TIMEOUT_SECONDS = 2.0
 SQLITE_MAINTENANCE_DISK_RESERVE_BYTES = 16 * 1024 * 1024
+_WINDOWS_LOCK_REGION_BYTES = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,16 +47,27 @@ class SqliteStoreMaintenancePreflight:
     page_size_bytes: int | None
     page_count: int | None
     freelist_count: int | None
+    auto_vacuum_mode: str | None = None
+    compact_target_size_bytes: int | None = None
     error_code: str | None = None
     message: str | None = None
 
-    def to_result_fields(self) -> dict[str, int | None]:
+    def to_result_fields(self) -> dict[str, int | None | str]:
+        freelist_potential_bytes = (
+            self.page_size_bytes * self.freelist_count
+            if self.page_size_bytes is not None and self.freelist_count is not None
+            else None
+        )
         return {
             "required_working_bytes": self.required_working_bytes,
             "available_bytes": self.available_bytes,
             "page_size_bytes": self.page_size_bytes,
             "page_count": self.page_count,
             "freelist_count": self.freelist_count,
+            "auto_vacuum_mode": self.auto_vacuum_mode,
+            "freelist_potential_bytes": freelist_potential_bytes,
+            "compact_target_size_bytes": self.compact_target_size_bytes,
+            "required_compact_target_size_bytes": self.compact_target_size_bytes,
         }
 
 
@@ -219,7 +231,135 @@ class SqliteMaintenanceCoordinator:
                 process_lease.release()
 
 
+@dataclass(slots=True)
+class SqliteRuntimePresenceLeaseSet:
+    """Shared presence locks held for the lifetime of one Runtime worker.
+
+    Offline compaction takes an exclusive lock on the same sidecar before it starts.
+    A live worker therefore blocks a startup swap even when it currently has no active
+    SQL operation and still owns an otherwise idle SQLite connection.
+    """
+
+    _leases: list[_ProcessFileLease]
+    _keys: tuple[str, ...] = ()
+
+    def release(self) -> None:
+        while self._leases:
+            self._leases.pop().release()
+        keys = self._keys
+        self._keys = ()
+        if keys:
+            with _RUNTIME_PRESENCE_LOCAL_LOCK:
+                for key in keys:
+                    count = _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS.get(key, 0) - 1
+                    if count > 0:
+                        _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS[key] = count
+                    else:
+                        _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS.pop(key, None)
+
+
+_RUNTIME_PRESENCE_LOCK_SUFFIX = ".spread-ai-runtime-presence.lock"
+_RUNTIME_PRESENCE_LOCK_REGION_BYTES = _WINDOWS_LOCK_REGION_BYTES
+_RUNTIME_PRESENCE_LOCAL_LOCK = threading.RLock()
+_RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS: dict[str, int] = {}
+
+
+def acquire_runtime_presence_leases(db_paths: Iterable[Path]) -> SqliteRuntimePresenceLeaseSet | None:
+    """Try to hold shared presence locks for all controlled stores in stable order."""
+    leases: list[_ProcessFileLease] = []
+    unique_paths = sorted({_database_key(Path(path)): Path(path) for path in db_paths}.values(), key=_database_key)
+    try:
+        for db_path in unique_paths:
+            lease = _try_acquire_runtime_presence_shared(db_path)
+            if lease is None:
+                raise OSError("runtime presence lock is already held")
+            leases.append(lease)
+    except OSError:
+        for lease in reversed(leases):
+            lease.release()
+        return None
+    keys = tuple(_database_key(Path(path)) for path in unique_paths)
+    with _RUNTIME_PRESENCE_LOCAL_LOCK:
+        for key in keys:
+            _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS[key] = _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS.get(key, 0) + 1
+    return SqliteRuntimePresenceLeaseSet(leases, keys)
+
+
+def try_acquire_runtime_presence_exclusive(
+    db_path: Path,
+    *,
+    deadline: float,
+ ) -> _ProcessFileLease | None:
+    """Acquire the offline-only exclusive presence lock until a monotonic deadline."""
+    key = _database_key(db_path)
+    with _RUNTIME_PRESENCE_LOCAL_LOCK:
+        if _RUNTIME_PRESENCE_LOCAL_SHARED_COUNTS.get(key, 0) > 0:
+            return None
+    handle = _open_runtime_presence_handle(db_path)
+    if os.name != "nt":
+        import fcntl
+
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return _ProcessFileLease(handle=handle, offset=0, length=1, shared=False)
+            except OSError:
+                time.sleep(0.05)
+        handle.close()
+        return None
+    import msvcrt
+
+    while time.monotonic() < deadline:
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, _WINDOWS_LOCK_REGION_BYTES)
+            return _ProcessFileLease(handle=handle, offset=0, length=_WINDOWS_LOCK_REGION_BYTES, shared=False)
+        except OSError:
+            time.sleep(0.05)
+    handle.close()
+    return None
+
+
+def _try_acquire_runtime_presence_shared(db_path: Path) -> _ProcessFileLease | None:
+    handle = _open_runtime_presence_handle(db_path)
+    if os.name != "nt":
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+        return _ProcessFileLease(handle=handle, offset=0, length=1, shared=True)
+    import msvcrt
+
+    offset = 1 + (os.getpid() % (_WINDOWS_LOCK_REGION_BYTES - 1))
+    try:
+        handle.seek(offset)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        handle.close()
+        return None
+    return _ProcessFileLease(handle=handle, offset=offset, length=1, shared=True)
+
+
+def _open_runtime_presence_handle(db_path: Path) -> Any:
+    lock_path = Path(str(db_path) + _RUNTIME_PRESENCE_LOCK_SUFFIX)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    if os.name == "nt":
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() < _WINDOWS_LOCK_REGION_BYTES:
+            handle.write(b"\0" * (_WINDOWS_LOCK_REGION_BYTES - handle.tell()))
+            handle.flush()
+    return handle
+
+
 _GLOBAL_SQLITE_MAINTENANCE_COORDINATOR = SqliteMaintenanceCoordinator()
+
+
+def get_sqlite_maintenance_coordinator() -> SqliteMaintenanceCoordinator:
+    return _GLOBAL_SQLITE_MAINTENANCE_COORDINATOR
 
 
 def sqlite_operation_lease(db_path: Path) -> Any:
@@ -284,6 +424,30 @@ class SafeSqliteStoreMaintenanceGateway:
                 "message": "数据库文件不存在，已安全跳过空间释放。",
             }
 
+        from agent_runtime.infrastructure.sqlite_compaction import (
+            compaction_manifest_path,
+            run_pending_sqlite_compactions,
+        )
+        if compaction_manifest_path(db_path).exists():
+            pending_results = run_pending_sqlite_compactions(
+                (db_path,),
+                coordinator=self._coordinator,
+            )
+            if pending_results:
+                return pending_results[0]
+            return {
+                **_deferred_result(
+                    base,
+                    before,
+                    db_path=db_path,
+                    status="failed",
+                    error_code="compaction_manifest_unreadable",
+                    message="受控离线压缩 manifest 无法读取，已保留待处理状态且未执行在线 VACUUM。",
+                ),
+                "compaction_pending": True,
+                "status": "failed",
+            }
+
         with self._coordinator.maintenance_lease(db_path) as lease_acquired:
             if not lease_acquired:
                 return _deferred_result(
@@ -297,7 +461,7 @@ class SafeSqliteStoreMaintenanceGateway:
             preflight = _collect_maintenance_preflight(db_path, before)
             base = {**base, **preflight.to_result_fields()}
             if preflight.error_code is not None:
-                return _deferred_result(
+                deferred = _deferred_result(
                     base,
                     before,
                     db_path=db_path,
@@ -310,6 +474,41 @@ class SafeSqliteStoreMaintenanceGateway:
                     message=preflight.message or "无法安全开始 SQLite 空间维护。",
                     reclaimed_size_bytes=0,
                 )
+                if preflight.error_code in {
+                    "source_volume_workspace_insufficient",
+                    "source_volume_workspace_unavailable",
+                }:
+                    from agent_runtime.infrastructure.sqlite_compaction import (
+                        queue_pending_sqlite_compaction,
+                        read_sqlite_compaction_diagnostic,
+                    )
+
+                    compaction_diagnostic = read_sqlite_compaction_diagnostic(db_path)
+                    pending = queue_pending_sqlite_compaction(
+                        store_id=store_id,
+                        db_path=db_path,
+                        categories=(store_id,),
+                        diagnostic=compaction_diagnostic,
+                        error_code=preflight.error_code,
+                        message=(
+                            "逻辑 DELETE 已提交；当前无法安全启动在线 VACUUM。"
+                            "已记录受控离线紧凑副本任务，需停止全部 Runtime worker 后重启；不代表删除失败。"
+                        ),
+                    )
+                    return {
+                        **deferred,
+                        "status": "requires_runtime_restart",
+                        "compaction_pending": True,
+                        "compact_copy_started": False,
+                        "compact_target_size_bytes": pending.get("compact_target_size_bytes"),
+                        "required_compact_target_size_bytes": pending.get("required_compact_target_size_bytes") or pending.get("compact_target_size_bytes"),
+                        "compact_output_size_bytes": None,
+                        "auto_vacuum_mode": pending.get("auto_vacuum_mode"),
+                        "freelist_potential_bytes": pending.get("freelist_potential_bytes"),
+                        "pending_manifest_epoch": pending.get("pending_manifest_epoch"),
+                        "message": pending.get("message") or deferred.get("message"),
+                    }
+                return deferred
 
             vacuum_started = False
 
@@ -340,6 +539,16 @@ class SafeSqliteStoreMaintenanceGateway:
                     ),
                 }
             except sqlite3.OperationalError as exc:
+                pending_result = _queue_pending_compaction_after_failure(
+                    store_id=store_id,
+                    base=base,
+                    before=before,
+                    db_path=db_path,
+                    exc=exc,
+                    vacuum_started=vacuum_started,
+                )
+                if pending_result is not None:
+                    return pending_result
                 if _is_busy_error(exc):
                     return _deferred_result(
                         base,
@@ -361,11 +570,41 @@ class SafeSqliteStoreMaintenanceGateway:
                     vacuum_started=vacuum_started,
                 )
             except OSError as exc:
+                pending_result = _queue_pending_compaction_after_failure(
+                    store_id=store_id,
+                    base=base,
+                    before=before,
+                    db_path=db_path,
+                    exc=exc,
+                    vacuum_started=vacuum_started,
+                )
+                if pending_result is not None:
+                    return pending_result
                 status = "permission_denied" if exc.errno in {errno.EACCES, errno.EPERM} else "io_error"
                 return _exception_result(base, before, exc, db_path=db_path, status=status, vacuum_started=vacuum_started)
             except sqlite3.Error as exc:
+                pending_result = _queue_pending_compaction_after_failure(
+                    store_id=store_id,
+                    base=base,
+                    before=before,
+                    db_path=db_path,
+                    exc=exc,
+                    vacuum_started=vacuum_started,
+                )
+                if pending_result is not None:
+                    return pending_result
                 return _exception_result(base, before, exc, db_path=db_path, vacuum_started=vacuum_started)
             except Exception as exc:
+                pending_result = _queue_pending_compaction_after_failure(
+                    store_id=store_id,
+                    base=base,
+                    before=before,
+                    db_path=db_path,
+                    exc=exc,
+                    vacuum_started=vacuum_started,
+                )
+                if pending_result is not None:
+                    return pending_result
                 return _exception_result(base, before, exc, db_path=db_path, vacuum_started=vacuum_started)
 
 
@@ -419,7 +658,14 @@ def _collect_maintenance_preflight(
     before: SqliteStoreMeasurement,
  ) -> SqliteStoreMaintenancePreflight:
     required_working_bytes = max(before.db_size_bytes * 2, SQLITE_MAINTENANCE_DISK_RESERVE_BYTES)
-    page_size_bytes, page_count, freelist_count = _read_sqlite_page_metrics(db_path)
+    page_size_bytes, page_count, freelist_count, auto_vacuum_value = _read_sqlite_page_metrics(db_path)
+    auto_vacuum_mode = _auto_vacuum_mode(auto_vacuum_value)
+    compact_target_size_bytes = _estimate_compact_target_size_bytes(
+        page_size_bytes=page_size_bytes,
+        page_count=page_count,
+        freelist_count=freelist_count,
+        fallback_db_size_bytes=before.db_size_bytes,
+    )
     try:
         available_bytes = int(shutil.disk_usage(db_path.parent).free)
     except OSError:
@@ -430,6 +676,8 @@ def _collect_maintenance_preflight(
             page_size_bytes=page_size_bytes,
             page_count=page_count,
             freelist_count=freelist_count,
+            auto_vacuum_mode=auto_vacuum_mode,
+            compact_target_size_bytes=compact_target_size_bytes,
             error_code="source_volume_workspace_unavailable",
             message="无法确认源卷临时工作区可用空间，安全维护未启动且 VACUUM 未执行。",
         )
@@ -440,6 +688,8 @@ def _collect_maintenance_preflight(
             page_size_bytes=page_size_bytes,
             page_count=page_count,
             freelist_count=freelist_count,
+            auto_vacuum_mode=auto_vacuum_mode,
+            compact_target_size_bytes=compact_target_size_bytes,
             error_code="source_volume_workspace_insufficient",
             message=(
                 "当前 Runtime 的保守源卷临时工作区预检未通过，安全维护未启动且 VACUUM 未执行；"
@@ -453,10 +703,14 @@ def _collect_maintenance_preflight(
         page_size_bytes=page_size_bytes,
         page_count=page_count,
         freelist_count=freelist_count,
+        auto_vacuum_mode=auto_vacuum_mode,
+        compact_target_size_bytes=compact_target_size_bytes,
     )
 
 
-def _read_sqlite_page_metrics(db_path: Path) -> tuple[int | None, int | None, int | None]:
+def _read_sqlite_page_metrics(
+    db_path: Path,
+ ) -> tuple[int | None, int | None, int | None, int | None]:
     """Reads explanatory page counters without opening a write-capable connection."""
     try:
         read_only_uri = db_path.resolve().as_uri() + "?mode=ro"
@@ -468,16 +722,17 @@ def _read_sqlite_page_metrics(db_path: Path) -> tuple[int | None, int | None, in
         )
     except (OSError, sqlite3.Error):
         logger.debug("无法读取 SQLite 页面诊断指标。", exc_info=True)
-        return None, None, None
+        return None, None, None, None
     try:
         return (
             _read_pragma_int(conn, "page_size"),
             _read_pragma_int(conn, "page_count"),
             _read_pragma_int(conn, "freelist_count"),
+            _read_pragma_int(conn, "auto_vacuum"),
         )
     except sqlite3.Error:
         logger.debug("无法读取 SQLite 页面诊断指标。", exc_info=True)
-        return None, None, None
+        return None, None, None, None
     finally:
         conn.close()
 
@@ -493,14 +748,28 @@ def _read_pragma_int(conn: sqlite3.Connection, name: str) -> int | None:
     return value if value >= 0 else None
 
 
+def _auto_vacuum_mode(value: int | None) -> str | None:
+    return {0: "none", 1: "full", 2: "incremental"}.get(value)
+
+
+def _estimate_compact_target_size_bytes(
+    *,
+    page_size_bytes: int | None,
+    page_count: int | None,
+    freelist_count: int | None,
+    fallback_db_size_bytes: int,
+ ) -> int | None:
+    if page_size_bytes is not None and page_count is not None and freelist_count is not None:
+        live_pages = max(page_count - freelist_count, 1)
+        return max(live_pages * page_size_bytes + page_size_bytes, page_size_bytes)
+    return fallback_db_size_bytes if fallback_db_size_bytes > 0 else None
+
+
 def _database_key(db_path: Path) -> str:
     try:
         return str(db_path.expanduser().resolve()).casefold()
     except OSError:
         return str(db_path.expanduser().absolute()).casefold()
-
-
-_WINDOWS_LOCK_REGION_BYTES = 256
 
 
 @dataclass(slots=True)
@@ -509,8 +778,12 @@ class _ProcessFileLease:
     offset: int
     length: int
     shared: bool
+    released: bool = False
 
     def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
         try:
             if os.name == "nt":
                 import msvcrt
@@ -608,11 +881,19 @@ def _store_result(
         "eligible": eligible,
         "status": status,
         "vacuum_started": False,
+        "compaction_pending": False,
+        "compact_copy_started": False,
+        "compact_target_size_bytes": None,
+        "required_compact_target_size_bytes": None,
+        "compact_output_size_bytes": None,
+        "pending_manifest_epoch": None,
         "required_working_bytes": None,
         "available_bytes": None,
         "page_size_bytes": None,
         "page_count": None,
         "freelist_count": None,
+        "auto_vacuum_mode": None,
+        "freelist_potential_bytes": None,
         "before_size_bytes": before.total_size_bytes,
         "after_size_bytes": None,
         "reclaimed_size_bytes": 0,
@@ -660,6 +941,58 @@ def _deferred_result(
     }
 
 
+def _queue_pending_compaction_after_failure(
+    *,
+    store_id: str,
+    base: dict[str, Any],
+    before: SqliteStoreMeasurement,
+    db_path: Path,
+    exc: BaseException,
+    vacuum_started: bool,
+ ) -> dict[str, Any] | None:
+    if not _is_no_space_error(exc):
+        return None
+    from agent_runtime.infrastructure.sqlite_compaction import (
+        queue_pending_sqlite_compaction,
+        read_sqlite_compaction_diagnostic,
+    )
+    diagnostic = read_sqlite_compaction_diagnostic(db_path)
+    pending = queue_pending_sqlite_compaction(
+        store_id=store_id,
+        db_path=db_path,
+        categories=(store_id,),
+        diagnostic=diagnostic,
+        error_code="compact_target_space_insufficient",
+        message=(
+            "逻辑 DELETE 已提交；在线 VACUUM 遇到目标空间不足，未宣称源库已释放。"
+            "已记录受控离线紧凑副本任务，需停止全部 Runtime worker 后重启；不代表删除失败。"
+        ),
+    )
+    result = _deferred_result(
+        {**base, **diagnostic.to_dict()},
+        before,
+        db_path=db_path,
+        status="requires_runtime_restart",
+        error_code="compact_target_space_insufficient",
+        message=pending.get("message") or "紧凑目标空间不足，已延期到离线维护。",
+        reclaimed_size_bytes=0,
+        vacuum_started=vacuum_started,
+    )
+    return {
+        **result,
+        "status": "requires_runtime_restart",
+        "compaction_pending": True,
+        "compact_copy_started": False,
+        "compact_target_size_bytes": pending.get("compact_target_size_bytes"),
+        "required_compact_target_size_bytes": pending.get("required_compact_target_size_bytes") or pending.get("compact_target_size_bytes"),
+        "compact_output_size_bytes": None,
+        "auto_vacuum_mode": pending.get("auto_vacuum_mode"),
+        "freelist_potential_bytes": pending.get("freelist_potential_bytes"),
+        "pending_manifest_epoch": pending.get("pending_manifest_epoch"),
+    }
+
+
+
 def _exception_result(
     base: dict[str, Any],
     before: SqliteStoreMeasurement,
@@ -695,6 +1028,14 @@ def _maintenance_error_message(status: str, exc: BaseException) -> str:
     if isinstance(exc, sqlite3.Error):
         return "SQLite 维护未完成，未将删除数量作为释放字节。"
     return "安全空间维护未完成，未将删除数量作为释放字节。"
+
+
+def _is_no_space_error(exc: BaseException) -> bool:
+    errno_value = getattr(exc, "errno", None)
+    if errno_value in {errno.ENOSPC, errno.EDQUOT, 112, 39}:
+        return True
+    message = str(exc).lower()
+    return "disk is full" in message or "database or disk is full" in message or "no space" in message
 
 
 def _is_busy_error(exc: sqlite3.OperationalError) -> bool:

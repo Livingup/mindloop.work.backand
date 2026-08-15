@@ -15,6 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool, monitored_to_thread, shutdown_blocking_executors
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry, shutdown_runtime_tasks
+from agent_runtime.infrastructure.sqlite_maintenance import acquire_runtime_presence_leases
+from agent_runtime.logs_management.service import (
+    controlled_log_database_paths,
+    run_pending_log_compactions_at_startup,
+ )
 
 from agent_runtime.auth.runtime_access_policy import (
     LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
@@ -208,6 +213,24 @@ def create_app(
         new_network_trace_id,
         runtime_network_monitor,
     )
+
+    controlled_paths = controlled_log_database_paths()
+    try:
+        startup_compaction_results = run_pending_log_compactions_at_startup(
+            controlled_paths=controlled_paths,
+        )
+        if startup_compaction_results:
+            logger.info(
+                "Runtime startup pending SQLite compactions processed: count=%d",
+                len(startup_compaction_results),
+            )
+    except Exception:  # noqa: BLE001 - a pending manifest must remain retryable without blocking API startup
+        logger.exception("Runtime startup pending SQLite compaction runner failed; manifests remain pending.")
+    runtime_presence_leases = acquire_runtime_presence_leases(controlled_paths)
+    if runtime_presence_leases is None:
+        raise RuntimeError(
+            "无法取得受控日志数据库 Runtime presence leases；为避免未协调的离线替换，Runtime 未启动。"
+        )
 
     startup_cloud_user_config_database = ConfigRegistry.instance().cloud_user_config_database
     cloud_user_config_database_active_at_start = (
@@ -752,8 +775,15 @@ def create_app(
                     diagnostic_context={"component": "runtime_lifespan", "phase": "shutdown.final_registry_sweep"},
                 )
             with suppress(Exception, asyncio.CancelledError):
-                logs_management_service.close()
-            shutdown_blocking_executors(wait=False, cancel_futures=False)
+                logs_management_service.close(wait=True)
+            with suppress(Exception, asyncio.CancelledError):
+                context_compression_archive_repository.close()
+            try:
+                shutdown_blocking_executors(wait=False, cancel_futures=False)
+            finally:
+                if runtime_presence_leases is not None:
+                    with suppress(Exception, asyncio.CancelledError):
+                        runtime_presence_leases.release()
             logger.info(
                 "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
                 "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",

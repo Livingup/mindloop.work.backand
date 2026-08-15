@@ -25,6 +25,8 @@ class LogsOverviewResponse(BaseModel):
 class LogsCapabilitiesResponse(BaseModel):
     supported_space_release_modes: list[str] = Field(default_factory=list)
     release_only_retry_supported: bool = False
+    pending_compaction_count: int = 0
+    pending_compactions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class LogsCleanupJobCreateRequest(BaseModel):
@@ -53,11 +55,19 @@ class LogsCleanupStoreSpaceReleaseResponse(BaseModel):
     eligible: bool = False
     status: str
     vacuum_started: bool = False
+    compaction_pending: bool = False
+    compact_copy_started: bool = False
+    compact_output_size_bytes: int | None = None
+    compact_target_size_bytes: int | None = None
+    required_compact_target_size_bytes: int | None = None
+    pending_manifest_epoch: str | None = None
     required_working_bytes: int | None = None
     available_bytes: int | None = None
     page_size_bytes: int | None = None
     page_count: int | None = None
     freelist_count: int | None = None
+    auto_vacuum_mode: str | None = None
+    freelist_potential_bytes: int | None = None
     before_size_bytes: int | None = None
     after_size_bytes: int | None = None
     reclaimed_size_bytes: int = 0
@@ -80,6 +90,12 @@ class LogsCleanupSpaceReleaseResponse(BaseModel):
     after_total_size_bytes: int | None = None
     reclaimed_size_bytes: int = 0
     net_size_change_bytes: int = 0
+    freelist_potential_bytes: int = 0
+    compact_target_size_bytes: int | None = None
+    required_compact_target_size_bytes: int | None = None
+    compact_output_size_bytes: int | None = None
+    compaction_pending: bool = False
+    pending_compaction_count: int = 0
     stores: list[LogsCleanupStoreSpaceReleaseResponse] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -94,6 +110,8 @@ class LogsCleanupResponse(BaseModel):
     category_results: list[LogsCleanupCategoryResultResponse] = Field(default_factory=list)
     total_matched_count: int
     total_deleted_count: int
+    logical_delete_committed: bool = False
+    cleanup_outcome: str = "preview"
     space_release: LogsCleanupSpaceReleaseResponse | None = None
 
 

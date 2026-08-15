@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from agent_runtime.config import ConfigRegistry
+from agent_runtime.infrastructure.sqlite_compaction import (
+    pending_sqlite_compaction_summaries,
+    run_pending_sqlite_compactions,
+ )
 from agent_runtime.infrastructure.sqlite_maintenance import (
     SafeSqliteStoreMaintenanceGateway,
     SqliteStoreMaintenanceGateway,
@@ -40,6 +44,9 @@ SUPPORTED_SPACE_RELEASE_MODES: frozenset[str] = frozenset({
 CLEANUP_PHASE_RESOLVING_SCOPE = "resolving_scope"
 CLEANUP_PHASE_DELETING_DATA = "deleting_data"
 CLEANUP_PHASE_RELEASING_SPACE = "releasing_space"
+CLEANUP_PHASE_COMPACT_COPYING = "compact_copying"
+CLEANUP_PHASE_SWAPPING = "swapping"
+CLEANUP_PHASE_REOPENING = "reopening"
 CLEANUP_PHASE_COMPLETED = "completed"
 CLEANUP_PHASE_FAILED = "failed"
 
@@ -201,8 +208,8 @@ class LogsManagementService:
         self._cleanup_executor.submit(self._run_cleanup_job, job.job_id)
         return job.to_dict()
 
-    def close(self) -> None:
-        self._cleanup_executor.shutdown(wait=False, cancel_futures=False)
+    def close(self, *, wait: bool = False) -> None:
+        self._cleanup_executor.shutdown(wait=wait, cancel_futures=False)
 
     def get_cleanup_job(self, job_id: str) -> dict[str, Any] | None:
         with self._jobs_lock:
@@ -315,9 +322,12 @@ class LogsManagementService:
             )
 
     def get_capabilities(self) -> dict[str, Any]:
+        pending = pending_sqlite_compaction_summaries(controlled_log_database_paths(self._paths_accessor()))
         return {
             "supported_space_release_modes": sorted(SUPPORTED_SPACE_RELEASE_MODES),
             "release_only_retry_supported": True,
+            "pending_compaction_count": len(pending),
+            "pending_compactions": pending,
         }
 
     def get_overview(self) -> dict[str, Any]:
@@ -427,10 +437,30 @@ class LogsManagementService:
                 selected_categories,
                 progress_callback=progress_callback,
             )
+        physical_release_deferred = bool(
+            space_release is not None
+            and (
+                space_release.get("compaction_pending")
+                or space_release.get("status") in {
+                    "requires_runtime_restart",
+                    "requires_more_space",
+                    "partial",
+                    "deferred_busy",
+                    "failed",
+                }
+            )
+        )
+        cleanup_outcome = (
+            "data_deleted_compaction_pending"
+            if execute and not release_only and physical_release_deferred
+            else "completed" if execute else "preview"
+        )
         return {
             "mode": "execute" if execute else "preview",
             "space_release_mode": normalized_space_release_mode,
             "release_only": release_only,
+            "logical_delete_committed": bool(execute and not release_only),
+            "cleanup_outcome": cleanup_outcome,
             "lifecycle_filters": list(scope.lifecycle_filters),
             "categories": list(selected_categories),
             "scope": {
@@ -459,11 +489,19 @@ class LogsManagementService:
                 "eligible": db_path.exists(),
                 "status": "preview_only" if db_path.exists() else "not_available",
                 "vacuum_started": False,
+                "compaction_pending": False,
+                "compact_copy_started": False,
+                "compact_target_size_bytes": None,
+                "required_compact_target_size_bytes": None,
+                "compact_output_size_bytes": None,
+                "pending_manifest_epoch": None,
                 "required_working_bytes": None,
                 "available_bytes": None,
                 "page_size_bytes": None,
                 "page_count": None,
                 "freelist_count": None,
+                "auto_vacuum_mode": None,
+                "freelist_potential_bytes": None,
                 "before_size_bytes": measurement.total_size_bytes,
                 "after_size_bytes": None,
                 "reclaimed_size_bytes": 0,
@@ -490,6 +528,12 @@ class LogsManagementService:
             "after_total_size_bytes": None,
             "reclaimed_size_bytes": 0,
             "net_size_change_bytes": 0,
+            "freelist_potential_bytes": 0,
+            "compact_target_size_bytes": None,
+            "required_compact_target_size_bytes": None,
+            "compact_output_size_bytes": None,
+            "compaction_pending": False,
+            "pending_compaction_count": 0,
             "stores": stores,
             "warnings": ["预览不执行 DELETE、checkpoint 或 VACUUM，也不估算可释放字节。"],
         }
@@ -505,14 +549,21 @@ class LogsManagementService:
         for category in MAINTENANCE_CATEGORY_ORDER:
             if category not in selected_categories:
                 continue
+            db_path = _category_db_path(paths, category)
+            pending_before = pending_sqlite_compaction_summaries((db_path,))
             if progress_callback is not None:
-                progress_callback(CLEANUP_PHASE_RELEASING_SPACE, category)
-            stores.append(
-                self._maintenance_gateway.maintain_store(
-                    store_id=category,
-                    db_path=_category_db_path(paths, category),
+                progress_callback(
+                    CLEANUP_PHASE_COMPACT_COPYING if pending_before else CLEANUP_PHASE_RELEASING_SPACE,
+                    category,
                 )
+            store_result = self._maintenance_gateway.maintain_store(
+                store_id=category,
+                db_path=db_path,
             )
+            if progress_callback is not None and store_result.get("compact_copy_started"):
+                progress_callback(CLEANUP_PHASE_SWAPPING, category)
+                progress_callback(CLEANUP_PHASE_REOPENING, category)
+            stores.append(store_result)
         if progress_callback is not None:
             progress_callback(CLEANUP_PHASE_RELEASING_SPACE, None)
         return _aggregate_space_release_results(stores)
@@ -781,6 +832,12 @@ def _logical_only_space_release_result() -> dict[str, Any]:
         "after_total_size_bytes": 0,
         "reclaimed_size_bytes": 0,
         "net_size_change_bytes": 0,
+        "freelist_potential_bytes": 0,
+        "compact_target_size_bytes": None,
+        "required_compact_target_size_bytes": None,
+        "compact_output_size_bytes": None,
+        "compaction_pending": False,
+        "pending_compaction_count": 0,
         "stores": [],
         "warnings": ["SQLite 文件未执行 checkpoint/VACUUM；已删除行形成的空闲页可供后续写入复用。"],
     }
@@ -788,8 +845,9 @@ def _logical_only_space_release_result() -> dict[str, Any]:
 
 def _aggregate_space_release_results(stores: list[dict[str, Any]]) -> dict[str, Any]:
     eligible = [item for item in stores if item.get("eligible")]
-    successful_statuses = {"released", "skipped_no_changes"}
+    successful_statuses = {"released", "completed", "skipped_no_changes"}
     deferred_statuses = {"busy", "timeout"}
+    pending_statuses = {"requires_runtime_restart", "requires_more_space"}
     failed_statuses = {"insufficient_disk_space", "permission_denied", "io_error", "failed"}
     statuses = {str(item.get("status")) for item in eligible}
     if not eligible:
@@ -798,9 +856,13 @@ def _aggregate_space_release_results(stores: list[dict[str, Any]]) -> dict[str, 
         status = "skipped_no_changes"
     elif statuses <= successful_statuses:
         status = "completed"
+    elif statuses <= {"requires_more_space"}:
+        status = "requires_more_space"
+    elif statuses <= pending_statuses:
+        status = "requires_runtime_restart"
     elif statuses and statuses <= deferred_statuses:
         status = "deferred_busy"
-    elif statuses & successful_statuses:
+    elif statuses & successful_statuses or statuses & pending_statuses:
         status = "partial"
     elif statuses & failed_statuses:
         status = "failed"
@@ -819,8 +881,14 @@ def _aggregate_space_release_results(stores: list[dict[str, Any]]) -> dict[str, 
         "after_total_size_bytes": sum(int(item.get("after_size_bytes") or 0) for item in eligible),
         "reclaimed_size_bytes": sum(int(item.get("reclaimed_size_bytes") or 0) for item in eligible),
         "net_size_change_bytes": sum(int(item.get("net_size_change_bytes") or 0) for item in eligible),
+        "freelist_potential_bytes": sum(int(item.get("freelist_potential_bytes") or 0) for item in eligible),
+        "compact_target_size_bytes": sum(int(item.get("compact_target_size_bytes") or 0) for item in eligible) or None,
+        "required_compact_target_size_bytes": sum(int(item.get("required_compact_target_size_bytes") or item.get("compact_target_size_bytes") or 0) for item in eligible) or None,
+        "compact_output_size_bytes": sum(int(item.get("compact_output_size_bytes") or 0) for item in eligible) or None,
+        "compaction_pending": any(bool(item.get("compaction_pending")) for item in eligible),
+        "pending_compaction_count": sum(1 for item in eligible if item.get("compaction_pending")),
         "stores": stores,
-        "warnings": warnings,
+        "warnings": warnings
     }
 
 
@@ -841,6 +909,40 @@ def _paths_from_config() -> LogsStorePaths:
         context_compression_db=context_compression_dir / "context_compression.db",
         terminal_db=terminal_dir / "terminal.db",
     )
+
+
+
+def controlled_log_database_paths(paths: LogsStorePaths | None = None) -> tuple[Path, ...]:
+    """Return only the five databases permitted for log maintenance."""
+    paths = paths or _paths_from_config()
+    return (
+        paths.communication_db,
+        paths.chat_bubbles_db,
+        paths.llm_http_trace_db,
+        paths.context_compression_db,
+        paths.terminal_db,
+    )
+
+
+
+def run_pending_log_compactions_at_startup(
+    paths: LogsStorePaths | None = None,
+    *,
+    controlled_paths: tuple[Path, ...] | None = None,
+ ) -> list[dict[str, Any]]:
+    """Run pending compact-copy swaps before Runtime repositories are constructed."""
+    if controlled_paths is None:
+        paths = paths or _paths_from_config()
+        controlled_paths = controlled_log_database_paths(paths)
+    results = run_pending_sqlite_compactions(controlled_paths)
+    for result in results:
+        logger.info(
+            "SQLite pending log compaction startup result: store_id=%s status=%s error_code=%s",
+            result.get("store_id"),
+            result.get("status"),
+            result.get("error_code"),
+        )
+    return results
 
 
 def _normalize_lifecycle_filters(lifecycle_filters: Iterable[str]) -> tuple[str, ...]:
