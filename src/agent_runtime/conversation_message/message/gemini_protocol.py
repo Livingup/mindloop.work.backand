@@ -29,6 +29,7 @@ from agent_runtime.conversation_message.message.assistant_projection import (
     iter_assistant_semantic_segments,
     should_include_cross_protocol_thinking_text,
     tool_name_for_result,
+    normalize_tool_input_object,
 )
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_GEMINI,
@@ -116,11 +117,14 @@ class GeminiAdapter:
                 content.append(TextPart(text=part["text"]))
             elif part.get("functionCall"):
                 fc = part["functionCall"]
+                tool_call_id = fc.get("id")
+                if not tool_call_id:
+                    tool_call_id = _build_gemini_tool_use_ref(fc.get("name", ""), part_index)
                 content.append(
                     ToolUsePart(
                         name=fc.get("name", ""),
                         input=fc.get("args"),
-                        tool_use_id=_build_gemini_tool_use_ref(fc.get("name", ""), part_index),
+                        tool_use_id=tool_call_id,
                     )
                 )
             # inlineData / fileData 仅用户侧出现，响应一般不会
@@ -304,6 +308,7 @@ async def _build_gemini_function_response(
         response["output"] = text_content
 
     function_response: dict[str, Any] = {
+        "id": tool_use_ref,
         "name": tool_name_for_result(tool_use_ref, tool_name_by_ref),
         "response": response,
     }
@@ -364,8 +369,9 @@ def _build_gemini_model(
         elif isinstance(segment, AssistantToolUseSegment):
             parts.append({
                 "functionCall": {
+                    "id": segment.tool_use_ref,
                     "name": segment.name,
-                    "args": segment.input,
+                    "args": normalize_tool_input_object(segment.input),
                 },
             })
     if not parts:
@@ -399,5 +405,9 @@ def _normalize_gemini_contents(
                 prev_parts.extend(curr_parts)
         else:
             merged.append(item)
+
+    # Gemini 强约束：请求内容的最后一轮不能是 "model" (Requests ending with a model turn are not supported.)
+    if merged[-1].get("role") == "model":
+        merged.append({"role": "user", "parts": [{"text": "Continue"}]})
 
     return merged

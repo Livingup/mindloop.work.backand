@@ -520,10 +520,11 @@ class LlmSemanticStreamParser:
     ) -> list[LlmSemanticStreamEvent]:
         events: list[LlmSemanticStreamEvent] = []
         name = _text_or_none(function_call.get("name")) or ""
+        call_id = _text_or_none(function_call.get("id"))
         state = self._gemini_tools_by_index.get(part_index)
         if state is None:
             state = _ChatToolState(
-                tool_call_id=_build_gemini_tool_call_id(name, part_index),
+                tool_call_id=call_id or _build_gemini_tool_call_id(name, part_index),
                 index=part_index,
                 tool_name=name,
             )
