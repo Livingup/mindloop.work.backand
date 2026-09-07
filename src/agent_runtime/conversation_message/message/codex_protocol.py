@@ -30,7 +30,18 @@ class CodexAdapter:
         resolver: ResourceResolver,
         options: dict[str, Any] | None = None,
     ) -> OpenAIRenderResult:
-        rendered = await OpenAIAdapter().render(_codex_as_openai_conversation(conv), resolver, options)
+        openai_options = dict(options or {})
+        for key in (
+            "openai_responses_configuration_view",
+            "prompt_cache_breakpoint",
+            "prompt_cache_options",
+        ):
+            openai_options.pop(key, None)
+        rendered = await OpenAIAdapter().render(
+            _codex_as_openai_conversation(conv),
+            resolver,
+            openai_options,
+        )
         return replace(rendered, input=_normalize_codex_input(rendered.input))
 
     def preflight(self, conv: Conversation) -> None:
@@ -61,11 +72,9 @@ def _codex_as_openai_conversation(conv: Conversation) -> Conversation:
             mapped_messages.append(message)
             continue
         mapped_messages.append(
-            UniMessage(
-                role=message.role,
-                content=message.content,
+            replace(
+                message,
                 source_provider=API_FORMAT_OPENAI_RESPONSES,
-                source_vendor=message.source_vendor,
                 provider_extras={API_FORMAT_OPENAI_RESPONSES: codex_extras},
             )
         )

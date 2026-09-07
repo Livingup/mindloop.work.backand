@@ -44,11 +44,14 @@ class OpenAIWebNativeToolAdapter:
             if filters:
                 tool["filters"] = filters
             tool["search_context_size"] = _openai_context_size(request.max_results)
-        return {
+        overrides = {
             "tools": [tool],
             "tool_choice": {"type": "web_search_preview"},
             "include": ["web_search_call.action.sources"],
         }
+        if self.api_format == API_FORMAT_OPENAI_RESPONSES:
+            overrides["openai_responses_input_configuration"] = True
+        return overrides
 
 
 @dataclass(frozen=True, slots=True)

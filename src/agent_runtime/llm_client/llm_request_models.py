@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from agent_runtime.conversation_message.message.models import Conversation, UniMessage
+from agent_runtime.conversation_message.message.models import (
+    Conversation,
+    RequestConfigurationView,
+    UniMessage,
+)
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
 from agent_runtime.llm_model_registry.llm_model_registry_service import (
     ResolvedLlmProviderModel,
@@ -78,6 +82,10 @@ class LlmPromptRequest:
     request_attempt_observer: Callable[[dict[str, Any]], None] | None = None
 
     request_event_observer: Callable[[str, dict[str, Any]], None] | None = None
+
+    # 上游 Agent/工具模块持有的配置视图。仅 OpenAI Responses 消费其历史事件；
+    # Conversation 不持久化该对象。未提供时请求服务只构造当次初始配置视图。
+    configuration_view: RequestConfigurationView | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -114,6 +114,7 @@ Desktop.ini
 !/tests/test_terminal_read_output_service.py
 !/tests/test_text_search_file_and_directory.py
 !/tests/test_file_edit_tools_expected_sha256.py
+!/tests/test_openai_responses_configuration_timeline.py
 
 /web-frontend/
 

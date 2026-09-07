@@ -31,6 +31,12 @@ from agent_runtime.conversation_message.message.assistant_projection import (
 from agent_runtime.conversation_message.message.models import (
     PROVIDER_OPENAI,
     ROLE_ASSISTANT,
+    ConfigurationAnchor,
+    ConfigurationComponentEvent,
+    CurrentPromptConfiguration,
+    CurrentToolsConfiguration,
+    RequestConfigurationView,
+    build_request_configuration_view_from_timeline,
     Conversation,
     ImagePart,
     PdfPart,
@@ -65,10 +71,9 @@ _OPENAI_REPLAYABLE_OUTPUT_ITEM_TYPES = frozenset({
 class OpenAIRenderResult:
     """OpenAI 渲染结果。
 
-    包含渲染后的 input 数组和 prompt_cache_key。
-    调用方在此基础上合并 model、instructions、reasoning 等参数后发送请求。
-
-    注意：store / instructions 不在此处；请求客户端会强制 store=false。
+    包含消息与配置事件组成的 input、缓存路由 key 和缓存选项。
+    调用方仅合并 model、reasoning 等请求参数；系统提示词和工具位于 input。
+    请求客户端强制 store=false，禁止再次注入顶层 instructions/tools。
     """
 
     # OpenAI Responses API 的 input 数组。
@@ -84,6 +89,12 @@ class OpenAIRenderResult:
     include: list[str] = field(
         default_factory=lambda: ["reasoning.encrypted_content"]
     )
+
+    # 配置时间线投影启用时，客户端合并到请求的缓存选项。
+    prompt_cache_options: dict[str, Any] | None = None
+
+    # 标识 system prompt/tools 已在 input developer 事件中表达。
+    uses_input_configuration: bool = False
 
 
 class OpenAIAdapter:
@@ -169,13 +180,30 @@ class OpenAIAdapter:
     ) -> OpenAIRenderResult:
         """将会话消息渲染为 OpenAI Responses API 的请求体。
 
-        只产出消息相关字段：input + prompt_cache_key + include。
-        模型名、instructions、reasoning、store 等由调用方合并；请求客户端会强制 store=false。
+        配置视图和消息共同投影为 input，附带缓存选项、prompt_cache_key 和 include。
+        模型名、reasoning 等由调用方合并；请求客户端会强制 store=false。
         """
         message_slice = conv.messages
+        configuration_view = _get_openai_configuration_view(conv, options)
+        prompt_cache_breakpoint = (options or {}).get("prompt_cache_breakpoint", {"mode": "explicit"})
+        prompt_cache_options = (options or {}).get("prompt_cache_options", {"mode": "implicit"})
+        if prompt_cache_breakpoint is not None and not isinstance(prompt_cache_breakpoint, dict):
+            raise TypeError("prompt_cache_breakpoint 必须是对象或 None。")
+        if prompt_cache_options is not None and not isinstance(prompt_cache_options, dict):
+            raise TypeError("prompt_cache_options 必须是对象或 None。")
+        start_configuration, before_configuration, after_configuration = (
+            _render_openai_configuration_timeline(
+                configuration_view,
+                conv,
+                prompt_cache_breakpoint=prompt_cache_breakpoint,
+            )
+            if configuration_view is not None
+            else ([], {}, {})
+        )
 
-        input_items: list[Any] = []
+        input_items: list[Any] = list(start_configuration)
         for m in message_slice:
+            input_items.extend(before_configuration.get(m.message_id, ()))
             if m.role == "user":
                 input_items.append(await _build_openai_user(m, resolver))
             elif m.role == "tool":
@@ -192,11 +220,14 @@ class OpenAIAdapter:
             else:
                 # assistant 消息
                 input_items.extend(_build_openai_assistant(m, options))
+            input_items.extend(after_configuration.get(m.message_id, ()))
 
         return OpenAIRenderResult(
             input=input_items,
             previous_response_id=None,
             prompt_cache_key=_prompt_cache_key(conv, options),
+            prompt_cache_options=clone_raw_value(prompt_cache_options) if configuration_view is not None else None,
+            uses_input_configuration=configuration_view is not None,
         )
 
     # ── 预检 ─────────────────────────────────────────────────────
@@ -233,6 +264,174 @@ def _prompt_cache_key(conv: Conversation, options: dict[str, Any] | None = None)
         if isinstance(state_cache_key, str) and state_cache_key.strip():
             return state_cache_key
     return conv.id
+
+
+_OPENAI_RESPONSES_CONFIGURATION_VIEW_OPTION = "openai_responses_configuration_view"
+
+
+def _get_openai_configuration_view(
+    conv: Conversation,
+    options: dict[str, Any] | None,
+) -> RequestConfigurationView | None:
+    value = (options or {}).get(_OPENAI_RESPONSES_CONFIGURATION_VIEW_OPTION)
+    if value is not None:
+        if not isinstance(value, RequestConfigurationView):
+            raise TypeError(
+                f"{_OPENAI_RESPONSES_CONFIGURATION_VIEW_OPTION} 必须是 RequestConfigurationView。"
+            )
+        if value.conversation_id != conv.id:
+            raise ValueError(
+                "Responses 配置视图的 conversation_id 必须与待渲染 Conversation 一致。"
+            )
+        return value
+    if getattr(conv, "timeline", None):
+        return build_request_configuration_view_from_timeline(
+            conversation_id=conv.id,
+            timeline=conv.timeline,
+            system_prompt=getattr(conv, "system_prompt", None),
+            tools=getattr(conv, "tools", ()),
+        )
+    return None
+
+
+def _render_openai_configuration_timeline(
+    view: RequestConfigurationView,
+    conv: Conversation,
+    *,
+    prompt_cache_breakpoint: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
+    """按稳定消息锚点把上游配置事件投影为 OpenAI Responses input 项。"""
+    known_message_ids = {message.message_id for message in conv.messages}
+    if len(known_message_ids) != len(conv.messages):
+        raise ValueError("Responses 配置锚点要求 Conversation.message_id 唯一。")
+    grouped: dict[tuple[str, str | None], list[tuple[ConfigurationComponentEvent, str]]] = {}
+    for component, events in (
+        ("tool", view.tool_events),
+        ("prompt", view.prompt_events),
+    ):
+        for event in events:
+            if event.anchor != "start" and event.anchor_message_id not in known_message_ids:
+                raise ValueError(
+                    f"配置事件 {event.event_id} 引用了不存在的 message_id: "
+                    f"{event.anchor_message_id}"
+                )
+            grouped.setdefault((event.anchor, event.anchor_message_id), []).append(
+                (event, component)
+            )
+
+    def render_group(
+        anchor: ConfigurationAnchor,
+        anchor_message_id: str | None,
+    ) -> list[dict[str, Any]]:
+        entries = grouped.get((anchor, anchor_message_id), [])
+        rendered: list[dict[str, Any]] = []
+        for event, component in sorted(
+            entries,
+            key=lambda item: (
+                item[0].sequence,
+                0 if item[1] == "tool" else 1,
+                item[0].event_id,
+            ),
+        ):
+            if component == "prompt":
+                prompt_value = _resolve_configuration_event_value(
+                    event,
+                    view.current_prompt,
+                    component_name="提示词",
+                )
+                rendered.append(_build_openai_developer_message(prompt_value))
+            else:
+                tool_value = _resolve_configuration_event_value(
+                    event,
+                    view.current_tools,
+                    component_name="工具",
+                )
+                rendered.append(_build_openai_additional_tools(tool_value))
+        return rendered
+
+    start_items = render_group("start", None)
+    _attach_initial_configuration_breakpoint(start_items, prompt_cache_breakpoint)
+    before = {
+        message_id: render_group("before_message_id", message_id)
+        for message_id in known_message_ids
+        if ("before_message_id", message_id) in grouped
+    }
+    after = {
+        message_id: render_group("after_message_id", message_id)
+        for message_id in known_message_ids
+        if ("after_message_id", message_id) in grouped
+    }
+    return start_items, before, after
+
+
+def _resolve_configuration_event_value(
+    event: ConfigurationComponentEvent,
+    current: CurrentPromptConfiguration | CurrentToolsConfiguration | None,
+    *,
+    component_name: str,
+) -> Any:
+    if event.status == "historical":
+        return clone_raw_value(event.snapshot)
+    if current is None:
+        raise ValueError(f"活动{component_name}配置事件缺少本次实时解析结果。")
+    if event.event_id != current.event_id or event.definition_id != current.definition_id:
+        raise ValueError(f"活动{component_name}配置事件与本次实时解析结果不匹配。")
+    if isinstance(current, CurrentPromptConfiguration):
+        return clone_raw_value(current.resolved_content)
+    return tuple(clone_raw_value(tool) for tool in current.ordered_definitions)
+
+
+def _build_openai_developer_message(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": value}]
+    elif isinstance(value, (list, tuple)):
+        content = [clone_raw_value(item) for item in value]
+        if not all(isinstance(item, dict) for item in content):
+            raise TypeError("提示词 snapshot/resolved_content 必须是 str 或内容块字典序列。")
+    else:
+        raise TypeError("提示词 snapshot/resolved_content 必须是 str 或内容块字典序列。")
+    for block in content:
+        block.pop("prompt_cache_breakpoint", None)
+    return {"role": "developer", "content": content}
+
+
+def _build_openai_additional_tools(value: Any) -> dict[str, Any]:
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, dict) for item in value):
+        raise TypeError("工具 snapshot/ordered_definitions 必须是工具 schema 字典序列。")
+    return {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [clone_raw_value(item) for item in value],
+    }
+
+
+def _attach_initial_configuration_breakpoint(
+    items: list[dict[str, Any]],
+    breakpoint_marker: dict[str, Any] | None = None,
+) -> None:
+    """在初始配置最后一个 developer 提示词内容块上重建显式缓存断点 B。"""
+    for item_index in range(len(items) - 1, -1, -1):
+        item = items[item_index]
+        if item.get("role") != "developer":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "input_text"
+                and isinstance(block.get("text"), str)
+            ):
+                if any(
+                    isinstance(later, dict) and later.get("type") == "additional_tools"
+                    for later in items[item_index + 1:]
+                ):
+                    return
+                if breakpoint_marker is not None:
+                    block["prompt_cache_breakpoint"] = clone_raw_value(breakpoint_marker)
+                return
+    # 允许没有系统提示词的配置视图，例如仅清空工具集；此时没有合法位置放置 B。
 
 
 # ── 渲染内部函数 ─────────────────────────────────────────────────

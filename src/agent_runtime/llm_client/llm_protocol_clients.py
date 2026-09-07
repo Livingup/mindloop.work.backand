@@ -91,6 +91,18 @@ class OpenAIResponsesProtocolClient:
     ) -> Any:
         if not isinstance(rendered_messages, OpenAIRenderResult):
             raise TypeError("openai_responses 渲染结果类型不正确。")
+        if "input" in request_params or "prompt_cache_breakpoint" in request_params:
+            raise ValueError("Responses input 和 prompt_cache_breakpoint 必须由消息渲染层提供。")
+        if "instructions" in request_params or "tools" in request_params:
+            raise ValueError(
+                "OpenAI Responses 的 instructions/tools 必须由配置视图投影到 input，"
+                "不能通过 request_params 发送顶层配置。"
+            )
+        if (system_prompt is not None or tools) and not rendered_messages.uses_input_configuration:
+            raise ValueError(
+                "OpenAI Responses 的 system_prompt/tools 必须先渲染为 developer/"
+                "additional_tools input 事件。"
+            )
         body: dict[str, Any] = {
             "model": resolved_model.model_alias,
             "input": rendered_messages.input,
@@ -100,14 +112,27 @@ class OpenAIResponsesProtocolClient:
         }
         body["store"] = False
         body["include"] = _ensure_include_item(body.get("include"), "reasoning.encrypted_content")
-        if system_prompt:
-            body.setdefault("instructions", system_prompt)
         body.pop("previous_response_id", None)
         if rendered_messages.prompt_cache_key:
             body["prompt_cache_key"] = rendered_messages.prompt_cache_key
+        cache_options = copy.deepcopy(rendered_messages.prompt_cache_options)
+        if "prompt_cache_options" in request_params:
+            requested_cache_options = request_params["prompt_cache_options"]
+            if requested_cache_options is None:
+                cache_options = None
+            elif isinstance(requested_cache_options, dict):
+                cache_options = {
+                    **(cache_options or {}),
+                    **copy.deepcopy(requested_cache_options),
+                }
+            else:
+                raise TypeError("prompt_cache_options 必须是对象或 None。")
+        if cache_options is None:
+            body.pop("prompt_cache_options", None)
+        else:
+            body["prompt_cache_options"] = cache_options
         if tools:
-            body.setdefault("tools", list(tools))
-            # 应用层默认启用并发工具调用；provider 通过 request_params.parallel_tool_calls=False 可显式关闭。
+            # parallel_tool_calls 仍是合法的请求级执行策略，不重复声明 tools。
             body.setdefault("parallel_tool_calls", True)
         url = _join_url(resolved_model.api_base_url, "responses")
         headers = _json_headers(resolved_model.custom_headers)

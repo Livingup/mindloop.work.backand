@@ -21,8 +21,17 @@ from agent_runtime.conversation_message.message.operations import (
     ingest_response,
     render_messages,
 )
-from agent_runtime.conversation_message.message.models import ThinkingPart, ToolUsePart
-from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
+from agent_runtime.conversation_message.message.models import (
+    Conversation,
+    ThinkingPart,
+    ToolUsePart,
+    build_current_request_configuration_view,
+    build_request_configuration_view_from_timeline,
+)
+from agent_runtime.conversation_message.message.openai_protocol import (
+    OpenAIAdapter,
+    OpenAIRenderResult,
+)
 from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeEventPublisher,
@@ -73,6 +82,107 @@ _PROJECTED_OUTPUT_SEMANTIC_EVENTS = {
 }
 logger = logging.getLogger(__name__)
 _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
+_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN = "openai_responses_input_configuration"
+_MISSING = object()
+
+
+def _responses_render_options(
+    request_params: dict[str, Any],
+    render_options: dict[str, Any],
+) -> dict[str, Any]:
+    """从当次参数副本提取 Responses input 配置控制项。"""
+    options = dict(render_options)
+    if "prompt_cache_breakpoint" in request_params:
+        marker = request_params.pop("prompt_cache_breakpoint")
+        options.setdefault("prompt_cache_breakpoint", marker)
+    request_opt_in = request_params.pop(_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN, None)
+    option_opt_in = options.pop(_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN, None)
+    if request_opt_in is not None and not isinstance(request_opt_in, bool):
+        raise TypeError(f"{_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN} 必须是 bool。")
+    if option_opt_in is not None and not isinstance(option_opt_in, bool):
+        raise TypeError(f"{_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN} 必须是 bool。")
+    if request_opt_in is not None and option_opt_in is not None and request_opt_in != option_opt_in:
+        raise ValueError("Responses input 配置能力声明在 request_overrides 与 render_options 中冲突。")
+    options["_openai_responses_input_configuration_enabled"] = bool(
+        request_opt_in if request_opt_in is not None else option_opt_in
+    )
+    return options
+
+
+def _normalize_openai_tools(value: Any, *, field_name: str) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, dict) for item in value):
+        raise TypeError(f"{field_name} 必须是工具 schema 字典序列。")
+    return tuple(copy.deepcopy(item) for item in value)
+
+
+def _resolve_openai_request_configuration(
+    *,
+    conversation_id: str,
+    system_prompt: str | None,
+    tools: tuple[dict[str, Any], ...],
+    request_params: dict[str, Any],
+    render_options: dict[str, Any],
+    configuration_view: Any = None,
+    conversation: Any = None,
+    force_input_configuration: bool = False,
+ ) -> tuple[dict[str, Any], dict[str, Any], str | None, tuple[dict[str, Any], ...], Any]:
+    """Resolve effective system/tools without leaking legacy top-level fields."""
+    params = request_params
+    options = render_options
+    instructions_override = params.pop("instructions", _MISSING)
+    tools_override = params.pop("tools", _MISSING)
+    if configuration_view is not None and (
+        instructions_override is not _MISSING or tools_override is not _MISSING
+    ):
+        raise ValueError("显式 configuration_view 不能与 request_overrides.instructions/tools 同时使用。")
+    if tools_override is _MISSING:
+        effective_tools = tuple(copy.deepcopy(item) for item in tools)
+    elif tools_override is None:
+        effective_tools = ()
+    else:
+        effective_tools = _normalize_openai_tools(tools_override, field_name="request_overrides.tools")
+    effective_system = (
+        system_prompt
+        if instructions_override is _MISSING
+        else instructions_override
+    )
+    if effective_system is not None and not isinstance(effective_system, str):
+        raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
+
+    if configuration_view is None and conversation is not None:
+        timeline = getattr(conversation, "timeline", None)
+        if timeline:
+            configuration_view = build_request_configuration_view_from_timeline(
+                conversation_id=conversation_id,
+                timeline=timeline,
+                system_prompt=effective_system,
+                tools=effective_tools,
+            )
+
+    if configuration_view is not None:
+        current_prompt = getattr(configuration_view, "current_prompt", None)
+        current_tools = getattr(configuration_view, "current_tools", None)
+        if current_prompt is None:
+            if effective_system is not None:
+                raise ValueError("显式 configuration_view 与 system_prompt 内容冲突。")
+        elif current_prompt.resolved_content != effective_system:
+            raise ValueError("显式 configuration_view 与 system_prompt 内容冲突。")
+        if current_tools is None:
+            if effective_tools:
+                raise ValueError("显式 configuration_view 与 tools 内容冲突。")
+        elif tuple(current_tools.ordered_definitions) != effective_tools:
+            raise ValueError("显式 configuration_view 与 tools 内容冲突。")
+        return params, options, effective_system, effective_tools, configuration_view
+    enabled = force_input_configuration or options.pop(
+        "_openai_responses_input_configuration_enabled", False
+    )
+    if enabled and (effective_system is not None or effective_tools):
+        configuration_view = build_current_request_configuration_view(
+            conversation_id=conversation_id,
+            system_prompt=effective_system,
+            tools=effective_tools,
+        )
+    return params, options, effective_system, effective_tools, configuration_view
 
 
 class LlmRequestService:
@@ -114,6 +224,7 @@ class LlmRequestService:
         tools: tuple[dict[str, Any], ...],
         request_params: dict[str, Any],
         api_key: str | None,
+        input_configuration_capability: bool = False,
     ) -> Any:
         """Dispatch a raw standard Responses request through the configured protocol client."""
         resolved = resolved_model
@@ -140,14 +251,48 @@ class LlmRequestService:
             if not any(key.lower() == "x-relay-session-id" for key in headers):
                 headers["x-relay-session-id"] = conversation_id
             resolved = replace(resolved, custom_headers=headers)
-        client_request_kwargs: dict[str, Any] = {
-            "resolved_model": resolved,
-            "rendered_messages": OpenAIRenderResult(
+        request_params = dict(request_params)
+        client_system_prompt = system_prompt
+        client_tools = tools
+        if resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
+            if not isinstance(input_configuration_capability, bool):
+                raise TypeError("input_configuration_capability 必须是 bool。")
+            if input_configuration_capability:
+                request_params[_OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN] = True
+            render_options = _responses_render_options(request_params, {})
+            (
+                request_params,
+                render_options,
+                client_system_prompt,
+                client_tools,
+                configuration_view,
+            ) = _resolve_openai_request_configuration(
+                conversation_id=conversation_id,
+                system_prompt=system_prompt,
+                tools=tools,
+                request_params=request_params,
+                render_options=render_options,
+            )
+            render_options["openai_responses_configuration_view"] = configuration_view
+            rendered_messages = await OpenAIAdapter().render(
+                Conversation(id=conversation_id),
+                self._resource_resolver,
+                render_options,
+            )
+            rendered_messages = replace(
+                rendered_messages,
+                input=[*rendered_messages.input, *copy.deepcopy(input_items)],
+            )
+        else:
+            rendered_messages = OpenAIRenderResult(
                 input=copy.deepcopy(input_items),
                 prompt_cache_key=conversation_id,
-            ),
-            "system_prompt": system_prompt,
-            "tools": tools,
+            )
+        client_request_kwargs: dict[str, Any] = {
+            "resolved_model": resolved,
+            "rendered_messages": rendered_messages,
+            "system_prompt": client_system_prompt,
+            "tools": client_tools,
             "request_params": dict(request_params),
             "api_key": None if owns_credentials_and_retries else api_key,
             "http_trace_service": self._http_trace_service,
@@ -183,18 +328,48 @@ class LlmRequestService:
             resolved = _with_default_relay_session_header(request)
 
         request_params = _merge_request_params(request)
+        tool_schemas = tuple(tool.schema for tool in request.tools)
+        if not tool_schemas and getattr(request.conversation, "tools", None):
+            tool_schemas = tuple(request.conversation.tools)
+        raw_system_prompt = (
+            request.system_prompt
+            if request.system_prompt is not None
+            else getattr(request.conversation, "system_prompt", None)
+        )
+        client_system_prompt = raw_system_prompt
+        client_tools = tool_schemas
         render_options = {
             **request.render_options,
             "request_params": request_params,
             "supported_input_modalities": resolved.supported_input_modalities,
         }
+        if resolved.api_format == API_FORMAT_OPENAI_RESPONSES:
+            render_options = _responses_render_options(request_params, render_options)
+            (
+                request_params,
+                render_options,
+                client_system_prompt,
+                client_tools,
+                configuration_view,
+            ) = _resolve_openai_request_configuration(
+                conversation_id=request.conversation.id,
+                system_prompt=raw_system_prompt,
+                tools=tool_schemas,
+                request_params=request_params,
+                render_options=render_options,
+                configuration_view=request.configuration_view,
+                conversation=request.conversation,
+            )
+            if configuration_view is not None:
+                render_options["openai_responses_configuration_view"] = configuration_view
+        else:
+            render_options.pop("openai_responses_configuration_view", None)
         rendered_messages = await render_messages(
             request.conversation,
             resolved.api_format,
             self._resource_resolver,
             render_options,
         )
-        tool_schemas = tuple(tool.schema for tool in request.tools)
         api_key_items = [] if owns_credentials_and_retries else list(resolved.api_keys)
         api_keys: list[str | None] = [item.key for item in api_key_items]
         if owns_credentials_and_retries or not api_keys:
@@ -362,8 +537,8 @@ class LlmRequestService:
                     client_request_kwargs: dict[str, Any] = {
                         "resolved_model": resolved,
                         "rendered_messages": rendered_messages,
-                        "system_prompt": request.system_prompt,
-                        "tools": tool_schemas,
+                        "system_prompt": client_system_prompt,
+                        "tools": client_tools,
                         "request_params": request_params,
                         "api_key": api_key,
                         "stream_event_handler": stream_event_handler,

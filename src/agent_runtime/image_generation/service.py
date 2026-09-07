@@ -323,6 +323,9 @@ class ImageGenerationService:
                 tools=({"type": "image_generation"},),
                 request_params=request_params,
                 api_key=api_key,
+                input_configuration_capability=(
+                    resolved_model.api_format == API_FORMAT_OPENAI_RESPONSES
+                ),
             )
             if not isinstance(raw_response, dict):
                 raise RuntimeError("Standard Responses image agent response must be a JSON object.")

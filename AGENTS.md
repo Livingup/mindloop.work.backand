@@ -1,4 +1,4 @@
-﻿# Agent Runtime — 通用 Agent 运行时环境服务
+# Agent Runtime — 通用 Agent 运行时环境服务
 
 为 AI Agent 提供完整的运行基础设施，包括 LLM 调用、工具执行、消息管理、文件资源管理等核心能力。
 
@@ -80,7 +80,14 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 
 ### 会话消息模块（conversation_message）
 
-统一历史对话消息管理，建立支持多平台（OpenAI / Claude / Gemini）的统一历史消息列表模型。包括统一消息模型、协议适配器、会话状态管理。不关心 LLM 调用本身，只关注消息的统一表示和协议转换。会话聚合根的持久化支持 InMemory 内存实现和 SQLite + JSONL 混合持久化实现，仓储接口定义在领域层（conversation_repository.py），实现类位于基础设施层（infrastructure/）。会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id。
+统一历史对话消息管理，建立支持多平台（OpenAI / Claude / Gemini / 智谱）的统一历史消息列表模型。包括统一消息模型、协议适配器、会话状态管理。不关心 LLM 调用本身，只关注消息的统一表示和协议转换。会话聚合根的持久化支持 InMemory 内存实现和 SQLite + JSONL 混合持久化实现，仓储接口定义在领域层（conversation_repository.py），实现类位于基础设施层（infrastructure/）。会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id。
+
+#### 协议与时间线核心约束
+1. 统一会话模型的消息列表（`Conversation.messages`）是通用规范消息列表（只包含 `user`、`assistant`、`tool` 等通用角色），绝对不得直接追加任何 OpenAI Responses 协议的 `developer` 消息或 `additional_tools` 进行污染。
+2. 系统提示词与工具组件的变更记录（时间线）统一由 Agent 维护并记录在 `Conversation.timeline`；会话模型只负责记录，底层根据变更记录和当次请求上下文动态构建适合目标协议的请求结构。
+3. 针对 OpenAI Responses 协议：初始配置由适配器在 `input` 顶部投影为 `developer` 消息与 `additional_tools` 并附加自定义显式缓存断点；后续组件切换通过在历史消息后按锚点追加新事件实现，保持旧前缀缓存不失效。
+4. 针对非 OpenAI Responses 协议（Claude、Gemini、Chat Completions 等）：底层自动忽略配置时间线重放，直接按本次请求传入的最新的系统提示词和工具定义处理。
+5. 异构模型接力对话时，各协议适配器遵循“同协议无损原样回灌 raw、跨协议公共层安全降级”原则；跨协议时必须剥离平台私有签名或加密思维链（如 Claude signature、OpenAI encrypted_content），绝不得伪造成目标协议的思维链凭证。
 
 ### 通用通信模块（communication）
 

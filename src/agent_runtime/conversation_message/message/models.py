@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
+from uuid import uuid4
 
 from agent_runtime.input_modality import (
     INPUT_MODALITY_IMAGE,
@@ -44,6 +45,10 @@ Modality: TypeAlias = str
 
 # 消息角色。
 Role: TypeAlias = str
+
+# Responses 配置时间线状态与稳定消息锚点类型。
+ConfigurationEventStatus: TypeAlias = Literal["historical", "active"]
+ConfigurationAnchor: TypeAlias = Literal["start", "before_message_id", "after_message_id"]
 
 # 内置 Provider 常量，方便调用方引用。Provider 取值与 api_format 保持一致。
 PROVIDER_ANTHROPIC_MESSAGES: str = API_FORMAT_ANTHROPIC_MESSAGES
@@ -216,6 +221,306 @@ class UniMessage:
     # 跨平台渲染时：忽略 raw，仅用 content[] 公共层重建（降级）。
     provider_extras: dict[str, dict[str, Any]] | None = None
 
+    # 持久稳定消息标识。配置时间线引用该锚点，不能引用目标协议数组下标。
+    message_id: str = field(default_factory=lambda: f"msg_{uuid4().hex}")
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.message_id, str) or not self.message_id.strip():
+            raise ValueError("message_id 必须是非空字符串。")
+
+
+# ── Responses configuration request view ─────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigurationComponentEvent:
+    """提示词或工具组件在上游维护的一个配置事件。
+
+    Conversation 只消费这个快照视图来渲染 OpenAI Responses；它不创建、
+    修改、冻结或持久化事件。历史事件必须提供 snapshot，活动事件的内容
+    则由相应的 Current*Configuration 在同一次请求中实时解析。
+    """
+
+    event_id: str
+    definition_id: str
+    anchor: ConfigurationAnchor = "start"
+    anchor_message_id: str | None = None
+    sequence: int = 0
+    status: ConfigurationEventStatus = "historical"
+    snapshot: Any | None = None
+    revision: str | None = None
+    component: Literal["prompt", "tool"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"historical", "active"}:
+            raise ValueError("配置事件 status 必须是 historical 或 active。")
+        if self.anchor not in {"start", "before_message_id", "after_message_id"}:
+            raise ValueError("配置事件 anchor 不合法。")
+        if self.sequence < 0:
+            raise ValueError("配置事件 sequence 不能为负数。")
+        if not self.event_id:
+            raise ValueError("配置事件 event_id 不能为空。")
+        if not self.definition_id:
+            raise ValueError("配置事件 definition_id 不能为空。")
+        if self.anchor == "start":
+            if self.anchor_message_id is not None:
+                raise ValueError("start 配置事件不能指定 anchor_message_id。")
+        elif not self.anchor_message_id:
+            raise ValueError(f"{self.anchor} 配置事件必须指定 anchor_message_id。")
+        if self.status == "historical" and self.snapshot is None:
+            raise ValueError("历史配置事件必须包含冻结 snapshot。")
+        if self.component is not None and self.component not in {"prompt", "tool"}:
+            raise ValueError("配置事件 component 必须是 prompt 或 tool。")
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentPromptConfiguration:
+    """上游本次按活动提示词 definition_id 解析出的实时内容。"""
+
+    event_id: str
+    definition_id: str
+    resolved_content: Any
+    revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentToolsConfiguration:
+    """上游本次按活动工具 definition_id 解析出的实时有序工具定义。"""
+
+    event_id: str
+    definition_id: str
+    ordered_definitions: tuple[dict[str, Any], ...]
+    allowlist: tuple[str, ...] = field(default_factory=tuple)
+    revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequestConfigurationView:
+    """上游提供给一次请求的不可变配置视图。
+
+    `prompt_events` 与 `tool_events` 是独立时间线。只有 OpenAI
+    Responses 会按其 anchor/sequence 消费历史事件；其他协议不消费本视图，
+    继续使用上游当次通过请求 system_prompt/tools 提供的实时配置。
+    """
+
+    conversation_id: str
+    view_revision: str
+    prompt_events: tuple[ConfigurationComponentEvent, ...] = field(default_factory=tuple)
+    tool_events: tuple[ConfigurationComponentEvent, ...] = field(default_factory=tuple)
+    current_prompt: CurrentPromptConfiguration | None = None
+    current_tools: CurrentToolsConfiguration | None = None
+
+    def __post_init__(self) -> None:
+        if not self.conversation_id:
+            raise ValueError("配置视图 conversation_id 不能为空。")
+        if not self.view_revision:
+            raise ValueError("配置视图 view_revision 不能为空。")
+        _validate_component_events("提示词", self.prompt_events, self.current_prompt)
+        _validate_component_events("工具", self.tool_events, self.current_tools)
+        all_event_ids = [event.event_id for event in (*self.prompt_events, *self.tool_events)]
+        if len(all_event_ids) != len(set(all_event_ids)):
+            raise ValueError("提示词和工具配置事件的 event_id 不能相互重复。")
+
+
+def _validate_component_events(
+    component_name: str,
+    events: tuple[ConfigurationComponentEvent, ...],
+    current: CurrentPromptConfiguration | CurrentToolsConfiguration | None,
+) -> None:
+    event_ids = [event.event_id for event in events]
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError(f"{component_name}配置事件 event_id 不能重复。")
+    active_events = [event for event in events if event.status == "active"]
+    if len(active_events) > 1:
+        raise ValueError(f"{component_name}配置事件最多只能有一个 active 事件。")
+    if active_events:
+        if current is None:
+            raise ValueError(f"活动{component_name}配置事件必须提供 current 解析结果。")
+        active = active_events[0]
+        if active.event_id != current.event_id or active.definition_id != current.definition_id:
+            raise ValueError(f"活动{component_name}配置事件必须与 current 解析结果匹配。")
+    elif current is not None:
+        raise ValueError(f"没有活动{component_name}配置事件时不能提供 current 解析结果。")
+
+
+def build_current_request_configuration_view(
+    *,
+    conversation_id: str,
+    system_prompt: str | None,
+    tools: tuple[dict[str, Any], ...],
+) -> RequestConfigurationView:
+    """为尚未接入上游时间线的调用构造当次初始配置视图。
+
+    该函数不写入 Conversation，也不保存事件；它只让已有调用路径能够
+    立即改用 Responses input 配置表达。上游接入时间线后应传入其自己
+    持久化并冻结的 RequestConfigurationView。
+    """
+
+    prompt_events: tuple[ConfigurationComponentEvent, ...] = ()
+    current_prompt: CurrentPromptConfiguration | None = None
+    if system_prompt is not None:
+        prompt_event_id = "runtime-current-prompt"
+        prompt_events = (
+            ConfigurationComponentEvent(
+                event_id=prompt_event_id,
+                definition_id="runtime-current-prompt",
+                anchor="start",
+                sequence=1,
+                status="active",
+            ),
+        )
+        current_prompt = CurrentPromptConfiguration(
+            event_id=prompt_event_id,
+            definition_id="runtime-current-prompt",
+            resolved_content=system_prompt,
+        )
+
+    tool_events: tuple[ConfigurationComponentEvent, ...] = ()
+    current_tools: CurrentToolsConfiguration | None = None
+    if tools:
+        tool_event_id = "runtime-current-tools"
+        tool_events = (
+            ConfigurationComponentEvent(
+                event_id=tool_event_id,
+                definition_id="runtime-current-tools",
+                anchor="start",
+                sequence=0,
+                status="active",
+            ),
+        )
+        current_tools = CurrentToolsConfiguration(
+            event_id=tool_event_id,
+            definition_id="runtime-current-tools",
+            ordered_definitions=tools,
+        )
+    return RequestConfigurationView(
+        conversation_id=conversation_id,
+        view_revision="runtime-current",
+        prompt_events=prompt_events,
+        tool_events=tool_events,
+        current_prompt=current_prompt,
+        current_tools=current_tools,
+    )
+
+
+def _infer_component_type(event: ConfigurationComponentEvent) -> Literal["prompt", "tool"]:
+    """推断或返回配置事件的组件类型（prompt 或 tool）。"""
+    if event.component in {"prompt", "tool"}:
+        return event.component
+    event_id_lower = event.event_id.lower()
+    def_id_lower = event.definition_id.lower()
+    if (
+        "tool" in event_id_lower
+        or "tool" in def_id_lower
+        or event_id_lower.startswith(("t-", "t_"))
+        or def_id_lower.startswith(("t-", "t_"))
+    ):
+        return "tool"
+    if (
+        "prompt" in event_id_lower
+        or "prompt" in def_id_lower
+        or event_id_lower.startswith(("p-", "p_"))
+        or def_id_lower.startswith(("p-", "p_"))
+    ):
+        return "prompt"
+    if event.snapshot is not None:
+        if isinstance(event.snapshot, (list, tuple)) and event.snapshot and isinstance(event.snapshot[0], dict):
+            return "tool"
+        if isinstance(event.snapshot, str):
+            return "prompt"
+    return "prompt"
+
+
+def build_request_configuration_view_from_timeline(
+    *,
+    conversation_id: str,
+    timeline: tuple[ConfigurationComponentEvent, ...] | list[ConfigurationComponentEvent],
+    system_prompt: str | None,
+    tools: tuple[dict[str, Any], ...],
+    view_revision: str | None = None,
+) -> RequestConfigurationView:
+    """根据会话配置时间线和当次 Agent 实时系统提示词/工具定义构建不可变配置视图。
+
+    - 历史事件使用冻结 snapshot。
+    - 活跃事件使用本次传入的实时解析结果（system_prompt 与 tools），天然支持热更新。
+    - 仅在目标为 OpenAI Responses 时由适配器按锚点消费；非 Responses 协议跳过该视图。
+    """
+    prompt_events: list[ConfigurationComponentEvent] = []
+    tool_events: list[ConfigurationComponentEvent] = []
+    for ev in timeline:
+        comp = _infer_component_type(ev)
+        if comp == "prompt":
+            prompt_events.append(ev)
+        else:
+            tool_events.append(ev)
+
+    current_prompt: CurrentPromptConfiguration | None = None
+    active_prompt_events = [e for e in prompt_events if e.status == "active"]
+    if len(active_prompt_events) > 1:
+        raise ValueError("提示词配置事件最多只能有一个 active 事件。")
+    if active_prompt_events:
+        active_p = active_prompt_events[0]
+        current_prompt = CurrentPromptConfiguration(
+            event_id=active_p.event_id,
+            definition_id=active_p.definition_id,
+            resolved_content=system_prompt,
+            revision=active_p.revision,
+        )
+    elif system_prompt is not None and not prompt_events:
+        p_id = "runtime-current-prompt"
+        active_p = ConfigurationComponentEvent(
+            event_id=p_id,
+            definition_id=p_id,
+            anchor="start",
+            sequence=1,
+            status="active",
+            component="prompt",
+        )
+        prompt_events.append(active_p)
+        current_prompt = CurrentPromptConfiguration(
+            event_id=p_id,
+            definition_id=p_id,
+            resolved_content=system_prompt,
+        )
+
+    current_tools: CurrentToolsConfiguration | None = None
+    active_tool_events = [e for e in tool_events if e.status == "active"]
+    if len(active_tool_events) > 1:
+        raise ValueError("工具配置事件最多只能有一个 active 事件。")
+    if active_tool_events:
+        active_t = active_tool_events[0]
+        current_tools = CurrentToolsConfiguration(
+            event_id=active_t.event_id,
+            definition_id=active_t.definition_id,
+            ordered_definitions=tuple(tools),
+            revision=active_t.revision,
+        )
+    elif tools and not tool_events:
+        t_id = "runtime-current-tools"
+        active_t = ConfigurationComponentEvent(
+            event_id=t_id,
+            definition_id=t_id,
+            anchor="start",
+            sequence=0,
+            status="active",
+            component="tool",
+        )
+        tool_events.append(active_t)
+        current_tools = CurrentToolsConfiguration(
+            event_id=t_id,
+            definition_id=t_id,
+            ordered_definitions=tuple(tools),
+        )
+
+    return RequestConfigurationView(
+        conversation_id=conversation_id,
+        view_revision=view_revision or f"view_{uuid4().hex[:8]}",
+        prompt_events=tuple(prompt_events),
+        tool_events=tuple(tool_events),
+        current_prompt=current_prompt,
+        current_tools=current_tools,
+    )
+
 
 # ── PartMeta ─────────────────────────────────────────────────────
 
@@ -340,6 +645,48 @@ class Conversation:
     #   gemini_generate_content:   {"cached_content": str}
     provider_state: dict[str, Any] = field(default_factory=dict)
 
+    # 系统提示词或工具组件切换时间线（由 Agent 自身维护，Conversation 层只读消费）。
+    timeline: list[ConfigurationComponentEvent] = field(default_factory=list)
+
+    # 当前生效的系统提示词（由 Agent 实时设置，支持热更新）。
+    system_prompt: str | None = None
+
+    # 当前生效的工具定义（由 Agent 实时设置，支持热更新）。
+    tools: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+    def record_configuration_event(self, event: ConfigurationComponentEvent) -> None:
+        """记录系统提示词或工具切换事件到会话时间线。
+
+        由 Agent 负责维护该时间线，Conversation 层保持只读快照视图。
+        """
+        if any(existing.event_id == event.event_id for existing in self.timeline):
+            raise ValueError(f"配置时间线已存在 event_id: {event.event_id}")
+        self.timeline.append(event)
+
+    def get_request_configuration_view(
+        self,
+        *,
+        system_prompt: str | None = None,
+        tools: tuple[dict[str, Any], ...] | None = None,
+    ) -> RequestConfigurationView | None:
+        """根据当前会话的时间线与实时配置构造不可变请求视图。"""
+        effective_system = system_prompt if system_prompt is not None else self.system_prompt
+        effective_tools = tools if tools is not None else self.tools
+        if self.timeline:
+            return build_request_configuration_view_from_timeline(
+                conversation_id=self.id,
+                timeline=self.timeline,
+                system_prompt=effective_system,
+                tools=effective_tools,
+            )
+        if effective_system is not None or effective_tools:
+            return build_current_request_configuration_view(
+                conversation_id=self.id,
+                system_prompt=effective_system,
+                tools=effective_tools,
+            )
+        return None
+
     def append_message(
         self,
         msg: UniMessage,
@@ -353,6 +700,8 @@ class Conversation:
         user messages MUST pass parts_meta (provides PDF page_count etc).
         assistant messages may omit it (auto-inferred from content[]).
         """
+        if any(existing.message_id == msg.message_id for existing in self.messages):
+            raise ValueError(f"Conversation 已存在 message_id: {msg.message_id}")
         self.messages.append(msg)
 
         state = self.state

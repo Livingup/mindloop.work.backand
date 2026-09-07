@@ -102,6 +102,7 @@ def _tool_result_output_from_json(output: Any) -> Any:
 def _message_to_json_line(msg: UniMessage) -> str:
     """将统一消息序列化为单行 JSON 字符串，用于 JSONL 文件追加写入。"""
     d = {
+        "message_id": msg.message_id,
         "role": msg.role,
         "content": [_part_to_dict(p) for p in msg.content],
     }
@@ -114,12 +115,17 @@ def _message_to_json_line(msg: UniMessage) -> str:
     return json.dumps(d, ensure_ascii=False)
 
 
-def _json_line_to_message(line: str) -> UniMessage:
+def _json_line_to_message(
+    line: str,
+    *,
+    legacy_message_id: str | None = None,
+) -> UniMessage:
     """将单行 JSON 字符串反序列化为统一消息对象，用于从 JSONL 文件还原消息。"""
     d = json.loads(line)
     return UniMessage(
         role=d["role"],
         content=[_dict_to_part(p) for p in d["content"]],
+        message_id=d.get("message_id") or legacy_message_id or f"msg_{uuid.uuid4().hex}",
         source_provider=d.get("source_provider"),
         source_vendor=d.get("source_vendor"),
         provider_extras=d.get("provider_extras"),
@@ -433,11 +439,21 @@ class SqliteConversationRepository:
         if not path.exists():
             return []
         messages: list[UniMessage] = []
+        needs_message_id_migration = False
         with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_index, line in enumerate(f):
                 line = line.strip()
-                if line:
-                    messages.append(_json_line_to_message(line))
+                if not line:
+                    continue
+                raw_message = json.loads(line)
+                if not raw_message.get("message_id"):
+                    needs_message_id_migration = True
+                legacy_message_id = f"msg_{uuid.uuid5(uuid.NAMESPACE_URL, f'{conversation_id}:{line_index}').hex}"
+                messages.append(
+                    _json_line_to_message(line, legacy_message_id=legacy_message_id)
+                )
+        if needs_message_id_migration:
+            self._write_messages_file(task_id, conversation_id, messages)
         return messages
 
     def _write_messages_file(
