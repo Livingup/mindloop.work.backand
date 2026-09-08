@@ -180,7 +180,13 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 - 其它协议到 OpenAI Responses：普通文本转 assistant message item；工具调用转 `function_call` item；其它平台 thinking 默认舍去，除非显式策略允许把明文 thinking 作为普通 `output_text`。
 - OpenAI Responses 到其它协议：`message.output_text` 和 `function_call` 必须保留；`reasoning.encrypted_content` 只能供 OpenAI Responses 同协议回灌，跨协议舍去；`summary` 若被产品策略允许，可作为普通文本降级，但不能伪造成目标平台 thinking。
 
-### 3. 缓存规则
+### 3. 缓存规则与配置输入契约（核心协议要求）
+
+**重要协议契约：系统提示词/tools 注入与首部断点是 OpenAI Responses 的通用协议要求，跟时间线没有任何关系！**
+- **input 内注入**：OpenAI Responses 协议统一采用 `input` 中的 `developer` 消息来设置系统提示词，使用 `additional_tools` 条目来设置工具定义，严禁设置在最外层顶层字段中（`body["instructions"]` 与 `body["tools"]` 严禁传递）。
+- **首部显式断点**：`input` 中最上方（即第一个系统提示词与 tools 定义）的后面**必须显式打上断点**（在初始 `developer` 消息末尾的内容块上附带 `prompt_cache_breakpoint: {"mode": "explicit"}`），其核心含义就是将「可复用的系统提示词 + tools 定义」作为稳定前缀进行缓存锁定。
+- **自定义断点 + 自动断点模式**：统一采用「显式自定义断点 + 服务端自动隐式断点（`mode="implicit"`）」联合模式，请求级下发 `prompt_cache_options: {"mode": "implicit"}`。
+- **与时间线彻底解耦**：时间线（Timeline）是指会话中系统提示词或 tools 发生了阶段性切换（例如 Agent 先以销售提示词工作，完成后切换到售后提示词和工具继续工作）；如果未发生切换，会话中就绝对没有时间线。但**无论会话是否存在时间线，只要转换为 OpenAI Responses 协议，都必须将当前系统的提示词和 tools 投影到 `input` 中并打上初始断点**。绝不能把时间线作为 OpenAI Responses 配置投影的前置条件！
 
 按本次用户确认的技术指南，OpenAI Responses 在 GPT-5.6 及以后支持该能力的模型上提供显式缓存断点；早期模型仍使用隐式缓存。本节的 `prompt_cache_breakpoint` 规则只属于 OpenAI Responses 契约。OpenAI Chat Completions 必须独立核实其目标端点能力，不能自动继承 Responses 的内容块 marker、`additional_tools` 或其它输入 item。显式断点是请求内容块上的标记，不是可以单独引用的缓存 ID，也不是可独立拼装的增量缓存切片。以下是协议使用规则，不表示 AgentRuntime 或任意 OpenAI-compatible 服务商已实现全部能力。
 

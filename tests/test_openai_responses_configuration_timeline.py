@@ -469,13 +469,22 @@ def test_web_native_openai_override_is_projected_into_input(monkeypatch):
 
 
 
-def test_responses_capability_opt_in_is_required_for_synthetic_projection():
+def test_responses_protocol_automatically_projects_synthetic_configuration(monkeypatch):
     async def run():
+        captured = {}
+        async def fake_post(url, headers, body, **kwargs):
+            captured.update(copy.deepcopy(body))
+            return {"output": [{"type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "ok"}]}]}
+        monkeypatch.setattr("agent_runtime.llm_client.llm_protocol_clients._post_json", fake_post)
         conv = Conversation(id="c", messages=[])
         service = LlmRequestService((OpenAIResponsesProtocolClient(),), _Resolver())
-        with pytest.raises(ValueError, match="developer"):
-            await service.send_prompt(LlmPromptRequest(
-                conversation=conv, resolved_model=_model(), system_prompt="system"))
+        await service.send_prompt(LlmPromptRequest(
+            conversation=conv, resolved_model=_model(), system_prompt="system"))
+        assert captured["input"][0]["role"] == "developer"
+        assert captured["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert captured["input"][0]["content"][0]["text"] == "system"
+        assert "instructions" not in captured
     asyncio.run(run())
 
 
@@ -1091,6 +1100,89 @@ def test_multi_protocol_relay_and_switch_back_to_openai_responses():
         assert not hasattr(conv, "configuration_view")
 
     asyncio.run(run())
+
+
+
+def test_send_prompt_clean_conversation_without_timeline_automatically_projects_input_configuration(monkeypatch):
+    """验证未发生切换的纯净会话（无时间线）在请求 OpenAI Responses 时，
+    必须无条件将当前 system_prompt 与 tools 转换为 input 内的 developer/additional_tools 事件，
+    并在初始 developer 消息末尾打上显式断点，且具备 implicit 自动缓存模式。
+    """
+    async def run():
+        captured = {}
+        async def fake_post(url, headers, body, **kwargs):
+            captured.update(copy.deepcopy(body))
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "assistant reply"}],
+                    }
+                ]
+            }
+
+        monkeypatch.setattr("agent_runtime.llm_client.llm_protocol_clients._post_json", fake_post)
+
+        # 纯净会话：没有发生过切换，timeline 为空
+        conv = Conversation(
+            id="clean-conv-001",
+            messages=[UniMessage("user", [TextPart("hello, test!")], message_id="m_1")],
+            timeline=[],
+        )
+        assert len(conv.timeline) == 0
+
+        service = LlmRequestService((OpenAIResponsesProtocolClient(),), _Resolver())
+
+        # 调用 send_prompt，未显式传 configuration_view，仅传实时的 system_prompt 与 tools
+        result = await service.send_prompt(
+            LlmPromptRequest(
+                conversation=conv,
+                resolved_model=_model(),
+                system_prompt="expert agent prompt",
+                tools=(LlmToolDefinition("expert_tool", {"type": "function", "name": "expert_tool"}),),
+            )
+        )
+
+        # 验证请求体：
+        # 1. 顶层 instructions 与 tools 严禁存在
+        assert "instructions" not in captured
+        assert "tools" not in captured
+        # 2. 服务端自动缓存断点模式 implicit
+        assert captured["prompt_cache_options"] == {"mode": "implicit"}
+        # 3. input 内首部为 additional_tools（序0）与带显式断点的 developer（序1）
+        assert len(captured["input"]) == 3
+        assert captured["input"][0]["type"] == "additional_tools"
+        assert captured["input"][0]["tools"] == [{"type": "function", "name": "expert_tool"}]
+        assert captured["input"][1]["role"] == "developer"
+        assert captured["input"][1]["content"][0]["text"] == "expert agent prompt"
+        assert captured["input"][1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        # 4. user 消息排在后方（序2）
+        assert captured["input"][2]["role"] == "user"
+        # 5. parallel_tool_calls 策略正确保留
+        assert captured.get("parallel_tool_calls") is True
+        # 6. 成功写回 assistant 消息且不污染通用会话流
+        assert conv.messages[-1] is result.assistant_message
+        assert not any(m.role == "developer" for m in conv.messages)
+
+        # 7. 同时验证直接调用 OpenAIAdapter().render(conv) 当 conv 上挂有 system_prompt/tools 且无 timeline 时的自适配能力
+        conv2 = Conversation(
+            id="clean-conv-002",
+            messages=[UniMessage("user", [TextPart("hello 2")], message_id="m_2")],
+            system_prompt="direct conv prompt",
+            tools=({"type": "function", "name": "direct_tool"},),
+            timeline=[],
+        )
+        rendered = await OpenAIAdapter().render(conv2, _Resolver())
+        assert rendered.uses_input_configuration is True
+        assert rendered.input[0]["type"] == "additional_tools"
+        assert rendered.input[0]["tools"] == [{"type": "function", "name": "direct_tool"}]
+        assert rendered.input[1]["role"] == "developer"
+        assert rendered.input[1]["content"][0]["text"] == "direct conv prompt"
+        assert rendered.input[1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+    asyncio.run(run())
+
 
 
 

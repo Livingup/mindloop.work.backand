@@ -36,6 +36,7 @@ from agent_runtime.conversation_message.message.models import (
     CurrentPromptConfiguration,
     CurrentToolsConfiguration,
     RequestConfigurationView,
+    build_current_request_configuration_view,
     build_request_configuration_view_from_timeline,
     Conversation,
     ImagePart,
@@ -288,6 +289,12 @@ def _get_openai_configuration_view(
         return build_request_configuration_view_from_timeline(
             conversation_id=conv.id,
             timeline=conv.timeline,
+            system_prompt=getattr(conv, "system_prompt", None),
+            tools=getattr(conv, "tools", ()),
+        )
+    if getattr(conv, "system_prompt", None) is not None or getattr(conv, "tools", None):
+        return build_current_request_configuration_view(
+            conversation_id=conv.id,
             system_prompt=getattr(conv, "system_prompt", None),
             tools=getattr(conv, "tools", ()),
         )

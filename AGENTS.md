@@ -85,7 +85,7 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 #### 协议与时间线核心约束
 1. 统一会话模型的消息列表（`Conversation.messages`）是通用规范消息列表（只包含 `user`、`assistant`、`tool` 等通用角色），绝对不得直接追加任何 OpenAI Responses 协议的 `developer` 消息或 `additional_tools` 进行污染。
 2. 系统提示词与工具组件的变更记录（时间线）统一由 Agent 维护并记录在 `Conversation.timeline`；会话模型只负责记录，底层根据变更记录和当次请求上下文动态构建适合目标协议的请求结构。
-3. 针对 OpenAI Responses 协议：初始配置由适配器在 `input` 顶部投影为 `developer` 消息与 `additional_tools` 并附加自定义显式缓存断点；后续组件切换通过在历史消息后按锚点追加新事件实现，保持旧前缀缓存不失效。
+3. 针对 OpenAI Responses 协议：系统提示词和 tools 投影到 `input`（作为 `developer` 消息与 `additional_tools`）并在初始提示词末尾打上显式缓存断点（自定义断点+自动隐式断点模式），是该协议本身的强制要求，与会话是否存在时间线彻底解耦。未发生角色切换的纯净会话（无时间线）无条件自动投影为首部 input 配置；时间线仅在中途发生定义切换时记录历史快照并按锚点追加新事件以维持前缀缓存。
 4. 针对非 OpenAI Responses 协议（Claude、Gemini、Chat Completions 等）：底层自动忽略配置时间线重放，直接按本次请求传入的最新的系统提示词和工具定义处理。
 5. 异构模型接力对话时，各协议适配器遵循“同协议无损原样回灌 raw、跨协议公共层安全降级”原则；跨协议时必须剥离平台私有签名或加密思维链（如 Claude signature、OpenAI encrypted_content），绝不得伪造成目标协议的思维链凭证。
 

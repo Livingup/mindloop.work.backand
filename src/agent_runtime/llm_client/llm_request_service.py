@@ -173,10 +173,9 @@ def _resolve_openai_request_configuration(
         elif tuple(current_tools.ordered_definitions) != effective_tools:
             raise ValueError("显式 configuration_view 与 tools 内容冲突。")
         return params, options, effective_system, effective_tools, configuration_view
-    enabled = force_input_configuration or options.pop(
-        "_openai_responses_input_configuration_enabled", False
-    )
-    if enabled and (effective_system is not None or effective_tools):
+
+    options.pop("_openai_responses_input_configuration_enabled", None)
+    if effective_system is not None or effective_tools:
         configuration_view = build_current_request_configuration_view(
             conversation_id=conversation_id,
             system_prompt=effective_system,
