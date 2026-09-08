@@ -482,7 +482,7 @@ def test_responses_protocol_automatically_projects_synthetic_configuration(monke
         await service.send_prompt(LlmPromptRequest(
             conversation=conv, resolved_model=_model(), system_prompt="system"))
         assert captured["input"][0]["role"] == "developer"
-        assert captured["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "prompt_cache_breakpoint" not in captured["input"][0]["content"][0]
         assert captured["input"][0]["content"][0]["text"] == "system"
         assert "instructions" not in captured
     asyncio.run(run())
@@ -615,7 +615,6 @@ def test_conversation_timeline_direct_rendering_and_cache_prefix_continuity():
                 {
                     "type": "input_text",
                     "text": "stage1 prompt",
-                    "prompt_cache_breakpoint": {"mode": "explicit"},
                 }
             ],
         }
@@ -729,7 +728,7 @@ def test_send_prompt_automatically_uses_conversation_timeline_without_explicit_v
         assert captured["input"][0]["type"] == "additional_tools"
         assert captured["input"][0]["tools"] == [{"type": "function", "name": "initial_tool"}]
         assert captured["input"][1]["role"] == "developer"
-        assert captured["input"][1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "prompt_cache_breakpoint" not in captured["input"][1]["content"][0]
         assert captured["input"][1]["content"][0]["text"] == "initial prompt"
         # 4. 尾部追加 Stage 2 的 additional_tools 与动态 real-time 活跃提示词
         assert captured["input"][4]["type"] == "additional_tools"
@@ -956,11 +955,11 @@ def test_send_prompt_hot_reloads_active_configuration_preserving_prefix_cache(mo
         )
         body_2 = captured_history[1]
 
-        # 核心断言：Stage 1 的前缀部分（前 4 项：additional_tools(tool_v1)、developer(prompt v1 带断点)、u1、a1）完全一致！
+        # 核心断言：Stage 1 的前缀部分（前 4 项：additional_tools(tool_v1)、developer(prompt v1)、u1、a1）完全一致！
         assert body_1["input"][:4] == body_2["input"][:4]
-        # 断点始终存在于 Stage 1 尾部
-        assert body_1["input"][1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
-        assert body_2["input"][1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        # 默认不注入显式断点，由服务端自动隐式缓存
+        assert "prompt_cache_breakpoint" not in body_1["input"][1]["content"][0]
+        assert "prompt_cache_breakpoint" not in body_2["input"][1]["content"][0]
 
         # 检查 Stage 2 成功热更新为新内容
         assert body_1["input"][4]["tools"] == [{"type": "function", "name": "tool_2_a"}]
@@ -1077,10 +1076,10 @@ def test_multi_protocol_relay_and_switch_back_to_openai_responses():
         openai_render = await OpenAIAdapter().render(conv, resolver)
 
         # 验证 OpenAI 渲染结果完备闭环：
-        # - 顶部包含 Stage 1 的 additional_tools 与 developer 提示词，且打上显式断点
+        # - 顶部包含 Stage 1 的 additional_tools 与 developer 提示词
         assert openai_render.input[0]["type"] == "additional_tools"
         assert openai_render.input[1]["role"] == "developer"
-        assert openai_render.input[1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "prompt_cache_breakpoint" not in openai_render.input[1]["content"][0]
 
         # - 第 1-10 轮由 OpenAI 产生的 assistant 消息原样重放 native raw（保留 reasoning 与 encrypted_content）
         openai_reasoning_count = sum(1 for item in openai_render.input if item.get("type") == "reasoning")
@@ -1150,13 +1149,13 @@ def test_send_prompt_clean_conversation_without_timeline_automatically_projects_
         assert "tools" not in captured
         # 2. 服务端自动缓存断点模式 implicit
         assert captured["prompt_cache_options"] == {"mode": "implicit"}
-        # 3. input 内首部为 additional_tools（序0）与带显式断点的 developer（序1）
+        # 3. input 内首部为 additional_tools（序0）与 developer（序1，默认无显式断点）
         assert len(captured["input"]) == 3
         assert captured["input"][0]["type"] == "additional_tools"
         assert captured["input"][0]["tools"] == [{"type": "function", "name": "expert_tool"}]
         assert captured["input"][1]["role"] == "developer"
         assert captured["input"][1]["content"][0]["text"] == "expert agent prompt"
-        assert captured["input"][1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "prompt_cache_breakpoint" not in captured["input"][1]["content"][0]
         # 4. user 消息排在后方（序2）
         assert captured["input"][2]["role"] == "user"
         # 5. parallel_tool_calls 策略正确保留
@@ -1179,10 +1178,51 @@ def test_send_prompt_clean_conversation_without_timeline_automatically_projects_
         assert rendered.input[0]["tools"] == [{"type": "function", "name": "direct_tool"}]
         assert rendered.input[1]["role"] == "developer"
         assert rendered.input[1]["content"][0]["text"] == "direct conv prompt"
-        assert rendered.input[1]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert "prompt_cache_breakpoint" not in rendered.input[1]["content"][0]
 
     asyncio.run(run())
 
 
+def test_explicit_prompt_cache_breakpoint_opt_in(monkeypatch):
+    """验证当通过 options 或 request_overrides 显式声明 prompt_cache_breakpoint 时，
+    系统依然支持在 developer 提示词内容块上正确挂载显式断点。
+    """
+    async def run():
+        captured = {}
+        async def fake_post(url, headers, body, **kwargs):
+            captured.update(copy.deepcopy(body))
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "assistant reply"}],
+                    }
+                ]
+            }
 
+        monkeypatch.setattr("agent_runtime.llm_client.llm_protocol_clients._post_json", fake_post)
 
+        conv = Conversation(
+            id="optin-conv-001",
+            messages=[UniMessage("user", [TextPart("hello optin")], message_id="m_1")],
+            timeline=[],
+        )
+        service = LlmRequestService((OpenAIResponsesProtocolClient(),), _Resolver())
+
+        # 显式传入 prompt_cache_breakpoint
+        await service.send_prompt(
+            LlmPromptRequest(
+                conversation=conv,
+                resolved_model=_model(),
+                system_prompt="optin prompt",
+                tools=(),
+                request_overrides={"prompt_cache_breakpoint": {"mode": "explicit"}},
+            )
+        )
+
+        assert captured["input"][0]["role"] == "developer"
+        assert captured["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        assert captured["input"][0]["content"][0]["text"] == "optin prompt"
+
+    asyncio.run(run())

@@ -182,13 +182,12 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 
 ### 3. 缓存规则与配置输入契约（核心协议要求）
 
-**重要协议契约：系统提示词/tools 注入与首部断点是 OpenAI Responses 的通用协议要求，跟时间线没有任何关系！**
+**重要协议契约：系统提示词/tools 注入是 OpenAI Responses 的通用协议要求，跟时间线没有任何关系！**
 - **input 内注入**：OpenAI Responses 协议统一采用 `input` 中的 `developer` 消息来设置系统提示词，使用 `additional_tools` 条目来设置工具定义，严禁设置在最外层顶层字段中（`body["instructions"]` 与 `body["tools"]` 严禁传递）。
-- **首部显式断点**：`input` 中最上方（即第一个系统提示词与 tools 定义）的后面**必须显式打上断点**（在初始 `developer` 消息末尾的内容块上附带 `prompt_cache_breakpoint: {"mode": "explicit"}`），其核心含义就是将「可复用的系统提示词 + tools 定义」作为稳定前缀进行缓存锁定。
-- **自定义断点 + 自动断点模式**：统一采用「显式自定义断点 + 服务端自动隐式断点（`mode="implicit"`）」联合模式，请求级下发 `prompt_cache_options: {"mode": "implicit"}`。
-- **与时间线彻底解耦**：时间线（Timeline）是指会话中系统提示词或 tools 发生了阶段性切换（例如 Agent 先以销售提示词工作，完成后切换到售后提示词和工具继续工作）；如果未发生切换，会话中就绝对没有时间线。但**无论会话是否存在时间线，只要转换为 OpenAI Responses 协议，都必须将当前系统的提示词和 tools 投影到 `input` 中并打上初始断点**。绝不能把时间线作为 OpenAI Responses 配置投影的前置条件！
+- **与时间线彻底解耦**：时间线（Timeline）是指会话中系统提示词或 tools 发生了阶段性切换（例如 Agent 先以销售提示词工作，完成后切换到售后提示词和工具继续工作）；如果未发生切换，会话中就绝对没有时间线。但**无论会话是否存在时间线，只要转换为 OpenAI Responses 协议，都必须将当前系统的提示词和 tools 投影到 `input` 中**。绝不能把时间线作为 OpenAI Responses 配置投影的前置条件！
+- **自动断点优先策略（上游生态现状适配）**：当前上游服务端与服务商生态（包括主流中继平台与 gpt-6-astra 等模型）尚未开放自定义显式断点能力，若请求内容块中携带 `prompt_cache_breakpoint` 会直接被远端拒绝并报错（`400 invalid_parameter: prompt_cache_breakpoint is not supported on this model`）。因此系统当前统一采用**服务端自动隐式断点（`mode="implicit"`）**，默认不在内容块中附带 `prompt_cache_breakpoint` 显式断点。顶层保留下发 `prompt_cache_options: {"mode": "implicit"}`，由服务端依据规范自动完成稳定前缀缓存管理。系统底层依然保留接收显式断点 options 的能力，待未来上游服务端全面放开后再行开启。
 
-按本次用户确认的技术指南，OpenAI Responses 在 GPT-5.6 及以后支持该能力的模型上提供显式缓存断点；早期模型仍使用隐式缓存。本节的 `prompt_cache_breakpoint` 规则只属于 OpenAI Responses 契约。OpenAI Chat Completions 必须独立核实其目标端点能力，不能自动继承 Responses 的内容块 marker、`additional_tools` 或其它输入 item。显式断点是请求内容块上的标记，不是可以单独引用的缓存 ID，也不是可独立拼装的增量缓存切片。以下是协议使用规则，不表示 AgentRuntime 或任意 OpenAI-compatible 服务商已实现全部能力。
+按本次技术确认，OpenAI Responses 的显式缓存断点能力受上游服务商和模型白名单严格限制；当前实现中默认使用自动隐式断点模式，不主动向内容块注入显式断点。本节关于 `prompt_cache_breakpoint` 的规则描述为协议理论契约与预留能力。OpenAI Chat Completions 必须独立核实其目标端点能力，不能自动继承 Responses 的内容块 marker、`additional_tools` 或其它输入 item。显式断点是请求内容块上的标记，不是可以单独引用的缓存 ID，也不是可独立拼装的增量缓存切片。以下是协议使用规则，不表示 AgentRuntime 或任意 OpenAI-compatible 服务商已实现全部能力。
 
 请求级控制：
 
