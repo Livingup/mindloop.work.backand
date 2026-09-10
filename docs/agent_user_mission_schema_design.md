@@ -12,8 +12,7 @@ CREATE TABLE agent_user_mission (
     refined_requirement     TEXT,                         -- 经 LLM 思考整理后的需求说明（需求/规范/约束/要求）
     status                  VARCHAR(32) NOT NULL DEFAULT 'in_progress', -- 任务状态
     sort_order              INT NOT NULL DEFAULT 1,       -- 班次内任务执行顺序
-    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at            TIMESTAMP WITH TIME ZONE      -- 任务完成时间
+    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_mission_task_status ON agent_user_mission(task_id, status);
@@ -33,7 +32,6 @@ CREATE INDEX idx_mission_scene ON agent_user_mission(scene_id);
 | `status` | VARCHAR(32) | 是 | `'in_progress'` | 状态枚举：`pending`（排队）、`in_progress`（执行中）、`completed`（已完成）、`abandoned`（废弃） |
 | `sort_order` | INT | 是 | `1` | 当前班次内该任务的编排序号 |
 | `created_at` | TIMESTAMP | 是 | `CURRENT_TIMESTAMP` | 任务创建时间戳 |
-| `completed_at` | TIMESTAMP | 否 | NULL | 任务完成时间戳，未完成为 NULL |
 
 ## 3. 支持“一个班次内多个独立复杂任务”的机制说明
 
@@ -51,7 +49,7 @@ CREATE INDEX idx_mission_scene ON agent_user_mission(scene_id);
    - 用户后续在该任务内的多轮追加与纠偏，按顺序追加至 `raw_prompts` 字符串数组；
    - Agent 调研项目规范与代码后，将思考整理出的需求、规范、约束与要求写入 `refined_requirement`，指导后续执行。
 2. **任务收敛（Completed）**：
-   - 当 `mission-01` 的工作落地并验证完毕后，系统将其 `status` 更新为 `'completed'`，并记录 `completed_at`；
+   - 当 `mission-01` 的工作落地并验证完毕后，系统将其 `status` 更新为 `'completed'`；
    - 该任务沉淀出的物理资产（代码、文件）与环境事实自动归档。
 3. **无缝切换（Transition）**：
    - 用户接着在同一会期内提出新任务（如“做数学作业”），系统识别出新目标，创建 `mission-02`，`status = 'in_progress'`，`sort_order = 2`；
