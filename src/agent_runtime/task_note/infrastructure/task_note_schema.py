@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS agent_user_mission (
     scene_id                VARCHAR(64) NOT NULL,
     agent_instance_id       VARCHAR(64) NOT NULL,
     title                   VARCHAR(255) NOT NULL,
-    raw_prompts             JSONB NOT NULL DEFAULT '[]',
+    raw_prompts             JSONB NOT NULL DEFAULT '[]',  -- 用户或父 Agent 委派输入字符串数组 (可优化措辞使需求更清晰明确，保证核心含义与需求不变)
     refined_requirement     TEXT,
     status                  VARCHAR(32) NOT NULL DEFAULT 'in_progress',
     sort_order              INT NOT NULL DEFAULT 1,

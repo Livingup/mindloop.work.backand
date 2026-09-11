@@ -8,7 +8,7 @@ CREATE TABLE agent_user_mission (
     task_id                 VARCHAR(64) NOT NULL,         -- 所属工作会期班次 ID
     scene_id                VARCHAR(64) NOT NULL,         -- 所属 Scene 场地 ID
     title                   VARCHAR(255) NOT NULL,        -- 任务标题
-    raw_prompts             JSONB NOT NULL DEFAULT '[]',  -- 用户原始输入字符串数组（按顺序追加）
+    raw_prompts             JSONB NOT NULL DEFAULT '[]',  -- 用户或父 Agent 委派输入字符串数组（按顺序追加，可优化措辞使需求更清晰，保持核心含义与需求不变）
     refined_requirement     TEXT,                         -- 经 LLM 思考整理后的需求说明（需求/规范/约束/要求）
     status                  VARCHAR(32) NOT NULL DEFAULT 'in_progress', -- 任务状态
     sort_order              INT NOT NULL DEFAULT 1,       -- 班次内任务执行顺序
@@ -27,7 +27,7 @@ CREATE INDEX idx_mission_scene ON agent_user_mission(scene_id);
 | `task_id` | VARCHAR(64) | 是 | - | 外键，所属班次 ID，用于支撑同一个班次内发起多个独立任务 |
 | `scene_id` | VARCHAR(64) | 是 | - | 所属 Scene 场景/场地 ID |
 | `title` | VARCHAR(255) | 是 | - | 简短任务名称（如“优化登录模块”、“做数学作业”） |
-| `raw_prompts` | JSONB | 是 | `'[]'` | 用户原始口语消息字符串数组，按时间发生顺序追加（如 `["优化下登录", "用JWT别改表结构"]`） |
+| `raw_prompts` | JSONB | 是 | `'[]'` | 用户或父 Agent 委派消息字符串数组，按时间发生顺序追加。不要求一字不变的死板原文，Agent 可优化措辞使需求更清晰明确，但核心含义与需求严禁篡改（如 `["优化登录模块", "用JWT实现认证且别改表结构"]`） |
 | `refined_requirement` | TEXT | 否 | NULL | 经 LLM 结合项目代码、历史设计与用户输入后思考整理出的需求说明，表达需求、规范、约束、要求，格式自由 |
 | `status` | VARCHAR(32) | 是 | `'in_progress'` | 状态枚举：`pending`（排队）、`in_progress`（执行中）、`completed`（已完成）、`abandoned`（废弃） |
 | `sort_order` | INT | 是 | `1` | 当前班次内该任务的编排序号 |
@@ -46,7 +46,7 @@ CREATE INDEX idx_mission_scene ON agent_user_mission(scene_id);
 ### 3.2 任务生命周期与轮转机制
 1. **任务创建（Initiated）**：
    - 用户在班次内发起第一个任务（如“优化登录模块”），系统创建 `mission-01`，`status = 'in_progress'`，`sort_order = 1`；
-   - 用户后续在该任务内的多轮追加与纠偏，按顺序追加至 `raw_prompts` 字符串数组；
+   - 用户后续在该任务内的多轮追加与纠偏（或父 Agent 委派指令），按顺序追加至 `raw_prompts` 字符串数组（可适当提炼优化措辞以使需求更清晰）；
    - Agent 调研项目规范与代码后，将思考整理出的需求、规范、约束与要求写入 `refined_requirement`，指导后续执行。
 2. **任务收敛（Completed）**：
    - 当 `mission-01` 的工作落地并验证完毕后，系统将其 `status` 更新为 `'completed'`；

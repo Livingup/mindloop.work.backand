@@ -75,7 +75,7 @@ def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### create_mission\n在班次内创建业务任务单元，保存任务标题、用户原始原话与提炼后的正式需求规格书。",
+    wiki="### create_mission\n在班次内创建业务任务单元，保存任务标题、用户/上级委派指令（支持在保持原意前提下优化措辞使描述更明确）与提炼后的正式需求规格书。",
 )
 def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
@@ -113,12 +113,12 @@ def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> Ba
 
 @tool(
     name="append_mission_prompt",
-    description="向目标业务任务追加用户最新原始发言文本或委派指令原话，完整保留对话时间序原貌。",
+    description="向目标业务任务追加用户最新发言文本或委派指令。支持在保持原始含义和需求不变的前提下优化措辞，使需求描述更清晰明确。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### append_mission_prompt\n增量追加用户发言原话，不修改已提炼的需求规格。",
+    wiki="### append_mission_prompt\n增量追加用户发言或委派指令（支持优化措辞使需求更清晰，保持核心含义与需求不变），不修改已提炼的需求规格。",
 )
 def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
@@ -135,7 +135,7 @@ def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeC
         output = {
             "mission_id": target_mission_id,
             "raw_prompts_count": 1,
-            "message": "用户原始发言已追加",
+            "message": "用户发言/委派指令已追加",
         }
         return BaseToolResult(output=output)
     except Exception as exc:

@@ -54,16 +54,16 @@ class CreateMissionRequest(BaseToolRequest):
     """创建新的独立业务任务单元请求。"""
 
     title: str = Field(min_length=1, description="任务简明标题，清晰表达业务目标。")
-    initial_prompt: str | None = Field(default=None, description="可选的用户初始原话或委派指令原文。")
+    initial_prompt: str | None = Field(default=None, description="可选的用户初始发言或委派指令（支持在保持核心含义与需求不变的前提下优化措辞，使需求描述更清晰明确）。")
     refined_requirement: str | None = Field(default=None, description="经思考提炼后的正式需求规格书、架构规范与验收标准。")
     sort_order: int = Field(default=1, ge=1, description="当前会期内的任务顺序号，默认为 1。")
 
 
 class AppendMissionPromptRequest(BaseToolRequest):
-    """向任务增量追加用户原始输入请求。"""
+    """向任务增量追加用户发言或委派指令请求。"""
 
     mission_id: str | None = Field(default=None, description="目标任务 ID；缺省不传时默认绑定当前活跃任务。")
-    prompt: str = Field(min_length=1, description="新增的用户原始发言文本或委派指令原话。")
+    prompt: str = Field(min_length=1, description="新增的用户发言或委派指令（支持在保持核心含义与需求不变的前提下优化措辞，使需求描述更清晰明确）。")
 
 
 class UpdateMissionRequirementRequest(BaseToolRequest):

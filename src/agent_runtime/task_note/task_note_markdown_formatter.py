@@ -241,11 +241,18 @@ def format_task_note_to_markdown(
                 sections.append(f"- **精炼业务需求**:\n  {refined}")
             if raw_prompts:
                 if isinstance(raw_prompts, list):
-                    prompt_strs = [f"  - \"{p}\"" for p in raw_prompts if p]
+                    prompt_strs = []
+                    for p in raw_prompts:
+                        if isinstance(p, dict):
+                            txt = p.get("prompt") or ""
+                            if txt:
+                                prompt_strs.append(f"  - \"{txt}\"")
+                        elif isinstance(p, str) and p:
+                            prompt_strs.append(f"  - \"{p}\"")
                     if prompt_strs:
-                        sections.append("- **用户原始指令记录**:\n" + "\n".join(prompt_strs))
+                        sections.append("- **用户与委派指令记录**:\n" + "\n".join(prompt_strs))
                 elif isinstance(raw_prompts, str):
-                    sections.append(f"- **用户原始指令记录**: {raw_prompts}")
+                    sections.append(f"- **用户与委派指令记录**: {raw_prompts}")
     else:
         sections.append("*(暂无意图任务)*")
 

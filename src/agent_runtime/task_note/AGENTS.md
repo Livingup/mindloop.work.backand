@@ -40,3 +40,6 @@
    - 清理动作由 Runtime 引擎静默执行，不得触发 LLM 对话或进入 Note 更新循环。
 8. **产物格式化真实契约约束**：
    - `task_artifact_records.edits` 的底层存储仅包含 `feature_desc` 和 `replace_lines`（无原始删除行记录）。在反查与 Markdown 格式化手记时，严禁虚构带 `-` 删减行的伪 Git Diff，必须真实渲染 `feature_desc` 与 `replace_lines` 代码块。
+9. **意图指令（raw_prompts）语义维护契约**：
+   - `agent_user_mission.raw_prompts` 记录用户或父 Agent 的委派消息，按时间序追加；
+   - 不强求一字不变的机械原文，允许 Agent 在保证原始核心含义和真实需求绝对不变的前提下，优化措辞或描述，使需求表达更清晰明确。

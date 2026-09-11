@@ -84,7 +84,7 @@ class TaskNoteStore:
         sort_order: int = 1,
         mission_id: str | None = None,
     ) -> str | None:
-        """创建新业务任务单元。"""
+        """创建新业务任务单元（保存标题、用户/委派输入与提炼需求，支持优化措辞使需求更清晰明确）。"""
         resolved_mission_id = mission_id or f"mission-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
         if self._connection_factory is None:
             logger.debug("TaskNoteStore 未配置数据库连接，跳过 create_mission")
@@ -136,7 +136,7 @@ class TaskNoteStore:
         mission_id: str,
         prompt: str,
     ) -> bool:
-        """向业务任务追加用户最新原始发言。"""
+        """向业务任务追加用户发言或委派指令（支持在保持原意前提下优化措辞使需求更明确）。"""
         if self._connection_factory is None:
             return True
 
