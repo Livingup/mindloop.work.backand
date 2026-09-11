@@ -1492,3 +1492,192 @@ def test_sqlite_conversation_repository_preserves_timeline_and_config(tmp_path):
             await repo.get("conv-cache-test")
 
     asyncio.run(run())
+
+
+def test_send_prompt_subagent_with_subset_tools_succeeds_without_conflict(monkeypatch):
+    """验证当子 Agent 工具是父工具的子集时（无 active 工具事件），send_prompt 不会误报配置视图与 tools 冲突。"""
+    async def run():
+        captured = {}
+        async def fake_post(url, headers, body, **kwargs):
+            captured.update(copy.deepcopy(body))
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "subagent completed"}],
+                    }
+                ]
+            }
+
+        monkeypatch.setattr("agent_runtime.llm_client.llm_protocol_clients._post_json", fake_post)
+
+        conv = Conversation(
+            id="conv-subagent-subset",
+            messages=[
+                UniMessage("user", [TextPart("parent task")], message_id="msg-1"),
+                UniMessage("assistant", [TextPart("dispatch subtask")], message_id="msg-2"),
+            ],
+            timeline=[
+                ConfigurationComponentEvent(
+                    event_id="evt-parent-tools",
+                    definition_id="parent",
+                    anchor="start",
+                    sequence=0,
+                    status="historical",
+                    snapshot=(
+                        {"type": "function", "name": "tool_a"},
+                        {"type": "function", "name": "tool_b"},
+                    ),
+                    component="tool",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="evt-parent-prompt",
+                    definition_id="parent",
+                    anchor="start",
+                    sequence=1,
+                    status="historical",
+                    snapshot="parent system prompt",
+                    component="prompt",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="evt-child-prompt",
+                    definition_id="child",
+                    anchor="after_message_id",
+                    anchor_message_id="msg-2",
+                    sequence=1,
+                    status="active",
+                    component="prompt",
+                    supplementary_prompts=("你是由 parent-id 创建的子 agent，可用工具范围是 {{available_tools}}",),
+                ),
+            ],
+        )
+
+        service = LlmRequestService((OpenAIResponsesProtocolClient(),), _Resolver())
+
+        # 子 Agent 仅声明 tool_a（父工具包含它，故 timeline 中无 active tool event）
+        child_tools = (
+            LlmToolDefinition("tool_a", {"type": "function", "name": "tool_a"}),
+        )
+
+        result = await service.send_prompt(
+            LlmPromptRequest(
+                conversation=conv,
+                resolved_model=_model(),
+                system_prompt="child agent prompt",
+                tools=child_tools,
+            )
+        )
+
+        assert conv.messages[-1] is result.assistant_message
+        assert captured["prompt_cache_options"] == {"mode": "implicit"}
+        # 输入最前面有父历史工具
+        assert captured["input"][0]["type"] == "additional_tools"
+        assert captured["input"][0]["tools"] == [
+            {"type": "function", "name": "tool_a"},
+            {"type": "function", "name": "tool_b"},
+        ]
+        # 边界处有子 agent developer 提示词，且 {{available_tools}} 被正确填充为子 Agent 的工具范围 ["tool_a"]
+        dev_msg = next(item for item in captured["input"] if "content" in item and any("child agent prompt" in c.get("text", "") for c in item["content"]))
+        assert '["tool_a"]' in dev_msg["content"][0]["text"]
+
+    asyncio.run(run())
+
+
+def test_send_prompt_subagent_with_delta_tools_succeeds_without_conflict(monkeypatch):
+    """验证当子 Agent 工具包含新增差集工具时，send_prompt 不会误报配置视图与 tools 冲突。"""
+    async def run():
+        captured = {}
+        async def fake_post(url, headers, body, **kwargs):
+            captured.update(copy.deepcopy(body))
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "delta subagent completed"}],
+                    }
+                ]
+            }
+
+        monkeypatch.setattr("agent_runtime.llm_client.llm_protocol_clients._post_json", fake_post)
+
+        conv = Conversation(
+            id="conv-subagent-delta",
+            messages=[
+                UniMessage("user", [TextPart("parent task")], message_id="msg-1"),
+                UniMessage("assistant", [TextPart("dispatch subtask")], message_id="msg-2"),
+            ],
+            timeline=[
+                ConfigurationComponentEvent(
+                    event_id="evt-parent-tools",
+                    definition_id="parent",
+                    anchor="start",
+                    sequence=0,
+                    status="historical",
+                    snapshot=(
+                        {"type": "function", "name": "tool_a"},
+                    ),
+                    component="tool",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="evt-parent-prompt",
+                    definition_id="parent",
+                    anchor="start",
+                    sequence=1,
+                    status="historical",
+                    snapshot="parent prompt",
+                    component="prompt",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="evt-child-tool",
+                    definition_id="child",
+                    anchor="after_message_id",
+                    anchor_message_id="msg-2",
+                    sequence=0,
+                    status="active",
+                    component="tool",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="evt-child-prompt",
+                    definition_id="child",
+                    anchor="after_message_id",
+                    anchor_message_id="msg-2",
+                    sequence=1,
+                    status="active",
+                    component="prompt",
+                ),
+            ],
+        )
+
+        service = LlmRequestService((OpenAIResponsesProtocolClient(),), _Resolver())
+
+        # 子 Agent 具备 tool_a（父已有）和 tool_c（新增差集）
+        child_tools = (
+            LlmToolDefinition("tool_a", {"type": "function", "name": "tool_a"}),
+            LlmToolDefinition("tool_c", {"type": "function", "name": "tool_c"}),
+        )
+
+        result = await service.send_prompt(
+            LlmPromptRequest(
+                conversation=conv,
+                resolved_model=_model(),
+                system_prompt="child agent prompt",
+                tools=child_tools,
+            )
+        )
+
+        assert conv.messages[-1] is result.assistant_message
+        # 验证 input 中：
+        # 1. 首部父历史工具只有 tool_a
+        assert captured["input"][0]["type"] == "additional_tools"
+        assert captured["input"][0]["tools"] == [{"type": "function", "name": "tool_a"}]
+        # 2. 边界处差集追加工具只有 tool_c，不重复声明 tool_a
+        delta_tools_items = [
+            item for item in captured["input"]
+            if item.get("type") == "additional_tools" and item.get("tools") == [{"type": "function", "name": "tool_c"}]
+        ]
+        assert len(delta_tools_items) == 1
+
+    asyncio.run(run())
+

@@ -149,15 +149,7 @@ def _resolve_openai_request_configuration(
     if effective_system is not None and not isinstance(effective_system, str):
         raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
 
-    if configuration_view is None and conversation is not None:
-        timeline = getattr(conversation, "timeline", None)
-        if timeline:
-            configuration_view = build_request_configuration_view_from_timeline(
-                conversation_id=conversation_id,
-                timeline=timeline,
-                system_prompt=effective_system,
-                tools=effective_tools,
-            )
+    options.pop("_openai_responses_input_configuration_enabled", None)
 
     if configuration_view is not None:
         current_prompt = getattr(configuration_view, "current_prompt", None)
@@ -167,14 +159,34 @@ def _resolve_openai_request_configuration(
                 raise ValueError("显式 configuration_view 与 system_prompt 内容冲突。")
         elif current_prompt.resolved_content != effective_system:
             raise ValueError("显式 configuration_view 与 system_prompt 内容冲突。")
-        if current_tools is None:
-            if effective_tools:
+
+        effective_tool_names = tuple(
+            str(t.get("name") or t.get("function", {}).get("name"))
+            for t in effective_tools
+            if (t.get("name") or t.get("function", {}).get("name"))
+        )
+        if getattr(configuration_view, "available_tool_names", None):
+            if tuple(configuration_view.available_tool_names) != effective_tool_names:
                 raise ValueError("显式 configuration_view 与 tools 内容冲突。")
-        elif tuple(current_tools.ordered_definitions) != effective_tools:
-            raise ValueError("显式 configuration_view 与 tools 内容冲突。")
+        else:
+            if current_tools is None:
+                if effective_tools:
+                    raise ValueError("显式 configuration_view 与 tools 内容冲突。")
+            elif tuple(current_tools.ordered_definitions) != effective_tools:
+                raise ValueError("显式 configuration_view 与 tools 内容冲突。")
         return params, options, effective_system, effective_tools, configuration_view
 
-    options.pop("_openai_responses_input_configuration_enabled", None)
+    if conversation is not None:
+        timeline = getattr(conversation, "timeline", None)
+        if timeline:
+            configuration_view = build_request_configuration_view_from_timeline(
+                conversation_id=conversation_id,
+                timeline=timeline,
+                system_prompt=effective_system,
+                tools=effective_tools,
+            )
+            return params, options, effective_system, effective_tools, configuration_view
+
     if effective_system is not None or effective_tools:
         configuration_view = build_current_request_configuration_view(
             conversation_id=conversation_id,
