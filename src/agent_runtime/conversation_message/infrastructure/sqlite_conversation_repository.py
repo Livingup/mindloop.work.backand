@@ -23,6 +23,7 @@ from threading import RLock
 from typing import Any
 
 from agent_runtime.conversation_message.message.models import (
+    ConfigurationComponentEvent,
     Conversation,
     ConversationState,
     ImagePart,
@@ -38,6 +39,44 @@ from agent_runtime.conversation_message.message.tool_result_output import normal
 
 
 # ── 序列化辅助函数 ──────────────────────────────────────────────
+
+
+def _configuration_event_to_dict(evt: ConfigurationComponentEvent) -> dict[str, Any]:
+    """将配置事件序列化为字典，用于 SQLite 持久化。"""
+    snapshot = evt.snapshot
+    if isinstance(snapshot, tuple):
+        snapshot = list(snapshot)
+    return {
+        "event_id": evt.event_id,
+        "definition_id": evt.definition_id,
+        "anchor": evt.anchor,
+        "anchor_message_id": evt.anchor_message_id,
+        "sequence": evt.sequence,
+        "status": evt.status,
+        "snapshot": snapshot,
+        "revision": evt.revision,
+        "component": evt.component,
+        "supplementary_prompts": list(evt.supplementary_prompts),
+    }
+
+
+def _dict_to_configuration_event(d: dict[str, Any]) -> ConfigurationComponentEvent:
+    """将字典反序列化为配置事件对象。"""
+    snapshot = d.get("snapshot")
+    if isinstance(snapshot, list):
+        snapshot = tuple(snapshot)
+    return ConfigurationComponentEvent(
+        event_id=d["event_id"],
+        definition_id=d["definition_id"],
+        anchor=d.get("anchor", "start"),
+        anchor_message_id=d.get("anchor_message_id"),
+        sequence=d.get("sequence", 0),
+        status=d.get("status", "historical"),
+        snapshot=snapshot,
+        revision=d.get("revision"),
+        component=d.get("component"),
+        supplementary_prompts=tuple(d.get("supplementary_prompts") or ()),
+    )
 
 
 def _part_to_dict(part: UniPart) -> dict[str, Any]:
@@ -171,6 +210,13 @@ CREATE TABLE IF NOT EXISTS pending_tool_results (
     result_part              TEXT NOT NULL,
     PRIMARY KEY (conversation_id, assistant_message_index, tool_use_ref)
 );
+
+CREATE TABLE IF NOT EXISTS conversation_configuration (
+    conversation_id   TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    timeline          TEXT NOT NULL DEFAULT '[]',
+    system_prompt     TEXT,
+    tools             TEXT NOT NULL DEFAULT '[]'
+);
 """
 
 
@@ -228,6 +274,12 @@ class SqliteConversationRepository:
                 (conv.id, task_id, thread_id, agent_id, agent_instance_id),
             )
             self._upsert_state(conv.id, conv.state)
+            self._upsert_configuration(
+                conv.id,
+                conv.timeline,
+                getattr(conv, "system_prompt", None),
+                getattr(conv, "tools", ()),
+            )
             c.commit()
             _TIMELINE_CACHE[conv.id] = list(conv.timeline)
             _SYSTEM_PROMPT_CACHE[conv.id] = getattr(conv, "system_prompt", None)
@@ -278,14 +330,41 @@ class SqliteConversationRepository:
             ).fetchall()
             provider_state: dict[str, Any] = {r[0]: json.loads(r[1]) for r in ps_rows}
 
+            # 从 SQLite 读取会话配置与时间线（优先读取已持久化配置，保障重启后完整恢复）。
+            cfg_row = c.execute(
+                "SELECT timeline, system_prompt, tools FROM conversation_configuration WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if cfg_row is not None:
+                try:
+                    timeline = [
+                        _dict_to_configuration_event(item)
+                        for item in json.loads(cfg_row[0])
+                    ]
+                except Exception:
+                    timeline = list(_TIMELINE_CACHE.get(conversation_id, []))
+                system_prompt = cfg_row[1]
+                try:
+                    tools = tuple(json.loads(cfg_row[2])) if cfg_row[2] else ()
+                except Exception:
+                    tools = _TOOLS_CACHE.get(conversation_id, ())
+            else:
+                timeline = list(_TIMELINE_CACHE.get(conversation_id, []))
+                system_prompt = _SYSTEM_PROMPT_CACHE.get(conversation_id)
+                tools = _TOOLS_CACHE.get(conversation_id, ())
+
+            _TIMELINE_CACHE[conversation_id] = list(timeline)
+            _SYSTEM_PROMPT_CACHE[conversation_id] = system_prompt
+            _TOOLS_CACHE[conversation_id] = tuple(tools)
+
             return Conversation(
                 id=conversation_id,
                 messages=messages,
                 state=state,
                 provider_state=provider_state,
-                timeline=list(_TIMELINE_CACHE.get(conversation_id, [])),
-                system_prompt=_SYSTEM_PROMPT_CACHE.get(conversation_id),
-                tools=_TOOLS_CACHE.get(conversation_id, ()),
+                timeline=list(timeline),
+                system_prompt=system_prompt,
+                tools=tools,
             )
 
     async def save(self, conv: Conversation) -> None:
@@ -295,6 +374,30 @@ class SqliteConversationRepository:
             task_id = self._get_task_id(cid)
             if not task_id:
                 raise KeyError(f"Conversation not found: {cid}")
+
+            # 裁剪孤儿时间线事件：若非 start 锚点引用的 message_id 在当前会话中已被删除，自动剔除
+            known_message_ids = {m.message_id for m in conv.messages}
+            valid_timeline = [
+                ev for ev in conv.timeline
+                if ev.anchor == "start" or ev.anchor_message_id in known_message_ids
+            ]
+            if len(valid_timeline) != len(conv.timeline):
+                conv.timeline = valid_timeline
+
+            # 若时间线及配置均为空，物理删除配置记录，避免残留无效数据
+            if not conv.timeline and not getattr(conv, "system_prompt", None) and not getattr(conv, "tools", ()):
+                self._conn.execute(
+                    "DELETE FROM conversation_configuration WHERE conversation_id = ?",
+                    (cid,),
+                )
+            else:
+                self._upsert_configuration(
+                    cid,
+                    conv.timeline,
+                    getattr(conv, "system_prompt", None),
+                    getattr(conv, "tools", ()),
+                )
+
             _TIMELINE_CACHE[cid] = list(conv.timeline)
             _SYSTEM_PROMPT_CACHE[cid] = getattr(conv, "system_prompt", None)
             _TOOLS_CACHE[cid] = tuple(getattr(conv, "tools", ()))
@@ -321,6 +424,11 @@ class SqliteConversationRepository:
             if task_id:
                 path = self._msg_path(task_id, conversation_id)
                 path.unlink(missing_ok=True)
+            # 物理删除配置记录。
+            self._conn.execute(
+                "DELETE FROM conversation_configuration WHERE conversation_id = ?",
+                (conversation_id,),
+            )
             # SQLite 外键 CASCADE 自动删除关联的状态行。
             self._conn.execute(
                 "DELETE FROM conversations WHERE id = ?", (conversation_id,),
@@ -505,6 +613,27 @@ class SqliteConversationRepository:
             ),
         )
 
+    def _upsert_configuration(
+        self,
+        cid: str,
+        timeline: list[ConfigurationComponentEvent],
+        system_prompt: str | None,
+        tools: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> None:
+        timeline_data = [_configuration_event_to_dict(evt) for evt in timeline]
+        tools_data = list(tools) if tools else []
+        self._conn.execute(
+            "INSERT OR REPLACE INTO conversation_configuration "
+            "(conversation_id, timeline, system_prompt, tools) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                cid,
+                json.dumps(timeline_data, ensure_ascii=False),
+                system_prompt,
+                json.dumps(tools_data, ensure_ascii=False),
+            ),
+        )
+
     def _migrate_schema(self) -> None:
         columns = {
             row[1]
@@ -512,3 +641,16 @@ class SqliteConversationRepository:
         }
         if "last_context_usage" not in columns:
             self._conn.execute("ALTER TABLE conversation_state ADD COLUMN last_context_usage TEXT")
+        tables = {
+            row[0]
+            for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "conversation_configuration" not in tables:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversation_configuration ("
+                "conversation_id   TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, "
+                "timeline          TEXT NOT NULL DEFAULT '[]', "
+                "system_prompt     TEXT, "
+                "tools             TEXT NOT NULL DEFAULT '[]'"
+                ")"
+            )

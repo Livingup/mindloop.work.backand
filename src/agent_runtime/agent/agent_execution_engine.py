@@ -2223,7 +2223,13 @@ class AgentExecutionEngine:
                         message_id=f"msg_{uuid.uuid4().hex[:12]}",
                     )
                     new_conversation.append_message(resumed_msg, [TextPartMeta()])
-                    await self._conversation_repository.save(new_conversation)
+                    await self._conversation_repository.create(
+                        new_conversation,
+                        task_id=task.task_id,
+                        thread_id=instance.thread_id,
+                        agent_id=agent_definition.agent_id,
+                        agent_instance_id=instance.instance_id,
+                    )
 
                     # 5. 调用 switch_agent_instance_conversation
                     self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, new_conversation.id)
@@ -3187,7 +3193,10 @@ class AgentExecutionEngine:
                     deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
                     for t in tools
                 )
-                if not getattr(conversation, "timeline", None):
+                if (
+                    instance.execution_substate != EXECUTION_SUBSTATE_NOTE_UPDATE
+                    and not getattr(conversation, "timeline", None)
+                ):
                     if system_prompt is not None:
                         conversation.record_configuration_event(
                             ConfigurationComponentEvent(

@@ -243,7 +243,13 @@ def test_legacy_jsonl_migration_is_persisted_and_repeatable(tmp_path):
         try:
             assert [m.message_id for m in (await repo.get("legacy")).messages] == ids
             tables = {r[0] for r in repo._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            assert tables == {"conversations", "conversation_state", "provider_state", "pending_tool_results"}
+            assert tables == {
+                "conversations",
+                "conversation_state",
+                "provider_state",
+                "pending_tool_results",
+                "conversation_configuration",
+            }
         finally:
             repo.close()
     asyncio.run(run())
@@ -1697,6 +1703,152 @@ def test_send_prompt_subagent_with_delta_tools_succeeds_without_conflict(monkeyp
             if item.get("type") == "additional_tools" and item.get("tools") == [{"type": "function", "name": "tool_c"}]
         ]
         assert len(delta_tools_items) == 1
+
+    asyncio.run(run())
+
+
+def test_sqlite_conversation_repository_persists_timeline_across_process_restart(tmp_path):
+    """验证 SqliteConversationRepository 跨进程重启（清空内存字典缓存并重新打开数据库）能够完整恢复时间线与配置。"""
+    from agent_runtime.conversation_message.infrastructure.sqlite_conversation_repository import (
+        _TIMELINE_CACHE,
+        _SYSTEM_PROMPT_CACHE,
+        _TOOLS_CACHE,
+    )
+
+    async def run():
+        repo = SqliteConversationRepository(tmp_path)
+        msg1 = UniMessage(role="user", content=[TextPart(text="Hello")], message_id="msg_001")
+        conv = Conversation(
+            id="conv-restart-test",
+            messages=[msg1],
+            system_prompt="Initial business prompt",
+            tools=({"type": "function", "name": "biz_tool"},),
+            timeline=[
+                ConfigurationComponentEvent(
+                    event_id="e_start_prompt",
+                    definition_id="def_biz",
+                    anchor="start",
+                    sequence=1,
+                    status="historical",
+                    snapshot="Initial business prompt",
+                    component="prompt",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="e_start_tool",
+                    definition_id="def_biz",
+                    anchor="start",
+                    sequence=0,
+                    status="historical",
+                    snapshot=({"type": "function", "name": "biz_tool"},),
+                    component="tool",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="e_note_prompt",
+                    definition_id="system_note_update",
+                    anchor="after_message_id",
+                    anchor_message_id="msg_001",
+                    sequence=1,
+                    status="active",
+                    component="prompt",
+                ),
+            ],
+        )
+        await repo.create(
+            conv,
+            task_id="task-restart",
+            thread_id="thread-restart",
+            agent_id="agent-scout",
+            agent_instance_id="inst-restart",
+        )
+
+        # 模拟完全关闭进程：清空所有内存全局缓存，并关闭连接
+        repo.close()
+        _TIMELINE_CACHE.clear()
+        _SYSTEM_PROMPT_CACHE.clear()
+        _TOOLS_CACHE.clear()
+
+        # 重新创建仓储实例连接同一磁盘目录
+        fresh_repo = SqliteConversationRepository(tmp_path)
+        try:
+            loaded = await fresh_repo.get("conv-restart-test")
+            assert loaded.id == "conv-restart-test"
+            assert loaded.system_prompt == "Initial business prompt"
+            assert len(loaded.tools) == 1
+            assert loaded.tools[0]["name"] == "biz_tool"
+            assert len(loaded.messages) == 1
+            assert loaded.messages[0].message_id == "msg_001"
+
+            # 验证时间线 100% 完整从 SQLite 恢复
+            assert len(loaded.timeline) == 3
+            assert loaded.timeline[0].event_id == "e_start_prompt"
+            assert loaded.timeline[0].anchor == "start"
+            assert loaded.timeline[0].snapshot == "Initial business prompt"
+            assert loaded.timeline[1].event_id == "e_start_tool"
+            assert loaded.timeline[1].snapshot == ({"type": "function", "name": "biz_tool"},)
+            assert loaded.timeline[2].event_id == "e_note_prompt"
+            assert loaded.timeline[2].anchor == "after_message_id"
+            assert loaded.timeline[2].anchor_message_id == "msg_001"
+            assert loaded.timeline[2].status == "active"
+
+            # 验证物理删除
+            await fresh_repo.delete("conv-restart-test")
+            cfg_rows = fresh_repo._conn.execute(
+                "SELECT COUNT(*) FROM conversation_configuration WHERE conversation_id = ?",
+                ("conv-restart-test",),
+            ).fetchone()[0]
+            assert cfg_rows == 0
+        finally:
+            fresh_repo.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_conversation_repository_prunes_dangling_timeline_events_on_message_removal(tmp_path):
+    """验证当会话消息被裁剪/删除时，依赖已删除 message_id 的时间线事件被自动物理剔除。"""
+    async def run():
+        repo = SqliteConversationRepository(tmp_path)
+        msg1 = UniMessage(role="user", content=[TextPart(text="Msg 1")], message_id="msg_1")
+        msg2 = UniMessage(role="user", content=[TextPart(text="Msg 2")], message_id="msg_2")
+        conv = Conversation(
+            id="conv-prune-test",
+            messages=[msg1, msg2],
+            timeline=[
+                ConfigurationComponentEvent(
+                    event_id="e_start",
+                    definition_id="def_1",
+                    anchor="start",
+                    status="historical",
+                    snapshot="Start",
+                    component="prompt",
+                ),
+                ConfigurationComponentEvent(
+                    event_id="e_after_msg2",
+                    definition_id="def_2",
+                    anchor="after_message_id",
+                    anchor_message_id="msg_2",
+                    status="active",
+                    component="prompt",
+                ),
+            ],
+        )
+        await repo.create(
+            conv,
+            task_id="task-p",
+            thread_id="th-p",
+            agent_id="ag-p",
+            agent_instance_id="inst-p",
+        )
+
+        # 模拟消息裁剪/历史截断：msg_2 被移除
+        conv.messages = [msg1]
+        await repo.save(conv)
+
+        # 验证内存与磁盘上的孤儿事件均被剔除
+        loaded = await repo.get("conv-prune-test")
+        assert len(loaded.timeline) == 1
+        assert loaded.timeline[0].event_id == "e_start"
+
+        repo.close()
 
     asyncio.run(run())
 
