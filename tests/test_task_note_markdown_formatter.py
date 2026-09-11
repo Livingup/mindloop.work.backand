@@ -275,6 +275,7 @@ def test_prompt_provider_build_resumed_conversation_prompt_markdown():
 
     resumed = provider.build_resumed_conversation_prompt(snapshot)
     assert "系统已完成上下文压缩与Note更新" in resumed
+    assert "以下是最新任务现场工作手记快照" in resumed
     assert "# 任务现场工作手记 (Task Work Note)" in resumed
     assert "启动服务并验证端口" in resumed
     assert "**命令行执行 ID**: `c1` ➔ **执行命令**: `uvicorn main:app --port 8000`" in resumed
