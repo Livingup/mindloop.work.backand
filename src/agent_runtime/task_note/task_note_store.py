@@ -1418,16 +1418,6 @@ class TaskNoteStore:
                             (mission_id, task_id, agent_instance_id, resource_ids),
                         )
                         bound_count = cur.rowcount
-                    elif resource_type in ("command", "commands"):
-                        cur.execute(
-                            """
-                            UPDATE task_command_records
-                            SET mission_id = %s
-                            WHERE task_id = %s AND agent_instance_id = %s AND command_id = ANY(%s)
-                            """,
-                            (mission_id, task_id, agent_instance_id, resource_ids),
-                        )
-                        bound_count = cur.rowcount
                     elif resource_type in ("agent_relationship", "agent_relationships"):
                         cur.execute(
                             """
@@ -1459,6 +1449,57 @@ class TaskNoteStore:
         except Exception as exc:
             logger.error("bind_resources_to_mission 绑定失败: %s", exc)
             raise
+
+    def get_command_lines_by_ids(
+        self,
+        *,
+        task_id: str,
+        command_ids: list[str],
+    ) -> dict[str, str]:
+        """按 command_id 列表批量反查对应的 命令行指令 (command_line)。"""
+        if not command_ids or self._connection_factory is None:
+            return {}
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT command_id, command_line
+                        FROM task_command_records
+                        WHERE task_id = %s AND command_id = ANY(%s)
+                        """,
+                        (task_id, list(command_ids)),
+                    )
+                    return {row["command_id"]: row["command_line"] for row in cur.fetchall()}
+        except Exception as exc:
+            logger.error("get_command_lines_by_ids 查询失败: %s", exc)
+            return {}
+
+    def get_all_command_lines_for_tenant(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+    ) -> dict[str, str]:
+        """反查当前租户 (task_id, agent_instance_id) 下的所有 命令行执行 ID 与 命令行指令映射。"""
+        if self._connection_factory is None:
+            return {}
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT command_id, command_line
+                        FROM task_command_records
+                        WHERE task_id = %s AND agent_instance_id = %s
+                        """,
+                        (task_id, agent_instance_id),
+                    )
+                    return {row["command_id"]: row["command_line"] for row in cur.fetchall()}
+        except Exception as exc:
+            logger.error("get_all_command_lines_for_tenant 查询失败: %s", exc)
+            return {}
+
 
 
 _global_task_note_store: TaskNoteStore | None = None

@@ -26,6 +26,9 @@
 3. **提示词模板化与工具权限隔离**：
    - Note 系统提示词必须从模板网关读取 `name="system_note_update"`（支持 `{{agent_instance_id}}` 和 `{{available_tools}}` 占位符），不得硬编码。
    - 在 `note_update` 状态下执行循环强制隔离工具，仅允许调用 32 个 Task Note 工具，非 Note 工具严格拦截并返回工具错误。
-4. **触发与退出时序**：
+4. **触发时序**：
    - 触发时序：查询 PG 基线快照 -> 追加边界 User 提示消息 -> 更新 `conversation.timeline`（冻结业务 prompt/tools 为 historical，追加 Note active 配置事件）并保存会话 -> `enter_note_update()` 持久化状态 -> 下发 Note Prompt/Tools。
-   - 退出时序：调用 `note_update_end` 工具 -> 查询 PG 最新完整快照 -> 创建全新干净 `Conversation` 并以快照为初始消息注入 -> timeline 初始化为业务 prompt/tools -> `switch_agent_instance_conversation` -> `exit_note_update()` 持久化状态 -> 覆盖 `loop_decision="continue"` 让业务 Agent 在新会话中无缝继续执行。
+5. **退出时序与上下文反查重建**：
+   - 调用 `note_update_end` 工具 -> 查询 PG 最新完整快照 -> 反查本地磁盘源码（`path + line_ranges` 带 1-based 行号）、反查命令行执行记录（`command_id` 映射到真实 `command_line`，标注为“命令行执行 ID”）、提取父子协作专线与远程 Agent 对等通信流 -> 组织为高密度结构化 Markdown 现场工作手记（突出 Next Step 与 Todo 复选框，严禁直接倾倒数据库表原始 JSON） -> 创建全新干净 `Conversation` 并以 Markdown 手记为初始消息注入 -> timeline 初始化为业务 prompt/tools -> `switch_agent_instance_conversation` -> `exit_note_update()` 持久化状态 -> 覆盖 `loop_decision="continue"` 让业务 Agent 在新会话中无缝继续执行。
+6. **辅助表与索引增效约束**：
+   - `task_command_records` 是纯技术辅助表，无 `mission_id` 字段，不归属业务任务，也不在 Note Agent 状态快照中直接倾倒。Note Agent 仅在业务表（workspace_context, validations, discoveries 等）中记录 `command_id` 作为命令行执行 ID，以极大节约上下文 Token；切回业务状态时由系统自动反查真实命令行指令。

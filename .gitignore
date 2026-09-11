@@ -117,6 +117,13 @@ Desktop.ini
 !/tests/test_openai_responses_configuration_timeline.py
 !/tests/test_prompt_variables.py
 !/tests/test_task_note_store.py
+!/tests/test_task_note_markdown_formatter.py
+!/tests/test_task_note_event_recorder.py
+!/tests/test_task_note_snapshot_service.py
+!/tests/test_task_note_prompt_provider.py
+!/tests/test_task_note_tools.py
+!/tests/test_agent_instance_note_substate.py
+!/tests/test_note_context_compression_flow.py
 
 /web-frontend/
 

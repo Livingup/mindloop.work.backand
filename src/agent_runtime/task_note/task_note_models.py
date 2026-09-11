@@ -27,7 +27,7 @@ ValidationMethod = Literal["automated_test", "build", "static_check", "manual_ch
 ValidationConclusion = Literal["passed", "failed", "partial", "not_completed"]
 ExternalStateTargetType = Literal["environment", "service", "database", "external_api", "process", "other"]
 ExternalStateReversibility = Literal["reversible", "irreversible", "unknown"]
-BindResourceType = Literal["artifact", "command", "agent_relationship"]
+BindResourceType = Literal["artifact", "agent_relationship"]
 
 
 class LineRange(BaseModel):
@@ -362,11 +362,10 @@ class BindResourcesToMissionRequest(BaseToolRequest):
         description=(
             "待绑定的底层资源类型；可选值仅限：\n"
             "• artifact: 文件产出记录（对应 task_artifact_records 中文件工具自动生成的文件项）\n"
-            "• command: 终端命令执行记录（对应 task_command_records）\n"
             "• agent_relationship: 子 Agent 协作拓扑关系（对应 task_agent_relationships）"
         )
     )
-    resource_ids: list[str] = Field(min_length=1, description="待绑定的目标资源 ID 数组（如 artifact_ids, command_ids）。")
+    resource_ids: list[str] = Field(min_length=1, description="待绑定的目标资源 ID 数组（如 artifact_ids, relationship_ids）。")
     mission_id: str = Field(min_length=1, description="目标业务任务 ID。")
 
 

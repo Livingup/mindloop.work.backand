@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Agent Task Note 提示词与工具提供器。
 
 负责：
@@ -167,26 +167,90 @@ class TaskNotePromptProvider:
         return render_prompt_variables(template_text, variable_values)
 
     def build_compression_boundary_prompt(self, note_snapshot: str | dict[str, Any]) -> str:
-        """生成触发上下文压缩时的边界 User 指令提示词（注入基线快照）。"""
-        snapshot_str = (
-            note_snapshot
-            if isinstance(note_snapshot, str)
-            else json.dumps(note_snapshot, ensure_ascii=False, indent=2)
-        )
+        """生成触发上下文压缩时的边界 User 指令提示词（注入基线快照）。
+        
+        注意：task_command_records 是底层技术反查辅助表，不直接倾倒给 Note Agent，
+        以极大节约上下文 Token，促使 Note Agent 仅记录 command_id 索引。
+        """
+        parsed_snapshot: Any
+        if isinstance(note_snapshot, str):
+            try:
+                parsed_snapshot = json.loads(note_snapshot)
+            except Exception:
+                parsed_snapshot = note_snapshot
+        else:
+            parsed_snapshot = note_snapshot
+
+        if isinstance(parsed_snapshot, dict):
+            # 剔除辅助表 commands，节约 prompt token
+            agent_facing = {k: v for k, v in parsed_snapshot.items() if k != "commands"}
+            snapshot_str = json.dumps(agent_facing, ensure_ascii=False, indent=2)
+        else:
+            snapshot_str = str(parsed_snapshot)
+
         return (
             "上面的历史消息是之前的业务agent的对话记录。你现在的状态是note agent，上下文空间快不足了，请立即更新业务agent的note。"
             f"下面是目标业务agent的当前note完整快照：{snapshot_str}。请更新由你负责的note部分。"
         )
 
-    def build_resumed_conversation_prompt(self, note_snapshot: str | dict[str, Any]) -> str:
-        """生成 Note 更新完成后全新会话的业务唤醒提示词。"""
-        snapshot_str = (
-            note_snapshot
-            if isinstance(note_snapshot, str)
-            else json.dumps(note_snapshot, ensure_ascii=False, indent=2)
+    def build_resumed_conversation_prompt(
+        self,
+        note_snapshot: str | dict[str, Any],
+        *,
+        current_working_directory: str = "",
+        command_lookup: dict[str, str] | None = None,
+        task_id: str | None = None,
+        agent_instance_id: str | None = None,
+    ) -> str:
+        """生成 Note 更新完成后全新会话的业务唤醒提示词。
+        
+        不再向业务 Agent 倾倒数据库表原始 JSON，而是反查磁盘源码行号与命令行指令，
+        组织为高结构化、高可读性的 Markdown 现场工作手册。
+        """
+        from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+
+        if isinstance(note_snapshot, str):
+            try:
+                snapshot_dict = json.loads(note_snapshot)
+            except Exception:
+                snapshot_dict = {}
+        elif isinstance(note_snapshot, dict):
+            snapshot_dict = note_snapshot
+        else:
+            snapshot_dict = {}
+
+        # 收集 command_lookup
+        final_lookup: dict[str, str] = dict(command_lookup or {})
+        if not final_lookup:
+            # 1. 尝试从 snapshot["commands"] 提取
+            raw_cmds = snapshot_dict.get("commands") or []
+            for c in raw_cmds:
+                if isinstance(c, dict) and c.get("command_id") and c.get("command_line"):
+                    final_lookup[c["command_id"]] = c["command_line"]
+
+            # 2. 尝试从 TaskNoteStore 反查租户全部命令
+            if task_id and agent_instance_id:
+                try:
+                    from agent_runtime.task_note.task_note_store import get_task_note_store
+
+                    store = get_task_note_store()
+                    db_cmds = store.get_all_command_lines_for_tenant(
+                        task_id=task_id, agent_instance_id=agent_instance_id
+                    )
+                    if db_cmds:
+                        final_lookup.update(db_cmds)
+                except Exception as exc:
+                    logger.debug("从 TaskNoteStore 反查命令行映射失败 (已忽略): %s", exc)
+
+        markdown_note = format_task_note_to_markdown(
+            snapshot_dict,
+            command_lookup=final_lookup,
+            current_working_directory=current_working_directory,
         )
+
         return (
             "系统已完成上下文压缩与Note更新，并切换至全新的干净会话。你的运行态已恢复为业务Agent。\n"
-            f"以下是为你恢复的最新完整Note快照：\n{snapshot_str}\n\n"
-            "请根据Note中的任务状态、进展与下一步计划，继续执行并推进用户业务任务。"
+            "以下是为你反查与整理的最新任务现场工作手记快照（含重点源码与命令行执行反查）：\n\n"
+            f"{markdown_note}\n\n"
+            "请根据工作手记中的现场进度与下一步行动指针（Next Step）、待办清单、已解决问题与业务方案，直接继续执行并推进用户业务任务。"
         )

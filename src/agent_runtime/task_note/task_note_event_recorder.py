@@ -118,7 +118,6 @@ class TaskNoteEventRecorder:
         agent_instance_id: str | None,
         command_id: str | None,
         command_line: str,
-        mission_id: str | None = None,
     ) -> bool:
         """记录终端命令索引到 task_command_records。"""
         if not task_id or not agent_instance_id or not command_id or self._connection_factory is None:
@@ -130,16 +129,15 @@ class TaskNoteEventRecorder:
                     cur.execute(
                         """
                         INSERT INTO task_command_records (
-                            command_id, task_id, mission_id, agent_instance_id, command_line
+                            command_id, task_id, agent_instance_id, command_line
                         ) VALUES (
-                            %s, %s, %s, %s, %s
+                            %s, %s, %s, %s
                         )
                         ON CONFLICT (command_id) DO NOTHING
                         """,
                         (
                             command_id,
                             task_id,
-                            mission_id,
                             agent_instance_id,
                             command_line,
                         ),
@@ -157,7 +155,6 @@ class TaskNoteEventRecorder:
         agent_instance_id: str | None,
         command_id: str | None,
         command_line: str,
-        mission_id: str | None = None,
     ) -> bool:
         """异步记录终端命令索引。"""
         return await asyncio.to_thread(
@@ -166,7 +163,6 @@ class TaskNoteEventRecorder:
             agent_instance_id=agent_instance_id,
             command_id=command_id,
             command_line=command_line,
-            mission_id=mission_id,
         )
 
     def record_subagent_relationship(

@@ -2209,8 +2209,13 @@ class AgentExecutionEngine:
                         )
                     )
 
-                    # 4. 注入包含 Note 快照与业务唤醒指示的初始消息
-                    resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(latest_note_snapshot)
+                    # 4. 注入包含 Note 快照与业务唤醒指示的初始消息（反查源码行号与命令行指令，组织为 Markdown 工作手记）
+                    resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(
+                        note_snapshot=latest_note_snapshot,
+                        current_working_directory=instance.current_working_directory,
+                        task_id=task.task_id,
+                        agent_instance_id=instance.instance_id,
+                    )
                     resumed_msg = UniMessage(
                         role=ROLE_USER,
                         content=[TextPart(text=resumed_prompt)],
@@ -4318,7 +4323,9 @@ class AgentExecutionEngine:
             timeout_seconds, wake_mode = self._pause_wake_metadata_from_tool_results(tool_results)
             current_instance = self._runtime_gateway.pause_agent_instance(instance_id)
             self._runtime_gateway.pause_task(task_id)
-            conversation_id = current_instance.conversation_id or communication_context.metadata.get("conversation_id")
+            conversation_id = (
+                current_instance.conversation_id if current_instance is not None else None
+            ) or communication_context.metadata.get("conversation_id")
             timeout_handle = None
             if timeout_seconds > 0:
                 timeout_handle = self._schedule_pause_timeout(

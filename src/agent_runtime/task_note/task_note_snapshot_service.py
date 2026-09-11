@@ -252,7 +252,7 @@ class TaskNoteSnapshotService:
                     # 12. task_command_records
                     cur.execute(
                         """
-                        SELECT command_id, task_id, mission_id, agent_instance_id,
+                        SELECT command_id, task_id, agent_instance_id,
                                command_line, created_at
                         FROM task_command_records
                         WHERE task_id = %s AND agent_instance_id = %s

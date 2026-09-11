@@ -259,15 +259,17 @@ def test_task_note_store_crud_with_mock_db(mock_db):
     assert "UPDATE task_artifact_records" in sql
     assert "mission_id = %s" in sql
 
-    store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="command", resource_ids=["cmd-1"])
-    sql, params = executed[-1]
-    assert "UPDATE task_command_records" in sql
-
     store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="agent_relationship", resource_ids=["rel-1"])
     assert len(executed) >= 2
     # 验证级联更新 task_agent_messages
     assert any("UPDATE task_agent_relationships" in s for s, _ in executed)
     assert any("UPDATE task_agent_messages" in s for s, _ in executed)
+
+    # 4. get_command_lines_by_ids & get_all_command_lines_for_tenant
+    store.get_command_lines_by_ids(task_id="t1", command_ids=["cmd-1", "cmd-2"])
+    sql, params = executed[-1]
+    assert "FROM task_command_records" in sql
+    assert "command_id = ANY(%s)" in sql
 
 
 def test_task_note_tool_database_error_handling():
