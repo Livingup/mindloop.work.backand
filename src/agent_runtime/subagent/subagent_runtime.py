@@ -17,7 +17,13 @@ from agent_runtime.agent.file_input_policy import (
 )
 from agent_runtime.agent.north_gateway.agent_runtime_contracts import CreateChildAgentInstanceRequest
 from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
-from agent_runtime.conversation_message.message.models import ROLE_USER, TextPart, TextPartMeta, UniMessage
+from agent_runtime.conversation_message.message.models import (
+    ConfigurationComponentEvent,
+    ROLE_USER,
+    TextPart,
+    TextPartMeta,
+    UniMessage,
+)
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.file_resource.north_gateway.resource_create_contracts import RemoteUrlCreateRequest
 from agent_runtime.file_resource.shared_service import get_file_resource_service
@@ -33,6 +39,36 @@ if TYPE_CHECKING:
     from agent_runtime.communication.runtime_event_publisher import RuntimeEventPublisher
 
 logger = logging.getLogger(__name__)
+
+SUBAGENT_SUPPLEMENTARY_PROMPT_TEMPLATE = (
+    "你是由{{父agent实例id}}创建的子agent，上面的对话是父agent在创建你时之前的对话过程，"
+    "仅作为背景知识参考，你只需要完成父agent给你派发的子任务内容，不要去完成父agent的任务内容，"
+    "子任务内容会在下面的对话消息中给到你。注意一定不要把自己当成父agent去完成父agent的任务！"
+    "注意你的任务边界！你现在可用的工具范围是{{available_tools}}"
+)
+
+
+def _extract_definition_tool_names(definition: Any) -> set[str]:
+    if definition is None:
+        return set()
+    tool_names = set(getattr(definition, "tool_ids", ()))
+    for mcp in getattr(definition, "mcp_tools", ()):
+        tool_names.update(getattr(mcp, "tool_ids", ()))
+    return tool_names
+
+
+def _extract_tool_names_from_tools(tools: Any) -> set[str]:
+    if not tools:
+        return set()
+    names: set[str] = set()
+    for t in tools:
+        if isinstance(t, dict):
+            name = t.get("name") or t.get("function", {}).get("name")
+            if name:
+                names.add(str(name))
+        elif hasattr(t, "name"):
+            names.add(str(t.name))
+    return names
 
 
 
@@ -106,6 +142,8 @@ class SubagentRuntime:
             child_agent_definition_id=agent_definition_id,
             parent_conversation_id=parent_conversation_id,
             conversation_history_copy_message_count=conversation_history_copy_message_count,
+            parent_definition=parent_definition,
+            child_definition=child_definition,
         )
         try:
             _updated_task, child, relation = self._runtime_gateway.create_child_agent_instance(
@@ -509,6 +547,8 @@ class SubagentRuntime:
         child_agent_definition_id: str,
         parent_conversation_id: str | None,
         conversation_history_copy_message_count: int | None,
+        parent_definition: Any = None,
+        child_definition: Any = None,
     ) -> str | None:
         if parent_conversation_id is None or conversation_history_copy_message_count is None:
             logger.info(
@@ -540,15 +580,138 @@ class SubagentRuntime:
                 f"copy_count={conversation_history_copy_message_count} parent_message_count={parent_message_count}"
             )
         child_conversation = create_conversation()
-        for message in parent_conversation.messages[:conversation_history_copy_message_count]:
+        copied_messages = parent_conversation.messages[:conversation_history_copy_message_count]
+        for message in copied_messages:
             child_conversation.append_message(deepcopy(message))
+        boundary_message = _build_parent_history_boundary_message(
+            parent_agent_name=parent_agent_name,
+            parent_instance_id=parent.instance_id,
+        )
         child_conversation.append_message(
-            _build_parent_history_boundary_message(
-                parent_agent_name=parent_agent_name,
-                parent_instance_id=parent.instance_id,
-            ),
+            boundary_message,
             [TextPartMeta()],
         )
+
+        # ── 构造子会话配置时间线 ──────────────────────────────────
+        copied_message_ids = {m.message_id for m in copied_messages}
+        child_timeline: list[ConfigurationComponentEvent] = []
+
+        # 1. 继承父会话历史配置并冻结为 historical 快照
+        if getattr(parent_conversation, "timeline", None):
+            for ev in parent_conversation.timeline:
+                if ev.anchor == "start" or (
+                    ev.anchor in {"before_message_id", "after_message_id"}
+                    and ev.anchor_message_id in copied_message_ids
+                ):
+                    snapshot = ev.snapshot
+                    if ev.status == "active" and snapshot is None:
+                        if ev.component == "prompt":
+                            snapshot = getattr(parent_conversation, "system_prompt", "") or ""
+                        elif ev.component == "tool":
+                            snapshot = getattr(parent_conversation, "tools", ()) or ()
+                    child_timeline.append(
+                        ConfigurationComponentEvent(
+                            event_id=ev.event_id,
+                            definition_id=ev.definition_id,
+                            anchor=ev.anchor,
+                            anchor_message_id=ev.anchor_message_id,
+                            sequence=ev.sequence,
+                            status="historical",
+                            snapshot=snapshot if snapshot is not None else ("" if ev.component == "prompt" else ()),
+                            revision=ev.revision,
+                            component=ev.component,
+                            supplementary_prompts=getattr(ev, "supplementary_prompts", ()),
+                        )
+                    )
+        else:
+            parent_def_id = getattr(parent, "agent_definition_id", "parent")
+            parent_tools = getattr(parent_conversation, "tools", ())
+            if parent_tools:
+                child_timeline.append(
+                    ConfigurationComponentEvent(
+                        event_id=f"evt_tool_parent_{uuid4().hex[:8]}",
+                        definition_id=parent_def_id,
+                        anchor="start",
+                        sequence=0,
+                        status="historical",
+                        snapshot=parent_tools,
+                        component="tool",
+                    )
+                )
+            parent_prompt = getattr(parent_conversation, "system_prompt", None)
+            if parent_prompt:
+                child_timeline.append(
+                    ConfigurationComponentEvent(
+                        event_id=f"evt_prompt_parent_{uuid4().hex[:8]}",
+                        definition_id=parent_def_id,
+                        anchor="start",
+                        sequence=1,
+                        status="historical",
+                        snapshot=parent_prompt,
+                        component="prompt",
+                    )
+                )
+
+        # 2. 尝试补齐 parent_definition 和 child_definition（若未传入且 gateway 可用）
+        if parent_definition is None and hasattr(self, "_agent_definition_gateway"):
+            parent_def_id = getattr(parent, "agent_definition_id", None)
+            if parent_def_id:
+                try:
+                    parent_definition = self._agent_definition_gateway.get_agent_definition(parent_def_id)
+                except Exception:
+                    parent_definition = None
+        if child_definition is None and hasattr(self, "_agent_definition_gateway"):
+            try:
+                child_definition = self._agent_definition_gateway.get_agent_definition(child_agent_definition_id)
+            except Exception:
+                child_definition = None
+
+        # 3. 统计父子工具集合，判断是否需要 active 工具事件
+        parent_tool_names: set[str] = set()
+        parent_tool_names.update(_extract_tool_names_from_tools(getattr(parent_conversation, "tools", ())))
+        for ev in child_timeline:
+            if ev.component == "tool" and ev.snapshot:
+                parent_tool_names.update(_extract_tool_names_from_tools(ev.snapshot))
+        parent_tool_names.update(_extract_definition_tool_names(parent_definition))
+
+        child_tool_names = _extract_definition_tool_names(child_definition)
+        need_child_tool_event = False
+        if child_tool_names:
+            need_child_tool_event = not child_tool_names.issubset(parent_tool_names)
+
+        if need_child_tool_event:
+            child_timeline.append(
+                ConfigurationComponentEvent(
+                    event_id=f"evt_tool_child_{uuid4().hex[:8]}",
+                    definition_id=child_agent_definition_id,
+                    anchor="after_message_id",
+                    anchor_message_id=boundary_message.message_id,
+                    sequence=0,
+                    status="active",
+                    component="tool",
+                )
+            )
+
+        # 4. 追加子 Agent 活跃系统提示词事件，挂载阶段 ① 替换完成的补充提示词
+        supplementary_prompt = SUBAGENT_SUPPLEMENTARY_PROMPT_TEMPLATE.replace(
+            "{{父agent实例id}}",
+            str(parent.instance_id),
+        )
+        child_timeline.append(
+            ConfigurationComponentEvent(
+                event_id=f"evt_prompt_child_{uuid4().hex[:8]}",
+                definition_id=child_agent_definition_id,
+                anchor="after_message_id",
+                anchor_message_id=boundary_message.message_id,
+                sequence=1,
+                status="active",
+                component="prompt",
+                supplementary_prompts=(supplementary_prompt,),
+            )
+        )
+
+        child_conversation.timeline = child_timeline
+
         await self._conversation_repository.create(
             child_conversation,
             task_id=parent.task_id,
@@ -557,15 +720,17 @@ class SubagentRuntime:
             agent_instance_id=child_instance_id,
         )
         logger.info(
-            "已为子 Agent 创建父会话历史副本并静默追加范围边界消息: "
+            "已为子 Agent 创建父会话历史副本并静默追加范围边界消息与配置时间线: "
             "parent_instance_id=%s child_instance_id=%s parent_conversation_id=%s "
-            "child_conversation_id=%s copied_parent_message_count=%s child_message_count=%s",
+            "child_conversation_id=%s copied_parent_message_count=%s child_message_count=%s "
+            "timeline_events_count=%s",
             parent.instance_id,
             child_instance_id,
             parent_conversation_id,
             child_conversation.id,
             conversation_history_copy_message_count,
             len(child_conversation.messages),
+            len(child_timeline),
         )
         return child_conversation.id
 

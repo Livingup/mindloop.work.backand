@@ -1226,3 +1226,269 @@ def test_explicit_prompt_cache_breakpoint_opt_in(monkeypatch):
         assert captured["input"][0]["content"][0]["text"] == "optin prompt"
 
     asyncio.run(run())
+
+
+def test_subagent_timeline_seeding_and_placeholder_replacement():
+    """验证子会话从父会话种子化时时间线的完整构建逻辑：
+    1. 父会话的历史配置被冻结为 historical snapshot（start 锚点）；
+    2. 子 Agent 活跃提示词事件被锚定在 boundary 消息之后；
+    3. 阶段 ① 替换：{{父agent实例id}} 在创建事件时被替换为父实例 ID；
+    4. 阶段 ② 替换：{{available_tools}} 在 Responses 适配器渲染时被替换为可用工具名 JSON 数组并置顶；
+    5. 当子工具为父工具子集时，不追加任何 additional_tools 事件。
+    """
+    from types import SimpleNamespace
+    from agent_runtime.subagent.subagent_runtime import SubagentRuntime
+
+    async def run():
+        parent_conv = Conversation(
+            id="conv-parent-001",
+            system_prompt="Parent system prompt",
+            tools=(
+                {"type": "function", "name": "read_file", "description": "read"},
+                {"type": "function", "name": "list_dir", "description": "list"},
+            ),
+        )
+        parent_conv.append_message(UniMessage(role="user", content=[TextPart("父第一轮消息")]))
+        parent_conv.append_message(UniMessage(role="assistant", content=[TextPart("父回复")]))
+
+        class _Repo:
+            def __init__(self):
+                self.saved: Conversation | None = None
+            async def get(self, cid):
+                return parent_conv
+            async def create(self, conv, **kwargs):
+                self.saved = conv
+
+        repo = _Repo()
+        runtime = SubagentRuntime(
+            runtime_gateway=object(),
+            agent_definition_gateway=object(),
+            llm_registry_gateway=object(),
+            execution_engine=object(),
+            event_publisher=object(),
+            conversation_repository=repo,
+        )
+
+        parent_def = SimpleNamespace(agent_id="parent_agent", tool_ids=("read_file", "list_dir"), mcp_tools=())
+        child_def = SimpleNamespace(agent_id="child_agent", tool_ids=("read_file",), mcp_tools=())
+
+        child_conv_id = await runtime._seed_child_conversation_from_parent_prefix(
+            parent=SimpleNamespace(
+                instance_id="inst-parent-999",
+                task_id="task-001",
+                conversation_id=parent_conv.id,
+                agent_definition_id="parent_agent",
+            ),
+            parent_agent_name="ParentAgent",
+            child_instance_id="inst-child-111",
+            child_thread_id="thread-child",
+            child_agent_definition_id="child_agent",
+            parent_conversation_id=parent_conv.id,
+            conversation_history_copy_message_count=2,
+            parent_definition=parent_def,
+            child_definition=child_def,
+        )
+
+        child_conv = repo.saved
+        assert child_conv is not None
+        # 验证 timeline 事件
+        assert len(child_conv.timeline) == 3
+        # 1. 历史 tool snapshot
+        assert child_conv.timeline[0].component == "tool"
+        assert child_conv.timeline[0].status == "historical"
+        assert child_conv.timeline[0].anchor == "start"
+        assert child_conv.timeline[0].snapshot == parent_conv.tools
+        # 2. 历史 prompt snapshot
+        assert child_conv.timeline[1].component == "prompt"
+        assert child_conv.timeline[1].status == "historical"
+        assert child_conv.timeline[1].anchor == "start"
+        assert child_conv.timeline[1].snapshot == "Parent system prompt"
+        # 3. 活跃 child prompt
+        boundary_id = child_conv.messages[-1].message_id
+        child_prompt_event = child_conv.timeline[2]
+        assert child_prompt_event.component == "prompt"
+        assert child_prompt_event.status == "active"
+        assert child_prompt_event.anchor == "after_message_id"
+        assert child_prompt_event.anchor_message_id == boundary_id
+        # 验证阶段 ① 替换：包含 inst-parent-999，但还保留 {{available_tools}}
+        assert "inst-parent-999" in child_prompt_event.supplementary_prompts[0]
+        assert "{{available_tools}}" in child_prompt_event.supplementary_prompts[0]
+
+        # 模拟 child agent 运行时设置自己的 prompt 和 tools 并执行 render
+        child_conv.system_prompt = "Child specific instructions"
+        child_conv.tools = ({"type": "function", "name": "read_file", "description": "read"},)
+
+        rendered = await OpenAIAdapter().render(child_conv, _Resolver())
+        items = rendered.input
+        assert items[0]["type"] == "additional_tools"
+        assert len(items[0]["tools"]) == 2
+        assert items[1]["role"] == "developer"
+        assert items[1]["content"][0]["text"] == "Parent system prompt"
+
+        # 找到 boundary 消息后面的项
+        # items[2] = user (父消息1), items[3] = assistant (父回复), items[4] = user (boundary)
+        assert items[4]["role"] == "user"
+        assert "ParentAgent" in items[4]["content"][0]["text"]
+
+        # items[5] 应该是 developer 消息，且不是 additional_tools (因为被父工具包含)
+        assert items[5]["role"] == "developer"
+        dev_text = items[5]["content"][0]["text"]
+        # 验证阶段 ② 替换：{{available_tools}} 已经被替换为 ["read_file"]
+        assert '["read_file"]' in dev_text
+        assert "你是由inst-parent-999创建的子agent" in dev_text
+        assert "Child specific instructions" in dev_text
+        assert len(items) == 6
+
+    asyncio.run(run())
+
+
+def test_subagent_timeline_delta_tools_when_not_subset():
+    """验证当子 Agent 拥有父 Agent 不具备的新工具时：
+    1. 子会话创建时在 boundary 后挂载 active tool 事件；
+    2. 渲染时仅在 boundary 后增量输出差集 additional_tools；
+    3. 补充提示词中的可用工具范围仍完整包含全部可用工具。
+    """
+    from types import SimpleNamespace
+    from agent_runtime.subagent.subagent_runtime import SubagentRuntime
+
+    async def run():
+        parent_conv = Conversation(
+            id="conv-parent-002",
+            system_prompt="Parent prompt",
+            tools=({"type": "function", "name": "read_file"},),
+        )
+        parent_conv.append_message(UniMessage(role="user", content=[TextPart("hello")]))
+
+        class _Repo:
+            def __init__(self):
+                self.saved: Conversation | None = None
+            async def get(self, cid):
+                return parent_conv
+            async def create(self, conv, **kwargs):
+                self.saved = conv
+
+        repo = _Repo()
+        runtime = SubagentRuntime(
+            runtime_gateway=object(),
+            agent_definition_gateway=object(),
+            llm_registry_gateway=object(),
+            execution_engine=object(),
+            event_publisher=object(),
+            conversation_repository=repo,
+        )
+
+        parent_def = SimpleNamespace(agent_id="parent_agent", tool_ids=("read_file",), mcp_tools=())
+        # child has read_file AND new_extra_tool
+        child_def = SimpleNamespace(agent_id="child_agent", tool_ids=("read_file", "new_extra_tool"), mcp_tools=())
+
+        child_conv_id = await runtime._seed_child_conversation_from_parent_prefix(
+            parent=SimpleNamespace(
+                instance_id="inst-parent-888",
+                task_id="task-002",
+                conversation_id=parent_conv.id,
+                agent_definition_id="parent_agent",
+            ),
+            parent_agent_name="ParentAgent",
+            child_instance_id="inst-child-222",
+            child_thread_id="thread-child-2",
+            child_agent_definition_id="child_agent",
+            parent_conversation_id=parent_conv.id,
+            conversation_history_copy_message_count=1,
+            parent_definition=parent_def,
+            child_definition=child_def,
+        )
+
+        child_conv = repo.saved
+        assert child_conv is not None
+        boundary_id = child_conv.messages[-1].message_id
+        # 应有 4 个事件：父tool(historical), 父prompt(historical), 子tool(active), 子prompt(active)
+        assert len(child_conv.timeline) == 4
+        assert child_conv.timeline[2].component == "tool"
+        assert child_conv.timeline[2].status == "active"
+        assert child_conv.timeline[2].anchor_message_id == boundary_id
+
+        # 运行时设置 child 完整工具
+        child_conv.system_prompt = "Child prompt"
+        child_conv.tools = (
+            {"type": "function", "name": "read_file"},
+            {"type": "function", "name": "new_extra_tool"},
+        )
+
+        rendered = await OpenAIAdapter().render(child_conv, _Resolver())
+        items = rendered.input
+        # items[0] = additional_tools (read_file)
+        assert items[0]["tools"] == [{"type": "function", "name": "read_file"}]
+        # items[1] = developer (Parent prompt)
+        assert items[1]["role"] == "developer"
+        # items[2] = user (hello)
+        assert items[2]["role"] == "user"
+        # items[3] = user (boundary)
+        assert items[3]["role"] == "user"
+        # items[4] = additional_tools AFTER boundary, containing ONLY new_extra_tool!
+        assert items[4]["type"] == "additional_tools"
+        assert items[4]["tools"] == [{"type": "function", "name": "new_extra_tool"}]
+        # items[5] = developer (Child prompt with supplementary prompt)
+        assert items[5]["role"] == "developer"
+        dev_text = items[5]["content"][0]["text"]
+        assert '["read_file", "new_extra_tool"]' in dev_text
+        assert "你是由inst-parent-888创建的子agent" in dev_text
+
+    asyncio.run(run())
+
+
+def test_sqlite_conversation_repository_preserves_timeline_and_config(tmp_path):
+    """验证 SqliteConversationRepository 内存缓存完整保留 timeline、system_prompt 和 tools。"""
+    async def run():
+        repo = SqliteConversationRepository(tmp_path)
+        conv = Conversation(
+            id="conv-cache-test",
+            system_prompt="My system prompt",
+            tools=({"type": "function", "name": "t1"},),
+            timeline=[
+                ConfigurationComponentEvent(
+                    event_id="e1",
+                    definition_id="def1",
+                    anchor="start",
+                    status="historical",
+                    snapshot="My system prompt",
+                    component="prompt",
+                )
+            ],
+        )
+        await repo.create(
+            conv,
+            task_id="task-1",
+            thread_id="th-1",
+            agent_id="ag-1",
+            agent_instance_id="inst-1",
+        )
+
+        loaded = await repo.get("conv-cache-test")
+        assert loaded.system_prompt == "My system prompt"
+        assert len(loaded.tools) == 1
+        assert loaded.tools[0]["name"] == "t1"
+        assert len(loaded.timeline) == 1
+        assert loaded.timeline[0].event_id == "e1"
+
+        # Update and save
+        loaded.system_prompt = "Updated prompt"
+        loaded.timeline.append(
+            ConfigurationComponentEvent(
+                event_id="e2",
+                definition_id="def2",
+                anchor="start",
+                status="active",
+                component="tool",
+            )
+        )
+        await repo.save(loaded)
+
+        loaded2 = await repo.get("conv-cache-test")
+        assert loaded2.system_prompt == "Updated prompt"
+        assert len(loaded2.timeline) == 2
+
+        await repo.delete("conv-cache-test")
+        with pytest.raises(KeyError):
+            await repo.get("conv-cache-test")
+
+    asyncio.run(run())

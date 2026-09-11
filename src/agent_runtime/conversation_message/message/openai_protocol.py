@@ -346,14 +346,21 @@ def _render_openai_configuration_timeline(
                     view.current_prompt,
                     component_name="提示词",
                 )
-                rendered.append(_build_openai_developer_message(prompt_value))
+                rendered.append(
+                    _build_openai_developer_message(
+                        prompt_value,
+                        supplementary_prompts=getattr(event, "supplementary_prompts", ()),
+                        available_tool_names=view.available_tool_names,
+                    )
+                )
             else:
                 tool_value = _resolve_configuration_event_value(
                     event,
                     view.current_tools,
                     component_name="工具",
                 )
-                rendered.append(_build_openai_additional_tools(tool_value))
+                if tool_value:
+                    rendered.append(_build_openai_additional_tools(tool_value))
         return rendered
 
     start_items = render_group("start", None)
@@ -388,13 +395,38 @@ def _resolve_configuration_event_value(
     return tuple(clone_raw_value(tool) for tool in current.ordered_definitions)
 
 
-def _build_openai_developer_message(value: Any) -> dict[str, Any]:
+def _build_openai_developer_message(
+    value: Any,
+    *,
+    supplementary_prompts: tuple[str, ...] = (),
+    available_tool_names: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    tool_names_json = json.dumps(list(available_tool_names), ensure_ascii=False)
+    rendered_supplements: list[str] = []
+    for sp in supplementary_prompts:
+        text = sp.replace("{{available_tools}}", tool_names_json)
+        text = text.replace(
+            "{{子agent的tools名称数组，根据agent设置的conversation中的最新tools来填充 }}",
+            tool_names_json,
+        )
+        text = text.replace("{{子agent的tools名称数组}}", tool_names_json)
+        rendered_supplements.append(text)
+
     if isinstance(value, str):
-        content: list[dict[str, Any]] = [{"type": "input_text", "text": value}]
+        if rendered_supplements:
+            full_text = "\n\n".join([*rendered_supplements, value])
+        else:
+            full_text = value
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": full_text}]
     elif isinstance(value, (list, tuple)):
         content = [clone_raw_value(item) for item in value]
         if not all(isinstance(item, dict) for item in content):
             raise TypeError("提示词 snapshot/resolved_content 必须是 str 或内容块字典序列。")
+        if rendered_supplements:
+            supplement_blocks = [
+                {"type": "input_text", "text": text} for text in rendered_supplements
+            ]
+            content = [*supplement_blocks, *content]
     else:
         raise TypeError("提示词 snapshot/resolved_content 必须是 str 或内容块字典序列。")
     for block in content:

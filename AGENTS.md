@@ -88,6 +88,7 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 3. 针对 OpenAI Responses 协议：系统提示词和 tools 投影到 `input`（作为 `developer` 消息与 `additional_tools`）并在初始提示词末尾打上显式缓存断点（自定义断点+自动隐式断点模式），是该协议本身的强制要求，与会话是否存在时间线彻底解耦。未发生角色切换的纯净会话（无时间线）无条件自动投影为首部 input 配置；时间线仅在中途发生定义切换时记录历史快照并按锚点追加新事件以维持前缀缓存。
 4. 针对非 OpenAI Responses 协议（Claude、Gemini、Chat Completions 等）：底层自动忽略配置时间线重放，直接按本次请求传入的最新的系统提示词和工具定义处理。
 5. 异构模型接力对话时，各协议适配器遵循“同协议无损原样回灌 raw、跨协议公共层安全降级”原则；跨协议时必须剥离平台私有签名或加密思维链（如 Claude signature、OpenAI encrypted_content），绝不得伪造成目标协议的思维链凭证。
+6. 子 Agent 继承父 Agent 会话前缀时，必须构建并继承配置时间线：将父会话配置冻结为 start 处的 historical 快照；子 Agent 的新配置作为 active 事件锚定在边界消息（boundary message）之后。子 Agent 系统提示词需在最开头挂载补充提示词（明确任务边界与可用工具范围），支持两阶段占位符替换（创建事件时替换父实例 ID，协议渲染时替换最新可用工具名列表）。子 Agent 工具若为父 Agent 工具子集，不追加新的 `additional_tools`，由提示词声明可用权限；若不包含，仅增量追加缺失的差集工具（$\Delta Tools = Tools_{child} \setminus Tools_{parent}$），确保最大化维持前缀缓存。
 
 ### 通用通信模块（communication）
 

@@ -10,6 +10,7 @@ import math
 import time
 import textwrap
 import uuid
+from copy import deepcopy
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,7 @@ from agent_runtime.communication.runtime_event_publisher import (
 )
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import (
+    ConfigurationComponentEvent,
     PartMeta,
     ImagePart,
     ImagePartMeta,
@@ -2990,6 +2992,34 @@ class AgentExecutionEngine:
                     },
                     expected_next="llm.candidate.response",
                 )
+                conversation.system_prompt = system_prompt
+                conversation.tools = tuple(
+                    deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
+                    for t in tools
+                )
+                if not getattr(conversation, "timeline", None):
+                    if system_prompt is not None:
+                        conversation.record_configuration_event(
+                            ConfigurationComponentEvent(
+                                event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
+                                definition_id=agent_definition.agent_id,
+                                anchor="start",
+                                sequence=1,
+                                status="active",
+                                component="prompt",
+                            )
+                        )
+                    if tools:
+                        conversation.record_configuration_event(
+                            ConfigurationComponentEvent(
+                                event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
+                                definition_id=agent_definition.agent_id,
+                                anchor="start",
+                                sequence=0,
+                                status="active",
+                                component="tool",
+                            )
+                        )
                 response = await self._llm_request_service.send_prompt(
                     LlmPromptRequest(
                         conversation=conversation,

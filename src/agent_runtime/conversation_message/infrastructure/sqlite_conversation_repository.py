@@ -174,6 +174,11 @@ CREATE TABLE IF NOT EXISTS pending_tool_results (
 """
 
 
+_TIMELINE_CACHE: dict[str, list[Any]] = {}
+_SYSTEM_PROMPT_CACHE: dict[str, str | None] = {}
+_TOOLS_CACHE: dict[str, tuple[dict[str, Any], ...]] = {}
+
+
 class SqliteConversationRepository:
     """会话仓储混合持久化实现：SQLite 元数据 + JSONL 消息文件。
 
@@ -224,6 +229,9 @@ class SqliteConversationRepository:
             )
             self._upsert_state(conv.id, conv.state)
             c.commit()
+            _TIMELINE_CACHE[conv.id] = list(conv.timeline)
+            _SYSTEM_PROMPT_CACHE[conv.id] = getattr(conv, "system_prompt", None)
+            _TOOLS_CACHE[conv.id] = tuple(getattr(conv, "tools", ()))
             # 写入已有消息（创建时通常为空）。
             if conv.messages:
                 self._write_messages_file(task_id, conv.id, conv.messages)
@@ -275,6 +283,9 @@ class SqliteConversationRepository:
                 messages=messages,
                 state=state,
                 provider_state=provider_state,
+                timeline=list(_TIMELINE_CACHE.get(conversation_id, [])),
+                system_prompt=_SYSTEM_PROMPT_CACHE.get(conversation_id),
+                tools=_TOOLS_CACHE.get(conversation_id, ()),
             )
 
     async def save(self, conv: Conversation) -> None:
@@ -284,6 +295,9 @@ class SqliteConversationRepository:
             task_id = self._get_task_id(cid)
             if not task_id:
                 raise KeyError(f"Conversation not found: {cid}")
+            _TIMELINE_CACHE[cid] = list(conv.timeline)
+            _SYSTEM_PROMPT_CACHE[cid] = getattr(conv, "system_prompt", None)
+            _TOOLS_CACHE[cid] = tuple(getattr(conv, "tools", ()))
             # 覆写 JSONL 消息文件。
             self._write_messages_file(task_id, cid, conv.messages)
             # 覆写会话派生状态。
@@ -299,6 +313,9 @@ class SqliteConversationRepository:
 
     async def delete(self, conversation_id: str) -> None:
         with self._lock:
+            _TIMELINE_CACHE.pop(conversation_id, None)
+            _SYSTEM_PROMPT_CACHE.pop(conversation_id, None)
+            _TOOLS_CACHE.pop(conversation_id, None)
             task_id = self._get_task_id(conversation_id)
             # 删除 JSONL 消息文件。
             if task_id:

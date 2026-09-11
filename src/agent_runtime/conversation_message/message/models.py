@@ -250,6 +250,7 @@ class ConfigurationComponentEvent:
     snapshot: Any | None = None
     revision: str | None = None
     component: Literal["prompt", "tool"] | None = None
+    supplementary_prompts: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.status not in {"historical", "active"}:
@@ -271,6 +272,13 @@ class ConfigurationComponentEvent:
             raise ValueError("历史配置事件必须包含冻结 snapshot。")
         if self.component is not None and self.component not in {"prompt", "tool"}:
             raise ValueError("配置事件 component 必须是 prompt 或 tool。")
+        if self.supplementary_prompts is None:
+            object.__setattr__(self, "supplementary_prompts", ())
+        elif not isinstance(self.supplementary_prompts, tuple):
+            object.__setattr__(self, "supplementary_prompts", tuple(self.supplementary_prompts))
+        for prompt in self.supplementary_prompts:
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError("supplementary_prompts 必须是非空字符串序列。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,12 +317,17 @@ class RequestConfigurationView:
     tool_events: tuple[ConfigurationComponentEvent, ...] = field(default_factory=tuple)
     current_prompt: CurrentPromptConfiguration | None = None
     current_tools: CurrentToolsConfiguration | None = None
+    available_tool_names: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not self.conversation_id:
             raise ValueError("配置视图 conversation_id 不能为空。")
         if not self.view_revision:
             raise ValueError("配置视图 view_revision 不能为空。")
+        if self.available_tool_names is None:
+            object.__setattr__(self, "available_tool_names", ())
+        elif not isinstance(self.available_tool_names, tuple):
+            object.__setattr__(self, "available_tool_names", tuple(self.available_tool_names))
         _validate_component_events("提示词", self.prompt_events, self.current_prompt)
         _validate_component_events("工具", self.tool_events, self.current_tools)
         all_event_ids = [event.event_id for event in (*self.prompt_events, *self.tool_events)]
@@ -393,6 +406,11 @@ def build_current_request_configuration_view(
             definition_id="runtime-current-tools",
             ordered_definitions=tools,
         )
+    tool_names = tuple(
+        str(t.get("name") or t.get("function", {}).get("name"))
+        for t in tools
+        if (t.get("name") or t.get("function", {}).get("name"))
+    )
     return RequestConfigurationView(
         conversation_id=conversation_id,
         view_revision="runtime-current",
@@ -400,6 +418,7 @@ def build_current_request_configuration_view(
         tool_events=tool_events,
         current_prompt=current_prompt,
         current_tools=current_tools,
+        available_tool_names=tool_names,
     )
 
 
@@ -489,10 +508,21 @@ def build_request_configuration_view_from_timeline(
         raise ValueError("工具配置事件最多只能有一个 active 事件。")
     if active_tool_events:
         active_t = active_tool_events[0]
+        existing_tool_names = {
+            str(t.get("name") or t.get("function", {}).get("name"))
+            for ev in tool_events
+            if ev.status == "historical" and ev.snapshot
+            for t in (ev.snapshot if isinstance(ev.snapshot, (list, tuple)) else ())
+            if (t.get("name") or t.get("function", {}).get("name"))
+        }
+        delta_tools = tuple(
+            t for t in tools
+            if str(t.get("name") or t.get("function", {}).get("name")) not in existing_tool_names
+        )
         current_tools = CurrentToolsConfiguration(
             event_id=active_t.event_id,
             definition_id=active_t.definition_id,
-            ordered_definitions=tuple(tools),
+            ordered_definitions=delta_tools,
             revision=active_t.revision,
         )
     elif tools and not tool_events:
@@ -512,6 +542,12 @@ def build_request_configuration_view_from_timeline(
             ordered_definitions=tuple(tools),
         )
 
+    tool_names = tuple(
+        str(t.get("name") or t.get("function", {}).get("name"))
+        for t in tools
+        if (t.get("name") or t.get("function", {}).get("name"))
+    )
+
     return RequestConfigurationView(
         conversation_id=conversation_id,
         view_revision=view_revision or f"view_{uuid4().hex[:8]}",
@@ -519,6 +555,7 @@ def build_request_configuration_view_from_timeline(
         tool_events=tuple(tool_events),
         current_prompt=current_prompt,
         current_tools=current_tools,
+        available_tool_names=tool_names,
     )
 
 
