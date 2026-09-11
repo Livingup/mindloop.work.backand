@@ -79,6 +79,13 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
             for s in snippets
         ]
 
+    @router.get("/builtin-variables", response_model=list[dict[str, str]])
+    def get_builtin_variables() -> list[dict[str, str]]:
+        """获取系统内置提示词变量定义列表（包含占位符、含义说明与取值逻辑说明）。"""
+        from agent_runtime.prompt_template.prompt_variables import list_builtin_prompt_variables
+
+        return list_builtin_prompt_variables()
+
     @router.get("/{name}", response_model=SnippetResponse)
     def get_snippet(name: str) -> SnippetResponse:
         """根据唯一描述名获取提示词片段。"""

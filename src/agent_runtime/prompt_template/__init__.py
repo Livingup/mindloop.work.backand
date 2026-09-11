@@ -8,9 +8,26 @@ from agent_runtime.prompt_template.prompt_template_factory import PromptTemplate
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_gateway import (
     PromptSnippetGateway,
 )
+from agent_runtime.prompt_template.prompt_variables import (
+    BUILTIN_PROMPT_VARIABLES,
+    PromptVariableContext,
+    PromptVariableDefinition,
+    build_prompt_variable_values,
+    get_builtin_prompt_variables,
+    list_builtin_prompt_variables,
+    render_prompt_variables,
+)
 
 __all__ = [
     "PromptTemplateConfig",
     "PromptTemplateFactory",
     "PromptSnippetGateway",
+    "PromptVariableDefinition",
+    "PromptVariableContext",
+    "BUILTIN_PROMPT_VARIABLES",
+    "get_builtin_prompt_variables",
+    "list_builtin_prompt_variables",
+    "build_prompt_variable_values",
+    "render_prompt_variables",
 ]
+

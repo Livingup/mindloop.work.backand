@@ -216,26 +216,16 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIsNotNone(prompt)
         prompt_text = prompt or ""
         self.assertTrue(prompt_text.startswith("# 身份id和工作空间"))
-        self.assertIn("你自己的 Agent 定义 ID：`agent-c`", prompt_text)
+        self.assertNotIn("你自己的 Agent 定义 ID", prompt_text)
         self.assertIn("你自己的 Agent 实例 ID：`agent-instance-self`", prompt_text)
         self.assertIn("当前工作目录：`G:\\project\\agent`", prompt_text)
-        self.assertIn("当前工作目录下的 Git 仓库根目录：", prompt_text)
-        self.assertIn("- `G:\\project\\agent`", prompt_text)
         self.assertIn("# 系统环境", prompt_text)
         self.assertIn("- Current working directory: `G:\\project\\agent`", prompt_text)
         self.assertIn("- Operating system:", prompt_text)
         self.assertIn("- OS release:", prompt_text)
         self.assertIn("- OS version:", prompt_text)
         self.assertIn("- Machine:", prompt_text)
-        self.assertIn("# 你的专属 Skill", prompt_text)
-        self.assertIn("`G:\\project\\agent\\skills\\agent-c\\SKILL.md`是你的专属 Skill 文件", prompt_text)
-        self.assertIn("系统会自动把他的内容追加到你系统提示词中。", prompt_text)
-        self.assertIn("# 你的专属项目记忆", prompt_text)
-        self.assertIn(
-            "`G:\\project\\agent\\.spread-ai\\memory\\agent-c\\memory.md`是专属于你的关于当前项目的私有记忆文件，"
-            "由你自己自学习进化来管理维护。系统会自动把他的内容追加到你系统提示词中。",
-            prompt_text,
-        )
+        self.assertNotIn("系统会自动把他的内容追加到你系统提示词中。", prompt_text)
         self.assertNotIn("# 沟通环境与身份", prompt_text)
         self.assertNotIn("MCP 支持说明", prompt_text)
         self.assertNotIn("# 专属 Skill 使用协议", prompt_text)
@@ -266,7 +256,11 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
                 AgentDefinition(
                     agent_id="agent-tail",
                     group="default",
-                    system_prompt=(SystemPromptSegment(text="AgentDefinition 自定义 prompt。"),),
+                    system_prompt=(
+                        SystemPromptSegment(
+                            text="AgentDefinition 自定义 prompt。\nSkill: {{dedicated_skill_file}}\nMemory: {{dedicated_memory_file}}"
+                        ),
+                    ),
                 ),
                 "agent-instance-tail",
                 str(workspace),
@@ -277,15 +271,14 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIsNotNone(prompt)
         prompt_text = prompt or ""
         self.assertIn("AgentDefinition 自定义 prompt。", prompt_text)
+        self.assertIn(str(skill_file), prompt_text)
+        self.assertIn(str(memory_file), prompt_text)
         self.assertIn("## Runtime lifecycle tool policy", prompt_text)
         self.assertIn("# 工具调用注意事项", prompt_text)
-        self.assertIn("# 你的专属 Skill 文件内容", prompt_text)
-        self.assertIn("# Skill Body\n\n- skill tail content", prompt_text)
-        self.assertIn("# 你的专属项目记忆文件内容", prompt_text)
-        self.assertIn("# Memory Body\n\n- memory tail content", prompt_text)
-        self.assertLess(prompt_text.index("# 工具调用注意事项"), prompt_text.index("# 你的专属 Skill 文件内容"))
-        self.assertLess(prompt_text.index("# 你的专属 Skill 文件内容"), prompt_text.index("# 你的专属项目记忆文件内容"))
-        self.assertTrue(prompt_text.endswith("# Memory Body\n\n- memory tail content"))
+        self.assertNotIn("# 你的专属 Skill 文件内容", prompt_text)
+        self.assertNotIn("# Skill Body\n\n- skill tail content", prompt_text)
+        self.assertNotIn("# 你的专属项目记忆文件内容", prompt_text)
+        self.assertNotIn("# Memory Body\n\n- memory tail content", prompt_text)
 
     def test_system_prompt_skips_missing_dedicated_learning_files_without_empty_headings(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -702,9 +695,6 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIn("# 可用的 MCP 服务列表", prompt)
         self.assertIn("`remote-search`：远端搜索 MCP 服务", prompt)
         self.assertIn("`search`：执行远端搜索", prompt)
-        self.assertIn("远端 MCP 服务工具不会直接设置到本轮 LLM 请求 tools 中", prompt)
-        self.assertIn("`mcp_get_tool_detail` 获取参数 schema", prompt)
-        self.assertIn("`mcp_call_tool` 执行", prompt)
         self.assertFalse(mcp_gateway.get_tool_detail_called)
 
     def test_build_llm_tools_keeps_mcp_meta_tools_local_and_skips_direct_mcp_tool_exposure(self) -> None:
@@ -782,8 +772,6 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         self.assertIn("# 可用的 MCP 服务列表", prompt_text)
         self.assertIn("`codebase-rag`", prompt_text)
         self.assertIn("`codebase_search`", prompt_text)
-        self.assertIn("`mcp_get_tool_detail` 获取参数 schema", prompt_text)
-        self.assertIn("`mcp_call_tool` 执行", prompt_text)
         self.assertNotIn("mcp__codebase-rag__codebase_search", prompt_text)
 
         stages = [item["stage"] for item in records]
@@ -824,8 +812,6 @@ class AgentExecutionPromptToolUsageNoticeTests(unittest.TestCase):
         prompt_text = prompt or ""
         self.assertIn("# 可用子 Agent", prompt_text)
         self.assertIn("- agent定义id：`research-agent`；功能：负责检索资料、整理事实依据，并把调研结论回传给父 Agent。", prompt_text)
-        self.assertIn("create_subagent", prompt_text)
-        self.assertIn("send_agent_message", prompt_text)
         self.assertNotIn("子 Agent 内部系统提示词不应泄漏给父 Agent。", prompt_text)
 
 

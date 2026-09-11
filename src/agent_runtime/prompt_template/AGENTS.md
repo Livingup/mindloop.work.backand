@@ -49,3 +49,11 @@ system_prompt:
 ```
 
 加载 Agent 定义时，调用本模块按 name 解析片段内容，拼接为完整系统提示词。
+
+## 提示词变量与占位符规范
+
+- **统一占位符模块**：系统内置变量统一由 `prompt_variables.py` 维护定义（占位符、名称、说明、取值逻辑说明字符串），并由执行引擎按上下文动态渲染替换。
+- **动态变量原则**：占位符纯粹代表运行时动态环境变量（如 `{{agent_instance_id}}`、`{{workspace}}`、`{{available_mcp_services}}`、`{{available_skills}}`、`{{available_subagents}}` 等），严禁设计常量占位符；常量必须直接作为普通自然语言写在模板文本中。
+- **条件分支控制**：系统提示词中包含 `if/else` 条件分支的逻辑（例如特定工具是否存在的使用注意事项、子 Agent 边界指令、动态列表装配）由程序执行引擎硬编码按条件组装，严禁在提示词模板引擎中自定义复杂的条件脚本语言。
+- **专属学习文件瘦身**：专属 Skill 文件（`SKILL.md`）和项目专属记忆文件（`memory.md`）不再将全文硬编码塞入系统提示词末尾，仅在模板中通过 `{{dedicated_skill_file}}` 与 `{{dedicated_memory_file}}` 注入绝对路径并声明阅读规范，由 Agent 自主通过 `file_read` 按需读取。
+- **Agent 身份标识约束**：Agent 执行环境与系统提示词中仅暴露运行时唯一实例句柄 `{{agent_instance_id}}`，不向 Agent 暴露静态定义 ID `agent_id`。

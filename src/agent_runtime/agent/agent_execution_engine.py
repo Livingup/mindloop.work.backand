@@ -54,6 +54,11 @@ from agent_runtime.communication.runtime_event_publisher import (
     RuntimeCommunicationContext,
     RuntimeEventPublisher,
 )
+from agent_runtime.prompt_template.prompt_variables import (
+    PromptVariableContext,
+    build_prompt_variable_values,
+    render_prompt_variables,
+)
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import (
     ConfigurationComponentEvent,
@@ -3372,30 +3377,72 @@ class AgentExecutionEngine:
             "llm.prompt.assemble.complete",
         )
 
-        dedicated_learning_files_prompt = _build_dedicated_learning_files_prompt(
-            definition,
-            current_working_directory,
-            skill_root_directory,
+        skill_root_path = Path(skill_root_directory).expanduser().resolve(strict=False) if skill_root_directory else Path("")
+        dedicated_skill_file = skill_root_path / definition.agent_id / "SKILL.md" if skill_root_directory else Path("")
+        working_directory = Path(current_working_directory).expanduser()
+        resolved_working_directory = working_directory.resolve(strict=False)
+        project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / definition.agent_id / "memory.md"
+        git_roots = _discover_git_roots_under(resolved_working_directory)
+        git_roots_prompt = "\n".join(f"- `{git_root}`" for git_root in git_roots)
+
+        var_context = PromptVariableContext(
+            agent_instance_id=agent_instance_id,
+            agent_name=definition.name or definition.agent_id,
+            current_working_directory=current_working_directory,
+            parent_agent_instance_id=str(render_options.get("parent_agent_instance_id") or ""),
+            skill_root_directory=skill_root_directory,
+            dedicated_skill_file=str(dedicated_skill_file) if skill_root_directory else "",
+            dedicated_memory_file=str(project_memory_file),
+            available_tools=tuple(tool.name for tool in llm_tools),
+            available_mcp_services=rendered_mcp_services_prompt,
+            available_subagents=available_subagents_prompt,
+            available_skills=skills_prompt,
+            git_repo_roots=git_roots_prompt,
+            frontend_channel=str(
+                render_options.get("channel")
+                or render_options.get("frontend_channel")
+                or "unknown"
+            ),
+            supported_text_formats=_format_render_option_values(
+                render_options.get("supported_text_formats")
+                or render_options.get("text_formats")
+                or ("html",)
+            ),
+            preferred_text_format=str(
+                render_options.get("preferred_text_format")
+                or render_options.get("text_format")
+                or "html"
+            ),
+        )
+        variable_values = build_prompt_variable_values(var_context)
+
+        # 若模板中已显式包含特定占位符，则避免在末尾重复追加该块
+        append_mcp = bool(rendered_mcp_services_prompt and "{{available_mcp_services}}" not in text)
+        append_skills = bool(skills_prompt and "{{available_skills}}" not in text)
+        append_subagents = bool(available_subagents_prompt and "{{available_subagents}}" not in text)
+        append_lifecycle = bool(
+            lifecycle_prompt
+            and "Runtime lifecycle tool policy" not in text
+            and "生命周期工具" not in text
         )
 
-        system_prompt = "\n\n".join(
-            item
-            for item in (
-                runtime_context_prompt,
-                text,
-                rendered_mcp_services_prompt,
-                skills_prompt,
-                available_subagents_prompt,
-                lifecycle_prompt,
-                tool_usage_notice,
-                dedicated_learning_files_prompt,
-            )
-            if item.strip()
-        ) or None
+        assembled_parts = [runtime_context_prompt, text]
+        if append_mcp:
+            assembled_parts.append(rendered_mcp_services_prompt)
+        if append_skills:
+            assembled_parts.append(skills_prompt)
+        if append_subagents:
+            assembled_parts.append(available_subagents_prompt)
+        if append_lifecycle:
+            assembled_parts.append(lifecycle_prompt)
+        assembled_parts.append(tool_usage_notice)
+
+        raw_system_prompt = "\n\n".join(item for item in assembled_parts if item.strip())
+        system_prompt = render_prompt_variables(raw_system_prompt, variable_values) or None
         _record_prompt_step(
             "llm.prompt.assemble.complete",
             "completed",
-            "系统提示词各片段拼接完成。",
+            "系统提示词各片段拼接与占位符变量替换完成。",
             {
                 "system_prompt_present": system_prompt is not None,
                 "system_prompt_length": len(system_prompt or ""),
@@ -3479,17 +3526,6 @@ class AgentExecutionEngine:
                     lines.append(f"    - `{tool_name}`：{tool_description}")
                 else:
                     lines.append(f"    - `{tool_name}`")
-        lines.append("## 使用方式")
-        lines.append(
-            "上方只列出 MCP 服务和可用工具摘要；为防止 LLM 请求参数中的 tools 膨胀，"
-            "这些远端 MCP 服务工具不会直接设置到本轮 LLM 请求 tools 中。"
-        )
-        lines.append(
-            "调用 MCP 工具时必须使用本地 MCP 代理工具：先用 `mcp_get_service_detail` 了解服务能力和使用指南，"
-            "必要时用 `mcp_list_resources` / `mcp_read_resource` 读取资源；调用具体工具前必须先用 "
-            "`mcp_get_tool_detail` 获取参数 schema，再用 `mcp_call_tool` 执行；"
-            "不要直接构造 mcp__{service_id}__{tool_name} 工具名。"
-        )
         return "\n".join(lines)
 
 
@@ -3528,12 +3564,7 @@ class AgentExecutionEngine:
         if not available_definitions:
             return ""
 
-        lines = [
-            "# 可用子 Agent",
-            "当前 Agent 可通过 `create_subagent` 工具创建下列直接子 Agent。"
-            "创建时 `agent_definition_id` 必须使用下方列出的定义 ID；"
-            "子 Agent 创建后可通过 `send_agent_message` 发送任务协作消息。",
-        ]
+        lines = ["# 可用子 Agent"]
         for sub_agent_definition in available_definitions:
             name = (sub_agent_definition.name or "").strip()
             description = (sub_agent_definition.description or "").strip()
@@ -3572,14 +3603,6 @@ class AgentExecutionEngine:
                 f"- `{skill.skill_id}`：skill 触发场景=`{skill.description}`；"
                 f"该 skill 仓库目录=`{skill.directory_path}`"
             )
-        lines.append("## skill 使用技巧")
-        lines.append(
-            "Skill 是 Agent 的“某个领域专家经验”，对你处理该领域的问题有极大的帮助。"
-            "每个 skill 都有他们适用的场景/领域，根据你当前的和接下来的目标来决定是否要读取某个 skill 的详细内容。"
-            "skill 仓库都是标准规范的 skill 目录，当你需要某个 skill 时，"
-            "使用命令行或是目录结构读取工具获取该 skill 仓库目录结构，"
-            "然后首先读取他的 SKILL.md 文件，再决定是否读取其他资源文件。"
-        )
         return "\n".join(lines)
 
     def _build_tool_usage_notice(
@@ -4310,27 +4333,22 @@ def _build_runtime_context_prompt(
     agent_instance_id: str,
     current_working_directory: str,
     skill_root_directory: str,
-    ) -> str:
+) -> str:
     working_directory = Path(current_working_directory).expanduser()
     resolved_working_directory = working_directory.resolve(strict=False)
-    skill_root_path = Path(skill_root_directory).expanduser().resolve(strict=False) if skill_root_directory else Path("")
-    dedicated_skill_file = skill_root_path / definition.agent_id / "SKILL.md"
-    project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / definition.agent_id / "memory.md"
-    git_roots_prompt = "\n".join(
-        f"- `{git_root}`"
-        for git_root in _discover_git_roots_under(resolved_working_directory)
+    git_roots = _discover_git_roots_under(resolved_working_directory)
+    git_roots_lines = "\n".join(f"- `{git_root}`" for git_root in git_roots)
+    git_roots_section = (
+        f"\n当前工作目录下的 Git 仓库根目录：\n\n{git_roots_lines}\n"
+        if git_roots_lines
+        else ""
     )
     return textwrap.dedent(
         f"""\
 # 身份id和工作空间
 
-你自己的 Agent 定义 ID：`{definition.agent_id}`
 你自己的 Agent 实例 ID：`{agent_instance_id}`
-当前工作目录：`{resolved_working_directory}`
-当前工作目录下的 Git 仓库根目录：
-
-{git_roots_prompt}
-
+当前工作目录：`{resolved_working_directory}`{git_roots_section}
 # 系统环境
 
 - Current working directory: `{resolved_working_directory}`
@@ -4338,65 +4356,8 @@ def _build_runtime_context_prompt(
 - OS release: `{platform.release()}`
 - OS version: `{platform.version()}`
 - Machine: `{platform.machine()}`
-
-# 你的专属 Skill
-
-`{dedicated_skill_file}`是你的专属 Skill 文件，由你自己自学习进化来管理维护。系统会自动把他的内容追加到你系统提示词中。
-
-
-# 你的专属项目记忆
-
-`{project_memory_file}`是专属于你的关于当前项目的私有记忆文件，由你自己自学习进化来管理维护。系统会自动把他的内容追加到你系统提示词中。
 """
     ).strip()
-
-
-def _build_dedicated_learning_files_prompt(
-    definition: AgentDefinition,
-    current_working_directory: str,
-    skill_root_directory: str,
-    ) -> str:
-    working_directory = Path(current_working_directory).expanduser()
-    resolved_working_directory = working_directory.resolve(strict=False)
-    skill_root_path = Path(skill_root_directory).expanduser().resolve(strict=False) if skill_root_directory else Path("")
-    dedicated_skill_file = skill_root_path / definition.agent_id / "SKILL.md"
-    project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / definition.agent_id / "memory.md"
-    sections: list[str] = []
-    skill_content = _read_optional_prompt_file(dedicated_skill_file)
-    if skill_content:
-        sections.append(
-            "\n\n".join((
-                "# 你的专属 Skill 文件内容",
-                f"以下内容自动读取自 `{dedicated_skill_file}`：",
-                skill_content,
-            ))
-        )
-    memory_content = _read_optional_prompt_file(project_memory_file)
-    if memory_content:
-        sections.append(
-            "\n\n".join((
-                "# 你的专属项目记忆文件内容",
-                f"以下内容自动读取自 `{project_memory_file}`：",
-                memory_content,
-            ))
-        )
-    return "\n\n".join(sections)
-
-
-def _read_optional_prompt_file(file_path: Path) -> str:
-    try:
-        content = file_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-    except (OSError, UnicodeError) as exc:
-        logger.warning(
-            "专属提示词附加文件读取失败，已跳过: path=%s, error_type=%s, error=%s",
-            file_path,
-            exc.__class__.__name__,
-            exc,
-        )
-        return ""
-    return content.strip()
 
 
 def _discover_git_roots_under(root: Path) -> list[str]:
