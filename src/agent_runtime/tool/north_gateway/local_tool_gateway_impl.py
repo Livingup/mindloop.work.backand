@@ -80,6 +80,7 @@ class LocalToolGatewayImpl:
             conversation_history_copy_message_count=request.conversation_history_copy_message_count,
             trace_id=request.trace_id,
             communication_stream_id=request.communication_stream_id,
+            scene_id=request.scene_id,
         )
         if self._execution_loop_logger is not None and request.agent_instance_id:
             self._execution_loop_logger.record_step(

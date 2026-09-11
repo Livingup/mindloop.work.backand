@@ -129,6 +129,7 @@ class ToolExecuteRequest(BaseToolRequest):
     )
     trace_id: str | None = PydanticField(default=None, description="执行链路追踪标识。")
     communication_stream_id: str | None = PydanticField(default=None, description="所属通信流标识。")
+    scene_id: str | None = PydanticField(default=None, description="所属业务场景标识。")
 
     def __init__(
         self,

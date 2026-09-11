@@ -7,11 +7,11 @@
 2. 入参通过 BaseToolRequest Pydantic 模型传递（生成标准 JSON Schema）；
 3. 运行环境通过 ToolRuntimeContext 隐式注入（在 Schema 中剔除）；
 4. 出参遵循零冗余原则，封装在 BaseToolResult(output={...}) 中。
+5. 数据操作真实持久化至 PostgreSQL 数据表（通过 TaskNoteStore）。
 """
 from __future__ import annotations
 
-import time
-import uuid
+import logging
 from typing import Any
 
 from agent_runtime.task_note.task_note_models import (
@@ -48,6 +48,7 @@ from agent_runtime.task_note.task_note_models import (
     UpdateTaskValidationRequest,
     UpdateTaskWorkspaceContextRequest,
 )
+from agent_runtime.task_note.task_note_store import get_task_note_store
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
@@ -55,11 +56,7 @@ from agent_runtime.tool.tool_execution_models import (
     ToolRuntimeContext,
 )
 
-# ── 工具 ID 生成辅助函数 ──────────────────────────────────────────────
-
-def _generate_id(prefix: str) -> str:
-    """生成带业务前缀的紧凑唯一标识。"""
-    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+logger = logging.getLogger("agent_runtime.task_note.tool")
 
 
 def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
@@ -81,13 +78,37 @@ def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
     wiki="### create_mission\n在班次内创建业务任务单元，保存任务标题、用户原始原话与提炼后的正式需求规格书。",
 )
 def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    mission_id = f"mission-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
-    output = {
-        "mission_id": mission_id,
-        "title": request.title,
-        "message": "业务任务单元创建成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    scene_id = getattr(ctx, "scene_id", None) or f"scene-{task_id}"
+    try:
+        mission_id = store.create_mission(
+            task_id=task_id,
+            scene_id=scene_id,
+            agent_instance_id=agent_instance_id,
+            title=request.title,
+            raw_prompt=request.initial_prompt,
+            refined_requirement=request.refined_requirement,
+            status="in_progress",
+            sort_order=request.sort_order,
+        )
+        output = {
+            "mission_id": mission_id,
+            "title": request.title,
+            "status": "in_progress",
+            "message": "业务任务单元创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_mission 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建业务任务单元失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -101,12 +122,31 @@ def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> Ba
 )
 def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
-    output = {
-        "mission_id": target_mission_id,
-        "raw_prompts_count": 1,
-        "message": "用户原始发言已追加",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.append_mission_prompt(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            prompt=request.prompt,
+        )
+        output = {
+            "mission_id": target_mission_id,
+            "raw_prompts_count": 1,
+            "message": "用户原始发言已追加",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("append_mission_prompt 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"追加用户发言失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -120,11 +160,30 @@ def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeC
 )
 def update_mission_requirement(request: UpdateMissionRequirementRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
-    output = {
-        "mission_id": target_mission_id,
-        "message": "任务需求规格已覆盖更新",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_mission_requirement(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            refined_requirement=request.refined_requirement,
+        )
+        output = {
+            "mission_id": target_mission_id,
+            "message": "任务需求规格已覆盖更新",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_mission_requirement 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新需求规格失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -138,11 +197,31 @@ def update_mission_requirement(request: UpdateMissionRequirementRequest, ctx: To
 )
 def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
-    output = {
-        "mission_id": target_mission_id,
-        "message": f"任务状态已推进为 {request.status}",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_mission_status(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            status=request.status,
+        )
+        output = {
+            "mission_id": target_mission_id,
+            "status": request.status,
+            "message": f"任务状态已推进为 {request.status}",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_mission_status 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"推进任务状态失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 2. 任务背景素材维护工具 (task_workspace_context) ────────────────
@@ -157,13 +236,44 @@ def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeC
     wiki="### create_task_workspace_context\n登记与当前任务强相关的背景素材，支持行区间与搜索结论提炼。",
 )
 def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    context_id = _generate_id("ctx")
-    output = {
-        "context_id": context_id,
-        "description": request.description or request.path or "背景素材",
-        "message": "背景素材记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        context_id = store.create_workspace_context(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            source_type=request.source_type,
+            description=request.description,
+            path=request.path,
+            line_ranges=request.line_ranges,
+            directory_structure=request.directory_structure,
+            search_content=request.search_content,
+            core_result_content=request.core_result_content,
+            reference_links=request.reference_links,
+            url_list=request.url_list,
+            core_content=request.core_content,
+            command_id=request.command_id,
+            important_content=request.important_content,
+            content=request.content,
+        )
+        output = {
+            "context_id": context_id,
+            "description": request.description or request.path or "背景素材",
+            "message": "背景素材记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_workspace_context 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建背景素材失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -176,11 +286,40 @@ def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ct
     wiki="### update_task_workspace_context\n按 context_id 精准修正背景素材。",
 )
 def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "context_id": request.context_id,
-        "message": "背景素材更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_workspace_context(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            context_id=request.context_id,
+            description=request.description,
+            path=request.path,
+            line_ranges=request.line_ranges,
+            directory_structure=request.directory_structure,
+            search_content=request.search_content,
+            core_result_content=request.core_result_content,
+            reference_links=request.reference_links,
+            url_list=request.url_list,
+            core_content=request.core_content,
+            important_content=request.important_content,
+            content=request.content,
+        )
+        output = {
+            "context_id": request.context_id,
+            "message": "背景素材更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_workspace_context 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新背景素材失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -193,11 +332,29 @@ def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ct
     wiki="### delete_task_workspace_context\n物理删除失效素材，防止工作记忆膨胀。",
 )
 def delete_task_workspace_context(request: DeleteTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "deleted_context_id": request.context_id,
-        "message": "背景素材删除成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.delete_workspace_context(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            context_id=request.context_id,
+        )
+        output = {
+            "deleted_context_id": request.context_id,
+            "message": "背景素材删除成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_task_workspace_context 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"删除背景素材失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 3. 当前宏观方案维护工具 (task_solution_content) ─────────────────
@@ -212,12 +369,32 @@ def delete_task_workspace_context(request: DeleteTaskWorkspaceContextRequest, ct
     wiki="### update_task_solution\n全量覆盖更新宏观技术架构方案，保持连贯思维。",
 )
 def update_task_solution(request: UpdateTaskSolutionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    solution_id = _generate_id("sol")
-    output = {
-        "solution_id": solution_id,
-        "message": "当前宏观方案快照覆盖更新成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        solution_id = store.upsert_solution(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            solution_content=request.solution_content,
+        )
+        output = {
+            "solution_id": solution_id,
+            "mission_id": target_mission_id,
+            "message": "当前宏观方案快照覆盖更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_solution 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新宏观方案失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -230,12 +407,31 @@ def update_task_solution(request: UpdateTaskSolutionRequest, ctx: ToolRuntimeCon
     wiki="### supersede_task_solution\n废弃宏观方案，留痕不物理删除。",
 )
 def supersede_task_solution(request: SupersedeTaskSolutionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    solution_id = _generate_id("sol")
-    output = {
-        "solution_id": solution_id,
-        "message": "当前方案已标记为软废弃留痕",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        solution_id = store.supersede_solution(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+        )
+        output = {
+            "solution_id": solution_id or f"sol-{target_mission_id}",
+            "mission_id": target_mission_id,
+            "message": "当前方案已标记为软废弃留痕",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("supersede_task_solution 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"废弃宏观方案失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 4. 关键决策记录维护工具 (task_decision_records) ──────────────────
@@ -250,13 +446,36 @@ def supersede_task_solution(request: SupersedeTaskSolutionRequest, ctx: ToolRunt
     wiki="### create_task_decision\n沉淀技术决策与被放弃的替代方案，防反复摇摆。",
 )
 def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    decision_id = _generate_id("dec")
-    output = {
-        "decision_id": decision_id,
-        "decision_content": request.decision_content,
-        "message": "关键决策记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        decision_id = store.create_decision(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            decision_content=request.decision_content,
+            rationale=request.rationale,
+            alternatives=request.alternatives,
+            impact=request.impact,
+            decision_status="active",
+        )
+        output = {
+            "decision_id": decision_id,
+            "decision_content": request.decision_content,
+            "message": "关键决策记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_decision 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建决策记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -269,11 +488,29 @@ def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeCon
     wiki="### supersede_task_decision\n软废弃决策留痕，必须指定 decision_id。",
 )
 def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "decision_id": request.decision_id,
-        "message": "决策已标记为软废弃留痕",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.supersede_decision(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            decision_id=request.decision_id,
+        )
+        output = {
+            "decision_id": request.decision_id,
+            "message": "决策已标记为软废弃留痕",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("supersede_task_decision 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"废弃决策失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -286,11 +523,33 @@ def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRunt
     wiki="### update_task_decision\n根据 decision_id 修正决策细节。",
 )
 def update_task_decision(request: UpdateTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "decision_id": request.decision_id,
-        "message": "决策内容更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_decision(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            decision_id=request.decision_id,
+            decision_content=request.decision_content,
+            rationale=request.rationale,
+            alternatives=request.alternatives,
+            impact=request.impact,
+        )
+        output = {
+            "decision_id": request.decision_id,
+            "message": "决策内容更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_decision 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新决策失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 5. 计划工作项维护工具 (task_todo_items) ─────────────────────────
@@ -305,13 +564,35 @@ def update_task_decision(request: UpdateTaskDecisionRequest, ctx: ToolRuntimeCon
     wiki="### create_task_todo\n创建单条工作待办，支持设置优先级。",
 )
 def create_task_todo(request: CreateTaskTodoRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    todo_id = _generate_id("todo")
-    output = {
-        "todo_id": todo_id,
-        "todo_content": request.todo_content,
-        "message": "待办工作项创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        todo_id = store.create_todo(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            todo_content=request.todo_content,
+            priority=request.priority,
+            status="未开始",
+        )
+        output = {
+            "todo_id": todo_id,
+            "todo_content": request.todo_content,
+            "status": "未开始",
+            "message": "待办工作项创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_todo 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建待办失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -324,17 +605,39 @@ def create_task_todo(request: CreateTaskTodoRequest, ctx: ToolRuntimeContext) ->
     wiki="### batch_create_task_todos\n一次性批量创建多条待办清单，返回生成的 todo_id 数组。",
 )
 def batch_create_task_todos(request: BatchCreateTaskTodosRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    created_todos = []
-    for item in request.todos:
-        created_todos.append({
-            "todo_id": _generate_id("todo"),
-            "todo_content": item.todo_content,
-        })
-    output = {
-        "created_todos": created_todos,
-        "message": f"批量创建 {len(created_todos)} 条待办成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        todos_payload = [
+            {
+                "todo_content": item.todo_content,
+                "priority": item.priority,
+                "status": "未开始",
+            }
+            for item in request.todos
+        ]
+        created = store.batch_create_todos(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            todos=todos_payload,
+        )
+        output = {
+            "created_todos": created,
+            "message": f"批量创建 {len(created)} 条待办成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("batch_create_task_todos 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"批量创建待办失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -347,11 +650,31 @@ def batch_create_task_todos(request: BatchCreateTaskTodosRequest, ctx: ToolRunti
     wiki="### update_task_todo_status\n单字段推进待办状态，避免重传完整待办内容。",
 )
 def update_task_todo_status(request: UpdateTaskTodoStatusRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "todo_id": request.todo_id,
-        "message": "待办状态推进成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_todo_status(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            todo_id=request.todo_id,
+            status=request.status,
+        )
+        output = {
+            "todo_id": request.todo_id,
+            "status": request.status,
+            "message": "待办状态推进成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_todo_status 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"推进待办状态失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -364,11 +687,31 @@ def update_task_todo_status(request: UpdateTaskTodoStatusRequest, ctx: ToolRunti
     wiki="### update_task_todo_content\n修改待办内容或优先级。",
 )
 def update_task_todo_content(request: UpdateTaskTodoContentRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "todo_id": request.todo_id,
-        "message": "待办内容/优先级修改成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_todo_content(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            todo_id=request.todo_id,
+            todo_content=request.todo_content,
+            priority=request.priority,
+        )
+        output = {
+            "todo_id": request.todo_id,
+            "message": "待办内容/优先级修改成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_todo_content 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"修改待办内容失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -381,11 +724,29 @@ def update_task_todo_content(request: UpdateTaskTodoContentRequest, ctx: ToolRun
     wiki="### delete_task_todo\n物理删除无效待办项。",
 )
 def delete_task_todo(request: DeleteTaskTodoRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "deleted_todo_id": request.todo_id,
-        "message": "待办项删除成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.delete_todo(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            todo_id=request.todo_id,
+        )
+        output = {
+            "deleted_todo_id": request.todo_id,
+            "message": "待办项删除成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_task_todo 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"删除待办失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 6. 客观认知发现维护工具 (task_discovery_records) ───────────────
@@ -400,13 +761,38 @@ def delete_task_todo(request: DeleteTaskTodoRequest, ctx: ToolRuntimeContext) ->
     wiki="### create_task_discovery\n沉淀客观认知与避坑事实，附带证据来源与代码行区间。",
 )
 def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    discovery_id = _generate_id("disc")
-    output = {
-        "discovery_id": discovery_id,
-        "discovery_content": request.discovery_content,
-        "message": "客观认知记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        discovery_id = store.create_discovery(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            discovery_content=request.discovery_content,
+            impact=request.impact,
+            source_type=request.source_type,
+            source_path=request.source_path,
+            line_ranges=request.line_ranges,
+            command_id=request.command_id,
+            reference_url=request.reference_url,
+        )
+        output = {
+            "discovery_id": discovery_id,
+            "discovery_content": request.discovery_content,
+            "message": "客观认知记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_discovery 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建认知记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -419,11 +805,36 @@ def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeC
     wiki="### update_task_discovery\n修正已有认知或补充证据。",
 )
 def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "discovery_id": request.discovery_id,
-        "message": "客观认知更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_discovery(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            discovery_id=request.discovery_id,
+            discovery_content=request.discovery_content,
+            impact=request.impact,
+            source_type=request.source_type,
+            source_path=request.source_path,
+            line_ranges=request.line_ranges,
+            command_id=request.command_id,
+            reference_url=request.reference_url,
+        )
+        output = {
+            "discovery_id": request.discovery_id,
+            "message": "客观认知更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_discovery 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新认知记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
@@ -436,11 +847,29 @@ def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeC
     wiki="### delete_task_discovery\n删除被证伪的认知噪音。",
 )
 def delete_task_discovery(request: DeleteTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "deleted_discovery_id": request.discovery_id,
-        "message": "认知记录删除成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.delete_discovery(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            discovery_id=request.discovery_id,
+        )
+        output = {
+            "deleted_discovery_id": request.discovery_id,
+            "message": "认知记录删除成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_task_discovery 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"删除认知记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 7. 问题与阻塞跟踪维护工具 (task_issue_records) ─────────────────
@@ -452,151 +881,333 @@ def delete_task_discovery(request: DeleteTaskDiscoveryRequest, ctx: ToolRuntimeC
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### create_task_issue\n登记故障与阻塞，跟踪推进进展。",
+    wiki="### create_task_issue\n登记阻塞与异常问题，必须描述阻碍与后续行动。",
 )
 def create_task_issue(request: CreateTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    issue_id = _generate_id("iss")
-    output = {
-        "issue_id": issue_id,
-        "issue_content": request.issue_content,
-        "message": "问题记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        issue_id = store.create_issue(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            issue_content=request.issue_content,
+            impact=request.impact,
+            status=request.status,
+            next_action=request.next_action,
+            closure_condition=request.closure_condition,
+            resolution=None,
+            source_type=request.source_type,
+            command_id=request.command_id,
+        )
+        output = {
+            "issue_id": issue_id,
+            "issue_content": request.issue_content,
+            "status": request.status,
+            "message": "问题与阻塞记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_issue 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建问题记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
     name="update_task_issue",
-    description="推进排查进展、更新问题状态或下一步排查行动。",
+    description="更新问题影响范围、修正后续行动方案或变更推进状态。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### update_task_issue\n推进问题排查，更新 next_action。",
+    wiki="### update_task_issue\n更新问题的排查进展或闭环条件。",
 )
 def update_task_issue(request: UpdateTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "issue_id": request.issue_id,
-        "message": "问题状态与进展更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_issue(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            issue_id=request.issue_id,
+            impact=request.impact,
+            status=request.status,
+            next_action=request.next_action,
+            closure_condition=request.closure_condition,
+        )
+        output = {
+            "issue_id": request.issue_id,
+            "message": "问题记录更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_issue 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新问题记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
     name="resolve_task_issue",
-    description="核心闭环动作：闭环解决问题并沉淀根本原因与避坑经验（严禁物理删除，强制填写 resolution）。",
+    description="闭环标记解决问题（status 置为 resolved，必须填写 resolution 沉淀避坑方案）。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### resolve_task_issue\n闭环解决问题，必须提供 resolution 避坑复盘。",
+    wiki="### resolve_task_issue\n闭环解决问题，沉淀有效解决方案。",
 )
 def resolve_task_issue(request: ResolveTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "issue_id": request.issue_id,
-        "message": "问题已闭环解决并成功沉淀 resolution 经验",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.resolve_issue(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            issue_id=request.issue_id,
+            resolution=request.resolution,
+        )
+        output = {
+            "issue_id": request.issue_id,
+            "status": "resolved",
+            "message": "问题已标记为闭环解决",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("resolve_task_issue 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"解决问题记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
-# ── 8. 交付产物维护工具 (task_artifact_records) ─────────────────────
+# ── 8. 通用成果交付产物维护工具 (task_artifact_records) ─────────────
 
 @tool(
     name="create_task_artifact_other",
-    description="登记非代码文件类的通用交付成果（如计算成果报告、分析数据包引用等）。主键 artifact_id 由系统自动生成返回。",
+    description="登记非代码文件类的通用业务交付产物（设计规范文档、架构草案、业务数据报告等）。主键 artifact_id 由系统自动生成返回。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### create_task_artifact_other\n登记非文件类通用成果，文件类由底层工具自动生成。",
+    wiki="### create_task_artifact_other\n登记通用成果产物，仅限非代码文件类。",
 )
 def create_task_artifact_other(request: CreateTaskArtifactOtherRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    artifact_id = _generate_id("art")
-    output = {
-        "artifact_id": artifact_id,
-        "message": "通用交付物记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        artifact_id = store.create_artifact_other(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            artifact_type="other",
+            content=request.content,
+        )
+        output = {
+            "artifact_id": artifact_id,
+            "type": "other",
+            "message": "通用交付产物登记成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_artifact_other 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"登记通用产物失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
     name="delete_task_artifact_other",
-    description="物理删除失效的非代码通用交付物（严禁删除任何底层程序自动记录的文件类产物）。",
+    description="物理删除非代码文件的通用交付产物（严禁删除代码文件物理产物）。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### delete_task_artifact_other\n仅限删除 type='other' 的通用成果。",
+    wiki="### delete_task_artifact_other\n物理删除无效通用成果，保护底层文件产物。",
 )
 def delete_task_artifact_other(request: DeleteTaskArtifactOtherRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "deleted_artifact_id": request.artifact_id,
-        "message": "通用交付物删除成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.delete_artifact_other(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            artifact_id=request.artifact_id,
+        )
+        output = {
+            "deleted_artifact_id": request.artifact_id,
+            "message": "通用交付物删除成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_task_artifact_other 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"删除通用产物失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
-# ── 9. 验证与检查结论维护工具 (task_validation_records) ─────────────
+# ── 9. 测试与验证结论维护工具 (task_validation_records) ─────────────
 
 @tool(
     name="create_task_validation",
-    description="增量记录一次测试、构建、静态扫描或人工验收结论。主键 validation_id 由系统自动生成返回。",
+    description="增量登记一项测试、构建、自测或人工验收的确定性结论。主键 validation_id 由系统自动生成返回。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### create_task_validation\n记录测试与验证结论，关联执行命令或源文件。",
+    wiki="### create_task_validation\n沉淀验证结论与测试证据，包含通过/失败与未覆盖范围。",
 )
 def create_task_validation(request: CreateTaskValidationRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    validation_id = _generate_id("val")
-    output = {
-        "validation_id": validation_id,
-        "validation_scope": request.validation_scope,
-        "message": "验证结论记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        validation_id = store.create_validation(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            target_type=request.target_type,
+            target_record_id=request.target_record_id,
+            validation_method=request.validation_method,
+            validation_scope=request.validation_scope,
+            conclusion=request.conclusion,
+            uncovered_scope=request.uncovered_scope,
+            validation_content=request.validation_content,
+            source_type=request.source_type or "manual",
+            command_id=request.command_id,
+            source_path=request.source_path,
+            line_ranges=request.line_ranges,
+        )
+        output = {
+            "validation_id": validation_id,
+            "conclusion": request.conclusion,
+            "message": "验证结论记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_validation 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建验证结论失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
     name="update_task_validation",
-    description="微调验证范围说明或补充关键异常细节。",
+    description="修正已有验证结论，补充未覆盖范围或修正验证描述。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### update_task_validation\n修正验证结论或补充未覆盖范围。",
+    wiki="### update_task_validation\n根据 validation_id 精准修正验证结论。",
 )
 def update_task_validation(request: UpdateTaskValidationRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "validation_id": request.validation_id,
-        "message": "验证结论更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_validation(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            validation_id=request.validation_id,
+            conclusion=request.conclusion,
+            uncovered_scope=request.uncovered_scope,
+            validation_content=request.validation_content,
+        )
+        output = {
+            "validation_id": request.validation_id,
+            "message": "验证结论更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_validation 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新验证结论失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
-# ── 10. 外部持久状态维护工具 (task_external_state_records) ──────────
+# ── 10. 外部持久状态变更工具 (task_external_state_records) ─────────
 
 @tool(
     name="create_task_external_state",
-    description="登记对代码库外部持久化环境的真实改变（容器启动、数据库迁移、服务启停等）。主键 external_state_id 由系统自动生成返回。",
+    description="登记不可逆或关键的环境状态变更（Docker 容器、数据库、远程主机端口、系统配置等），提供精确回滚方案。主键 external_state_id 由系统自动生成返回。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### create_task_external_state\n记录外部环境真实变更，提供回滚指引与可逆性评估。",
+    wiki="### create_task_external_state\n记录外部环境变更与回滚命令，确保系统安全可逆。",
 )
 def create_task_external_state(request: CreateTaskExternalStateRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    external_state_id = _generate_id("ext")
-    output = {
-        "external_state_id": external_state_id,
-        "target_identifier": request.target_identifier,
-        "message": "外部状态变更记录创建成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        external_state_id = store.create_external_state(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            target_type=request.target_type,
+            target_identifier=request.target_identifier,
+            change_content=request.change_content,
+            current_state=request.current_state,
+            reversibility=request.reversibility,
+            rollback_info=request.rollback_info,
+            command_id=request.command_id,
+        )
+        output = {
+            "external_state_id": external_state_id,
+            "message": "外部状态变更记录创建成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("create_task_external_state 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"创建外部状态记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
     name="update_task_external_state",
-    description="更新外部环境最新当前状态或补充回滚指引说明。",
+    description="更新外部环境的当前状态或补充完善回滚方案。",
     group="task_note",
     category="business",
     public=True,
@@ -604,11 +1215,32 @@ def create_task_external_state(request: CreateTaskExternalStateRequest, ctx: Too
     wiki="### update_task_external_state\n更新外部状态或回滚方案。",
 )
 def update_task_external_state(request: UpdateTaskExternalStateRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "external_state_id": request.external_state_id,
-        "message": "外部状态更新成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_external_state(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            external_state_id=request.external_state_id,
+            current_state=request.current_state,
+            reversibility=request.reversibility,
+            rollback_info=request.rollback_info,
+        )
+        output = {
+            "external_state_id": request.external_state_id,
+            "message": "外部状态更新成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_external_state 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新外部状态记录失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 11. 任务恢复快照维护工具 (task_progress_content) ────────────────
@@ -623,12 +1255,38 @@ def update_task_external_state(request: UpdateTaskExternalStateRequest, ctx: Too
     wiki="### update_task_progress\nNote 更新最后一步必调，重写唯一步骤断点与唤醒后的第一个动作。",
 )
 def update_task_progress(request: UpdateTaskProgressRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    progress_id = _generate_id("prog")
-    output = {
-        "progress_id": progress_id,
-        "message": "唯一恢复快照与即刻动量生成成功",
-    }
-    return BaseToolResult(output=output)
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        progress_id = store.upsert_progress(
+            task_id=task_id,
+            mission_id=target_mission_id,
+            agent_instance_id=agent_instance_id,
+            completed_summary=request.completed_summary,
+            current_work=request.current_work,
+            current_blockers=request.current_blockers,
+            recent_validation=request.recent_validation,
+            next_step=request.next_step,
+            handoff_notes=request.handoff_notes,
+        )
+        output = {
+            "progress_id": progress_id,
+            "mission_id": target_mission_id,
+            "next_step": request.next_step,
+            "message": "唯一恢复快照与即刻动量生成成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_task_progress 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新任务恢复快照失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 # ── 12. 物理资源延迟归属与状态生命周期工具 ─────────────────────────
@@ -643,12 +1301,33 @@ def update_task_progress(request: UpdateTaskProgressRequest, ctx: ToolRuntimeCon
     wiki="### bind_resources_to_mission\n按资源类型批量关联底层物理事实到业务任务，专线通信随关系绑定自动级联。",
 )
 def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    output = {
-        "resource_type": request.resource_type,
-        "bound_count": len(request.resource_ids),
-        "message": "底层物理资源延迟归属绑定成功",
-    }
-    return BaseToolResult(output=output)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        bound_count = store.bind_resources_to_mission(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=request.mission_id,
+            resource_type=request.resource_type,
+            resource_ids=request.resource_ids,
+        )
+        output = {
+            "mission_id": request.mission_id,
+            "resource_type": request.resource_type,
+            "bound_count": bound_count,
+            "message": "底层物理资源延迟归属绑定成功",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("bind_resources_to_mission 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"绑定物理资源失败: {exc}",
+            output={"error": str(exc)},
+        )
 
 
 @tool(
