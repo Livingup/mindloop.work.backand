@@ -432,11 +432,92 @@ def format_task_note_to_markdown(
         for a in artifacts:
             aid = a.get("artifact_id", "")
             atype = a.get("type", "file")
-            path = a.get("path", "")
+            file_path = a.get("file_path") or a.get("path") or ""
             desc = a.get("description", "")
-            sections.append(f"- **产物 [{atype}]**: `{path}` (`{aid}`)")
-            if desc:
-                sections.append(f"  - 描述: {desc}")
+            edits = a.get("edits")
+            content_lines = a.get("content_lines")
+            content = a.get("content")
+            source_path = a.get("source_path")
+            target_path = a.get("target_path")
+
+            if atype == "modify":
+                sections.append(f"- 📝 **[文件修改 (modify)]**: `{file_path}` (`{aid}`)")
+                parsed_edits: list[dict[str, Any]] = []
+                if isinstance(edits, str):
+                    try:
+                        parsed_edits = json.loads(edits)
+                    except Exception:
+                        parsed_edits = []
+                elif isinstance(edits, list):
+                    parsed_edits = edits
+
+                if parsed_edits:
+                    for edit in parsed_edits:
+                        if isinstance(edit, dict):
+                            f_desc = edit.get("feature_desc")
+                            s_line = edit.get("start_line")
+                            e_line = edit.get("end_line")
+                            del_l = edit.get("deleted_lines")
+                            ins_l = edit.get("inserted_lines")
+                            search_lines = edit.get("search_lines")
+                            replace_lines = edit.get("replace_lines")
+
+                            detail_parts: list[str] = []
+                            if s_line is not None and e_line is not None:
+                                detail_parts.append(f"修改区间: `L{s_line}-L{e_line}`")
+                            if del_l is not None and ins_l is not None:
+                                detail_parts.append(f"删减 {del_l} 行 / 新增 {ins_l} 行")
+
+                            detail_str = f"  - **变更详情**: {', '.join(detail_parts)}" if detail_parts else ""
+                            if detail_str:
+                                sections.append(detail_str)
+                            if f_desc:
+                                sections.append(f"    - 功能说明: {f_desc}")
+
+                            diff_snippets: list[str] = []
+                            if search_lines:
+                                s_list = search_lines if isinstance(search_lines, list) else str(search_lines).splitlines()
+                                for sl in s_list[:4]:
+                                    diff_snippets.append(f"- {sl}")
+                                if len(s_list) > 4:
+                                    diff_snippets.append("  ...")
+                            if replace_lines:
+                                r_list = replace_lines if isinstance(replace_lines, list) else str(replace_lines).splitlines()
+                                for rl in r_list[:4]:
+                                    diff_snippets.append(f"+ {rl}")
+                                if len(r_list) > 4:
+                                    diff_snippets.append("  ...")
+                            if diff_snippets:
+                                diff_block = "\n".join(diff_snippets)
+                                sections.append(f"    ```diff\n{diff_block}\n    ```")
+                elif desc:
+                    sections.append(f"  - 说明: {desc}")
+
+            elif atype == "create":
+                sections.append(f"- 📄 **[文件新建 (create)]**: `{file_path}` (`{aid}`)")
+                if isinstance(content_lines, list):
+                    sections.append(f"  - 规模: 新建共 {len(content_lines)} 行")
+                elif content:
+                    sections.append(f"  - 规模: 新建共 {len(str(content).splitlines())} 行")
+                if desc:
+                    sections.append(f"  - 说明: {desc}")
+
+            elif atype == "move":
+                sections.append(f"- 🚚 **[文件移动/重命名 (move)]**: `{source_path or file_path}` ➔ `{target_path or file_path}` (`{aid}`)")
+                if desc:
+                    sections.append(f"  - 说明: {desc}")
+
+            elif atype == "delete":
+                sections.append(f"- 🗑️ **[文件删除 (delete)]**: `{file_path}` (`{aid}`)")
+                if desc:
+                    sections.append(f"  - 说明: {desc}")
+
+            elif atype == "other":
+                sections.append(f"- 📦 **[成果交付 (other)]**: {content or desc or '通用交付产物'} (`{aid}`)")
+            else:
+                sections.append(f"- **产物 [{atype}]**: `{file_path}` (`{aid}`)")
+                if desc:
+                    sections.append(f"  - 描述: {desc}")
     else:
         sections.append("*(暂无关键产物)*")
 
@@ -466,18 +547,43 @@ def format_task_note_to_markdown(
     else:
         sections.append("*(暂无外部环境变更)*")
 
-    # ── 12. 子 Agent 协作拓扑与专线对话流水 (Subagent Dialogs) ─────────
+    # ── 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Dialogs) ─────────
     agent_rels = note_snapshot.get("agent_relationships") or []
     agent_msgs = note_snapshot.get("agent_messages") or []
-    sections.append("\n## 12. 子 Agent 协作拓扑与通信记录 (Subagent Dialogs)")
+    sections.append("\n## 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)")
     if agent_rels or agent_msgs:
         rel_map = {r.get("target_agent_instance_id"): r for r in agent_rels}
-        all_child_ids = list(dict.fromkeys(
-            [r.get("target_agent_instance_id") for r in agent_rels if r.get("target_agent_instance_id")]
-            + [m.get("target_agent_instance_id") for m in agent_msgs if m.get("target_agent_instance_id")]
+
+        # 区分父 Agent 与子 Agent
+        parent_ids = list(dict.fromkeys(
+            [r.get("target_agent_instance_id") for r in agent_rels if r.get("target_agent_type") == "parent" and r.get("target_agent_instance_id")]
+            + [m.get("target_agent_instance_id") for m in agent_msgs if m.get("target_agent_type") == "parent" and m.get("target_agent_instance_id")]
+        ))
+        child_ids = list(dict.fromkeys(
+            [r.get("target_agent_instance_id") for r in agent_rels if r.get("target_agent_type") != "parent" and r.get("target_agent_instance_id")]
+            + [m.get("target_agent_instance_id") for m in agent_msgs if m.get("target_agent_type") != "parent" and m.get("target_agent_instance_id")]
         ))
 
-        for cid in all_child_ids:
+        # 1. 上级父 Agent 协作专线
+        for pid in parent_ids:
+            rel_info = rel_map.get(pid, {})
+            st = rel_info.get("status", "unreleased")
+            sections.append(f"### 🔼 上级父 Agent: `{pid}` (角色: `parent`, 状态: `{st}`)")
+
+            p_msgs = [m for m in agent_msgs if m.get("target_agent_instance_id") == pid]
+            if p_msgs:
+                for msg in p_msgs:
+                    mtype = msg.get("message_type", "send")
+                    mbody = msg.get("message", "")
+                    ts = msg.get("created_at", "")
+                    prefix = "📤 **[向父 Agent 汇报]**" if mtype == "send" else "📥 **[收到父 Agent 指令]**"
+                    ts_label = f"`{ts}` " if ts else ""
+                    sections.append(f"- {ts_label}{prefix}: {mbody}")
+            else:
+                sections.append("- *(暂无通信消息流水)*")
+
+        # 2. 下级协作子 Agent 专线
+        for cid in child_ids:
             rel_info = rel_map.get(cid, {})
             role = rel_info.get("target_agent_type", "child")
             st = rel_info.get("status", "unreleased")
@@ -495,7 +601,7 @@ def format_task_note_to_markdown(
             else:
                 sections.append("- *(暂无通信消息流水)*")
     else:
-        sections.append("*(暂无子 Agent 协作关系与通信记录)*")
+        sections.append("*(暂无多 Agent 协作关系与通信记录)*")
 
     # ── 13. 外部远程对等 Agent 通信记录 (Remote Agent Messages) ────────
     remote_msgs = note_snapshot.get("remote_agent_messages") or []

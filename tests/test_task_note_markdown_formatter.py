@@ -281,3 +281,140 @@ def test_prompt_provider_build_resumed_conversation_prompt_markdown():
     assert "**命令行执行 ID**: `c1` ➔ **执行命令**: `uvicorn main:app --port 8000`" in resumed
     # 确认没有未反查的生硬 JSON table 倾倒
     assert "{\n  \"task_id\"" not in resumed
+
+
+def test_format_task_note_parent_and_two_children_topology_and_file_modify_artifact():
+    """专门测试：1 个父 Agent + 2 个子 Agent 的拓扑对话组织，以及文件修改产物 (modify) 的行号与 Diff 呈现。"""
+    snapshot = {
+        "task_id": "task_multi_agent_101",
+        "agent_instance_id": "agent_backend_mid_01",
+        "artifacts": [
+            {
+                "artifact_id": "art_mod_001",
+                "type": "modify",
+                "file_path": "src/services/auth_service.py",
+                "edits": [
+                    {
+                        "feature_desc": "修复 JWT 过期时间校验及缓存失效逻辑",
+                        "start_line": 45,
+                        "end_line": 58,
+                        "deleted_lines": 5,
+                        "inserted_lines": 8,
+                        "search_lines": [
+                            "if token.expired:",
+                            "    return None",
+                        ],
+                        "replace_lines": [
+                            "if token.is_expired(clock_skew=30):",
+                            "    cache.invalidate(token.id)",
+                            "    return None",
+                        ],
+                    }
+                ],
+            }
+        ],
+        "agent_relationships": [
+            {
+                "relationship_id": "rel_p_01",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "status": "unreleased",
+            },
+            {
+                "relationship_id": "rel_c_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "status": "unreleased",
+            },
+            {
+                "relationship_id": "rel_c_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "status": "released",
+            },
+        ],
+        "agent_messages": [
+            # 与父 Agent 通信
+            {
+                "message_id": "m_p_01",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "message_type": "receive",
+                "message": "请尽快修复鉴权漏洞并协调子 Agent 跑测",
+                "created_at": "2026-09-11 10:10:00",
+            },
+            {
+                "message_id": "m_p_02",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "message_type": "send",
+                "message": "已完成 auth_service.py 修改，子 Agent 正在进行测试",
+                "created_at": "2026-09-11 10:12:00",
+            },
+            # 与子 Agent 1 (DB) 通信
+            {
+                "message_id": "m_c1_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "message_type": "send",
+                "message": "请检查 token 索引是否命中",
+                "created_at": "2026-09-11 10:10:30",
+            },
+            {
+                "message_id": "m_c1_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "message_type": "receive",
+                "message": "索引正常，执行耗时 1.2ms",
+                "created_at": "2026-09-11 10:11:00",
+            },
+            # 与子 Agent 2 (QA) 通信
+            {
+                "message_id": "m_c2_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "message_type": "send",
+                "message": "请执行鉴权相关单测",
+                "created_at": "2026-09-11 10:11:15",
+            },
+            {
+                "message_id": "m_c2_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "message_type": "receive",
+                "message": "12 项鉴权测试全绿通过",
+                "created_at": "2026-09-11 10:11:50",
+            },
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 1. 验证关键产物 (Artifacts) 中的文件修改输出
+    assert "## 10. 关键产物与文件 (Artifacts)" in md
+    assert "- 📝 **[文件修改 (modify)]**: `src/services/auth_service.py` (`art_mod_001`)" in md
+    assert "修改区间: `L45-L58`" in md
+    assert "删减 5 行 / 新增 8 行" in md
+    assert "功能说明: 修复 JWT 过期时间校验及缓存失效逻辑" in md
+    assert "```diff" in md
+    assert "- if token.expired:" in md
+    assert "+ if token.is_expired(clock_skew=30):" in md
+
+    # 2. 验证多 Agent 协作拓扑：明确区分父 Agent 与 2 个子 Agent
+    assert "## 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)" in md
+    
+    # 2.1 父 Agent 专线
+    assert "### 🔼 上级父 Agent: `agent_lead_orchestrator` (角色: `parent`, 状态: `unreleased`)" in md
+    assert "📥 **[收到父 Agent 指令]**: 请尽快修复鉴权漏洞并协调子 Agent 跑测" in md
+    assert "📤 **[向父 Agent 汇报]**: 已完成 auth_service.py 修改，子 Agent 正在进行测试" in md
+
+    # 2.2 子 Agent 1 专线
+    assert "### 协作子 Agent: `agent_worker_db` (角色: `child`, 状态: `unreleased`)" in md
+    assert "📤 **[发往子 Agent]**: 请检查 token 索引是否命中" in md
+    assert "📥 **[收到子 Agent 回复]**: 索引正常，执行耗时 1.2ms" in md
+
+    # 2.3 子 Agent 2 专线
+    assert "### 协作子 Agent: `agent_worker_qa` (角色: `child`, 状态: `released`)" in md
+    assert "📤 **[发往子 Agent]**: 请执行鉴权相关单测" in md
+    assert "📥 **[收到子 Agent 回复]**: 12 项鉴权测试全绿通过" in md
+

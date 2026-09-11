@@ -211,7 +211,8 @@ class TaskNoteSnapshotService:
                     cur.execute(
                         """
                         SELECT artifact_id, task_id, mission_id, agent_instance_id,
-                               type, path, description, line_ranges, created_at
+                               type, file_path, edits, content_lines, source_path,
+                               target_path, content, created_at
                         FROM task_artifact_records
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
