@@ -59,6 +59,7 @@ class LocalToolFactory:
         import agent_runtime.mcp.mcp_meta_tools.mcp_meta_tools  # noqa: F401
         import agent_runtime.subagent.subagent_tool  # noqa: F401
         import agent_runtime.terminal.terminal_tool  # noqa: F401
+        import agent_runtime.task_note.task_note_tool  # noqa: F401
         import agent_runtime.web_tools.web_tools  # noqa: F401
 
         repository = get_global_repository()
