@@ -265,36 +265,35 @@ class TaskNoteSnapshotService:
                     # 13. task_agent_relationships
                     cur.execute(
                         """
-                        SELECT relationship_id, task_id, mission_id, parent_agent_instance_id,
-                               child_agent_instance_id, status, created_at
+                        SELECT relationship_id, task_id, mission_id, agent_instance_id,
+                               target_agent_type, target_agent_instance_id, status, created_at
                         FROM task_agent_relationships
-                        WHERE task_id = %s AND (parent_agent_instance_id = %s OR child_agent_instance_id = %s)
+                        WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
                         """,
-                        (task_id, agent_instance_id, agent_instance_id),
+                        (task_id, agent_instance_id),
                     )
                     snapshot["agent_relationships"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 14. task_agent_messages
                     cur.execute(
                         """
-                        SELECT conversation_scope_id, task_id, mission_id,
-                               parent_agent_instance_id, child_agent_instance_id,
-                               messages, created_at
+                        SELECT message_id, task_id, mission_id, agent_instance_id,
+                               target_agent_instance_id, target_agent_type, message_type,
+                               message, created_at
                         FROM task_agent_messages
-                        WHERE task_id = %s AND (parent_agent_instance_id = %s OR child_agent_instance_id = %s)
+                        WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
                         """,
-                        (task_id, agent_instance_id, agent_instance_id),
+                        (task_id, agent_instance_id),
                     )
                     snapshot["agent_messages"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 15. task_remote_agent_messages
                     cur.execute(
                         """
-                        SELECT remote_conversation_scope_id, task_id, mission_id,
-                               agent_instance_id, remote_agent_instance_id,
-                               messages, created_at
+                        SELECT remote_message_id, task_id, mission_id, agent_instance_id,
+                               remote_agent_instance_id, message_type, message, created_at
                         FROM task_remote_agent_messages
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC

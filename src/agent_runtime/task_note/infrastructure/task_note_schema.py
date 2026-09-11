@@ -218,40 +218,53 @@ CREATE TABLE IF NOT EXISTS task_command_records (
 CREATE INDEX IF NOT EXISTS idx_command_mission ON task_command_records(task_id, mission_id);
 
 -- 13. 子 Agent 协作关系表 (task_agent_relationships)
+-- 面向 agent_instance_id 双向记录，无 updated_at
 CREATE TABLE IF NOT EXISTS task_agent_relationships (
-    relationship_id         VARCHAR(64) PRIMARY KEY,
-    task_id                 VARCHAR(64) NOT NULL,
-    mission_id              VARCHAR(64),
-    parent_agent_instance_id VARCHAR(64) NOT NULL,
-    child_agent_instance_id  VARCHAR(64) NOT NULL,
-    status                  VARCHAR(32) NOT NULL DEFAULT 'unreleased',
-    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_agent_rel UNIQUE (task_id, parent_agent_instance_id, child_agent_instance_id)
+    relationship_id          VARCHAR(64) PRIMARY KEY,
+    task_id                  VARCHAR(64) NOT NULL,
+    mission_id               VARCHAR(64),
+    agent_instance_id        VARCHAR(64) NOT NULL,
+    target_agent_type        VARCHAR(32) NOT NULL,        -- 'child' / 'parent'
+    target_agent_instance_id VARCHAR(64) NOT NULL,
+    status                   VARCHAR(32) NOT NULL DEFAULT 'unreleased', -- unreleased, released
+    created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_agent_rel UNIQUE (task_id, agent_instance_id, target_agent_instance_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_agent_rel_tenant ON task_agent_relationships(task_id, agent_instance_id);
 
 -- 14. 父子 Agent 专线消息表 (task_agent_messages)
+-- 一条消息一行记录，面向 agent_instance_id，无 updated_at
 CREATE TABLE IF NOT EXISTS task_agent_messages (
-    conversation_scope_id   VARCHAR(128) PRIMARY KEY,
-    task_id                 VARCHAR(64) NOT NULL,
-    mission_id              VARCHAR(64),
-    parent_agent_instance_id VARCHAR(64) NOT NULL,
-    child_agent_instance_id  VARCHAR(64) NOT NULL,
-    messages                JSONB NOT NULL DEFAULT '[]',
-    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_agent_msg UNIQUE (task_id, parent_agent_instance_id, child_agent_instance_id)
+    message_id               VARCHAR(64) PRIMARY KEY,
+    task_id                  VARCHAR(64) NOT NULL,
+    mission_id               VARCHAR(64),
+    agent_instance_id        VARCHAR(64) NOT NULL,
+    target_agent_instance_id VARCHAR(64) NOT NULL,
+    target_agent_type        VARCHAR(32) NOT NULL,        -- 'child' / 'parent'
+    message_type             VARCHAR(32) NOT NULL,        -- 'send' / 'receive'
+    message                  TEXT NOT NULL,
+    created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_agent_msg_tenant ON task_agent_messages(task_id, agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_agent_msg_target ON task_agent_messages(task_id, agent_instance_id, target_agent_instance_id);
+
 -- 15. 远程对等 Agent 消息表 (task_remote_agent_messages)
+-- 一条消息一行记录，面向 agent_instance_id，无 updated_at
 CREATE TABLE IF NOT EXISTS task_remote_agent_messages (
-    remote_conversation_scope_id VARCHAR(128) PRIMARY KEY,
-    task_id                 VARCHAR(64) NOT NULL,
-    mission_id              VARCHAR(64),
-    agent_instance_id       VARCHAR(64) NOT NULL,
+    remote_message_id        VARCHAR(64) PRIMARY KEY,
+    task_id                  VARCHAR(64) NOT NULL,
+    mission_id               VARCHAR(64),
+    agent_instance_id        VARCHAR(64) NOT NULL,
     remote_agent_instance_id VARCHAR(64) NOT NULL,
-    messages                JSONB NOT NULL DEFAULT '[]',
-    created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_remote_msg UNIQUE (task_id, agent_instance_id, remote_agent_instance_id)
+    message_type             VARCHAR(32) NOT NULL,        -- 'send' / 'receive'
+    message                  TEXT NOT NULL,
+    created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_remote_msg_tenant ON task_remote_agent_messages(task_id, agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_remote_msg_target ON task_remote_agent_messages(task_id, agent_instance_id, remote_agent_instance_id);
 """
 
 
