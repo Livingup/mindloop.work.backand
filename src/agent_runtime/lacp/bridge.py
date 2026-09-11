@@ -118,6 +118,20 @@ class AgentRuntimeLacpBridge:
                 attachments=attachments,
                 message_metadata=metadata,
             )
+            try:
+                from agent_runtime.task_note.task_note_event_recorder import get_task_note_event_recorder
+
+                target_instance = self._runtime_gateway.get_agent_instance(message.to_instance_id)
+                task_id = target_instance.task_id
+                await get_task_note_event_recorder().async_record_remote_agent_message(
+                    task_id=task_id,
+                    agent_instance_id=message.to_instance_id,
+                    remote_agent_instance_id=message.from_instance_id,
+                    message_type="receive",
+                    message=message.content,
+                )
+            except Exception:
+                logger.exception("记录 LACP 远程消息到 task_remote_agent_messages 失败 (已忽略)")
             return True
         except Exception:
             logger.exception("LACP inbound message enqueue failed: message_id=%s", message.message_id)

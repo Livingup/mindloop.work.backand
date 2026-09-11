@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from agent_runtime.task_note.task_note_event_recorder import get_task_note_event_recorder
 from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
 from agent_runtime.subagent.subagent_runtime import get_subagent_runtime
@@ -76,6 +77,22 @@ async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContex
         parent_conversation_id=ctx.conversation_id,
         conversation_history_copy_message_count=ctx.conversation_history_copy_message_count,
     )
+    task_id = output.get("task_id") or ctx.task_id
+    child_id = output.get("child_agent_instance_id")
+    if task_id and ctx.agent_instance_id and child_id:
+        await get_task_note_event_recorder().async_record_subagent_relationship(
+            task_id=task_id,
+            parent_instance_id=ctx.agent_instance_id,
+            child_instance_id=child_id,
+        )
+        if request.initial_message and request.initial_message.strip():
+            await get_task_note_event_recorder().async_record_agent_message(
+                task_id=task_id,
+                from_instance_id=ctx.agent_instance_id,
+                to_instance_id=child_id,
+                target_agent_type="child",
+                message=request.initial_message.strip(),
+            )
     return BaseToolResult(output=output, metadata={"subagent_action": "create_subagent"})
 
 
@@ -98,6 +115,29 @@ async def send_agent_message(request: SendAgentMessageRequest, ctx: ToolRuntimeC
         content=request.content,
         attachments=[item.model_dump() for item in request.attachments],
     )
+    target_agent_type = "child"
+    task_id = ctx.task_id
+    try:
+        subagent_rt = get_subagent_runtime()
+        source = subagent_rt._runtime_gateway.get_agent_instance(ctx.agent_instance_id)
+        task = subagent_rt._runtime_gateway.get_task(source.task_id)
+        rel = task.child_relation_of(request.to_agent_instance_id)
+        if rel and rel.parent_agent_instance_id == ctx.agent_instance_id:
+            target_agent_type = "child"
+        else:
+            target_agent_type = "parent"
+        task_id = source.task_id
+    except Exception:
+        pass
+
+    if task_id and ctx.agent_instance_id and request.to_agent_instance_id and request.content:
+        await get_task_note_event_recorder().async_record_agent_message(
+            task_id=task_id,
+            from_instance_id=ctx.agent_instance_id,
+            to_instance_id=request.to_agent_instance_id,
+            target_agent_type=target_agent_type,
+            message=request.content,
+        )
     return BaseToolResult(output=output, metadata={"subagent_action": "send_agent_message"})
 
 

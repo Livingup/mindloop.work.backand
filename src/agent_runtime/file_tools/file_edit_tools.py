@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from agent_runtime.file_tools.file_tools import ALWAYS_EXCLUDED_NAMES, _encoding_candidates, _is_binary_file
 from agent_runtime.infrastructure.asyncio_diagnostics import BlockingPool
+from agent_runtime.task_note.task_note_event_recorder import get_task_note_event_recorder
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolResult, ToolRuntimeContext
 
@@ -478,6 +479,26 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
         modified = old_text != new_text
         if modified and not request.dry_run:
             _write_text_atomically(target.path, new_text, used_encoding)
+            if ctx.task_id and ctx.agent_instance_id:
+                detailed_edits = [
+                    {
+                        "feature_desc": edit.feature_desc,
+                        "search_lines": edit.search_lines,
+                        "replace_lines": edit.replace_lines,
+                        "start_line": applied["start_line"],
+                        "end_line": applied["end_line"],
+                        "deleted_lines": applied["deleted_lines"],
+                        "inserted_lines": applied["inserted_lines"],
+                    }
+                    for edit, applied in zip(request.edits, applied_edits)
+                ]
+                get_task_note_event_recorder().record_file_artifact(
+                    task_id=ctx.task_id,
+                    agent_instance_id=ctx.agent_instance_id,
+                    op_type="modify",
+                    file_path=str(target.path),
+                    edits=detailed_edits,
+                )
 
         output = {
             **output_base,
@@ -537,6 +558,14 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
             if target.path.exists() and not request.overwrite:
                 raise FileEditBusinessError("FileAlreadyExists", f"文件已存在，默认禁止覆盖: {target.path}")
             _write_text_atomically(target.path, new_text, request.encoding)
+            if ctx.task_id and ctx.agent_instance_id:
+                get_task_note_event_recorder().record_file_artifact(
+                    task_id=ctx.task_id,
+                    agent_instance_id=ctx.agent_instance_id,
+                    op_type="create",
+                    file_path=str(target.path),
+                    content_lines=request.content_lines,
+                )
 
         output = {
             **output_base,
@@ -580,6 +609,14 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
                 raise FileEditBusinessError("WritePermissionDenied", f"没有权限删除文件: {target.path}") from exc
             except OSError as exc:
                 raise FileEditBusinessError("FileDeleteFailed", f"删除文件失败: {target.path}: {exc}") from exc
+            if ctx.task_id and ctx.agent_instance_id:
+                get_task_note_event_recorder().record_file_artifact(
+                    task_id=ctx.task_id,
+                    agent_instance_id=ctx.agent_instance_id,
+                    op_type="delete",
+                    file_path=str(target.path),
+                    content=request.reason,
+                )
 
         output = {
             **output_base,
@@ -669,6 +706,16 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
                 raise FileEditBusinessError("WritePermissionDenied", f"没有权限移动文件: {source.path} -> {target.path}") from exc
             except OSError as exc:
                 raise FileEditBusinessError("FileMoveFailed", f"移动文件失败: {source.path} -> {target.path}: {exc}") from exc
+            if ctx.task_id and ctx.agent_instance_id:
+                get_task_note_event_recorder().record_file_artifact(
+                    task_id=ctx.task_id,
+                    agent_instance_id=ctx.agent_instance_id,
+                    op_type="move",
+                    file_path=str(target.path),
+                    source_path=str(source.path),
+                    target_path=str(target.path),
+                    content=request.reason,
+                )
 
         output = {
             **output_base,

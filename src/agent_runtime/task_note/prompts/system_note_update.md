@@ -61,7 +61,7 @@ Note 包含 **五大核心认知层级与一个贯穿基石**：
 ### 3.1 业务工具执行时由程序钩子自动记录（严禁篡改与重复记录）
 以下信息在底层工具执行成功后，**由程序钩子直接写入数据库**，保留确定性物理事实。底层工具执行时无法获知上层业务任务语义，因此自动记录时其 `mission_id` 初始为 NULL。此类物理记录无需你从历史中重新总结，更严禁你调用 Note 工具重复创建：
 1. **`task_artifact_records` 中的文件工具产出**：成功执行 `file_create`、`file_modify`、`file_delete`、`file_move` 后，程序原样记录路径、替换行与编辑块（`mission_id` 初始为 NULL）；
-2. **终端命令执行记录**：终端命令执行由系统在后台自动记录，分配全局 `command_id` 并持久化完整输出（`mission_id` 初始为 NULL）；此类客观执行流无需你重复记录，在 Note 各主题中通过 `command_id` 反查；
+2. **终端命令执行记录 (`task_command_records`)**：终端命令执行由系统在后台自动记录命令索引（直接复用 `terminal_execute_command` 返回的 `command_id` 与 `command_line`，`mission_id` 初始为 NULL）；此类客观执行流无需你重复记录，终端输出通过 `terminal_read_output` 按 `command_id` 反查，在 Note 各主题中通过 `command_id` 关联引用；
 3. **`task_agent_relationships`**：子 Agent 创建与释放的拓扑关系，面向 `agent_instance_id`（记录所属租户）双向记录（记录所属租户、目标角色 `target_agent_type`、目标实例 `target_agent_instance_id`，`mission_id` 初始为 NULL）；
 4. **`task_agent_messages`**：父子 Agent 专线消息，一条消息一行记录，面向 `agent_instance_id`（记录所属租户），包含 `target_agent_instance_id`、`target_agent_type`、`message_type`（`send`/`receive`）和消息正文 `message`；
 5. **`task_remote_agent_messages`**：与外部远程 Agent 沟通的消息，一条消息一行记录，面向 `agent_instance_id`（记录所属租户），包含 `remote_agent_instance_id`、`message_type`（`send`/`receive`）和消息正文 `message`。
@@ -247,6 +247,7 @@ Note 包含 **五大核心认知层级与一个贯穿基石**：
 ---
 
 ### 4.3 你严禁通过工具或 SQL 篡改的数据（程序自动维护）
+- `task_command_records`（终端命令索引由系统自动维护，Note 中仅通过 `command_id` 关联反查）
 - `task_agent_relationships`（拓扑关系与生命周期由系统维护）
 - `task_agent_messages`（专线消息内容由系统自动追加）
 - `task_remote_agent_messages`（远程消息由系统维护）

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict
 from typing import Literal
 
 from pydantic import Field
 
+from agent_runtime.task_note.task_note_event_recorder import get_task_note_event_recorder
 from agent_runtime.terminal.north_gateway.terminal_contracts import (
     CreateTerminalRequest,
     ExecuteTerminalCommandRequest,
@@ -114,24 +116,67 @@ async def terminal_execute_command(request: TerminalExecuteCommandToolRequest, c
                 trace_id=ctx.trace_id,
             )
         )
+        if ctx.task_id and ctx.agent_instance_id and result.command_id:
+            await get_task_note_event_recorder().async_record_terminal_command(
+                task_id=ctx.task_id,
+                agent_instance_id=ctx.agent_instance_id,
+                command_id=result.command_id,
+                command_line=request.command_line,
+            )
+        return BaseToolResult(
+            success=result.accepted,
+            execution_status="success" if result.accepted else "failed",
+            output={
+                "accepted": result.accepted,
+                "terminal_id": result.terminal_id,
+                "command_id": result.command_id,
+            },
+        )
     except TerminalCapacityExceededError as exc:
+        fallback_command_id = f"cmd_err_{uuid.uuid4().hex[:12]}"
+        if ctx.task_id and ctx.agent_instance_id:
+            await get_task_note_event_recorder().async_record_terminal_command(
+                task_id=ctx.task_id,
+                agent_instance_id=ctx.agent_instance_id,
+                command_id=fallback_command_id,
+                command_line=request.command_line,
+            )
+        metadata = exc.to_metadata()
+        output = dict(metadata)
+        output["command_id"] = fallback_command_id
+        output["terminal_id"] = request.terminal_id
+        output["accepted"] = False
         return BaseToolResult(
             success=False,
             execution_status="failed",
             error_code=exc.error_code,
             error_message=str(exc),
-            output=exc.to_metadata(),
-            metadata=exc.to_metadata(),
+            output=output,
+            metadata=metadata,
         )
-    return BaseToolResult(
-        success=result.accepted,
-        execution_status="success" if result.accepted else "failed",
-        output={
-            "accepted": result.accepted,
-            "terminal_id": result.terminal_id,
-            "command_id": result.command_id,
-        },
-    )
+    except Exception as exc:
+        fallback_command_id = f"cmd_err_{uuid.uuid4().hex[:12]}"
+        if ctx.task_id and ctx.agent_instance_id:
+            await get_task_note_event_recorder().async_record_terminal_command(
+                task_id=ctx.task_id,
+                agent_instance_id=ctx.agent_instance_id,
+                command_id=fallback_command_id,
+                command_line=request.command_line,
+            )
+        output = {
+            "accepted": False,
+            "terminal_id": request.terminal_id,
+            "command_id": fallback_command_id,
+            "error": str(exc),
+        }
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code=exc.__class__.__name__,
+            error_message=str(exc),
+            output=output,
+            metadata={"command_id": fallback_command_id},
+        )
 
 
 @tool(
