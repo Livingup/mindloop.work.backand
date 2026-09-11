@@ -93,11 +93,15 @@ class OpenAIResponsesProtocolClient:
             raise TypeError("openai_responses 渲染结果类型不正确。")
         if "input" in request_params or "prompt_cache_breakpoint" in request_params:
             raise ValueError("Responses input 和 prompt_cache_breakpoint 必须由消息渲染层提供。")
-        if "instructions" in request_params or "tools" in request_params:
+        if "tools" in request_params:
             raise ValueError(
-                "OpenAI Responses 的 instructions/tools 必须由配置视图投影到 input，"
+                "OpenAI Responses 的 tools 必须由配置视图投影到 input，"
                 "不能通过 request_params 发送顶层配置。"
             )
+        if "instructions" in request_params:
+            custom_instructions = request_params["instructions"]
+            if custom_instructions is not None and not isinstance(custom_instructions, str):
+                raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
         if (system_prompt is not None or tools) and not rendered_messages.uses_input_configuration:
             raise ValueError(
                 "OpenAI Responses 的 system_prompt/tools 必须先渲染为 developer/"
@@ -110,6 +114,11 @@ class OpenAIResponsesProtocolClient:
             "include": rendered_messages.include,
             **request_params,
         }
+        custom_instructions = body.get("instructions")
+        if isinstance(custom_instructions, str) and custom_instructions.strip():
+            body["instructions"] = custom_instructions
+        else:
+            body["instructions"] = "你是一个善于学习的AI。"
         body["store"] = False
         body["include"] = _ensure_include_item(body.get("include"), "reasoning.encrypted_content")
         body.pop("previous_response_id", None)

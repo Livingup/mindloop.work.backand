@@ -74,7 +74,7 @@ class OpenAIRenderResult:
 
     包含消息与配置事件组成的 input、缓存路由 key 和缓存选项。
     调用方仅合并 model、reasoning 等请求参数；系统提示词和工具位于 input。
-    请求客户端强制 store=false，禁止再次注入顶层 instructions/tools。
+    请求客户端强制 store=false，禁止注入顶层 tools，未指定 instructions 时回退为固定默认指令。
     """
 
     # OpenAI Responses API 的 input 数组。

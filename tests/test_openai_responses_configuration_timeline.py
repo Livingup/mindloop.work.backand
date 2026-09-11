@@ -154,7 +154,7 @@ def test_responses_timeline_uses_snapshot_then_active_current_and_anchor_order()
 
 
 
-def test_responses_client_does_not_send_top_level_instructions_or_tools(monkeypatch):
+def test_responses_client_sends_default_or_defined_instructions_and_no_tools(monkeypatch):
     async def run():
         captured = {}
         async def fake_post(url, headers, body, **kwargs):
@@ -184,9 +184,17 @@ def test_responses_client_does_not_send_top_level_instructions_or_tools(monkeypa
             resolved_model=model, rendered_messages=result, system_prompt="ignored",
             tools=({"name": "ignored"},), request_params={}, api_key=None,
         )
-        assert "instructions" not in captured
+        assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
         assert captured["prompt_cache_options"] == {"mode": "implicit"}
+
+        captured.clear()
+        await OpenAIResponsesProtocolClient().request(
+            resolved_model=model, rendered_messages=result, system_prompt="ignored",
+            tools=({"name": "ignored"},), request_params={"instructions": "自定义特定指令"}, api_key=None,
+        )
+        assert captured["instructions"] == "自定义特定指令"
+        assert "tools" not in captured
     asyncio.run(run())
 
 
@@ -348,13 +356,22 @@ def test_tools_only_or_empty_prompt_never_fabricates_marker(prompt):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("field", ["instructions", "tools", "input", "prompt_cache_breakpoint"])
+@pytest.mark.parametrize("field", ["tools", "input", "prompt_cache_breakpoint"])
 def test_responses_client_rejects_reserved_configuration_params(field):
     async def run():
         with pytest.raises(ValueError):
             await OpenAIResponsesProtocolClient().request(
                 resolved_model=_model(), rendered_messages=OpenAIRenderResult([]),
                 system_prompt=None, tools=(), request_params={field: None}, api_key=None)
+    asyncio.run(run())
+
+
+def test_responses_client_rejects_non_string_instructions():
+    async def run():
+        with pytest.raises(TypeError, match="instructions 必须是字符串或 None"):
+            await OpenAIResponsesProtocolClient().request(
+                resolved_model=_model(), rendered_messages=OpenAIRenderResult([]),
+                system_prompt=None, tools=(), request_params={"instructions": 123}, api_key=None)
     asyncio.run(run())
 
 
@@ -383,7 +400,8 @@ def test_service_standard_responses_cache_overrides_and_input_only(monkeypatch, 
             resolved_model=_model(), conversation_id="c", input_items=input_items,
             system_prompt="system", tools=({"type": "function", "name": "tool"},),
             request_params=params, api_key=None, input_configuration_capability=True)
-        assert "instructions" not in captured and "tools" not in captured
+        assert captured["instructions"] == "你是一个善于学习的AI。"
+        assert "tools" not in captured
         assert captured["input"][0]["type"] == "additional_tools"
         assert captured["input"][1] == {"role": "developer", "content": [{"type": "input_text", "text": "system"}]}
         assert captured["input"][2:] == input_items
@@ -461,7 +479,8 @@ def test_web_native_openai_override_is_projected_into_input(monkeypatch):
             )))
         tools = [item for item in captured["input"] if item.get("type") == "additional_tools"]
         assert tools and tools[0]["tools"][0]["type"] == "web_search_preview"
-        assert "instructions" not in captured and "tools" not in captured
+        assert captured["instructions"] == "你是一个善于学习的AI。"
+        assert "tools" not in captured
         assert captured["tool_choice"] == {"type": "web_search_preview"}
         assert "web_search_call.action.sources" in captured["include"]
         assert result.assistant_message.role == "assistant"
@@ -484,7 +503,7 @@ def test_responses_protocol_automatically_projects_synthetic_configuration(monke
         assert captured["input"][0]["role"] == "developer"
         assert "prompt_cache_breakpoint" not in captured["input"][0]["content"][0]
         assert captured["input"][0]["content"][0]["text"] == "system"
-        assert "instructions" not in captured
+        assert captured["instructions"] == "你是一个善于学习的AI。"
     asyncio.run(run())
 
 
@@ -719,8 +738,8 @@ def test_send_prompt_automatically_uses_conversation_timeline_without_explicit_v
         )
 
         # 检查 OpenAI 请求体字段：
-        # 1. 顶层 instructions 与 tools 严禁存在
-        assert "instructions" not in captured
+        # 1. 顶层 instructions 回退为固定默认值，tools 严禁存在
+        assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
         # 2. 服务端自动缓存断点模式 implicit
         assert captured["prompt_cache_options"] == {"mode": "implicit"}
@@ -1144,8 +1163,8 @@ def test_send_prompt_clean_conversation_without_timeline_automatically_projects_
         )
 
         # 验证请求体：
-        # 1. 顶层 instructions 与 tools 严禁存在
-        assert "instructions" not in captured
+        # 1. 顶层 instructions 回退为固定默认值，tools 严禁存在
+        assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
         # 2. 服务端自动缓存断点模式 implicit
         assert captured["prompt_cache_options"] == {"mode": "implicit"}
