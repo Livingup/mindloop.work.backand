@@ -1500,6 +1500,102 @@ class TaskNoteStore:
             logger.error("get_all_command_lines_for_tenant 查询失败: %s", exc)
             return {}
 
+    def cleanup_agent_instance_note(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+    ) -> int:
+        """物理清除指定子 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。
+
+        用于非 Root Agent 调用 end_task 完成会话时的垃圾回收。
+        """
+        if not task_id or not agent_instance_id or self._connection_factory is None:
+            return 0
+
+        total_deleted = 0
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    for table in ALL_NOTE_TABLES:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE task_id = %s AND agent_instance_id = %s",
+                            (task_id, agent_instance_id),
+                        )
+                        total_deleted += cur.rowcount if cur.rowcount > 0 else 0
+                conn.commit()
+            logger.info(
+                "物理清理子 Agent Note 记录完成: task_id=%s, agent_instance_id=%s, deleted_rows=%d",
+                task_id,
+                agent_instance_id,
+                total_deleted,
+            )
+            return total_deleted
+        except Exception as exc:
+            logger.error(
+                "物理清理子 Agent Note 记录失败 (忽略异常): task_id=%s, agent_instance_id=%s, error=%s",
+                task_id,
+                agent_instance_id,
+                exc,
+            )
+            return 0
+
+    def cleanup_task_note(
+        self,
+        *,
+        task_id: str,
+    ) -> int:
+        """物理清除指定 Task 下所有 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。
+
+        用于 Root Agent 调用 end_task 结束全任务时的垃圾回收。
+        """
+        if not task_id or self._connection_factory is None:
+            return 0
+
+        total_deleted = 0
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    for table in ALL_NOTE_TABLES:
+                        cur.execute(
+                            f"DELETE FROM {table} WHERE task_id = %s",
+                            (task_id,),
+                        )
+                        total_deleted += cur.rowcount if cur.rowcount > 0 else 0
+                conn.commit()
+            logger.info(
+                "物理清理 Task 全量 Note 记录完成: task_id=%s, deleted_rows=%d",
+                task_id,
+                total_deleted,
+            )
+            return total_deleted
+        except Exception as exc:
+            logger.error(
+                "物理清理 Task 全量 Note 记录失败 (忽略异常): task_id=%s, error=%s",
+                task_id,
+                exc,
+            )
+            return 0
+
+
+ALL_NOTE_TABLES: tuple[str, ...] = (
+    "task_mission_records",
+    "task_active_solution",
+    "task_decision_records",
+    "task_progress_content",
+    "task_todo_items",
+    "task_workspace_context",
+    "task_discovery_records",
+    "task_issue_records",
+    "task_artifact_records",
+    "task_validation_records",
+    "task_external_state_records",
+    "task_command_records",
+    "task_agent_relationships",
+    "task_agent_messages",
+    "task_remote_agent_messages",
+)
+
 
 
 _global_task_note_store: TaskNoteStore | None = None

@@ -440,8 +440,8 @@ def format_task_note_to_markdown(
             source_path = a.get("source_path")
             target_path = a.get("target_path")
 
-            if atype == "modify":
-                sections.append(f"- 📝 **[文件修改 (modify)]**: `{file_path}` (`{aid}`)")
+            if atype in ("file_modify", "modify"):
+                sections.append(f"- 📝 **[文件修改 (file_modify)]**: `{file_path}` (`{aid}`)")
                 parsed_edits: list[dict[str, Any]] = []
                 if isinstance(edits, str):
                     try:
@@ -457,58 +457,41 @@ def format_task_note_to_markdown(
                             f_desc = edit.get("feature_desc")
                             s_line = edit.get("start_line")
                             e_line = edit.get("end_line")
-                            del_l = edit.get("deleted_lines")
-                            ins_l = edit.get("inserted_lines")
-                            search_lines = edit.get("search_lines")
                             replace_lines = edit.get("replace_lines")
 
-                            detail_parts: list[str] = []
-                            if s_line is not None and e_line is not None:
-                                detail_parts.append(f"修改区间: `L{s_line}-L{e_line}`")
-                            if del_l is not None and ins_l is not None:
-                                detail_parts.append(f"删减 {del_l} 行 / 新增 {ins_l} 行")
-
-                            detail_str = f"  - **变更详情**: {', '.join(detail_parts)}" if detail_parts else ""
-                            if detail_str:
-                                sections.append(detail_str)
+                            loc_str = f" (行区间: `L{s_line}-L{e_line}`)" if (s_line is not None and e_line is not None) else ""
                             if f_desc:
-                                sections.append(f"    - 功能说明: {f_desc}")
+                                sections.append(f"  - **功能说明{loc_str}**: {f_desc}")
+                            elif loc_str:
+                                sections.append(f"  - **修改位置**: {loc_str}")
 
-                            diff_snippets: list[str] = []
-                            if search_lines:
-                                s_list = search_lines if isinstance(search_lines, list) else str(search_lines).splitlines()
-                                for sl in s_list[:4]:
-                                    diff_snippets.append(f"- {sl}")
-                                if len(s_list) > 4:
-                                    diff_snippets.append("  ...")
                             if replace_lines:
                                 r_list = replace_lines if isinstance(replace_lines, list) else str(replace_lines).splitlines()
-                                for rl in r_list[:4]:
-                                    diff_snippets.append(f"+ {rl}")
-                                if len(r_list) > 4:
-                                    diff_snippets.append("  ...")
-                            if diff_snippets:
-                                diff_block = "\n".join(diff_snippets)
-                                sections.append(f"    ```diff\n{diff_block}\n    ```")
+                                lang = _detect_lang(file_path)
+                                r_text = "\n".join(r_list)
+                                sections.append(f"  - **替换写入代码 (replace_lines)**:\n    ```{lang}\n{r_text}\n    ```")
                 elif desc:
                     sections.append(f"  - 说明: {desc}")
 
-            elif atype == "create":
-                sections.append(f"- 📄 **[文件新建 (create)]**: `{file_path}` (`{aid}`)")
-                if isinstance(content_lines, list):
-                    sections.append(f"  - 规模: 新建共 {len(content_lines)} 行")
+            elif atype in ("file_create", "create"):
+                sections.append(f"- 📄 **[文件新建 (file_create)]**: `{file_path}` (`{aid}`)")
+                if content_lines:
+                    c_list = content_lines if isinstance(content_lines, list) else str(content_lines).splitlines()
+                    lang = _detect_lang(file_path)
+                    c_text = "\n".join(c_list[:30])
+                    sections.append(f"  - **新建代码内容 ({len(c_list)} 行)**:\n    ```{lang}\n{c_text}\n    ```")
                 elif content:
                     sections.append(f"  - 规模: 新建共 {len(str(content).splitlines())} 行")
                 if desc:
                     sections.append(f"  - 说明: {desc}")
 
-            elif atype == "move":
-                sections.append(f"- 🚚 **[文件移动/重命名 (move)]**: `{source_path or file_path}` ➔ `{target_path or file_path}` (`{aid}`)")
+            elif atype in ("file_move", "move"):
+                sections.append(f"- 🚚 **[文件移动/重命名 (file_move)]**: `{source_path or file_path}` ➔ `{target_path or file_path}` (`{aid}`)")
                 if desc:
                     sections.append(f"  - 说明: {desc}")
 
-            elif atype == "delete":
-                sections.append(f"- 🗑️ **[文件删除 (delete)]**: `{file_path}` (`{aid}`)")
+            elif atype in ("file_delete", "delete"):
+                sections.append(f"- 🗑️ **[文件删除 (file_delete)]**: `{file_path}` (`{aid}`)")
                 if desc:
                     sections.append(f"  - 说明: {desc}")
 

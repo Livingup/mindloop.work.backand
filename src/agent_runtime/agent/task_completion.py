@@ -91,6 +91,7 @@ class AgentTaskCompletionCoordinator:
         delete_task_terminals: Callable[[str], Awaitable[None]],
         is_instance_active: Callable[[str], bool],
         release_pause_timeout: Callable[[str, str], None],
+        cleanup_task_notes: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._runtime_gateway = runtime_gateway
         self._trace_recorder = trace_recorder
@@ -99,6 +100,7 @@ class AgentTaskCompletionCoordinator:
         self._delete_task_terminals = delete_task_terminals
         self._is_instance_active = is_instance_active
         self._release_pause_timeout = release_pause_timeout
+        self._cleanup_task_notes = cleanup_task_notes
 
     async def complete_current_scene_task(
         self,
@@ -254,6 +256,11 @@ class AgentTaskCompletionCoordinator:
             self._runtime_gateway.complete_task(current_task.task_id)
 
         await self._delete_task_terminals(current_task.task_id)
+        if self._cleanup_task_notes is not None:
+            try:
+                await self._cleanup_task_notes(current_task.task_id)
+            except Exception as exc:
+                logger.warning("完成清理 Task Note 异常 (已忽略): %s", exc)
         self._trace_recorder.record_completed(trace_path)
         await self._publish_completed_event(
             communication_context=communication_context,

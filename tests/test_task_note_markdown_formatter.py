@@ -390,15 +390,15 @@ def test_format_task_note_parent_and_two_children_topology_and_file_modify_artif
 
     md = format_task_note_to_markdown(snapshot)
 
-    # 1. 验证关键产物 (Artifacts) 中的文件修改输出
+    # 1. 验证关键产物 (Artifacts) 中的文件修改输出 (严禁虚构伪 Git Diff，展示真实 replace_lines)
     assert "## 10. 关键产物与文件 (Artifacts)" in md
-    assert "- 📝 **[文件修改 (modify)]**: `src/services/auth_service.py` (`art_mod_001`)" in md
-    assert "修改区间: `L45-L58`" in md
-    assert "删减 5 行 / 新增 8 行" in md
-    assert "功能说明: 修复 JWT 过期时间校验及缓存失效逻辑" in md
-    assert "```diff" in md
-    assert "- if token.expired:" in md
-    assert "+ if token.is_expired(clock_skew=30):" in md
+    assert "- 📝 **[文件修改 (file_modify)]**: `src/services/auth_service.py` (`art_mod_001`)" in md
+    assert "行区间: `L45-L58`" in md
+    assert "功能说明" in md
+    assert "修复 JWT 过期时间校验及缓存失效逻辑" in md
+    assert "替换写入代码 (replace_lines)" in md
+    assert "if token.is_expired(clock_skew=30):" in md
+    assert "cache.invalidate(token.id)" in md
 
     # 2. 验证多 Agent 协作拓扑：明确区分父 Agent 与 2 个子 Agent
     assert "## 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)" in md

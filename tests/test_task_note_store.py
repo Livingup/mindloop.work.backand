@@ -332,3 +332,71 @@ def test_snapshot_service_read_after_store_contract_alignment():
     assert "agent_relationships" in snapshot
     assert "agent_messages" in snapshot
     assert "remote_agent_messages" in snapshot
+
+
+def test_cleanup_agent_instance_note(mock_db: Any):
+    """测试非 Root Agent 调用 end_task 时物理删除该实例的 15 张表 Note 记录（含 task_command_records）。"""
+    store, executed = mock_db
+    deleted = store.cleanup_agent_instance_note(task_id="task-cleanup-01", agent_instance_id="subagent-worker-01")
+
+    # 15 张表每个表执行一条 DELETE 语句，总共 15 条
+    assert len(executed) == 15
+    assert deleted == 15
+
+    executed_tables = []
+    for sql, params in executed:
+        assert sql.startswith("DELETE FROM task_")
+        assert "WHERE task_id = %s AND agent_instance_id = %s" in sql
+        assert params == ("task-cleanup-01", "subagent-worker-01")
+        # 提取表名
+        table_name = sql.split()[2]
+        executed_tables.append(table_name)
+
+    # 重点验证：task_command_records 必须在内
+    assert "task_command_records" in executed_tables
+    assert "task_todo_items" in executed_tables
+    assert "task_artifact_records" in executed_tables
+    assert "task_agent_relationships" in executed_tables
+    assert "task_agent_messages" in executed_tables
+
+
+def test_cleanup_task_note(mock_db: Any):
+    """测试 Root Agent 调用 end_task 时物理删除该 Task 下所有实例的 15 张表 Note 记录（含 task_command_records）。"""
+    store, executed = mock_db
+    deleted = store.cleanup_task_note(task_id="task-cleanup-02")
+
+    assert len(executed) == 15
+    assert deleted == 15
+
+    executed_tables = []
+    for sql, params in executed:
+        assert sql.startswith("DELETE FROM task_")
+        assert sql.endswith("WHERE task_id = %s")
+        assert params == ("task-cleanup-02",)
+        table_name = sql.split()[2]
+        executed_tables.append(table_name)
+
+    # 重点验证：task_command_records 必须在内
+    assert "task_command_records" in executed_tables
+    assert "task_mission_records" in executed_tables
+    assert "task_progress_content" in executed_tables
+
+
+@pytest.mark.asyncio
+async def test_snapshot_service_async_cleanup(mock_db: Any):
+    """测试 TaskNoteSnapshotService 的异步封装清理调用。"""
+    _store, executed = mock_db
+    # 构建连接工厂
+    def factory():
+        return MockConnectionContext(executed)
+
+    service = TaskNoteSnapshotService(connection_factory=factory)
+
+    # 1. 异步清理子 Agent 实例
+    del_inst = await service.async_cleanup_agent_instance_note(task_id="t1", agent_instance_id="sub1")
+    assert del_inst == 15
+
+    # 2. 异步清理 Task 全量
+    del_task = await service.async_cleanup_task_note(task_id="t1")
+    assert del_task == 15
+
