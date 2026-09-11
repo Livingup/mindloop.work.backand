@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import json
 import pytest
 
@@ -20,8 +20,18 @@ def test_get_note_tool_names():
     assert "update_task_progress" in names
 
 
-def test_render_note_system_prompt_built_in_fallback():
-    provider = TaskNotePromptProvider()
+def test_render_note_system_prompt_from_gateway():
+    from types import SimpleNamespace
+
+    class MockGateway:
+        def get_snippet(self, name: str):
+            assert name == NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID
+            return SimpleNamespace(
+                name=name,
+                text="你是{{agent_instance_id}}，你处于Note更新状态。可用工具：{{available_tools}}。",
+            )
+
+    provider = TaskNotePromptProvider(prompt_snippet_gateway=MockGateway())
     rendered = provider.render_note_system_prompt(
         agent_instance_id="agent-inst-test-001",
     )
@@ -30,6 +40,16 @@ def test_render_note_system_prompt_built_in_fallback():
     assert "note_update_end" in rendered
     assert "{{agent_instance_id}}" not in rendered
     assert "{{available_tools}}" not in rendered
+
+
+def test_load_raw_template_missing_raises_keyerror():
+    class EmptyGateway:
+        def get_snippet(self, name: str):
+            raise KeyError(f"未找到: {name}")
+
+    provider = TaskNotePromptProvider(prompt_snippet_gateway=EmptyGateway())
+    with pytest.raises(KeyError):
+        provider.load_raw_template()
 
 
 def test_get_note_tools_with_gateway():

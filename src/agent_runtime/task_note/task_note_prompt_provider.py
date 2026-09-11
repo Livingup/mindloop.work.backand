@@ -3,10 +3,9 @@
 
 负责：
 1. 从提示词模板服务（PromptSnippetNorthGateway）动态读取 note 更新系统提示词模板 system_note_update；
-2. 若未预先注册，自动从内置模板文件（system_note_update.md）加载并向网关注册持久化；
-3. 将标准变量（如 {{agent_instance_id}} 和 {{available_tools}}）渲染为针对当前 Agent 实例与 32 个 Note 工具的系统提示词；
-4. 按调用方请求的 API Format 构建 32 个 Note 工具的 LlmToolDefinition；
-5. 提供触发压缩时的边界指令提示词以及会话替换时的恢复引导提示词。
+2. 将标准变量（如 {{agent_instance_id}} 和 {{available_tools}}）渲染为针对当前 Agent 实例与 32 个 Note 工具的系统提示词；
+3. 按调用方请求的 API Format 构建 32 个 Note 工具的 LlmToolDefinition；
+4. 提供触发压缩时的边界指令提示词以及会话替换时的恢复现场工作手记。
 """
 from __future__ import annotations
 
@@ -80,9 +79,20 @@ class TaskNotePromptProvider:
     ) -> None:
         self._prompt_snippet_gateway = prompt_snippet_gateway
         self._local_tool_gateway = local_tool_gateway
-        self._default_template_path = (
-            Path(__file__).resolve().parent / "prompts" / "system_note_update.md"
-        )
+
+    def _resolve_gateway(self) -> PromptSnippetNorthGateway:
+        """获取提示词模板网关；若未显式注入则尝试从工厂创建。"""
+        if self._prompt_snippet_gateway is not None:
+            return self._prompt_snippet_gateway
+        try:
+            from agent_runtime.prompt_template.prompt_template_factory import (
+                PromptTemplateFactory,
+            )
+            return PromptTemplateFactory.create()
+        except Exception as exc:
+            raise RuntimeError(
+                f"未注入 PromptSnippetNorthGateway 且无法通过工厂创建模板网关: {exc}"
+            ) from exc
 
     def get_note_tool_names(self) -> tuple[str, ...]:
         """获取所有 32 个 Note 专属工具名称列表。"""
@@ -111,40 +121,14 @@ class TaskNotePromptProvider:
         return tuple(llm_tools)
 
     def load_raw_template(self) -> str:
-        """从模板网关或内置模板文件加载未渲染的系统提示词模板。"""
-        if self._prompt_snippet_gateway is not None:
-            try:
-                snippet = self._prompt_snippet_gateway.get_snippet(NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID)
-                if snippet and snippet.text:
-                    return snippet.text
-            except KeyError:
-                logger.info(
-                    "提示词模板 %s 未在网关注册，准备从内置文件加载并注册。",
-                    NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
-                )
-            except Exception as exc:
-                logger.warning("从提示词模板网关读取模板失败: %s，回退到内置文件", exc)
-
-        # 从内置文件加载
-        if not self._default_template_path.exists():
-            raise FileNotFoundError(f"内置 Note 更新提示词模板不存在: {self._default_template_path}")
-        raw_text = self._default_template_path.read_text(encoding="utf-8")
-
-        # 尝试自动在网关中注册以持久化
-        if self._prompt_snippet_gateway is not None:
-            try:
-                self._prompt_snippet_gateway.create_snippet(
-                    PromptSnippetCreateRequest(
-                        name=NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
-                        text=raw_text,
-                        category=NOTE_UPDATE_SNIPPET_CATEGORY,
-                    )
-                )
-                logger.info("已自动向模板网关注册 %s 提示词模板。", NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID)
-            except Exception as exc:
-                logger.warning("自动向模板网关注册 %s 失败（忽略）: %s", NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID, exc)
-
-        return raw_text
+        """从模板库网关严格读取系统提示词模板，保证模板库为唯一定义源。"""
+        gateway = self._resolve_gateway()
+        snippet = gateway.get_snippet(NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID)
+        if not snippet or not snippet.text:
+            raise KeyError(
+                f"系统提示词模板 '{NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID}' 在模板库中不存在或内容为空，请在模板库中维护该模板。"
+            )
+        return snippet.text
 
     def render_note_system_prompt(
         self,
