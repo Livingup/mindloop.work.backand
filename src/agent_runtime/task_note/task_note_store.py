@@ -32,16 +32,32 @@ def _generate_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+def _to_json_compatible(val: Any) -> Any:
+    """递归将 Pydantic 模型、dataclass 等对象转换为原生 JSON 可序列化类型。"""
+    if val is None:
+        return None
+    if hasattr(val, "model_dump") and callable(val.model_dump):
+        return val.model_dump(mode="json")
+    if hasattr(val, "dict") and callable(val.dict):
+        return val.dict()
+    if isinstance(val, (list, tuple, set)):
+        return [_to_json_compatible(item) for item in val]
+    if isinstance(val, dict):
+        return {k: _to_json_compatible(v) for k, v in val.items()}
+    return val
+
+
 def _dump_json(val: Any) -> Any:
     """序列化为数据库驱动支持的 JSONB 或 JSON 字符串。"""
     if val is None:
         return None
+    normalized = _to_json_compatible(val)
     try:
         from psycopg.types.json import Jsonb
 
-        return Jsonb(val)
+        return Jsonb(normalized)
     except ImportError:
-        return json.dumps(val, ensure_ascii=False)
+        return json.dumps(normalized, ensure_ascii=False)
 
 
 class TaskNoteStore:

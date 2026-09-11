@@ -66,6 +66,16 @@ def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
     return f"mission-default-{ctx.task_id or 'main'}"
 
 
+def _normalize_line_ranges(line_ranges: Any) -> list[dict[str, Any]] | None:
+    """将 LineRange 列表或混合行区间归一化为纯 dict 列表。"""
+    if line_ranges is None:
+        return None
+    return [
+        r.model_dump(mode="json") if hasattr(r, "model_dump") and callable(r.model_dump) else r
+        for r in line_ranges
+    ]
+
+
 # ── 1. 业务任务与需求维护工具 (agent_user_mission) ───────────────────
 
 @tool(
@@ -248,7 +258,7 @@ def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ct
             source_type=request.source_type,
             description=request.description,
             path=request.path,
-            line_ranges=request.line_ranges,
+            line_ranges=_normalize_line_ranges(request.line_ranges),
             directory_structure=request.directory_structure,
             search_content=request.search_content,
             core_result_content=request.core_result_content,
@@ -296,7 +306,7 @@ def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ct
             context_id=request.context_id,
             description=request.description,
             path=request.path,
-            line_ranges=request.line_ranges,
+            line_ranges=_normalize_line_ranges(request.line_ranges),
             directory_structure=request.directory_structure,
             search_content=request.search_content,
             core_result_content=request.core_result_content,
@@ -774,7 +784,7 @@ def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeC
             impact=request.impact,
             source_type=request.source_type,
             source_path=request.source_path,
-            line_ranges=request.line_ranges,
+            line_ranges=_normalize_line_ranges(request.line_ranges),
             command_id=request.command_id,
             reference_url=request.reference_url,
         )
@@ -817,7 +827,7 @@ def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeC
             impact=request.impact,
             source_type=request.source_type,
             source_path=request.source_path,
-            line_ranges=request.line_ranges,
+            line_ranges=_normalize_line_ranges(request.line_ranges),
             command_id=request.command_id,
             reference_url=request.reference_url,
         )
@@ -1103,7 +1113,7 @@ def create_task_validation(request: CreateTaskValidationRequest, ctx: ToolRuntim
             source_type=request.source_type or "manual",
             command_id=request.command_id,
             source_path=request.source_path,
-            line_ranges=request.line_ranges,
+            line_ranges=_normalize_line_ranges(request.line_ranges),
         )
         output = {
             "validation_id": validation_id,

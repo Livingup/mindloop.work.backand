@@ -400,3 +400,52 @@ async def test_snapshot_service_async_cleanup(mock_db: Any):
     del_task = await service.async_cleanup_task_note(task_id="t1")
     assert del_task == 15
 
+
+def test_dump_json_serializes_pydantic_line_ranges():
+    """测试 _dump_json 能够安全将包含 Pydantic LineRange 的对象序列化为原生可序列化格式。"""
+    import json
+    from agent_runtime.task_note.task_note_models import LineRange
+    from agent_runtime.task_note.task_note_store import _dump_json, _to_json_compatible
+
+    ranges = [LineRange(start_line=10, end_line=30), LineRange(start_line=50, end_line=100)]
+    compat = _to_json_compatible(ranges)
+    assert compat == [{"start_line": 10, "end_line": 30}, {"start_line": 50, "end_line": 100}]
+
+    dumped = _dump_json(ranges)
+    # 不论是 Jsonb 还是 fallback json str，都应可被标准 json.dumps 处理
+    inner_val = getattr(dumped, "obj", dumped)
+    serialized = json.dumps(inner_val)
+    assert '{"start_line": 10, "end_line": 30}' in serialized
+    assert '{"start_line": 50, "end_line": 100}' in serialized
+
+
+def test_create_workspace_context_with_pydantic_line_ranges(mock_db: Any):
+    """测试 create_task_workspace_context 传入 Pydantic LineRange 实例时正常执行入库。"""
+    import json
+    from agent_runtime.task_note.task_note_models import CreateTaskWorkspaceContextRequest, LineRange
+    from agent_runtime.task_note.task_note_store import set_task_note_store
+    _store, executed = mock_db
+    set_task_note_store(_store)
+    try:
+        ctx = ToolRuntimeContext(task_id="t_real", agent_instance_id="inst_real")
+
+        req = CreateTaskWorkspaceContextRequest(
+            mission_id="m1",
+            source_type="file",
+            path="src/engine.py",
+            line_ranges=[LineRange(start_line=3300, end_line=3479)],
+            description="引擎门禁",
+        )
+        res = create_task_workspace_context(req, ctx)
+        assert res.success is True
+        assert "context_id" in res.output
+
+        # 验证执行的 SQL 参数中 line_ranges 已正确转换为原生 dict，可被 json.dumps 序列化
+        insert_stmt = [stmt for stmt in executed if "INSERT INTO task_workspace_context" in stmt[0]][0]
+        line_ranges_param = insert_stmt[1][7]
+        inner = getattr(line_ranges_param, "obj", line_ranges_param)
+        dumped = json.dumps(inner)
+        assert '{"start_line": 3300, "end_line": 3479}' in dumped
+    finally:
+        set_task_note_store(None)
+
