@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Agent 运行时任务与实例管理北向网关契约。
 
 该模块定义程序内部动态运行态管理能力。后续 Agent 执行引擎应通过该契约
@@ -362,6 +362,15 @@ class AgentRuntimeGateway(Protocol):
         conversation_id: str,
     ) -> AgentInstance:
         ...
+
+    def update_agent_instance_execution_substate(
+        self,
+        instance_id: str,
+        execution_substate: str | None,
+    ) -> AgentInstance:
+        """更新 Agent 实例的执行子状态并持久化。"""
+        ...
+
 
     def enqueue_agent_instance_user_message(
         self,

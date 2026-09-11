@@ -21,6 +21,7 @@ from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
     AgentInstance,
+    EXECUTION_SUBSTATE_NOTE_UPDATE,
     PendingAgentUserMessage,
     PendingUserMessageAttachment,
 )
@@ -61,6 +62,7 @@ from agent_runtime.prompt_template.prompt_variables import (
 )
 from agent_runtime.conversation_message.conversation_repository import ConversationRepository
 from agent_runtime.conversation_message.message.models import (
+    Conversation,
     ConfigurationComponentEvent,
     PartMeta,
     ImagePart,
@@ -73,11 +75,20 @@ from agent_runtime.conversation_message.message.models import (
     ToolUsePart,
     UniMessage,
     UniPart,
+    ROLE_USER,
+    ROLE_ASSISTANT,
     ROLE_TOOL,
 )
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.context_compression.compression_service import ContextCompressionService
+from agent_runtime.context_compression.gate import decide_context_compression
+from agent_runtime.context_compression.models import CompressionDecision
+from agent_runtime.task_note.task_note_prompt_provider import (
+    NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
+    TaskNotePromptProvider,
+)
+from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -344,6 +355,8 @@ class AgentExecutionEngine:
         context_compression_service: ContextCompressionService | None = None,
         execution_loop_logger: AgentExecutionLoopLogger | NoopAgentExecutionLoopLogger | None = None,
         file_resource_service_getter: Callable[[], Any] | None = None,
+        task_note_prompt_provider: TaskNotePromptProvider | None = None,
+        task_note_snapshot_service: TaskNoteSnapshotService | None = None,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -371,6 +384,11 @@ class AgentExecutionEngine:
         self._context_compression_service = context_compression_service
         self._execution_loop_logger = execution_loop_logger or NoopAgentExecutionLoopLogger()
         self._file_resource_service_getter = file_resource_service_getter
+        self._task_note_prompt_provider = task_note_prompt_provider or TaskNotePromptProvider(
+            prompt_snippet_gateway=prompt_snippet_gateway,
+            local_tool_gateway=local_tool_gateway,
+        )
+        self._task_note_snapshot_service = task_note_snapshot_service or TaskNoteSnapshotService()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
@@ -2044,6 +2062,7 @@ class AgentExecutionEngine:
                         conversation_id=conversation.id,
                         assistant_message_index=assistant_message_index,
                         interrupt_state=interrupt_state,
+                        instance=instance,
                     ),
                     stage="tool_batch",
                     task_id=task.task_id,
@@ -2127,6 +2146,125 @@ class AgentExecutionEngine:
                 )
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
+                has_note_update_end = any(tu.name == "note_update_end" for tu in tool_uses)
+                if has_note_update_end and instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
+                    self._record_execution_loop_step(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        stage="task_note.update_end.detected",
+                        status="started",
+                        summary="检测到 note_update_end 工具调用，开始构建全新会话并替换 Conversation。",
+                        details={
+                            "task_id": task.task_id,
+                            "old_conversation_id": conversation.id,
+                            "instance_id": instance.instance_id,
+                        },
+                        expected_next="task_note.conversation.swap",
+                    )
+                    # 1. 从 PostgreSQL 读取当前 agent 实例 + task_id 的最新完整 Note 全量快照 JSON
+                    latest_note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
+                        task_id=task.task_id,
+                        agent_instance_id=instance.instance_id,
+                    )
+
+                    # 2. 调用会话仓储创建全新的 Conversation
+                    new_conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
+                    new_conversation = Conversation(id=new_conversation_id)
+
+                    # 3. 在新会话的 timeline 中初始化业务 Agent 定义的 Prompt 与 Tools
+                    business_tools = await self._tool_dispatcher.build_llm_tools(
+                        agent_definition=agent_definition,
+                        api_format=resolved_candidates[0].api_format,
+                    )
+                    business_system_prompt = self._render_system_prompt(
+                        agent_definition,
+                        instance.instance_id,
+                        instance.current_working_directory,
+                        request.render_options,
+                        business_tools,
+                    )
+                    new_conversation.system_prompt = business_system_prompt
+                    new_conversation.tools = tuple(
+                        deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
+                        for t in business_tools
+                    )
+                    new_conversation.record_configuration_event(
+                        ConfigurationComponentEvent(
+                            event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
+                            definition_id=agent_definition.agent_id,
+                            anchor="start",
+                            sequence=1,
+                            status="active",
+                            component="prompt",
+                        )
+                    )
+                    new_conversation.record_configuration_event(
+                        ConfigurationComponentEvent(
+                            event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
+                            definition_id=agent_definition.agent_id,
+                            anchor="start",
+                            sequence=0,
+                            status="active",
+                            component="tool",
+                        )
+                    )
+
+                    # 4. 注入包含 Note 快照与业务唤醒指示的初始消息
+                    resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(latest_note_snapshot)
+                    resumed_msg = UniMessage(
+                        role=ROLE_USER,
+                        content=[TextPart(text=resumed_prompt)],
+                        message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                    )
+                    new_conversation.append_message(resumed_msg, [TextPartMeta()])
+                    await self._conversation_repository.save(new_conversation)
+
+                    # 5. 调用 switch_agent_instance_conversation
+                    self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, new_conversation.id)
+
+                    # 6. 更新实例状态：instance = instance.exit_note_update()，写回 SQLite
+                    instance = instance.exit_note_update()
+                    self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
+
+                    # 7. 切换会话引用与上下文
+                    old_conversation_id = conversation.id
+                    conversation = new_conversation
+                    communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+
+                    # 8. 记录事件与日志
+                    self._record_execution_conversation_rebind(
+                        instance_id=instance.instance_id,
+                        frame_id=current_frame_id,
+                        reason="task_note_update_completed",
+                        job_id=None,
+                        source_conversation_id=old_conversation_id,
+                        target_conversation_id=new_conversation.id,
+                    )
+                    self._trace_recorder.record_event(
+                        trace_path,
+                        "task_note_update_conversation_swapped",
+                        {
+                            "old_conversation_id": old_conversation_id,
+                            "new_conversation_id": new_conversation.id,
+                            "task_id": task.task_id,
+                            "agent_instance_id": instance.instance_id,
+                        },
+                    )
+                    await self._event_publisher.publish(
+                        communication_context,
+                        "agent.conversation.swapped",
+                        {
+                            "task_id": task.task_id,
+                            "agent_instance_id": instance.instance_id,
+                            "old_conversation_id": old_conversation_id,
+                            "new_conversation_id": new_conversation.id,
+                            "reason": "task_note_update_completed",
+                        },
+                        source="agent_execution_engine",
+                    )
+
+                    # 9. 强制收敛决策为 continue，让循环继续进入新会话
+                    loop_decision = "continue"
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     frame_id=current_frame_id,
@@ -2794,89 +2932,110 @@ class AgentExecutionEngine:
                     expected_next=expected_next,
                 )
 
-            _record_prompt_preparation_step(
-                "llm.prompt.tools.build.start",
-                "started",
-                "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
-                {
-                    "agent_definition_id": agent_definition.agent_id,
-                    "local_tool_id_count": len(agent_definition.tool_ids),
-                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
-                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
-                },
-                "llm.prompt.tools.build.complete",
-            )
-            tools = await self._tool_dispatcher.build_llm_tools(
-                agent_definition=agent_definition,
-                api_format=resolved_model.api_format,
-            )
-            tool_source_counts: dict[str, int] = {}
-            for tool in tools:
-                tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
-            _record_prompt_preparation_step(
-                "llm.prompt.tools.build.complete",
-                "completed",
-                "LLM 可见工具 schema 构建完成。",
-                {
-                    "tool_schema_count": len(tools),
-                    "tool_names": [tool.name for tool in tools],
-                    "tool_source_counts": tool_source_counts,
-                    "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
-                },
-                "llm.prompt.mcp_services.load.start",
-            )
-            _record_prompt_preparation_step(
-                "llm.prompt.mcp_services.load.start",
-                "started",
-                "开始加载 MCP 服务与工具摘要提示词。",
-                {
-                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
-                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
-                },
-                "llm.prompt.mcp_services.load.complete",
-            )
-            mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
-            _record_prompt_preparation_step(
-                "llm.prompt.mcp_services.load.complete",
-                "completed",
-                "MCP 服务与工具摘要提示词加载完成。",
-                {
-                    "mcp_services_prompt_present": bool(mcp_services_prompt),
-                    "mcp_services_prompt_length": len(mcp_services_prompt),
-                },
-                "llm.prompt.render.start",
-            )
-            _record_prompt_preparation_step(
-                "llm.prompt.render.start",
-                "started",
-                "开始渲染系统提示词。",
-                {
-                    "system_prompt_segment_count": len(agent_definition.system_prompt),
-                    "skill_id_count": len(agent_definition.skill_ids),
-                    "available_sub_agent_id_count": len(agent_definition.available_sub_agent_ids),
-                    "render_option_keys": sorted(render_options.keys()),
-                },
-                "llm.prompt.agent_segments.start",
-            )
-            system_prompt = self._render_system_prompt(
-                agent_definition,
-                instance.instance_id,
-                instance.current_working_directory,
-                render_options,
-                tools,
-                mcp_services_prompt=mcp_services_prompt,
-                prompt_step_recorder=_record_prompt_preparation_step,
-            )
-            _record_prompt_preparation_step(
-                "llm.prompt.render.complete",
-                "completed",
-                "系统提示词渲染完成。",
-                {
-                    "system_prompt_present": system_prompt is not None,
-                    "system_prompt_length": len(system_prompt or ""),
-                },
-                "llm.prompt.prepared",
-            )
+            if instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
+                tools = self._task_note_prompt_provider.get_note_tools(resolved_model.api_format)
+                note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
+                system_prompt = self._task_note_prompt_provider.render_note_system_prompt(
+                    agent_instance_id=instance.instance_id,
+                    agent_name=agent_definition.name,
+                    current_working_directory=instance.current_working_directory,
+                    available_tools=note_tool_names,
+                )
+                _record_prompt_preparation_step(
+                    "llm.prompt.note_update.prepared",
+                    "completed",
+                    "Note 更新状态：已构建 32 个 Note 专属工具并渲染 Note 更新系统提示词。",
+                    {
+                        "system_prompt_length": len(system_prompt),
+                        "tool_count": len(tools),
+                        "tool_names": [tool.name for tool in tools],
+                    },
+                    "llm.candidate.request.start",
+                )
+            else:
+                _record_prompt_preparation_step(
+                    "llm.prompt.tools.build.start",
+                    "started",
+                    "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
+                    {
+                        "agent_definition_id": agent_definition.agent_id,
+                        "local_tool_id_count": len(agent_definition.tool_ids),
+                        "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                        "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                    },
+                    "llm.prompt.tools.build.complete",
+                )
+                tools = await self._tool_dispatcher.build_llm_tools(
+                    agent_definition=agent_definition,
+                    api_format=resolved_model.api_format,
+                )
+                tool_source_counts: dict[str, int] = {}
+                for tool in tools:
+                    tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
+                _record_prompt_preparation_step(
+                    "llm.prompt.tools.build.complete",
+                    "completed",
+                    "LLM 可见工具 schema 构建完成。",
+                    {
+                        "tool_schema_count": len(tools),
+                        "tool_names": [tool.name for tool in tools],
+                        "tool_source_counts": tool_source_counts,
+                        "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
+                    },
+                    "llm.prompt.mcp_services.load.start",
+                )
+                _record_prompt_preparation_step(
+                    "llm.prompt.mcp_services.load.start",
+                    "started",
+                    "开始加载 MCP 服务与工具摘要提示词。",
+                    {
+                        "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                        "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                    },
+                    "llm.prompt.mcp_services.load.complete",
+                )
+                mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
+                _record_prompt_preparation_step(
+                    "llm.prompt.mcp_services.load.complete",
+                    "completed",
+                    "MCP 服务与工具摘要提示词加载完成。",
+                    {
+                        "mcp_services_prompt_present": bool(mcp_services_prompt),
+                        "mcp_services_prompt_length": len(mcp_services_prompt),
+                    },
+                    "llm.prompt.render.start",
+                )
+                _record_prompt_preparation_step(
+                    "llm.prompt.render.start",
+                    "started",
+                    "开始渲染系统提示词。",
+                    {
+                        "system_prompt_segment_count": len(agent_definition.system_prompt),
+                        "skill_id_count": len(agent_definition.skill_ids),
+                        "available_sub_agent_id_count": len(agent_definition.available_sub_agent_ids),
+                        "render_option_keys": sorted(render_options.keys()),
+                    },
+                    "llm.prompt.agent_segments.start",
+                )
+                system_prompt = self._render_system_prompt(
+                    agent_definition,
+                    instance.instance_id,
+                    instance.current_working_directory,
+                    render_options,
+                    tools,
+                    mcp_services_prompt=mcp_services_prompt,
+                    prompt_step_recorder=_record_prompt_preparation_step,
+                )
+                _record_prompt_preparation_step(
+                    "llm.prompt.render.complete",
+                    "completed",
+                    "系统提示词渲染完成。",
+                    {
+                        "system_prompt_present": system_prompt is not None,
+                        "system_prompt_length": len(system_prompt or ""),
+                    },
+                    "llm.prompt.prepared",
+                )
             self._record_execution_loop_step(
                 instance_id=instance.instance_id,
                 stage="llm.prompt.prepared",
@@ -2894,70 +3053,90 @@ class AgentExecutionEngine:
                     "tool_names": [tool.name for tool in tools],
                     "system_prompt_present": system_prompt is not None,
                     "system_prompt_length": len(system_prompt or ""),
+                    "execution_substate": instance.execution_substate,
                 },
                 expected_next="context_compression_or_llm_request",
             )
             try:
-                if self._context_compression_service is not None:
-                    self._set_execution_phase(
-                        task_id=task.task_id,
-                        instance_id=instance.instance_id,
-                        stream_id=communication_context.stream_id,
-                        conversation_id=conversation.id,
-                        phase="context_compression",
-                        metadata={
-                            "candidate_index": candidate_index,
-                            "provider_id": resolved_model.provider_id,
-                            "model_id": resolved_model.model_id,
-                            "model_alias": resolved_model.model_alias,
-                        },
-                    )
-                    compression_result = await self._context_compression_service.compress_if_needed(
-                        task=task,
-                        instance=instance,
-                        source_conversation=conversation,
-                        trigger_model=resolved_model,
-                        communication_context=communication_context,
-                        interrupt_checker=lambda state=interrupt_state: state.requested,
-                        request_canceller_observer=interrupt_state.register_current_llm_request_canceller,
-                    )
-                    if compression_result.created and compression_result.target_conversation is not None:
-                        source_conversation_id = conversation.id
-                        conversation = compression_result.target_conversation
-                        instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
-                        communication_context = communication_context.with_metadata(conversation_id=conversation.id)
-                        job_id = compression_result.job.job_id if compression_result.job else None
-                        self._record_execution_conversation_rebind(
+                if instance.execution_substate != EXECUTION_SUBSTATE_NOTE_UPDATE:
+                    compression_decision = self._check_compression_gate(conversation, resolved_model)
+                    if compression_decision.should_compress:
+                        self._record_execution_loop_step(
                             instance_id=instance.instance_id,
-                            frame_id=execution_frame_id,
-                            reason="context_compression",
-                            job_id=job_id,
-                            source_conversation_id=source_conversation_id,
-                            target_conversation_id=conversation.id,
+                            stage="context_compression.note_update.triggered",
+                            status="triggered",
+                            summary="上下文使用量达到阈值，触发 Note 更新状态切换与基线快照注入。",
+                            details={
+                                "task_id": task.task_id,
+                                "conversation_id": conversation.id,
+                                "decision_reason": compression_decision.reason,
+                                "used_tokens": compression_decision.used_tokens,
+                                "threshold": compression_decision.threshold,
+                            },
+                            expected_next="task_note_snapshot_build",
+                        )
+                        # 步骤 1：从 PG 读取 Note 基线快照
+                        note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
+                            task_id=task.task_id,
+                            agent_instance_id=instance.instance_id,
+                        )
+
+                        # 步骤 2：追加边界 User 提示消息（包含基线 Note 快照）
+                        boundary_prompt = self._task_note_prompt_provider.build_compression_boundary_prompt(note_snapshot)
+                        boundary_msg = UniMessage(
+                            role=ROLE_USER,
+                            content=[TextPart(text=boundary_prompt)],
+                            message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                        )
+                        conversation.append_message(boundary_msg, [TextPartMeta()])
+
+                        # 步骤 3：更新 conversation.timeline（冻结当前业务 prompt/tools 为 historical，追加 Note prompt/tools 的活跃配置事件，并保存会话）
+                        self._freeze_and_append_note_timeline(
+                            conversation=conversation,
+                            agent_definition=agent_definition,
+                            business_system_prompt=system_prompt,
+                            business_tools=tools,
+                            boundary_message_id=boundary_msg.message_id,
+                        )
+                        await self._conversation_repository.save(conversation)
+
+                        # 步骤 4：更新实例状态为 note_update 并持久化到 SQLite
+                        instance = instance.enter_note_update()
+                        self._runtime_gateway.update_agent_instance_execution_substate(
+                            instance.instance_id,
+                            EXECUTION_SUBSTATE_NOTE_UPDATE,
+                        )
+
+                        # 步骤 5：当前轮次立即切换为 Note Prompt + Note Tools 发送给 LLM
+                        tools = self._task_note_prompt_provider.get_note_tools(resolved_model.api_format)
+                        note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
+                        system_prompt = self._task_note_prompt_provider.render_note_system_prompt(
+                            agent_instance_id=instance.instance_id,
+                            agent_name=agent_definition.name,
+                            current_working_directory=instance.current_working_directory,
+                            available_tools=note_tool_names,
                         )
                         self._trace_recorder.record_event(
                             trace_path,
-                            "context_compression_completed",
+                            "context_compression_note_update_entered",
                             {
-                                "job_id": job_id,
-                                "target_conversation_id": conversation.id,
+                                "task_id": task.task_id,
+                                "agent_instance_id": instance.instance_id,
+                                "boundary_message_id": boundary_msg.message_id,
+                                "decision_reason": compression_decision.reason,
                             },
                         )
-                    self._record_execution_loop_step(
-                        instance_id=instance.instance_id,
-                        stage="context_compression.checked",
-                        status="created" if compression_result.created else "unchanged",
-                        summary="上下文压缩服务已检查当前会话是否需要切换压缩后的 Conversation。",
-                        details={
-                            "task_id": task.task_id,
-                            "conversation_id": conversation.id,
-                            "candidate_index": candidate_index,
-                            "compression_created": compression_result.created,
-                            "target_conversation_id": getattr(compression_result.target_conversation, "id", None),
-                            "job_id": compression_result.job.job_id if compression_result.job else None,
-                        },
-                        expected_next="llm.candidate.request.start",
-                    )
+                        await self._event_publisher.publish(
+                            communication_context,
+                            "agent.context_compression.note_update_entered",
+                            {
+                                "task_id": task.task_id,
+                                "agent_instance_id": instance.instance_id,
+                                "conversation_id": conversation.id,
+                                "reason": compression_decision.reason,
+                            },
+                            source="agent_execution_engine",
+                        )
                     if interrupt_state.requested:
                         raise LlmRequestCancelled("LLM request cancelled.")
                 self._set_execution_phase(
@@ -3198,6 +3377,101 @@ class AgentExecutionEngine:
             )
         await self._conversation_repository.save(conversation)
         return len(pending_messages)
+
+    def _check_compression_gate(
+        self,
+        conversation: Conversation,
+        resolved_model: ResolvedLlmProviderModel,
+    ) -> CompressionDecision:
+        if self._context_compression_service is not None:
+            try:
+                config = replace(
+                    self._context_compression_service._config_accessor(),
+                    input_mode="native_multimodal_history",
+                )
+                return decide_context_compression(conversation, resolved_model, config)
+            except Exception as exc:
+                logger.warning("检查上下文压缩门禁异常: %s", exc)
+        return CompressionDecision(False, "no_compression_service")
+
+    def _freeze_and_append_note_timeline(
+        self,
+        *,
+        conversation: Conversation,
+        agent_definition: AgentDefinition,
+        business_system_prompt: str | None,
+        business_tools: tuple[LlmToolDefinition, ...] | list[LlmToolDefinition],
+        boundary_message_id: str,
+    ) -> None:
+        business_tool_schemas = tuple(
+            deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
+            for t in business_tools
+        )
+        if not conversation.timeline:
+            if business_system_prompt is not None:
+                conversation.record_configuration_event(
+                    ConfigurationComponentEvent(
+                        event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
+                        definition_id=agent_definition.agent_id,
+                        anchor="start",
+                        sequence=1,
+                        status="active",
+                        component="prompt",
+                    )
+                )
+            if business_tools:
+                conversation.record_configuration_event(
+                    ConfigurationComponentEvent(
+                        event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
+                        definition_id=agent_definition.agent_id,
+                        anchor="start",
+                        sequence=0,
+                        status="active",
+                        component="tool",
+                    )
+                )
+
+        frozen_timeline: list[ConfigurationComponentEvent] = []
+        for evt in conversation.timeline:
+            if evt.status == "active":
+                snapshot = (
+                    business_system_prompt or ""
+                    if evt.component == "prompt"
+                    else business_tool_schemas
+                )
+                frozen_timeline.append(
+                    replace(
+                        evt,
+                        status="historical",
+                        snapshot=snapshot,
+                    )
+                )
+            else:
+                frozen_timeline.append(evt)
+        conversation.timeline = frozen_timeline
+
+        conversation.record_configuration_event(
+            ConfigurationComponentEvent(
+                event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
+                definition_id=NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
+                anchor="after_message_id",
+                anchor_message_id=boundary_message_id,
+                sequence=1,
+                status="active",
+                component="prompt",
+            )
+        )
+        conversation.record_configuration_event(
+            ConfigurationComponentEvent(
+                event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
+                definition_id="task_note",
+                anchor="after_message_id",
+                anchor_message_id=boundary_message_id,
+                sequence=0,
+                status="active",
+                component="tool",
+            )
+        )
 
     def _render_system_prompt(
         self,
@@ -3641,11 +3915,25 @@ class AgentExecutionEngine:
         definition: AgentDefinition,
         tool_use: ToolUsePart,
         communication_context: RuntimeCommunicationContext,
+        *,
+        instance: AgentInstance | None = None,
     ) -> ToolDispatchResult:
         """执行单个工具调用，调度层异常也转换为 LLM 可见的工具错误结果。"""
         try:
+            if instance is not None and instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
+                note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
+                if tool_use.name not in note_tool_names:
+                    raise PermissionError(f"Note 更新状态下仅允许调用 Task Note 工具，禁止调用工具: {tool_use.name}")
+                effective_definition = replace(
+                    definition,
+                    tool_ids=note_tool_names,
+                    mcp_tools=(),
+                )
+            else:
+                effective_definition = definition
+
             return await self._tool_dispatcher.dispatch_tool_call(
-                agent_definition=definition,
+                agent_definition=effective_definition,
                 tool_use=tool_use,
                 communication_context=communication_context.with_actor(
                     actor_type="tool_dispatcher",
@@ -3689,6 +3977,7 @@ class AgentExecutionEngine:
         conversation_id: str | None = None,
         assistant_message_index: int | None = None,
         interrupt_state: _AgentExecutionInterruptState,
+        instance: AgentInstance | None = None,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
         started_at = time.perf_counter()
@@ -3774,6 +4063,7 @@ class AgentExecutionEngine:
                 definition,
                 tool_use,
                 communication_context,
+                instance=instance,
             ))
             tasks.append((tool_use, tool_task))
         if tasks:

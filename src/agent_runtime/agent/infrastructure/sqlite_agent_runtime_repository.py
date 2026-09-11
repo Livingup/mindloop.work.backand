@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS agent_instances (
     conversation_id      TEXT,
     trace_id             TEXT NOT NULL,
     status               TEXT NOT NULL,
+    execution_substate   TEXT,
     pending_user_messages_json TEXT NOT NULL DEFAULT '[]',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
@@ -264,9 +265,9 @@ class SqliteAgentRuntimeRepository:
                     instance_id, task_id, thread_id, current_working_directory, agent_definition_id,
                     llm_provider_id, llm_model_binding_id, llm_policy_group_id,
                     conversation_id, trace_id,
-                    status, pending_user_messages_json, created_at, updated_at, started_at, paused_at,
+                    status, execution_substate, pending_user_messages_json, created_at, updated_at, started_at, paused_at,
                     finished_at, failed_at, failure_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     instance.instance_id,
@@ -280,6 +281,7 @@ class SqliteAgentRuntimeRepository:
                     instance.conversation_id,
                     instance.trace_id,
                     instance.status,
+                    instance.execution_substate,
                     _pending_user_messages_to_json(instance.pending_user_messages),
                     _datetime_to_text(instance.created_at),
                     _datetime_to_text(instance.updated_at),
@@ -425,6 +427,14 @@ class SqliteAgentRuntimeRepository:
                 "ALTER TABLE agent_parent_child_relations "
                 "ADD COLUMN released_by_instance_id TEXT"
             )
+        instance_columns = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(agent_instances)").fetchall()
+        }
+        if "execution_substate" not in instance_columns:
+            self._conn.execute(
+                "ALTER TABLE agent_instances ADD COLUMN execution_substate TEXT"
+            )
 
     def _load_task_relations(self, task_id: str) -> tuple[AgentParentChildRelation, ...]:
         """加载指定 task 的父子关系树边集合。"""
@@ -513,7 +523,7 @@ SELECT instance_id, task_id, thread_id, current_working_directory, agent_definit
        llm_provider_id, llm_model_binding_id, llm_policy_group_id,
        conversation_id, trace_id,
        status, pending_user_messages_json, created_at, updated_at, started_at, paused_at,
-       finished_at, failed_at, failure_message
+       finished_at, failed_at, failure_message, execution_substate
 FROM agent_instances
 """
 
@@ -551,6 +561,7 @@ def _row_to_task(
 
 def _row_to_instance(row: sqlite3.Row | tuple) -> AgentInstance:
     """将 SQLite instance 行还原为 AgentInstance 实体。"""
+    execution_substate = row[19] if len(row) > 19 else None
     return AgentInstance(
         instance_id=row[0],
         task_id=row[1],
@@ -563,6 +574,7 @@ def _row_to_instance(row: sqlite3.Row | tuple) -> AgentInstance:
         conversation_id=row[8],
         trace_id=row[9],
         status=row[10],
+        execution_substate=execution_substate,
         pending_user_messages=_pending_user_messages_from_json(row[11]),
         created_at=_text_to_datetime(row[12]),
         updated_at=_text_to_datetime(row[13]),

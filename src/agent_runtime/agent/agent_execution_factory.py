@@ -34,6 +34,8 @@ from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
 )
 from agent_runtime.prompt_template import PromptTemplateFactory
 from agent_runtime.skill.skill_factory import SkillFactory
+from agent_runtime.task_note.task_note_prompt_provider import TaskNotePromptProvider
+from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
 
 
@@ -177,12 +179,18 @@ class AgentExecutionFactory:
             settings_repository=context_compression_settings_repository,
             prompt_repository=context_compression_prompt_repository,
         )
+        prompt_snippet_gateway = PromptTemplateFactory.create()
+        task_note_prompt_provider = TaskNotePromptProvider(
+            prompt_snippet_gateway=prompt_snippet_gateway,
+            local_tool_gateway=local_tool_gateway,
+        )
+        task_note_snapshot_service = TaskNoteSnapshotService()
         engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
             agent_definition_gateway=agent_definition_gateway,
             llm_registry_gateway=llm_registry_gateway,
             conversation_repository=conversation_repository,
-            prompt_snippet_gateway=PromptTemplateFactory.create(),
+            prompt_snippet_gateway=prompt_snippet_gateway,
             local_tool_gateway=local_tool_gateway,
             mcp_client_gateway=mcp_gateway,
             skill_gateway=SkillFactory.create(),
@@ -194,6 +202,8 @@ class AgentExecutionFactory:
             context_compression_service=context_compression_service,
             execution_loop_logger=execution_loop_logger,
             file_resource_service_getter=get_file_resource_service,
+            task_note_prompt_provider=task_note_prompt_provider,
+            task_note_snapshot_service=task_note_snapshot_service,
         )
         LacpFactory.create_bridge(
             runtime_gateway=runtime_gateway,

@@ -13,6 +13,7 @@
 from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
+    EXECUTION_SUBSTATE_NOTE_UPDATE,
     AgentInstance,
     AgentInstanceStatus,
     PendingAgentUserMessage,
@@ -39,6 +40,7 @@ __all__ = [
     "PendingAgentUserMessage",
     "AGENT_INSTANCE_STATUS_READY",
     "AGENT_INSTANCE_STATUS_RUNNING",
+    "EXECUTION_SUBSTATE_NOTE_UPDATE",
     "AgentTask",
     "AgentTaskStatus",
     "AgentParentChildRelation",

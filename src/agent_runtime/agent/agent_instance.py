@@ -26,6 +26,9 @@ AGENT_INSTANCE_STATUSES: Final[frozenset[str]] = frozenset({
     AGENT_INSTANCE_STATUS_RUNNING,
 })
 
+# 执行子状态：Note 上下文压缩更新中。
+EXECUTION_SUBSTATE_NOTE_UPDATE: Final[str] = "note_update"
+
 _LEGACY_READY_INSTANCE_STATUSES: Final[frozenset[str]] = frozenset({
     "created",
     "paused",
@@ -169,6 +172,9 @@ class AgentInstance:
 
     # 当前实例执行载体状态。ready 可接收输入，running 表示执行循环正在进行。
     status: AgentInstanceStatus = AGENT_INSTANCE_STATUS_READY
+
+    # 当前实例执行子状态。None 表示普通业务执行态；"note_update" 表示正在执行 Note 上下文压缩更新。
+    execution_substate: str | None = None
 
     # 用户发给当前 AgentInstance 但尚未被对话消费的消息队列。
     # 队列只能由执行循环在完整轮次边界按 FIFO 顺序 drain 到 conversation。
@@ -425,3 +431,14 @@ class AgentInstance:
         if target_status == self.status and failure_message is None:
             return self
         return replace(self, **values)
+
+    def enter_note_update(self, *, at: datetime | None = None) -> "AgentInstance":
+        """将实例执行子状态流转为 note_update。"""
+        now = at or _utc_now()
+        return replace(self, execution_substate=EXECUTION_SUBSTATE_NOTE_UPDATE, updated_at=now)
+
+    def exit_note_update(self, *, at: datetime | None = None) -> "AgentInstance":
+        """将实例执行子状态恢复为常规业务态（None）。"""
+        now = at or _utc_now()
+        return replace(self, execution_substate=None, updated_at=now)
+

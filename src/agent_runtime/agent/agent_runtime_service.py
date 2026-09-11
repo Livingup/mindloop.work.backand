@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Agent 运行时任务与实例管理领域服务。"""
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from uuid import uuid4
 from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_READY,
     AGENT_INSTANCE_STATUS_RUNNING,
+    EXECUTION_SUBSTATE_NOTE_UPDATE,
     AgentInstance,
     AgentInstanceStatus,
     PendingAgentUserMessage,
@@ -558,6 +559,22 @@ class AgentRuntimeService:
             updated = instance.switch_conversation(conversation_id)
             self._repository.save_agent_instance(updated)
             return updated
+
+    def update_agent_instance_execution_substate(
+        self,
+        instance_id: str,
+        execution_substate: str | None,
+    ) -> AgentInstance:
+        """更新 Agent 实例的执行子状态并持久化。"""
+        with self._lock:
+            instance = self._get_required_instance(instance_id)
+            if execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
+                updated = instance.enter_note_update()
+            else:
+                updated = instance.exit_note_update()
+            self._repository.save_agent_instance(updated)
+            return updated
+
 
     def enqueue_agent_instance_user_message(
         self,

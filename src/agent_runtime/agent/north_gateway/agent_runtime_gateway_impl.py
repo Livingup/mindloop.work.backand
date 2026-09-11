@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Agent 运行时任务与实例管理北向网关实现。"""
 from __future__ import annotations
 
@@ -275,6 +275,17 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
             instance_id,
             conversation_id,
         )
+
+    def update_agent_instance_execution_substate(
+        self,
+        instance_id: str,
+        execution_substate: str | None,
+    ) -> AgentInstance:
+        return self._service.update_agent_instance_execution_substate(
+            instance_id,
+            execution_substate,
+        )
+
 
     def enqueue_agent_instance_user_message(
         self,
