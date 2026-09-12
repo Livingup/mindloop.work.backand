@@ -390,8 +390,8 @@ def test_format_task_note_parent_and_two_children_topology_and_file_modify_artif
 
     md = format_task_note_to_markdown(snapshot)
 
-    # 1. 验证关键产物 (Artifacts) 中的文件修改输出 (严禁虚构伪 Git Diff，展示真实 replace_lines)
-    assert "## 10. 关键产物与文件 (Artifacts)" in md
+    # 1. 验证关键产物 (Artifacts) 中的文件修改输出 (空章节跳过后动态编号为 1)
+    assert "## 1. 关键产物与文件 (Artifacts)" in md
     assert "- 📝 **[文件修改 (file_modify)]**: `src/services/auth_service.py` (`art_mod_001`)" in md
     assert "行区间: `L45-L58`" in md
     assert "功能说明" in md
@@ -400,8 +400,8 @@ def test_format_task_note_parent_and_two_children_topology_and_file_modify_artif
     assert "if token.is_expired(clock_skew=30):" in md
     assert "cache.invalidate(token.id)" in md
 
-    # 2. 验证多 Agent 协作拓扑：明确区分父 Agent 与 2 个子 Agent
-    assert "## 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)" in md
+    # 2. 验证多 Agent 协作拓扑：明确区分父 Agent 与 2 个子 Agent (动态编号为 2)
+    assert "## 2. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)" in md
     
     # 2.1 父 Agent 专线
     assert "### 🔼 上级父 Agent: `agent_lead_orchestrator` (角色: `parent`, 状态: `unreleased`)" in md
@@ -417,4 +417,59 @@ def test_format_task_note_parent_and_two_children_topology_and_file_modify_artif
     assert "### 协作子 Agent: `agent_worker_qa` (角色: `child`, 状态: `released`)" in md
     assert "📤 **[发往子 Agent]**: 请执行鉴权相关单测" in md
     assert "📥 **[收到子 Agent 回复]**: 12 项鉴权测试全绿通过" in md
+
+
+def test_format_task_note_skips_empty_sections():
+    """测试当部分或大部分表为空时，绝不输出空章节标题与占位文本，并保持动态连续序号。"""
+    # 只有 missions 和 workspace_context
+    snapshot = {
+        "task_id": "task_sparse_01",
+        "agent_instance_id": "agent_sparse_01",
+        "missions": [
+            {
+                "mission_id": "m_sparse_1",
+                "title": "排查空章节渲染问题",
+                "status": "active",
+                "refined_requirement": "仅对有内容的表进行章节渲染",
+            }
+        ],
+        "workspace_context": [
+            {
+                "context_id": "ctx_sparse_1",
+                "source_type": "file",
+                "description": "格式化代码",
+                "path": "src/agent_runtime/task_note/task_note_markdown_formatter.py",
+                "important_content": "sec_idx 动态自增计数",
+            }
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 1. 验证仅有内容的两个部分被渲染，且序号分别为 1 和 2
+    assert "## 1. 意图与目标需求 (Missions)" in md
+    assert "## 2. 工作区关键上下文与重点源码 (Workspace Context)" in md
+    assert "排查空章节渲染问题" in md
+    assert "sec_idx 动态自增计数" in md
+
+    # 2. 验证空表章节完全被跳过，不出现其标题或占位符
+    assert "现场进度与下一步行动指针" not in md
+    assert "任务待办清单" not in md
+    assert "当前执行方案与架构设计" not in md
+    assert "关键技术决策与约定" not in md
+    assert "探索与关键分析发现" not in md
+    assert "问题排查与阻碍记录" not in md
+    assert "验证与测试结论" not in md
+    assert "关键产物与文件" not in md
+    assert "外部环境与服务状态" not in md
+    assert "多 Agent 协作拓扑" not in md
+    assert "外部远程 Agent" not in md
+    assert "暂无" not in md
+
+    # 3. 验证如果完全没有任何有效内容，则输出提示行
+    empty_snapshot = {"task_id": "task_empty", "agent_instance_id": "agent_empty"}
+    empty_md = format_task_note_to_markdown(empty_snapshot)
+    assert "## 1." not in empty_md
+    assert "*(当前暂无持久化任务手记记录)*" in empty_md
+
 

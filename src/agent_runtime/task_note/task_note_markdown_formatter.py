@@ -173,35 +173,50 @@ def format_task_note_to_markdown(
         aid_str = f"`{agent_id}`" if agent_id else "-"
         sections.append(f"> 任务 ID: {tid_str} | Agent 实例: {aid_str}\n")
 
+    sec_idx = 1
+
     # ── 1. 当前行动指针与最新进展 (Progress & Next Action) ─────────────
     progress = note_snapshot.get("progress")
-    sections.append("## 1. 现场进度与下一步行动指针 (Progress & Next Action)")
     if progress and isinstance(progress, dict):
-        next_step = progress.get("next_step") or "(未设定明确下一步)"
-        sections.append(f"> 🎯 **下一步明确行动 (Next Step)**:\n> **{next_step}**\n")
+        has_progress = any(
+            progress.get(k)
+            for k in (
+                "next_step",
+                "completed_summary",
+                "current_work",
+                "current_blockers",
+                "recent_validation",
+                "handoff_notes",
+            )
+        )
+        if has_progress:
+            p_lines = [f"## {sec_idx}. 现场进度与下一步行动指针 (Progress & Next Action)"]
+            sec_idx += 1
+            next_step = progress.get("next_step") or "(未设定明确下一步)"
+            p_lines.append(f"> 🎯 **下一步明确行动 (Next Step)**:\n> **{next_step}**\n")
 
-        comp = progress.get("completed_summary")
-        if comp:
-            sections.append(f"- **已完成工作摘要**: {comp}")
-        cur_w = progress.get("current_work")
-        if cur_w:
-            sections.append(f"- **当前正在进行**: {cur_w}")
-        blockers = progress.get("current_blockers")
-        if blockers:
-            sections.append(f"- **当前阻塞与风险**: {blockers}")
-        rec_v = progress.get("recent_validation")
-        if rec_v:
-            sections.append(f"- **最近验证结论**: {rec_v}")
-        handoff = progress.get("handoff_notes")
-        if handoff:
-            sections.append(f"- **交接备忘**: {handoff}")
-    else:
-        sections.append("*(暂无持久化进展记录，请以用户初始任务为准)*")
+            comp = progress.get("completed_summary")
+            if comp:
+                p_lines.append(f"- **已完成工作摘要**: {comp}")
+            cur_w = progress.get("current_work")
+            if cur_w:
+                p_lines.append(f"- **当前正在进行**: {cur_w}")
+            blockers = progress.get("current_blockers")
+            if blockers:
+                p_lines.append(f"- **当前阻塞与风险**: {blockers}")
+            rec_v = progress.get("recent_validation")
+            if rec_v:
+                p_lines.append(f"- **最近验证结论**: {rec_v}")
+            handoff = progress.get("handoff_notes")
+            if handoff:
+                p_lines.append(f"- **交接备忘**: {handoff}")
+            sections.append("\n".join(p_lines))
 
     # ── 2. 待办任务清单 (Todos) ───────────────────────────────────────
     todos = note_snapshot.get("todos") or []
-    sections.append("\n## 2. 任务待办清单 (Todos)")
     if todos:
+        t_lines = [f"## {sec_idx}. 任务待办清单 (Todos)"]
+        sec_idx += 1
         sorted_todos = sorted(todos, key=lambda x: (x.get("priority", 999), x.get("created_at", "")))
         todo_lines: list[str] = []
         for t in sorted_todos:
@@ -222,23 +237,23 @@ def format_task_note_to_markdown(
                 box = "- [ ]"
                 label = f"[P{p}] {content}"
             todo_lines.append(f"{box} {label} `({tid})`")
-        sections.append("\n".join(todo_lines))
-    else:
-        sections.append("*(暂无待办项)*")
+        t_lines.append("\n".join(todo_lines))
+        sections.append("\n".join(t_lines))
 
     # ── 3. 用户任务目标与意图 (Missions) ───────────────────────────────
     missions = note_snapshot.get("missions") or []
-    sections.append("\n## 3. 意图与目标需求 (Missions)")
     if missions:
+        m_lines = [f"## {sec_idx}. 意图与目标需求 (Missions)"]
+        sec_idx += 1
         for idx, m in enumerate(missions, start=1):
             mid = m.get("mission_id", f"m_{idx}")
             title = m.get("title", "(无标题任务)")
             st = m.get("status", "active")
             refined = m.get("refined_requirement", "")
             raw_prompts = m.get("raw_prompts") or []
-            sections.append(f"### Mission: {title} (ID: `{mid}`, 状态: `{st}`)")
+            m_lines.append(f"### Mission: {title} (ID: `{mid}`, 状态: `{st}`)")
             if refined:
-                sections.append(f"- **精炼业务需求**:\n  {refined}")
+                m_lines.append(f"- **精炼业务需求**:\n  {refined}")
             if raw_prompts:
                 if isinstance(raw_prompts, list):
                     prompt_strs = []
@@ -250,24 +265,22 @@ def format_task_note_to_markdown(
                         elif isinstance(p, str) and p:
                             prompt_strs.append(f"  - \"{p}\"")
                     if prompt_strs:
-                        sections.append("- **用户与委派指令记录**:\n" + "\n".join(prompt_strs))
+                        m_lines.append("- **用户与委派指令记录**:\n" + "\n".join(prompt_strs))
                 elif isinstance(raw_prompts, str):
-                    sections.append(f"- **用户与委派指令记录**: {raw_prompts}")
-    else:
-        sections.append("*(暂无意图任务)*")
+                    m_lines.append(f"- **用户与委派指令记录**: {raw_prompts}")
+        sections.append("\n".join(m_lines))
 
     # ── 4. 当前方案设计与架构方案 (Active Solution) ─────────────────────
     solution = note_snapshot.get("solution")
-    sections.append("\n## 4. 当前执行方案与架构设计 (Active Solution)")
     if solution and isinstance(solution, dict) and solution.get("solution_content"):
-        sections.append(solution["solution_content"])
-    else:
-        sections.append("*(暂无明确方案正文)*")
+        sections.append(f"## {sec_idx}. 当前执行方案与架构设计 (Active Solution)\n" + solution["solution_content"])
+        sec_idx += 1
 
     # ── 5. 关键技术决策与约定 (Technical Decisions) ───────────────────
     decisions = note_snapshot.get("decisions") or []
-    sections.append("\n## 5. 关键技术决策与约定 (Technical Decisions)")
     if decisions:
+        d_lines = [f"## {sec_idx}. 关键技术决策与约定 (Technical Decisions)"]
+        sec_idx += 1
         for d in decisions:
             did = d.get("decision_id", "")
             status = d.get("decision_status", "active")
@@ -275,20 +288,20 @@ def format_task_note_to_markdown(
             rat = d.get("rationale")
             alt = d.get("alternatives")
             imp = d.get("impact")
-            sections.append(f"- **决策**: {content} (ID: `{did}`, 状态: `{status}`)")
+            d_lines.append(f"- **决策**: {content} (ID: `{did}`, 状态: `{status}`)")
             if rat:
-                sections.append(f"  - 决策理由: {rat}")
+                d_lines.append(f"  - 决策理由: {rat}")
             if alt:
-                sections.append(f"  - 备选考量: {alt}")
+                d_lines.append(f"  - 备选考量: {alt}")
             if imp:
-                sections.append(f"  - 影响范围: {imp}")
-    else:
-        sections.append("*(暂无决策记录)*")
+                d_lines.append(f"  - 影响范围: {imp}")
+        sections.append("\n".join(d_lines))
 
     # ── 6. 工作区重点代码与上下文 (Workspace Context) ─────────────────
     ctx_list = note_snapshot.get("workspace_context") or []
-    sections.append("\n## 6. 工作区关键上下文与重点源码 (Workspace Context)")
     if ctx_list:
+        w_lines = [f"## {sec_idx}. 工作区关键上下文与重点源码 (Workspace Context)"]
+        sec_idx += 1
         for c in ctx_list:
             cid = c.get("context_id", "")
             stype = c.get("source_type", "file")
@@ -302,11 +315,11 @@ def format_task_note_to_markdown(
             d_struct = c.get("directory_structure")
             urls = c.get("url_list") or c.get("reference_links")
 
-            sections.append(f"### 上下文: {desc or stype} (`{cid}`)")
+            w_lines.append(f"### 上下文: {desc or stype} (`{cid}`)")
             if cmd_id:
                 cmd_str = _format_command_execution(cmd_id, cmd_lookup)
                 if cmd_str:
-                    sections.append(cmd_str)
+                    w_lines.append(cmd_str)
 
             # 源码反查
             if path and line_ranges:
@@ -314,30 +327,30 @@ def format_task_note_to_markdown(
                     path, line_ranges, current_working_directory=current_working_directory
                 )
                 if code_snippet:
-                    sections.append(f"**关联源码反查**:\n{code_snippet}")
+                    w_lines.append(f"**关联源码反查**:\n{code_snippet}")
             elif path:
-                sections.append(f"- **文件路径**: `{path}`")
+                w_lines.append(f"- **文件路径**: `{path}`")
 
             if important:
-                sections.append(f"- **核心内容**: {important}")
+                w_lines.append(f"- **核心内容**: {important}")
             if search_c:
-                sections.append(f"- **检索词**: `{search_c}`")
+                w_lines.append(f"- **检索词**: `{search_c}`")
             if core_res:
-                sections.append(f"- **检索结果摘要**: {core_res}")
+                w_lines.append(f"- **检索结果摘要**: {core_res}")
             if d_struct:
-                sections.append(f"- **目录结构**:\n```text\n{d_struct}\n```")
+                w_lines.append(f"- **目录结构**:\n```text\n{d_struct}\n```")
             if urls:
                 if isinstance(urls, list):
-                    sections.append("- **参考链接**: " + ", ".join(f"`{u}`" for u in urls))
+                    w_lines.append("- **参考链接**: " + ", ".join(f"`{u}`" for u in urls))
                 else:
-                    sections.append(f"- **参考链接**: `{urls}`")
-    else:
-        sections.append("*(暂无工作区上下文)*")
+                    w_lines.append(f"- **参考链接**: `{urls}`")
+        sections.append("\n".join(w_lines))
 
     # ── 7. 代码探索与关键分析发现 (Discoveries) ────────────────────────
     discoveries = note_snapshot.get("discoveries") or []
-    sections.append("\n## 7. 探索与关键分析发现 (Discoveries)")
     if discoveries:
+        disc_lines = [f"## {sec_idx}. 探索与关键分析发现 (Discoveries)"]
+        sec_idx += 1
         for d in discoveries:
             did = d.get("discovery_id", "")
             content = d.get("discovery_content", "")
@@ -347,30 +360,30 @@ def format_task_note_to_markdown(
             cmd_id = d.get("command_id")
             ref_url = d.get("reference_url")
 
-            sections.append(f"- **发现 (`{did}`)**: {content}")
+            disc_lines.append(f"- **发现 (`{did}`)**: {content}")
             if impact:
-                sections.append(f"  - 影响面: {impact}")
+                disc_lines.append(f"  - 影响面: {impact}")
             if cmd_id:
                 cmd_str = _format_command_execution(cmd_id, cmd_lookup)
                 if cmd_str:
-                    sections.append(f"  {cmd_str}")
+                    disc_lines.append(f"  {cmd_str}")
             if source_path and line_ranges:
                 code_snippet = reverse_lookup_source_code(
                     source_path, line_ranges, current_working_directory=current_working_directory
                 )
                 if code_snippet:
-                    sections.append(f"  **关联源码**:\n{code_snippet}")
+                    disc_lines.append(f"  **关联源码**:\n{code_snippet}")
             elif source_path:
-                sections.append(f"  - 涉及路径: `{source_path}`")
+                disc_lines.append(f"  - 涉及路径: `{source_path}`")
             if ref_url:
-                sections.append(f"  - 参考来源: `{ref_url}`")
-    else:
-        sections.append("*(暂无探索发现)*")
+                disc_lines.append(f"  - 参考来源: `{ref_url}`")
+        sections.append("\n".join(disc_lines))
 
     # ── 8. 问题排查与阻碍记录 (Issues) ────────────────────────────────
     issues = note_snapshot.get("issues") or []
-    sections.append("\n## 8. 问题排查与阻碍记录 (Issues)")
     if issues:
+        iss_lines = [f"## {sec_idx}. 问题排查与阻碍记录 (Issues)"]
+        sec_idx += 1
         for iss in issues:
             iid = iss.get("issue_id", "")
             status = iss.get("status", "open")
@@ -382,28 +395,28 @@ def format_task_note_to_markdown(
             cmd_id = iss.get("command_id")
 
             st_icon = "🟢 [已解决]" if status == "resolved" else "🔴 [未解决]"
-            sections.append(f"### {st_icon} {content} (`{iid}`)")
+            iss_lines.append(f"### {st_icon} {content} (`{iid}`)")
             if impact:
-                sections.append(f"- **影响表现**: {impact}")
+                iss_lines.append(f"- **影响表现**: {impact}")
             if res:
-                sections.append(f"- **解决方案/根因**: {res}")
+                iss_lines.append(f"- **解决方案/根因**: {res}")
             if cmd_id:
                 cmd_str = _format_command_execution(cmd_id, cmd_lookup)
                 if cmd_str:
-                    sections.append(cmd_str)
+                    iss_lines.append(cmd_str)
             if source_path and line_ranges:
                 code_snippet = reverse_lookup_source_code(
                     source_path, line_ranges, current_working_directory=current_working_directory
                 )
                 if code_snippet:
-                    sections.append(f"**相关源码**:\n{code_snippet}")
-    else:
-        sections.append("*(暂无已知问题或缺陷)*")
+                    iss_lines.append(f"**相关源码**:\n{code_snippet}")
+        sections.append("\n".join(iss_lines))
 
     # ── 9. 验证与测试结论 (Validations) ───────────────────────────────
     validations = note_snapshot.get("validations") or []
-    sections.append("\n## 9. 验证与测试结论 (Validations)")
     if validations:
+        v_lines = [f"## {sec_idx}. 验证与测试结论 (Validations)"]
+        sec_idx += 1
         for v in validations:
             vid = v.get("validation_id", "")
             scope = v.get("validation_scope", "")
@@ -415,27 +428,27 @@ def format_task_note_to_markdown(
             line_ranges = v.get("line_ranges")
 
             conc_icon = "✅ 通过" if conclusion == "passed" else ("❌ 失败" if conclusion == "failed" else f"⚠️ {conclusion}")
-            sections.append(f"- **验证范围**: {scope} ➔ **结论**: **{conc_icon}** (`{vid}`)")
-            sections.append(f"  - 验证细节: {content}")
+            v_lines.append(f"- **验证范围**: {scope} ➔ **结论**: **{conc_icon}** (`{vid}`)")
+            v_lines.append(f"  - 验证细节: {content}")
             if cmd_id:
                 cmd_str = _format_command_execution(cmd_id, cmd_lookup)
                 if cmd_str:
-                    sections.append(f"  {cmd_str}")
+                    v_lines.append(f"  {cmd_str}")
             if uncovered:
-                sections.append(f"  - 未覆盖范围: {uncovered}")
+                v_lines.append(f"  - 未覆盖范围: {uncovered}")
             if source_path and line_ranges:
                 code_snippet = reverse_lookup_source_code(
                     source_path, line_ranges, current_working_directory=current_working_directory
                 )
                 if code_snippet:
-                    sections.append(f"  **测试用例代码**:\n{code_snippet}")
-    else:
-        sections.append("*(暂无验证记录)*")
+                    v_lines.append(f"  **测试用例代码**:\n{code_snippet}")
+        sections.append("\n".join(v_lines))
 
     # ── 10. 关键物理产物 (Artifacts) ──────────────────────────────────
     artifacts = note_snapshot.get("artifacts") or []
-    sections.append("\n## 10. 关键产物与文件 (Artifacts)")
     if artifacts:
+        art_lines = [f"## {sec_idx}. 关键产物与文件 (Artifacts)"]
+        sec_idx += 1
         for a in artifacts:
             aid = a.get("artifact_id", "")
             atype = a.get("type", "file")
@@ -448,7 +461,7 @@ def format_task_note_to_markdown(
             target_path = a.get("target_path")
 
             if atype in ("file_modify", "modify"):
-                sections.append(f"- 📝 **[文件修改 (file_modify)]**: `{file_path}` (`{aid}`)")
+                art_lines.append(f"- 📝 **[文件修改 (file_modify)]**: `{file_path}` (`{aid}`)")
                 parsed_edits: list[dict[str, Any]] = []
                 if isinstance(edits, str):
                     try:
@@ -468,53 +481,53 @@ def format_task_note_to_markdown(
 
                             loc_str = f" (行区间: `L{s_line}-L{e_line}`)" if (s_line is not None and e_line is not None) else ""
                             if f_desc:
-                                sections.append(f"  - **功能说明{loc_str}**: {f_desc}")
+                                art_lines.append(f"  - **功能说明{loc_str}**: {f_desc}")
                             elif loc_str:
-                                sections.append(f"  - **修改位置**: {loc_str}")
+                                art_lines.append(f"  - **修改位置**: {loc_str}")
 
                             if replace_lines:
                                 r_list = replace_lines if isinstance(replace_lines, list) else str(replace_lines).splitlines()
                                 lang = _detect_lang(file_path)
                                 r_text = "\n".join(r_list)
-                                sections.append(f"  - **替换写入代码 (replace_lines)**:\n    ```{lang}\n{r_text}\n    ```")
+                                art_lines.append(f"  - **替换写入代码 (replace_lines)**:\n    ```{lang}\n{r_text}\n    ```")
                 elif desc:
-                    sections.append(f"  - 说明: {desc}")
+                    art_lines.append(f"  - 说明: {desc}")
 
             elif atype in ("file_create", "create"):
-                sections.append(f"- 📄 **[文件新建 (file_create)]**: `{file_path}` (`{aid}`)")
+                art_lines.append(f"- 📄 **[文件新建 (file_create)]**: `{file_path}` (`{aid}`)")
                 if content_lines:
                     c_list = content_lines if isinstance(content_lines, list) else str(content_lines).splitlines()
                     lang = _detect_lang(file_path)
                     c_text = "\n".join(c_list[:30])
-                    sections.append(f"  - **新建代码内容 ({len(c_list)} 行)**:\n    ```{lang}\n{c_text}\n    ```")
+                    art_lines.append(f"  - **新建代码内容 ({len(c_list)} 行)**:\n    ```{lang}\n{c_text}\n    ```")
                 elif content:
-                    sections.append(f"  - 规模: 新建共 {len(str(content).splitlines())} 行")
+                    art_lines.append(f"  - 规模: 新建共 {len(str(content).splitlines())} 行")
                 if desc:
-                    sections.append(f"  - 说明: {desc}")
+                    art_lines.append(f"  - 说明: {desc}")
 
             elif atype in ("file_move", "move"):
-                sections.append(f"- 🚚 **[文件移动/重命名 (file_move)]**: `{source_path or file_path}` ➔ `{target_path or file_path}` (`{aid}`)")
+                art_lines.append(f"- 🚚 **[文件移动/重命名 (file_move)]**: `{source_path or file_path}` ➔ `{target_path or file_path}` (`{aid}`)")
                 if desc:
-                    sections.append(f"  - 说明: {desc}")
+                    art_lines.append(f"  - 说明: {desc}")
 
             elif atype in ("file_delete", "delete"):
-                sections.append(f"- 🗑️ **[文件删除 (file_delete)]**: `{file_path}` (`{aid}`)")
+                art_lines.append(f"- 🗑️ **[文件删除 (file_delete)]**: `{file_path}` (`{aid}`)")
                 if desc:
-                    sections.append(f"  - 说明: {desc}")
+                    art_lines.append(f"  - 说明: {desc}")
 
             elif atype == "other":
-                sections.append(f"- 📦 **[成果交付 (other)]**: {content or desc or '通用交付产物'} (`{aid}`)")
+                art_lines.append(f"- 📦 **[成果交付 (other)]**: {content or desc or '通用交付产物'} (`{aid}`)")
             else:
-                sections.append(f"- **产物 [{atype}]**: `{file_path}` (`{aid}`)")
+                art_lines.append(f"- **产物 [{atype}]**: `{file_path}` (`{aid}`)")
                 if desc:
-                    sections.append(f"  - 描述: {desc}")
-    else:
-        sections.append("*(暂无关键产物)*")
+                    art_lines.append(f"  - 描述: {desc}")
+        sections.append("\n".join(art_lines))
 
     # ── 11. 外部环境与持久状态变更 (External States) ───────────────────
     ext_states = note_snapshot.get("external_states") or []
-    sections.append("\n## 11. 外部环境与服务状态 (External States)")
     if ext_states:
+        es_lines = [f"## {sec_idx}. 外部环境与服务状态 (External States)"]
+        sec_idx += 1
         for es in ext_states:
             eid = es.get("external_state_id", "")
             ttype = es.get("target_type", "")
@@ -525,23 +538,23 @@ def format_task_note_to_markdown(
             rb = es.get("rollback_info")
             cmd_id = es.get("command_id")
 
-            sections.append(f"- **[{ttype}] `{tident}`** (`{eid}`)")
-            sections.append(f"  - 变更内容: {cchange}")
-            sections.append(f"  - 当前状态: {cstate} (可逆性: `{rev}`)")
+            es_lines.append(f"- **[{ttype}] `{tident}`** (`{eid}`)")
+            es_lines.append(f"  - 变更内容: {cchange}")
+            es_lines.append(f"  - 当前状态: {cstate} (可逆性: `{rev}`)")
             if cmd_id:
                 cmd_str = _format_command_execution(cmd_id, cmd_lookup)
                 if cmd_str:
-                    sections.append(f"  {cmd_str}")
+                    es_lines.append(f"  {cmd_str}")
             if rb:
-                sections.append(f"  - 回滚指南: {rb}")
-    else:
-        sections.append("*(暂无外部环境变更)*")
+                es_lines.append(f"  - 回滚指南: {rb}")
+        sections.append("\n".join(es_lines))
 
     # ── 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Dialogs) ─────────
     agent_rels = note_snapshot.get("agent_relationships") or []
     agent_msgs = note_snapshot.get("agent_messages") or []
-    sections.append("\n## 12. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)")
     if agent_rels or agent_msgs:
+        dlg_lines = [f"## {sec_idx}. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)"]
+        sec_idx += 1
         rel_map = {r.get("target_agent_instance_id"): r for r in agent_rels}
 
         # 区分父 Agent 与子 Agent
@@ -558,7 +571,7 @@ def format_task_note_to_markdown(
         for pid in parent_ids:
             rel_info = rel_map.get(pid, {})
             st = rel_info.get("status", "unreleased")
-            sections.append(f"### 🔼 上级父 Agent: `{pid}` (角色: `parent`, 状态: `{st}`)")
+            dlg_lines.append(f"### 🔼 上级父 Agent: `{pid}` (角色: `parent`, 状态: `{st}`)")
 
             p_msgs = [m for m in agent_msgs if m.get("target_agent_instance_id") == pid]
             if p_msgs:
@@ -568,16 +581,16 @@ def format_task_note_to_markdown(
                     ts = msg.get("created_at", "")
                     prefix = "📤 **[向父 Agent 汇报]**" if mtype == "send" else "📥 **[收到父 Agent 指令]**"
                     ts_label = f"`{ts}` " if ts else ""
-                    sections.append(f"- {ts_label}{prefix}: {mbody}")
+                    dlg_lines.append(f"- {ts_label}{prefix}: {mbody}")
             else:
-                sections.append("- *(暂无通信消息流水)*")
+                dlg_lines.append("- *(暂无通信消息流水)*")
 
         # 2. 下级协作子 Agent 专线
         for cid in child_ids:
             rel_info = rel_map.get(cid, {})
             role = rel_info.get("target_agent_type", "child")
             st = rel_info.get("status", "unreleased")
-            sections.append(f"### 协作子 Agent: `{cid}` (角色: `{role}`, 状态: `{st}`)")
+            dlg_lines.append(f"### 协作子 Agent: `{cid}` (角色: `{role}`, 状态: `{st}`)")
 
             child_msgs = [m for m in agent_msgs if m.get("target_agent_instance_id") == cid]
             if child_msgs:
@@ -587,30 +600,32 @@ def format_task_note_to_markdown(
                     ts = msg.get("created_at", "")
                     prefix = "📤 **[发往子 Agent]**" if mtype == "send" else "📥 **[收到子 Agent 回复]**"
                     ts_label = f"`{ts}` " if ts else ""
-                    sections.append(f"- {ts_label}{prefix}: {mbody}")
+                    dlg_lines.append(f"- {ts_label}{prefix}: {mbody}")
             else:
-                sections.append("- *(暂无通信消息流水)*")
-    else:
-        sections.append("*(暂无多 Agent 协作关系与通信记录)*")
+                dlg_lines.append("- *(暂无通信消息流水)*")
+        sections.append("\n".join(dlg_lines))
 
     # ── 13. 外部远程对等 Agent 通信记录 (Remote Agent Messages) ────────
     remote_msgs = note_snapshot.get("remote_agent_messages") or []
-    sections.append("\n## 13. 外部远程 Agent 对等通信流水 (Remote Agent Messages)")
     if remote_msgs:
+        rem_lines = [f"## {sec_idx}. 外部远程 Agent 对等通信流水 (Remote Agent Messages)"]
+        sec_idx += 1
         remote_groups: dict[str, list[dict[str, Any]]] = {}
         for rm in remote_msgs:
             rid = rm.get("remote_agent_instance_id") or "unknown_remote_agent"
             remote_groups.setdefault(rid, []).append(rm)
 
         for rid, msgs in remote_groups.items():
-            sections.append(f"### 远程对等 Agent 实例 ID: `{rid}`")
+            rem_lines.append(f"### 远程对等 Agent 实例 ID: `{rid}`")
             for rm in msgs:
                 mtype = rm.get("message_type", "send")
                 mbody = rm.get("message", "")
                 ts = rm.get("created_at", "")
                 prefix = "📤 **[发往远程 Agent]**" if mtype == "send" else "📥 **[接收自远程 Agent]**"
                 ts_label = f"`{ts}` " if ts else ""
-                sections.append(f"- {ts_label}{prefix}: {mbody}")
+                rem_lines.append(f"- {ts_label}{prefix}: {mbody}")
+        sections.append("\n".join(rem_lines))
+
     # ── 14. 补充现场信息 (Additional Context) ──────────────────────────
     known_keys = {
         "task_id", "agent_instance_id", "progress", "todos", "missions",
@@ -619,24 +634,29 @@ def format_task_note_to_markdown(
         "agent_relationships", "agent_messages", "remote_agent_messages",
         "commands",
     }
-    extra_keys = [k for k in note_snapshot.keys() if k not in known_keys]
+    extra_keys = [k for k in note_snapshot.keys() if k not in known_keys and note_snapshot[k]]
     if extra_keys:
-        sections.append("\n## 14. 补充现场信息 (Additional Context)")
+        ext_lines = [f"## {sec_idx}. 补充现场信息 (Additional Context)"]
+        sec_idx += 1
         for k in extra_keys:
             val = note_snapshot[k]
             if isinstance(val, list):
-                sections.append(f"### {k}")
+                ext_lines.append(f"### {k}")
                 for item in val:
                     if isinstance(item, dict):
                         desc_parts = [f"{ik}: {iv}" for ik, iv in item.items()]
-                        sections.append("- " + ", ".join(desc_parts))
+                        ext_lines.append("- " + ", ".join(desc_parts))
                     else:
-                        sections.append(f"- {item}")
+                        ext_lines.append(f"- {item}")
             elif isinstance(val, dict):
-                sections.append(f"### {k}")
+                ext_lines.append(f"### {k}")
                 for ik, iv in val.items():
-                    sections.append(f"- **{ik}**: {iv}")
+                    ext_lines.append(f"- **{ik}**: {iv}")
             else:
-                sections.append(f"- **{k}**: {val}")
+                ext_lines.append(f"- **{k}**: {val}")
+        sections.append("\n".join(ext_lines))
+
+    if sec_idx == 1:
+        sections.append("*(当前暂无持久化任务手记记录)*")
 
     return "\n\n".join(sections)
