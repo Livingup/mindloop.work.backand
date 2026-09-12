@@ -88,7 +88,10 @@ from agent_runtime.task_note.task_note_prompt_provider import (
     NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
     TaskNotePromptProvider,
 )
-from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
+from agent_runtime.task_note.task_note_snapshot_service import (
+    TaskNoteSnapshotService,
+    get_task_note_snapshot_service,
+)
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -388,7 +391,7 @@ class AgentExecutionEngine:
             prompt_snippet_gateway=prompt_snippet_gateway,
             local_tool_gateway=local_tool_gateway,
         )
-        self._task_note_snapshot_service = task_note_snapshot_service or TaskNoteSnapshotService()
+        self._task_note_snapshot_service = task_note_snapshot_service or get_task_note_snapshot_service()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}

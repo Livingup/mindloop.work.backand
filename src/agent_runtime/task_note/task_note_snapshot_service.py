@@ -53,18 +53,68 @@ def get_empty_task_note_snapshot(task_id: str, agent_instance_id: str) -> dict[s
     }
 
 
+_SENTINEL = object()
+
+
 class TaskNoteSnapshotService:
     """Task Note 快照服务。"""
 
     def __init__(
         self,
-        connection_factory: Callable[[], ContextManager[Any]] | None = None,
+        connection_factory: Callable[[], ContextManager[Any]] | None | object = _SENTINEL,
     ) -> None:
-        self._connection_factory = connection_factory
+        if connection_factory is _SENTINEL:
+            self._connection_factory = None
+            self._allow_auto_resolve = True
+        else:
+            self._connection_factory = connection_factory  # type: ignore[assignment]
+            self._allow_auto_resolve = False
+
+    def _get_connection_factory(self) -> Callable[[], ContextManager[Any]] | None:
+        """获取或自动延迟解析数据库连接工厂。"""
+        if self._connection_factory is not None:
+            return self._connection_factory
+        if not self._allow_auto_resolve:
+            return None
+
+        # 1. 尝试从 get_task_note_store() 获取连接工厂
+        try:
+            from agent_runtime.task_note.task_note_store import get_task_note_store
+
+            store = get_task_note_store()
+            if store._connection_factory is not None:
+                self._connection_factory = store._connection_factory
+                return self._connection_factory
+        except Exception:
+            pass
+
+        # 2. 尝试从 ConfigRegistry 动态初始化
+        try:
+            from agent_runtime.config import ConfigRegistry
+
+            cfg = ConfigRegistry.instance()
+            if cfg.cloud_user_config_database.is_postgresql_enabled:
+                from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+
+                store = PostgresUserConfigStore(lambda: cfg.cloud_user_config_database)
+                self._connection_factory = store._connect
+                return self._connection_factory
+        except Exception as exc:
+            logger.warning("动态解析 TaskNoteSnapshotService 连接工厂失败: %s", exc)
+        return None
 
     @classmethod
     def from_config_registry(cls) -> "TaskNoteSnapshotService":
         """从全局配置中心创建 Task Note 快照服务实例。"""
+        try:
+            from agent_runtime.task_note.task_note_store import get_task_note_store
+
+            store = get_task_note_store()
+            if store._connection_factory is not None:
+                return cls(connection_factory=store._connection_factory)
+        except Exception:
+            pass
+
         try:
             from agent_runtime.config import ConfigRegistry
 
@@ -76,7 +126,7 @@ class TaskNoteSnapshotService:
                 return cls(connection_factory=store._connect)
         except Exception as exc:
             logger.warning("无法从 ConfigRegistry 初始化 TaskNoteSnapshotService 连接工厂: %s", exc)
-        return cls(connection_factory=None)
+        return cls()
 
     def build_snapshot(
         self,
@@ -86,11 +136,12 @@ class TaskNoteSnapshotService:
     ) -> dict[str, Any]:
         """构建指定 task_id 和 agent_instance_id 的完整 Note 快照 JSON。"""
         snapshot = get_empty_task_note_snapshot(task_id, agent_instance_id)
-        if self._connection_factory is None:
+        conn_factory = self._get_connection_factory()
+        if conn_factory is None:
             return snapshot
 
         try:
-            with self._connection_factory() as conn:
+            with conn_factory() as conn:
                 with conn.cursor() as cur:
                     def _query_rows(table_name: str, sql: str, params: tuple) -> list[dict[str, Any]]:
                         try:
@@ -375,7 +426,7 @@ class TaskNoteSnapshotService:
         """物理清除指定子 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。"""
         from agent_runtime.task_note.task_note_store import TaskNoteStore
 
-        store = TaskNoteStore(connection_factory=self._connection_factory)
+        store = TaskNoteStore(connection_factory=self._get_connection_factory())
         return store.cleanup_agent_instance_note(
             task_id=task_id, agent_instance_id=agent_instance_id
         )
@@ -388,7 +439,7 @@ class TaskNoteSnapshotService:
         """物理清除指定 Task 下所有 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。"""
         from agent_runtime.task_note.task_note_store import TaskNoteStore
 
-        store = TaskNoteStore(connection_factory=self._connection_factory)
+        store = TaskNoteStore(connection_factory=self._get_connection_factory())
         return store.cleanup_task_note(task_id=task_id)
 
     async def async_cleanup_agent_instance_note(
@@ -417,4 +468,22 @@ class TaskNoteSnapshotService:
             None,
             lambda: self.cleanup_task_note(task_id=task_id),
         )
+
+
+_global_task_note_snapshot_service: TaskNoteSnapshotService | None = None
+
+
+def get_task_note_snapshot_service() -> TaskNoteSnapshotService:
+    """获取全局 TaskNoteSnapshotService 单例。"""
+    global _global_task_note_snapshot_service
+    if _global_task_note_snapshot_service is None:
+        _global_task_note_snapshot_service = TaskNoteSnapshotService.from_config_registry()
+    return _global_task_note_snapshot_service
+
+
+def set_task_note_snapshot_service(service: TaskNoteSnapshotService | None) -> None:
+    """设置或重置全局 TaskNoteSnapshotService 单例（用于测试与依赖注入）。"""
+    global _global_task_note_snapshot_service
+    _global_task_note_snapshot_service = service
+
 

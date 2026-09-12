@@ -35,7 +35,10 @@ from agent_runtime.mcp.mcp_client.north_gateway.mcp_client_contracts import (
 from agent_runtime.prompt_template import PromptTemplateFactory
 from agent_runtime.skill.skill_factory import SkillFactory
 from agent_runtime.task_note.task_note_prompt_provider import TaskNotePromptProvider
-from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
+from agent_runtime.task_note.task_note_snapshot_service import (
+    TaskNoteSnapshotService,
+    get_task_note_snapshot_service,
+)
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
 
 
@@ -184,7 +187,7 @@ class AgentExecutionFactory:
             prompt_snippet_gateway=prompt_snippet_gateway,
             local_tool_gateway=local_tool_gateway,
         )
-        task_note_snapshot_service = TaskNoteSnapshotService()
+        task_note_snapshot_service = get_task_note_snapshot_service()
         engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
             agent_definition_gateway=agent_definition_gateway,

@@ -32,3 +32,45 @@ def test_snapshot_service_without_db() -> None:
     assert snapshot["task_id"] == "task-001"
     assert snapshot["agent_instance_id"] == "inst-001"
     assert isinstance(snapshot["todos"], list)
+
+
+def test_snapshot_service_singleton() -> None:
+    from agent_runtime.task_note.task_note_snapshot_service import (
+        get_task_note_snapshot_service,
+        set_task_note_snapshot_service,
+    )
+
+    original = get_task_note_snapshot_service()
+    assert original is not None
+
+    custom = TaskNoteSnapshotService(connection_factory=None)
+    set_task_note_snapshot_service(custom)
+    assert get_task_note_snapshot_service() is custom
+
+    set_task_note_snapshot_service(None)
+    reloaded = get_task_note_snapshot_service()
+    assert reloaded is not None
+    assert reloaded is not custom
+
+
+def test_snapshot_service_mock_db() -> None:
+    from unittest.mock import MagicMock
+    from contextlib import contextmanager
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchone.return_value = None
+
+    @contextmanager
+    def mock_conn():
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = mock_cursor
+        conn.cursor.return_value.__exit__.return_value = False
+        yield conn
+
+    service = TaskNoteSnapshotService(connection_factory=mock_conn)
+    snapshot = service.build_snapshot(task_id="t-1", agent_instance_id="a-1")
+    assert snapshot["task_id"] == "t-1"
+    assert snapshot["agent_instance_id"] == "a-1"
+    assert mock_cursor.execute.called
+
