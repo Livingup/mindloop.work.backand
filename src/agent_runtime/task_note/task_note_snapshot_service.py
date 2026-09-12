@@ -92,8 +92,44 @@ class TaskNoteSnapshotService:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    def _query_rows(table_name: str, sql: str, params: tuple) -> list[dict[str, Any]]:
+                        try:
+                            cur.execute(sql, params)
+                            return [_serialize_row(r) for r in cur.fetchall()]
+                        except Exception as exc:
+                            logger.warning(
+                                "构建 Task Note 快照时查询 %s 失败 (已降级为空): %s",
+                                table_name,
+                                exc,
+                            )
+                            if hasattr(conn, "rollback"):
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                            return []
+
+                    def _query_one(table_name: str, sql: str, params: tuple) -> dict[str, Any] | None:
+                        try:
+                            cur.execute(sql, params)
+                            row = cur.fetchone()
+                            return _serialize_row(row) if row else None
+                        except Exception as exc:
+                            logger.warning(
+                                "构建 Task Note 快照时查询 %s 失败 (已降级为空): %s",
+                                table_name,
+                                exc,
+                            )
+                            if hasattr(conn, "rollback"):
+                                try:
+                                    conn.rollback()
+                                except Exception:
+                                    pass
+                            return None
+
                     # 1. agent_user_mission (该 task 下所有关联或当前 agent 创建的 mission)
-                    cur.execute(
+                    snapshot["missions"] = _query_rows(
+                        "agent_user_mission",
                         """
                         SELECT mission_id, task_id, scene_id, agent_instance_id, title,
                                raw_prompts, refined_requirement, status, sort_order, created_at
@@ -103,10 +139,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id,),
                     )
-                    snapshot["missions"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 2. task_workspace_context
-                    cur.execute(
+                    snapshot["workspace_context"] = _query_rows(
+                        "task_workspace_context",
                         """
                         SELECT context_id, task_id, mission_id, agent_instance_id, source_type,
                                description, path, line_ranges, directory_structure, search_content,
@@ -118,10 +154,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["workspace_context"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 3. task_solution_content (当前 agent 的活跃方案)
-                    cur.execute(
+                    snapshot["solution"] = _query_one(
+                        "task_solution_content",
                         """
                         SELECT solution_id, task_id, mission_id, agent_instance_id,
                                solution_content, solution_status, created_at
@@ -132,12 +168,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    solution_row = cur.fetchone()
-                    if solution_row:
-                        snapshot["solution"] = _serialize_row(solution_row)
 
                     # 4. task_decision_records
-                    cur.execute(
+                    snapshot["decisions"] = _query_rows(
+                        "task_decision_records",
                         """
                         SELECT decision_id, task_id, mission_id, agent_instance_id,
                                decision_content, rationale, alternatives, impact, decision_status, created_at
@@ -147,10 +181,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["decisions"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 5. task_todo_items
-                    cur.execute(
+                    snapshot["todos"] = _query_rows(
+                        "task_todo_items",
                         """
                         SELECT todo_id, task_id, mission_id, agent_instance_id,
                                priority, todo_content, status, created_at
@@ -160,10 +194,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["todos"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 6. task_progress_content (当前 agent 唯一恢复快照)
-                    cur.execute(
+                    snapshot["progress"] = _query_one(
+                        "task_progress_content",
                         """
                         SELECT progress_id, task_id, mission_id, agent_instance_id,
                                completed_summary, current_work, current_blockers,
@@ -175,12 +209,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    progress_row = cur.fetchone()
-                    if progress_row:
-                        snapshot["progress"] = _serialize_row(progress_row)
 
                     # 7. task_discovery_records
-                    cur.execute(
+                    snapshot["discoveries"] = _query_rows(
+                        "task_discovery_records",
                         """
                         SELECT discovery_id, task_id, mission_id, agent_instance_id,
                                discovery_content, impact, source_type, source_path,
@@ -191,24 +223,24 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["discoveries"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 8. task_issue_records
-                    cur.execute(
+                    snapshot["issues"] = _query_rows(
+                        "task_issue_records",
                         """
                         SELECT issue_id, task_id, mission_id, agent_instance_id,
-                               issue_content, status, impact, resolution, related_context_id,
-                               command_id, source_path, line_ranges, created_at
+                               issue_content, impact, status, next_action, closure_condition,
+                               resolution, source_type, command_id, created_at
                         FROM task_issue_records
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["issues"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 9. task_artifact_records
-                    cur.execute(
+                    snapshot["artifacts"] = _query_rows(
+                        "task_artifact_records",
                         """
                         SELECT artifact_id, task_id, mission_id, agent_instance_id,
                                type, file_path, edits, content_lines, source_path,
@@ -219,25 +251,25 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["artifacts"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 10. task_validation_records
-                    cur.execute(
+                    snapshot["validations"] = _query_rows(
+                        "task_validation_records",
                         """
                         SELECT validation_id, task_id, mission_id, agent_instance_id,
-                               validation_scope, conclusion, validation_content,
-                               uncovered_scope, source_type, command_id, source_path,
-                               line_ranges, created_at
+                               target_type, target_record_id, validation_method,
+                               validation_scope, conclusion, uncovered_scope, validation_content,
+                               source_type, command_id, source_path, line_ranges, created_at
                         FROM task_validation_records
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["validations"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 11. task_external_state_records
-                    cur.execute(
+                    snapshot["external_states"] = _query_rows(
+                        "task_external_state_records",
                         """
                         SELECT external_state_id, task_id, mission_id, agent_instance_id,
                                target_type, target_identifier, change_content, current_state,
@@ -248,10 +280,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["external_states"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 12. task_command_records
-                    cur.execute(
+                    snapshot["commands"] = _query_rows(
+                        "task_command_records",
                         """
                         SELECT command_id, task_id, agent_instance_id,
                                command_line, created_at
@@ -261,10 +293,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["commands"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 13. task_agent_relationships
-                    cur.execute(
+                    snapshot["agent_relationships"] = _query_rows(
+                        "task_agent_relationships",
                         """
                         SELECT relationship_id, task_id, mission_id, agent_instance_id,
                                target_agent_type, target_agent_instance_id, status, created_at
@@ -274,10 +306,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["agent_relationships"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 14. task_agent_messages
-                    cur.execute(
+                    snapshot["agent_messages"] = _query_rows(
+                        "task_agent_messages",
                         """
                         SELECT message_id, task_id, mission_id, agent_instance_id,
                                target_agent_instance_id, target_agent_type, message_type,
@@ -288,10 +320,10 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["agent_messages"] = [_serialize_row(r) for r in cur.fetchall()]
 
                     # 15. task_remote_agent_messages
-                    cur.execute(
+                    snapshot["remote_agent_messages"] = _query_rows(
+                        "task_remote_agent_messages",
                         """
                         SELECT remote_message_id, task_id, mission_id, agent_instance_id,
                                remote_agent_instance_id, message_type, message, created_at
@@ -301,7 +333,6 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
-                    snapshot["remote_agent_messages"] = [_serialize_row(r) for r in cur.fetchall()]
 
         except Exception as exc:
             logger.exception("构建 Task Note 快照失败: task_id=%s, agent_instance_id=%s, error=%s", task_id, agent_instance_id, exc)
