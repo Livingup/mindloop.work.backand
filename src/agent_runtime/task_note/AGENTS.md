@@ -43,3 +43,7 @@
 9. **意图指令（raw_prompts）语义维护契约**：
    - `agent_user_mission.raw_prompts` 记录用户或父 Agent 的委派消息，按时间序追加；
    - 不强求一字不变的机械原文，允许 Agent 在保证原始核心含义和真实需求绝对不变的前提下，优化措辞或描述，使需求表达更清晰明确。
+10. **Note 状态下的消息精准路由与隔离消费规则**：
+    - Note 状态（`execution_substate="note_update"`）下，执行循环仅允许过滤消费真实人类用户提交的消息（供 Note Agent 了解最新指引并辅助整理手记）；
+    - 外部远程 Agent（LACP/remote_agent）或本地父/子 Agent（subagent/local_agent）发来的消息属于业务 Agent 的协作消息，严禁进入 Note 会话；
+    - 该类外部业务协作消息必须保留在 `AgentInstance.pending_user_messages` 队列中，待调用 `note_update_end` 切换为全新业务会话并恢复正常业务状态后，在业务执行循环的第一轮开头全量消费并追加到新业务会话尾部。

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from agent_runtime.agent.agent_instance import (
@@ -613,11 +613,16 @@ class AgentRuntimeService:
     def drain_agent_instance_user_messages(
         self,
         instance_id: str,
+        *,
+        predicate: Callable[[PendingAgentUserMessage], bool] | None = None,
     ) -> tuple[AgentInstance, tuple[PendingAgentUserMessage, ...]]:
-        """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
+        """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。
+
+        若提供 predicate，仅取出满足条件的消息，其余消息保留在原队列中。
+        """
         with self._lock:
             instance = self._get_required_instance(instance_id)
-            updated, drained_messages = instance.drain_pending_user_messages()
+            updated, drained_messages = instance.drain_pending_user_messages(predicate=predicate)
             if drained_messages:
                 self._repository.save_agent_instance(updated)
             return updated, drained_messages

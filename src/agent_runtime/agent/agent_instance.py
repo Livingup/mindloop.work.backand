@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Final, TypeAlias
+from typing import Any, Callable, Final, TypeAlias
 
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 
@@ -363,17 +363,40 @@ class AgentInstance:
     def drain_pending_user_messages(
         self,
         *,
+        predicate: Callable[[PendingAgentUserMessage], bool] | None = None,
         at: datetime | None = None,
     ) -> tuple["AgentInstance", tuple[PendingAgentUserMessage, ...]]:
-        """按 FIFO 顺序取出并清空待处理用户消息队列。"""
+        """按 FIFO 顺序取出并清空待处理用户消息队列。
+
+        若提供了 predicate，则仅取出满足 predicate(msg) is True 的消息，其余消息继续保留在队列中。
+        若未提供 predicate，则默认全量取出并清空队列。
+        """
         if not self.pending_user_messages:
             return self, ()
-        drained = self.pending_user_messages
+        if predicate is None:
+            drained = self.pending_user_messages
+            return replace(
+                self,
+                pending_user_messages=(),
+                updated_at=at or _utc_now(),
+            ), drained
+
+        drained_list: list[PendingAgentUserMessage] = []
+        retained_list: list[PendingAgentUserMessage] = []
+        for msg in self.pending_user_messages:
+            if predicate(msg):
+                drained_list.append(msg)
+            else:
+                retained_list.append(msg)
+
+        if not drained_list:
+            return self, ()
+
         return replace(
             self,
-            pending_user_messages=(),
+            pending_user_messages=tuple(retained_list),
             updated_at=at or _utc_now(),
-        ), drained
+        ), tuple(drained_list)
 
     def remove_pending_user_message(
         self,

@@ -332,6 +332,23 @@ class AgentMessageSubmissionResult:
     message_metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def _is_note_state_allowed_user_message(message: PendingAgentUserMessage) -> bool:
+    """Note 状态下只允许消费真实人类用户消息，保留外部远程 Agent 和本地父子 Agent 的业务消息。"""
+    meta = message.metadata or {}
+    source_type = str(meta.get("source_type") or "").strip().lower()
+    transport = str(meta.get("transport") or "").strip().lower()
+    channel = str(meta.get("channel") or "").strip().lower()
+    if source_type in {"local_agent", "remote_agent"}:
+        return False
+    if transport in {"subagent", "lacp"}:
+        return False
+    if channel in {"subagent", "lacp"}:
+        return False
+    if "subagent" in meta or "remote_agent" in meta or "lacp" in meta:
+        return False
+    return True
+
+
 class AgentExecutionEngine:
     """真正 Agent 执行循环。
 
@@ -1694,6 +1711,8 @@ class AgentExecutionEngine:
                     phase="drain_user_messages",
                     loop_index=loop_index,
                 )
+                is_note_update = instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE
+                drain_predicate = _is_note_state_allowed_user_message if is_note_update else None
                 pending_user_message_count = len(instance.pending_user_messages)
                 if pending_user_message_count:
                     communication_context = communication_context.with_metadata(
@@ -1704,23 +1723,31 @@ class AgentExecutionEngine:
                     conversation=conversation,
                     communication_context=communication_context,
                     trace_path=trace_path,
+                    predicate=drain_predicate,
                 )
                 self._touch_execution_progress(instance.instance_id, metadata={"drained_user_message_count": drained_count})
+                current_instance_after_drain = self._runtime_gateway.get_agent_instance(instance.instance_id)
                 self._record_execution_instance_event(
                     instance_id=instance.instance_id,
                     stage="pending_user_messages.drain",
                     status="drained" if drained_count else "empty",
-                    summary="执行循环在下一次 LLM 请求前完成待处理用户消息队列消费。",
+                    summary=(
+                        "Note 状态下已过滤消费人类用户消息，保留外部业务消息在队列等待切回业务状态。"
+                        if is_note_update and len(current_instance_after_drain.pending_user_messages) > 0
+                        else "执行循环在下一次 LLM 请求前完成待处理用户消息队列消费。"
+                    ),
                     details={
                         "task_id": task.task_id,
                         "conversation_id": conversation.id,
                         "loop_index": loop_index,
                         "drained_count": drained_count,
+                        "retained_count": len(current_instance_after_drain.pending_user_messages),
+                        "execution_substate": instance.execution_substate,
                         "message_count_after_drain": len(conversation.messages),
                     },
                     expected_next="llm_frame_start",
                 )
-                instance = self._runtime_gateway.get_agent_instance(instance.instance_id)
+                instance = current_instance_after_drain
                 resolved_candidates, unsupported_modality_strategy = self._resolve_instance_llm_policy(instance)
                 agent_definition = self._load_agent_definition(instance.agent_definition_id)
                 current_frame_id = self._begin_execution_loop_frame(
@@ -3358,14 +3385,17 @@ class AgentExecutionEngine:
         conversation: Any,
         communication_context: RuntimeCommunicationContext,
         trace_path: Any,
+        predicate: Callable[[PendingAgentUserMessage], bool] | None = None,
     ) -> int:
         """在完整执行轮次边界消费 AgentInstance 待处理用户消息队列。
 
         用户消息无论是在 ready 还是 running 时提交，都会先进入 AgentInstance 队列；
         执行循环只在下一次 LLM 请求前按 FIFO 顺序追加到 conversation 末尾。
+        若提供 predicate，仅取出满足条件的消息，其余消息保留在原队列中。
         """
         _updated_instance, pending_messages = self._runtime_gateway.drain_agent_instance_user_messages(
             instance_id,
+            predicate=predicate,
         )
         if not pending_messages:
             return 0

@@ -129,7 +129,11 @@ class _MockRuntimeGateway:
     def get_agent_instance(self, instance_id: str) -> AgentInstance:
         return self.instance
 
-    def drain_agent_instance_user_messages(self, instance_id: str):
+    def drain_agent_instance_user_messages(self, instance_id: str, *, predicate: Any = None):
+        if self.instance and self.instance.instance_id == instance_id:
+            updated, drained = self.instance.drain_pending_user_messages(predicate=predicate)
+            self.instance = updated
+            return updated, drained
         return self.instance, ()
 
     def update_agent_instance_execution_substate(

@@ -124,6 +124,7 @@ Desktop.ini
 !/tests/test_task_note_tools.py
 !/tests/test_agent_instance_note_substate.py
 !/tests/test_note_context_compression_flow.py
+!/tests/test_note_state_message_isolation.py
 
 /web-frontend/
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, Callable
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -310,9 +311,11 @@ class AgentRuntimeGatewayImpl(AgentRuntimeGateway):
     def drain_agent_instance_user_messages(
         self,
         instance_id: str,
+        *,
+        predicate: Callable[[Any], bool] | None = None,
     ):
         """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
-        return self._service.drain_agent_instance_user_messages(instance_id)
+        return self._service.drain_agent_instance_user_messages(instance_id, predicate=predicate)
 
     def remove_agent_instance_user_message(
         self,

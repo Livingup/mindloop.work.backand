@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agent_runtime.agent.agent_instance import (
     AgentInstance,
@@ -388,6 +388,8 @@ class AgentRuntimeGateway(Protocol):
     def drain_agent_instance_user_messages(
         self,
         instance_id: str,
+        *,
+        predicate: Callable[[PendingAgentUserMessage], bool] | None = None,
     ) -> tuple[AgentInstance, tuple[PendingAgentUserMessage, ...]]:
         """按 FIFO 顺序取出并清空 Agent 实例待处理用户消息队列。"""
         ...
