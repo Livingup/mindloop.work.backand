@@ -419,11 +419,10 @@ class TaskNoteSnapshotService:
 
     def cleanup_agent_instance_note(
         self,
-        *,
         task_id: str,
         agent_instance_id: str,
     ) -> int:
-        """物理清除指定子 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。"""
+        """物理清除指定子 Agent 实例的全部 Note 记录。"""
         from agent_runtime.task_note.task_note_store import TaskNoteStore
 
         store = TaskNoteStore(connection_factory=self._get_connection_factory())
@@ -433,7 +432,6 @@ class TaskNoteSnapshotService:
 
     def cleanup_task_note(
         self,
-        *,
         task_id: str,
     ) -> int:
         """物理清除指定 Task 下所有 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。"""
@@ -444,7 +442,6 @@ class TaskNoteSnapshotService:
 
     async def async_cleanup_agent_instance_note(
         self,
-        *,
         task_id: str,
         agent_instance_id: str,
     ) -> int:
@@ -459,7 +456,6 @@ class TaskNoteSnapshotService:
 
     async def async_cleanup_task_note(
         self,
-        *,
         task_id: str,
     ) -> int:
         """异步物理清除指定 Task 下所有 Agent 实例的全部 Note 记录。"""

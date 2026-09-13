@@ -395,13 +395,17 @@ async def test_snapshot_service_async_cleanup(mock_db: Any):
 
     service = TaskNoteSnapshotService(connection_factory=factory)
 
-    # 1. 异步清理子 Agent 实例
+    # 1. 异步清理子 Agent 实例 (支持关键字与位置传参)
     del_inst = await service.async_cleanup_agent_instance_note(task_id="t1", agent_instance_id="sub1")
     assert del_inst == 15
+    del_inst_pos = await service.async_cleanup_agent_instance_note("t1", "sub1")
+    assert del_inst_pos == 15
 
-    # 2. 异步清理 Task 全量
+    # 2. 异步清理 Task 全量 (支持关键字与位置传参)
     del_task = await service.async_cleanup_task_note(task_id="t1")
     assert del_task == 15
+    del_task_pos = await service.async_cleanup_task_note("t1")
+    assert del_task_pos == 15
 
 
 def test_dump_json_serializes_pydantic_line_ranges():

@@ -258,7 +258,10 @@ class AgentTaskCompletionCoordinator:
         await self._delete_task_terminals(current_task.task_id)
         if self._cleanup_task_notes is not None:
             try:
-                await self._cleanup_task_notes(current_task.task_id)
+                try:
+                    await self._cleanup_task_notes(current_task.task_id)
+                except TypeError:
+                    await self._cleanup_task_notes(task_id=current_task.task_id)
             except Exception as exc:
                 logger.warning("完成清理 Task Note 异常 (已忽略): %s", exc)
         self._trace_recorder.record_completed(trace_path)
