@@ -263,7 +263,7 @@ class AgentTaskCompletionCoordinator:
                 except TypeError:
                     await self._cleanup_task_notes(task_id=current_task.task_id)
             except Exception as exc:
-                logger.warning("完成清理 Task Note 异常 (已忽略): %s", exc)
+                logger.error("完成清理 Task Note 异常: %s", exc, exc_info=True)
         self._trace_recorder.record_completed(trace_path)
         await self._publish_completed_event(
             communication_context=communication_context,

@@ -4426,7 +4426,7 @@ class AgentExecutionEngine:
                                 task_id=task_id, agent_instance_id=tid
                             )
                         except Exception as exc:
-                            logger.warning("清理子 Agent Note 记录异常 (已忽略): %s", exc)
+                            logger.error("清理子 Agent Note 记录异常: %s", exc, exc_info=True)
                 await self._publish_loop_decision_event(
                     communication_context,
                     "agent.subagent.completed",
@@ -4470,7 +4470,7 @@ class AgentExecutionEngine:
                                 task_id=task_id, agent_instance_id=tid
                             )
                         except Exception as exc:
-                            logger.warning("清理失败子 Agent Note 记录异常 (已忽略): %s", exc)
+                            logger.error("清理失败子 Agent Note 记录异常: %s", exc, exc_info=True)
                 await self._publish_loop_decision_event(
                     communication_context,
                     "agent.subagent.failed",
@@ -4487,7 +4487,7 @@ class AgentExecutionEngine:
                 try:
                     await self._task_note_snapshot_service.async_cleanup_task_note(task_id=task_id)
                 except Exception as exc:
-                    logger.warning("失败清理 Task Note 记录异常 (已忽略): %s", exc)
+                    logger.error("失败清理 Task Note 记录异常: %s", exc, exc_info=True)
             self._runtime_gateway.fail_agent_instance(instance_id, failure_message)
             self._runtime_gateway.fail_task(task_id, failure_message)
             self._trace_recorder.record_failure(trace_path, failure_message)

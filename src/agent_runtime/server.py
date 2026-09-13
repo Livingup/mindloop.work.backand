@@ -1362,17 +1362,9 @@ def run_server(
     watch: bool = True,
     frontend_dist_dir: str | Path | None = None,
 ) -> None:
-    log_level = _runtime_log_level()
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        datefmt="%H:%M:%S",
-        force=True,
-    )
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-    for handler in root_logger.handlers:
-        handler.setLevel(log_level)
+    from agent_runtime.logging_setup import setup_runtime_logging
+
+    setup_runtime_logging()
     load_runtime_config(config_file_path, env_file_path, watch=watch)
     runtime_cfg = ConfigRegistry.instance().agent_runtime_service
     effective_host = host or runtime_cfg.service_host
