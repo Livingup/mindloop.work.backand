@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 from dataclasses import dataclass
@@ -410,6 +410,37 @@ def create_agent_runtime_router(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Agent 任务不存在: {task_id}")
         return _task_response(task)
+
+    @router.get("/tasks/{task_id}/agents/{agent_instance_id}/note")
+    async def get_agent_instance_task_note(
+        task_id: str,
+        agent_instance_id: str,
+        mission_id: str | None = None,
+    ) -> dict[str, Any]:
+        """获取指定 task_id 和 agent_instance_id 的 Task Note 结构化快照与 Markdown 视图。"""
+        from agent_runtime.task_note.task_note_snapshot_service import get_task_note_snapshot_service
+        from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+
+        snapshot_service = get_task_note_snapshot_service()
+        snapshot = snapshot_service.build_snapshot(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+        )
+        cwd = ""
+        try:
+            instance = gateway.get_agent_instance(agent_instance_id)
+            cwd = instance.current_working_directory or ""
+        except Exception:
+            pass
+
+        markdown = format_task_note_to_markdown(snapshot, current_working_directory=cwd)
+        return {
+            "task_id": task_id,
+            "agent_instance_id": agent_instance_id,
+            "mission_id": mission_id,
+            "snapshot": snapshot,
+            "markdown": markdown,
+        }
 
     @router.get("/instances/{instance_id}", response_model=AgentInstanceResponse)
     async def get_agent_instance(instance_id: str) -> AgentInstanceResponse:

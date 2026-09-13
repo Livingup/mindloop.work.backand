@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
@@ -35,6 +36,7 @@ from agent_runtime.tool.north_gateway.local_tool_contracts import (
     LocalToolGateway,
     ToolExecuteRequest,
 )
+from agent_runtime.task_note.task_note_prompt_provider import TASK_NOTE_TOOL_NAMES
 from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
     LoopControl,
@@ -271,6 +273,37 @@ class AgentToolDispatcher:
             source="tool_dispatcher",
             correlation_id=tool_call_id,
         )
+        is_task_note_mutating = (
+            result.tool_name in TASK_NOTE_TOOL_NAMES
+            or result.tool_name in (
+                "file_create",
+                "file_modify",
+                "file_delete",
+                "file_move",
+                "terminal_execute_command",
+            )
+        )
+        if result.tool_result.success and is_task_note_mutating and communication_context is not None:
+            try:
+                task_id = metadata.get("task_id")
+                agent_instance_id = metadata.get("agent_instance_id") or instance_id
+                scene_id = metadata.get("scene_id")
+                await self._event_publisher.publish(
+                    communication_context,
+                    "task_note.updated",
+                    {
+                        "task_id": task_id,
+                        "agent_instance_id": agent_instance_id,
+                        "scene_id": scene_id,
+                        "tool_name": result.tool_name,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    source="task_note",
+                    correlation_id=tool_call_id,
+                )
+            except Exception as e:
+                logger.warning("发布 task_note.updated 事件失败 (已忽略): %s", e)
+
         return result
 
     async def _dispatch_local_tool(
