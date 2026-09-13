@@ -1595,8 +1595,8 @@ class TaskNoteStore:
 
 
 ALL_NOTE_TABLES: tuple[str, ...] = (
-    "task_mission_records",
-    "task_active_solution",
+    "agent_user_mission",
+    "task_solution_content",
     "task_decision_records",
     "task_progress_content",
     "task_todo_items",

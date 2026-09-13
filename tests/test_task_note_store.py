@@ -345,7 +345,7 @@ def test_cleanup_agent_instance_note(mock_db: Any):
 
     executed_tables = []
     for sql, params in executed:
-        assert sql.startswith("DELETE FROM task_")
+        assert sql.startswith("DELETE FROM ")
         assert "WHERE task_id = %s AND agent_instance_id = %s" in sql
         assert params == ("task-cleanup-01", "subagent-worker-01")
         # 提取表名
@@ -354,6 +354,8 @@ def test_cleanup_agent_instance_note(mock_db: Any):
 
     # 重点验证：task_command_records 必须在内
     assert "task_command_records" in executed_tables
+    assert "agent_user_mission" in executed_tables
+    assert "task_solution_content" in executed_tables
     assert "task_todo_items" in executed_tables
     assert "task_artifact_records" in executed_tables
     assert "task_agent_relationships" in executed_tables
@@ -370,7 +372,7 @@ def test_cleanup_task_note(mock_db: Any):
 
     executed_tables = []
     for sql, params in executed:
-        assert sql.startswith("DELETE FROM task_")
+        assert sql.startswith("DELETE FROM ")
         assert sql.endswith("WHERE task_id = %s")
         assert params == ("task-cleanup-02",)
         table_name = sql.split()[2]
@@ -378,7 +380,8 @@ def test_cleanup_task_note(mock_db: Any):
 
     # 重点验证：task_command_records 必须在内
     assert "task_command_records" in executed_tables
-    assert "task_mission_records" in executed_tables
+    assert "agent_user_mission" in executed_tables
+    assert "task_solution_content" in executed_tables
     assert "task_progress_content" in executed_tables
 
 
