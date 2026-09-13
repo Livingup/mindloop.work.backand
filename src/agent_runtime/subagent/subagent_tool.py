@@ -173,6 +173,14 @@ async def end_subagent(request: EndSubagentRequest, ctx: ToolRuntimeContext) -> 
         child_instance_ids=request.child_agent_instance_ids,
         reason=request.reason,
     )
+    task_id = output.get("task_id") or ctx.task_id
+    released_ids = output.get("released_agent_instance_ids") or request.child_agent_instance_ids
+    if task_id and ctx.agent_instance_id and released_ids:
+        await get_task_note_event_recorder().async_record_subagents_released(
+            task_id=task_id,
+            parent_instance_id=ctx.agent_instance_id,
+            child_instance_ids=released_ids,
+        )
     return BaseToolResult(output=output, metadata={"subagent_action": "end_subagent"})
 
 

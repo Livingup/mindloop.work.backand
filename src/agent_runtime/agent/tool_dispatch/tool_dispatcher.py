@@ -281,26 +281,49 @@ class AgentToolDispatcher:
                 "file_delete",
                 "file_move",
                 "terminal_execute_command",
+                "create_subagent",
+                "send_agent_message",
+                "end_subagent",
             )
         )
         if result.tool_result.success and is_task_note_mutating and communication_context is not None:
             try:
                 task_id = metadata.get("task_id")
-                agent_instance_id = metadata.get("agent_instance_id") or instance_id
+                caller_instance_id = metadata.get("agent_instance_id") or instance_id
                 scene_id = metadata.get("scene_id")
-                await self._event_publisher.publish(
-                    communication_context,
-                    "task_note.updated",
-                    {
-                        "task_id": task_id,
-                        "agent_instance_id": agent_instance_id,
-                        "scene_id": scene_id,
-                        "tool_name": result.tool_name,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    source="task_note",
-                    correlation_id=tool_call_id,
-                )
+                target_instances: list[str] = [str(caller_instance_id)] if caller_instance_id else []
+
+                tool_output = result.tool_result.output if isinstance(result.tool_result.output, dict) else {}
+                if result.tool_name == "create_subagent":
+                    child_id = tool_output.get("child_agent_instance_id")
+                    if child_id and str(child_id) not in target_instances:
+                        target_instances.append(str(child_id))
+                elif result.tool_name == "send_agent_message":
+                    target_id = tool_output.get("target_agent_instance_id")
+                    if target_id and str(target_id) not in target_instances:
+                        target_instances.append(str(target_id))
+                elif result.tool_name == "end_subagent":
+                    released_ids = tool_output.get("released_agent_instance_ids")
+                    if isinstance(released_ids, (list, tuple)):
+                        for rid in released_ids:
+                            if rid and str(rid) not in target_instances:
+                                target_instances.append(str(rid))
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for inst_id in target_instances:
+                    await self._event_publisher.publish(
+                        communication_context,
+                        "task_note.updated",
+                        {
+                            "task_id": task_id,
+                            "agent_instance_id": inst_id,
+                            "scene_id": scene_id,
+                            "tool_name": result.tool_name,
+                            "updated_at": now_iso,
+                        },
+                        source="task_note",
+                        correlation_id=tool_call_id,
+                    )
             except Exception as e:
                 logger.warning("发布 task_note.updated 事件失败 (已忽略): %s", e)
 

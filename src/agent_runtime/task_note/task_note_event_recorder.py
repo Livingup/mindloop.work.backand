@@ -250,6 +250,54 @@ class TaskNoteEventRecorder:
             mission_id=mission_id,
         )
 
+    def record_subagents_released(
+        self,
+        *,
+        task_id: str | None,
+        parent_instance_id: str | None,
+        child_instance_ids: list[str] | tuple[str, ...],
+    ) -> bool:
+        """更新子 Agent 协作拓扑关系状态为 released（双向更新）。"""
+        if not task_id or not parent_instance_id or not child_instance_ids or self._connection_factory is None:
+            return False
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    for child_id in child_instance_ids:
+                        cur.execute(
+                            """
+                            UPDATE task_agent_relationships
+                            SET status = 'released'
+                            WHERE task_id = %s
+                              AND (
+                                (agent_instance_id = %s AND target_agent_instance_id = %s)
+                                OR (agent_instance_id = %s AND target_agent_instance_id = %s)
+                              )
+                            """,
+                            (task_id, parent_instance_id, child_id, child_id, parent_instance_id),
+                        )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.warning("更新 task_agent_relationships 状态为 released 异常 (已忽略): %s", exc)
+            return False
+
+    async def async_record_subagents_released(
+        self,
+        *,
+        task_id: str | None,
+        parent_instance_id: str | None,
+        child_instance_ids: list[str] | tuple[str, ...],
+    ) -> bool:
+        """异步更新子 Agent 协作拓扑关系状态为 released。"""
+        return await asyncio.to_thread(
+            self.record_subagents_released,
+            task_id=task_id,
+            parent_instance_id=parent_instance_id,
+            child_instance_ids=child_instance_ids,
+        )
+
     def record_agent_message(
         self,
         *,

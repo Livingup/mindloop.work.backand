@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -130,8 +131,39 @@ class AgentRuntimeLacpBridge:
                     message_type="receive",
                     message=message.content,
                 )
+                if self._execution_engine and getattr(self._execution_engine, "_event_publisher", None):
+                    from agent_runtime.communication.runtime_event_publisher import RuntimeCommunicationContext
+                    from agent_runtime.subagent.subagent_runtime import _default_stream_id_for_task
+
+                    task = self._runtime_gateway.get_task(task_id)
+                    scene_id = getattr(task, "scene_id", None)
+                    stream_id = _default_stream_id_for_task(scene_id, task_id)
+                    comm_context = RuntimeCommunicationContext(
+                        stream_id=stream_id,
+                        actor_type="agent_instance",
+                        actor_id=message.to_instance_id,
+                        trace_id=None,
+                        metadata={
+                            "task_id": task_id,
+                            "scene_id": scene_id,
+                            "agent_instance_id": message.to_instance_id,
+                        },
+                    )
+                    await self._execution_engine._event_publisher.publish(
+                        comm_context,
+                        "task_note.updated",
+                        {
+                            "task_id": task_id,
+                            "agent_instance_id": message.to_instance_id,
+                            "scene_id": scene_id,
+                            "tool_name": "lacp_inbound_message",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        source="task_note",
+                        correlation_id=message.message_id,
+                    )
             except Exception:
-                logger.exception("记录 LACP 远程消息到 task_remote_agent_messages 失败 (已忽略)")
+                logger.exception("记录 LACP 远程消息到 task_remote_agent_messages 或广播 task_note.updated 失败 (已忽略)")
             return True
         except Exception:
             logger.exception("LACP inbound message enqueue failed: message_id=%s", message.message_id)
