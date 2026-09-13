@@ -149,6 +149,17 @@ Phase-1 访问模型是单 Runtime 主机的多端接入：后端 runtime-local 
 
 `/logs` 是独立日志工作区，后端必须通过 `server.create_app()` 挂载专用 `/api/logs` 路由；不要把日志管理并入 `/api/system-settings`，也不要把 `persistence_inventory` 当作日志产品面的主要数据源。日志统计总览必须从实际 SQLite / 文件系统存储实时检查当前总量和大小。日志清理仅允许用户手动选择生命周期过滤和清理类别、先预览影响、再显式执行删除；不得新增 TTL、定时任务、后台保留策略或其他自动删除。当前允许清理的类别仅限 Communication messages、Chat Bubbles、LLM HTTP Trace、Context Compression archive、Terminal history；Conversation history、Agent Trace Markdown、File resources/archive 等受保护存储不得在日志清理中删除。Communication messages 只能删消息行不能删共享 stream；Context Compression archive 清理必须同时处理 DB 行与 summaries/snapshots 引用文件；Terminal history 按终端会话/命令/输出历史成组清理。
 
+### 系统错误日志与分流机制（logging）
+
+系统错误日志专职记录运行时异常与系统故障，独立分流存储，不与全量控制台/流式日志混杂：
+- **专用错误日志文件**：文件名固定为 `backend-error.log`，通过 `RotatingFileHandler` 轮转（单文件上限 10MB，保留 5 个切片，UTF-8 编码）。
+- **严格级别过滤**：日志 Handler 级别严格限定为 `logging.ERROR`。**只捕获 `ERROR` 与 `CRITICAL` 级别日志**，彻底过滤排除 `DEBUG`、`INFO`、`WARNING`。
+- **全量异常捕获**：覆盖全代码库 `logger.error`、`logger.critical`、`logger.exception`，挂载 `sys.excepthook` 与 `threading.excepthook` 自动截获主线程及工作线程的未捕获崩溃异常并记录完整 Traceback 堆栈；自动配置 `uvicorn` / `uvicorn.error` 日志传播，确保 Web 服务层 500 异常一并汇入。
+- **日志存放位置与优先级**：
+  1. **正式安装版（Release/Desktop）**：Electron 主进程启动后端 sidecar 时通过环境变量 `SPREAD_AI_DESKTOP_BACKEND_ERROR_LOG` 显式注入，统一存放在 Windows 应用程序数据目录 `%APPDATA%\spread-ai-web\logs\backend-error.log`；
+  2. **源码自测（Dev 独立启动）**：独立使用 `config/.env.dev` 启动时，由 `SPREAD_AI_DATA_ROOT` 推导，存放在开发沙箱数据根 `~/.spread-ai-dev/logs/backend-error.log`；未配置时兜底使用 `${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/logs/backend-error.log`；
+  3. **环境变量覆盖**：优先读取 `SPREAD_AI_BACKEND_ERROR_LOG`；若存在 `SPREAD_AI_DESKTOP_BACKEND_STDERR_LOG` 则自动归集到其同级目录下的 `backend-error.log`。排查系统崩溃或后端报错时，优先检索此专用文件。
+
 ---
 
 ## 规划模块
