@@ -10,7 +10,7 @@ const RESOURCE_PATHS = Object.freeze({
   "llm-model": "/api/llm-registry/models",
   "llm-provider": "/api/llm-registry/providers",
   "llm-policy": "/api/llm-registry/execution-policies",
-  prompt: "/api/prompt-snippets",
+  prompt: "/api/prompt-snippets/",
   skill: "/api/skills",
   tool: "/api/tools/",
 })
