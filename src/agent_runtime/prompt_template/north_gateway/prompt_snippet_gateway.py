@@ -7,6 +7,7 @@ from __future__ import annotations
 from agent_runtime.prompt_template.prompt_snippet import PromptSnippet
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import (
     PromptSnippetCreateRequest,
+    PromptSnippetEditRequest,
     PromptSnippetUpdateRequest,
 )
 from agent_runtime.prompt_template.prompt_snippet_service import PromptSnippetService
@@ -38,6 +39,11 @@ class PromptSnippetGateway:
         """更新提示词片段。目标片段不存在时抛出 KeyError。"""
         return self._service.update_snippet(request)
 
+    def edit_snippet_content(self, request: PromptSnippetEditRequest) -> PromptSnippet:
+        """按连续行唯一匹配局部编辑提示词正文。"""
+        return self._service.edit_snippet_content(request)
+
     def delete_snippet(self, name: str) -> None:
         """删除提示词片段。不存在时静默跳过。"""
         self._service.delete_snippet(name)
+

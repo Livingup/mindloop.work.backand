@@ -10,10 +10,16 @@ from pydantic import BaseModel
 
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import (
     PromptSnippetCreateRequest,
+    PromptSnippetEditRequest,
+    PromptSnippetTextEdit,
     PromptSnippetUpdateRequest,
 )
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_gateway import (
     PromptSnippetGateway,
+)
+from agent_runtime.prompt_template.prompt_snippet import (
+    PromptSnippetConflictError,
+    PromptSnippetValidationError,
 )
 
 # ── 请求 / 响应 Pydantic 模型 ───────────────────────────────────
@@ -49,6 +55,18 @@ class SnippetUpdateBody(BaseModel):
 class SnippetContentBody(BaseModel):
     """提示词片段正文更新请求体。"""
     text: str
+
+
+class PromptSnippetEditItem(BaseModel):
+    """单项连续行编辑。"""
+    search_lines: list[str]
+    replace_lines: list[str] = []
+
+
+class PromptSnippetEditContentBody(BaseModel):
+    """提示词正文局部编辑请求体。"""
+    edits: list[PromptSnippetEditItem]
+    expected_text_sha256: str | None = None
 
 
 # ── 路由工厂 ─────────────────────────────────────────────────────
@@ -121,6 +139,37 @@ def create_prompt_snippet_router(gateway: PromptSnippetGateway) -> APIRouter:
     def patch_snippet_content(name: str, body: SnippetContentBody) -> SnippetResponse:
         """仅替换提示词片段正文；PATCH 作为内容子资源的部分写入口。"""
         return set_snippet_content(name, body)
+
+    @router.post("/{name}/content/edits", response_model=SnippetResponse)
+    def edit_snippet_content(name: str, body: PromptSnippetEditContentBody) -> SnippetResponse:
+        """按连续行唯一匹配局部编辑提示词正文。"""
+        if not body.edits:
+            raise HTTPException(status_code=400, detail="edits 列表不能为空。")
+        for edit in body.edits:
+            if not edit.search_lines:
+                raise HTTPException(status_code=400, detail="search_lines 必须至少包含一行。")
+
+        try:
+            request = PromptSnippetEditRequest(
+                name=name,
+                edits=[
+                    PromptSnippetTextEdit(
+                        search_lines=item.search_lines,
+                        replace_lines=item.replace_lines,
+                    )
+                    for item in body.edits
+                ],
+                expected_text_sha256=body.expected_text_sha256,
+            )
+            snippet = gateway.edit_snippet_content(request)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"提示词片段不存在: {name}")
+        except PromptSnippetValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except (PromptSnippetConflictError, ValueError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return SnippetResponse(name=snippet.name, text=snippet.text, category=snippet.category)
+
 
     @router.post("/", response_model=SnippetResponse, status_code=201)
     def create_snippet(body: SnippetCreateBody) -> SnippetResponse:

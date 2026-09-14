@@ -27,6 +27,8 @@ const ACTIONS = new Set([
   "disable",
   "resolved",
   "reorder",
+  "edit-content",
+  "edit",
 ])
 
 class ConfigClientError extends Error {
@@ -151,7 +153,7 @@ function helpText() {
   return [
     "Usage: node scripts/manage-config.mjs <resource> <action> [options]",
     "Resources: agent, mcp, llm-model, llm-provider, llm-policy, prompt, skill, tool",
-    "Actions: list, get, create, update, patch, delete, enable, disable, resolved, reorder",
+    "Actions: list, get, create, update, patch, delete, enable, disable, resolved, reorder, edit-content (or edit)",
     "Read-only metadata: skill list/get and tool list/get. Tool execution is not exposed.",
     "Options: --id <id> --sub-path <path> --file <path|-> --runtime-url <url> --login-file <path> --token-file <path> --token-stdin --auth-file <path>",
     "Auth priority: explicit token sources first, then login properties file, then advanced token environment fallbacks. Never pass passwords or tokens as command-line values.",
@@ -255,6 +257,19 @@ async function buildRequest(args) {
         throw new ConfigClientError("reorder requires --sub-path.")
       }
       return { method: "POST", relativePath: relativePath(id, `${subPath.replace(/[\\/]+$/, "")}/reorder`), body: await readPayload(args.file) }
+    case "edit-content":
+    case "edit":
+      if (resource !== "prompt") {
+        throw new ConfigClientError(`${action} is only supported for prompt.`)
+      }
+      requireId(id, action)
+      if (!args.file) {
+        throw new ConfigClientError(`${action} requires --file.`)
+      }
+      if (subPath) {
+        throw new ConfigClientError(`${action} does not support --sub-path.`)
+      }
+      return { method: "POST", relativePath: relativePath(id, "content/edits"), body: await readPayload(args.file) }
     default:
       throw new ConfigClientError(`Unsupported action: ${action}`)
   }

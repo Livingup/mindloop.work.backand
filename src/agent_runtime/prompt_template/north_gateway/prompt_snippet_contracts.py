@@ -6,9 +6,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from agent_runtime.prompt_template.prompt_snippet import PromptSnippet
+
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSnippetTextEdit:
+    """提示词正文中的一个连续行替换编辑。"""
+
+    search_lines: Sequence[str]
+    replace_lines: Sequence[str] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSnippetEditRequest:
+    """提示词正文局部编辑请求。"""
+
+    # 目标片段唯一描述名。
+    name: str
+
+    # 连续行编辑项列表。
+    edits: Sequence[PromptSnippetTextEdit]
+
+    # 可选预期正文 SHA256，用于乐观并发控制。
+    expected_text_sha256: str | None = None
+
+
+# 别名兼容
+PromptSnippetEditContentRequest = PromptSnippetEditRequest
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +93,10 @@ class PromptSnippetNorthGateway(Protocol):
 
     def update_snippet(self, request: PromptSnippetUpdateRequest) -> PromptSnippet:
         """更新提示词片段。目标片段不存在时抛出 KeyError。"""
+        ...
+
+    def edit_snippet_content(self, request: PromptSnippetEditRequest) -> PromptSnippet:
+        """按连续行唯一匹配局部编辑提示词正文。目标片段不存在时抛出 KeyError。"""
         ...
 
     def delete_snippet(self, name: str) -> None:

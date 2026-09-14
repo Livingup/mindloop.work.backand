@@ -4,11 +4,17 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
 
-from agent_runtime.prompt_template.prompt_snippet import PromptSnippet
+from agent_runtime.prompt_template.prompt_snippet import (
+    PromptSnippet,
+    PromptSnippetConflictError,
+)
 from agent_runtime.prompt_template.north_gateway.prompt_snippet_contracts import (
     PromptSnippetCreateRequest,
+    PromptSnippetEditRequest,
     PromptSnippetUpdateRequest,
 )
 from agent_runtime.prompt_template.prompt_snippet_repository import (
@@ -27,6 +33,7 @@ class PromptSnippetService:
 
     def __init__(self, repo: PromptSnippetRepository) -> None:
         self._repo = repo
+        self._lock = threading.Lock()
 
     # ── 片段增删改查 ───────────────────────────────────────────────
 
@@ -85,6 +92,34 @@ class PromptSnippetService:
         self._repo.save(updated)
         logger.info("更新提示词片段: %s -> %s", request.current_name, updated.name)
         return updated
+
+    def edit_snippet_content(self, request: PromptSnippetEditRequest) -> PromptSnippet:
+        """按连续行唯一匹配局部编辑提示词正文。
+
+        业务规则：
+        1. 根据 request.name 从仓储获取当前聚合根，不存在时抛出 KeyError。
+        2. 若提供了 expected_text_sha256，与当前正文 SHA256 对比，不一致时抛出 PromptSnippetConflictError。
+        3. 调用聚合根的 apply_text_edits 方法，顺序执行并内存校验所有连续行替换规则。
+        4. 任意校验或匹配失败均不写入仓储（原子性保证）。
+        5. 全部校验通过后单次保存到仓储，仅正文发生变更，name 和 category 保持不变。
+        """
+        with self._lock:
+            current = self._repo.find_by_name(request.name)
+            if current is None:
+                raise KeyError(f"提示词片段不存在: {request.name}")
+
+            if request.expected_text_sha256 is not None:
+                current_sha256 = hashlib.sha256(current.text.encode("utf-8")).hexdigest()
+                if current_sha256.lower() != request.expected_text_sha256.strip().lower():
+                    raise PromptSnippetConflictError(
+                        f"提示词正文版本冲突: 预期 SHA256 为 {request.expected_text_sha256}，"
+                        f"实际为 {current_sha256}。"
+                    )
+
+            updated = current.apply_text_edits(request.edits)
+            self._repo.save(updated)
+            logger.info("局部更新提示词片段正文: %s", request.name)
+            return updated
 
     def delete_snippet(self, name: str) -> None:
         """删除提示词片段。不存在时静默跳过。"""
