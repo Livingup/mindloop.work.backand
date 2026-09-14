@@ -64,6 +64,7 @@ from agent_runtime.conversation_message.conversation_repository import Conversat
 from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConfigurationComponentEvent,
+    InstructionsSnapshot,
     PartMeta,
     ImagePart,
     ImagePartMeta,
@@ -128,6 +129,13 @@ _PLAIN_TEXT_FALLBACK_PAUSE_THRESHOLD = 5
 _AGENT_STAGE_PROGRESS_LOG_INTERVAL_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+
+STABLE_PREFIX_BASE_TEMPLATES: frozenset[str] = frozenset({
+    "General-purpose self-learning agent",
+    "MCP服务使用",
+    "生命周期工具调用规范",
+})
+DEFAULT_INSTRUCTIONS_FALLBACK = "你是一个善于学习的AI。"
 
 
 def _safe_runtime_task_label(value: str | None, *, max_length: int = 80) -> str:
@@ -2213,6 +2221,7 @@ class AgentExecutionEngine:
                         instance.current_working_directory,
                         request.render_options,
                         business_tools,
+                        conversation=new_conversation,
                     )
                     new_conversation.system_prompt = business_system_prompt
                     new_conversation.tools = tuple(
@@ -3065,6 +3074,7 @@ class AgentExecutionEngine:
                     instance.current_working_directory,
                     render_options,
                     tools,
+                    conversation=conversation,
                     mcp_services_prompt=mcp_services_prompt,
                     prompt_step_recorder=_record_prompt_preparation_step,
                 )
@@ -3529,10 +3539,21 @@ class AgentExecutionEngine:
         render_options: dict[str, Any],
         llm_tools: tuple[LlmToolDefinition, ...],
         *,
+        conversation: Conversation | None = None,
         mcp_services_prompt: str | None = None,
         prompt_step_recorder: Callable[[str, str, str, dict[str, Any] | None, str | None], None] | None = None,
     ) -> str | None:
-        """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。"""
+        """按运行时上下文、AgentDefinition.system_prompt 和工具提示顺序拼接最终系统提示词。
+
+        稳定前缀机制：
+        - 若 conversation.instructions_snapshot 尚未建立（首次 Agent 启动）：
+          扫描 definition.system_prompt，提取命中的 3 大基座模板（STABLE_PREFIX_BASE_TEMPLATES），
+          渲染变量后构造 InstructionsSnapshot 存入 conversation；若无命中，则存入默认兜底。
+        - 若 conversation.instructions_snapshot 已存在：保持快照不变（终身不可变）。
+        - 在渲染当前 Agent 的差异系统提示词时，过滤掉已在快照 template_names 中的模板。
+        - 移除原硬编码的前置运行时上下文与后置英文 lifecycle / MCP / Skill 兜底追加，
+          仅保留当前 Agent 的差异模板内容与针对其可见工具集的 tool_usage_notice。
+        """
 
         def _record_prompt_step(
             stage: str,
@@ -3545,64 +3566,7 @@ class AgentExecutionEngine:
                 return
             prompt_step_recorder(stage, status, summary, details, expected_next)
 
-        template_ids = tuple(
-            segment.template_id for segment in definition.system_prompt if segment.template_id is not None
-        )
-        _record_prompt_step(
-            "llm.prompt.agent_segments.start",
-            "started",
-            "开始读取 AgentDefinition 系统提示词片段。",
-            {
-                "system_prompt_segment_count": len(definition.system_prompt),
-                "template_segment_count": len(template_ids),
-                "template_ids": list(template_ids),
-            },
-            "llm.prompt.agent_segments.complete",
-        )
-        segments: list[str] = []
-        for segment in definition.system_prompt:
-            if segment.text is not None:
-                segments.append(segment.text)
-            elif segment.template_id is not None:
-                snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
-                segments.append(snippet.text)
-        text = "\n\n".join(item for item in segments if item.strip())
-        _record_prompt_step(
-            "llm.prompt.agent_segments.complete",
-            "completed",
-            "AgentDefinition 系统提示词片段读取完成。",
-            {
-                "rendered_segment_count": len(segments),
-                "agent_prompt_text_length": len(text),
-            },
-            "llm.prompt.runtime_context.start",
-        )
-
-        _record_prompt_step(
-            "llm.prompt.runtime_context.start",
-            "started",
-            "开始构造运行时上下文提示词。",
-            {
-                "agent_instance_id": agent_instance_id,
-                "current_working_directory": current_working_directory,
-            },
-            "llm.prompt.runtime_context.complete",
-        )
-        skill_root_directory = self._resolve_skill_root_directory()
-        runtime_context_prompt = _build_runtime_context_prompt(
-            definition,
-            agent_instance_id,
-            current_working_directory,
-            skill_root_directory,
-        )
-        _record_prompt_step(
-            "llm.prompt.runtime_context.complete",
-            "completed",
-            "运行时上下文提示词构造完成。",
-            {"runtime_context_prompt_length": len(runtime_context_prompt)},
-            "llm.prompt.mcp_services.start",
-        )
-
+        # 1. 准备运行时插槽变量数据
         _record_prompt_step(
             "llm.prompt.mcp_services.start",
             "started",
@@ -3661,55 +3625,23 @@ class AgentExecutionEngine:
                 "available_subagents_prompt_present": bool(available_subagents_prompt),
                 "available_subagents_prompt_length": len(available_subagents_prompt),
             },
-            "llm.prompt.lifecycle.start",
+            "llm.prompt.variables.start",
         )
 
-        _record_prompt_step(
-            "llm.prompt.lifecycle.start",
-            "started",
-            "开始构造 lifecycle runtime 提示词。",
-            {"render_option_keys": sorted(render_options.keys())},
-            "llm.prompt.lifecycle.complete",
-        )
-        lifecycle_prompt = _build_lifecycle_runtime_prompt(render_options)
-        _record_prompt_step(
-            "llm.prompt.lifecycle.complete",
-            "completed",
-            "lifecycle runtime 提示词构造完成。",
-            {
-                "lifecycle_prompt_present": bool(lifecycle_prompt),
-                "lifecycle_prompt_length": len(lifecycle_prompt),
-            },
-            "llm.prompt.tool_usage_notice.start",
-        )
-
-        _record_prompt_step(
-            "llm.prompt.tool_usage_notice.start",
-            "started",
-            "开始构造工具使用注意事项提示词。",
-            {"llm_tool_names": [tool.name for tool in llm_tools]},
-            "llm.prompt.tool_usage_notice.complete",
-        )
-        tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
-        _record_prompt_step(
-            "llm.prompt.tool_usage_notice.complete",
-            "completed",
-            "工具使用注意事项提示词构造完成。",
-            {"tool_usage_notice_length": len(tool_usage_notice)},
-            "llm.prompt.assemble.complete",
-        )
-
+        agent_id = getattr(definition, "agent_id", "") or "default"
+        agent_name = getattr(definition, "name", None) or agent_id
+        skill_root_directory = self._resolve_skill_root_directory()
         skill_root_path = Path(skill_root_directory).expanduser().resolve(strict=False) if skill_root_directory else Path("")
-        dedicated_skill_file = skill_root_path / definition.agent_id / "SKILL.md" if skill_root_directory else Path("")
+        dedicated_skill_file = skill_root_path / agent_id / "SKILL.md" if skill_root_directory else Path("")
         working_directory = Path(current_working_directory).expanduser()
         resolved_working_directory = working_directory.resolve(strict=False)
-        project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / definition.agent_id / "memory.md"
+        project_memory_file = resolved_working_directory / ".spread-ai" / "memory" / agent_id / "memory.md"
         git_roots = _discover_git_roots_under(resolved_working_directory)
         git_roots_prompt = "\n".join(f"- `{git_root}`" for git_root in git_roots)
 
         var_context = PromptVariableContext(
             agent_instance_id=agent_instance_id,
-            agent_name=definition.name or definition.agent_id,
+            agent_name=agent_name,
             current_working_directory=current_working_directory,
             parent_agent_instance_id=str(render_options.get("parent_agent_instance_id") or ""),
             skill_root_directory=skill_root_directory,
@@ -3738,26 +3670,93 @@ class AgentExecutionEngine:
         )
         variable_values = build_prompt_variable_values(var_context)
 
-        # 若模板中已显式包含特定占位符，则避免在末尾重复追加该块
-        append_mcp = bool(rendered_mcp_services_prompt and "{{available_mcp_services}}" not in text)
-        append_skills = bool(skills_prompt and "{{available_skills}}" not in text)
-        append_subagents = bool(available_subagents_prompt and "{{available_subagents}}" not in text)
-        append_lifecycle = bool(
-            lifecycle_prompt
-            and "Runtime lifecycle tool policy" not in text
-            and "生命周期工具" not in text
+        # 2. 建立或读取 instructions 稳定前缀快照
+        system_prompt_segments = getattr(definition, "system_prompt", ()) or ()
+        snapshot_template_names: set[str] = set()
+        if conversation is not None:
+            if conversation.instructions_snapshot is None:
+                base_texts: list[str] = []
+                matched_names: list[str] = []
+                for segment in system_prompt_segments:
+                    template_id = getattr(segment, "template_id", None)
+                    if template_id and template_id in STABLE_PREFIX_BASE_TEMPLATES:
+                        snippet = self._prompt_snippet_gateway.get_snippet(template_id)
+                        base_texts.append(snippet.text)
+                        matched_names.append(template_id)
+                if matched_names:
+                    raw_base = "\n\n".join(item for item in base_texts if item.strip())
+                    rendered_base = render_prompt_variables(raw_base, variable_values)
+                    conversation.instructions_snapshot = InstructionsSnapshot(
+                        template_names=tuple(matched_names),
+                        content=rendered_base,
+                    )
+                else:
+                    conversation.instructions_snapshot = InstructionsSnapshot(
+                        template_names=(),
+                        content=DEFAULT_INSTRUCTIONS_FALLBACK,
+                    )
+            snapshot_template_names = set(conversation.instructions_snapshot.template_names)
+
+        # 3. 读取 AgentDefinition 片段并过滤掉已在 instructions 快照中的基座模板
+        template_ids = tuple(
+            getattr(segment, "template_id", None)
+            for segment in system_prompt_segments
+            if getattr(segment, "template_id", None) is not None
+        )
+        _record_prompt_step(
+            "llm.prompt.agent_segments.start",
+            "started",
+            "开始读取 AgentDefinition 系统提示词片段。",
+            {
+                "system_prompt_segment_count": len(system_prompt_segments),
+                "template_segment_count": len(template_ids),
+                "template_ids": list(template_ids),
+                "filtered_out_template_count": len([tid for tid in template_ids if tid in snapshot_template_names]),
+            },
+            "llm.prompt.agent_segments.complete",
+        )
+        segments: list[str] = []
+        for segment in definition.system_prompt:
+            if segment.template_id and segment.template_id in snapshot_template_names:
+                continue
+            if segment.text is not None:
+                segments.append(segment.text)
+            elif segment.template_id is not None:
+                snippet = self._prompt_snippet_gateway.get_snippet(segment.template_id)
+                segments.append(snippet.text)
+        text = "\n\n".join(item for item in segments if item.strip())
+        _record_prompt_step(
+            "llm.prompt.agent_segments.complete",
+            "completed",
+            "AgentDefinition 系统提示词片段读取完成（已过滤全局稳定前缀模板）。",
+            {
+                "rendered_segment_count": len(segments),
+                "agent_prompt_text_length": len(text),
+            },
+            "llm.prompt.tool_usage_notice.start",
         )
 
-        assembled_parts = [runtime_context_prompt, text]
-        if append_mcp:
-            assembled_parts.append(rendered_mcp_services_prompt)
-        if append_skills:
-            assembled_parts.append(skills_prompt)
-        if append_subagents:
-            assembled_parts.append(available_subagents_prompt)
-        if append_lifecycle:
-            assembled_parts.append(lifecycle_prompt)
-        assembled_parts.append(tool_usage_notice)
+        # 4. 构造针对当前 Agent 可见工具的注意事项（特定 Agent 局部规则）
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.start",
+            "started",
+            "开始构造工具使用注意事项提示词。",
+            {"llm_tool_names": [tool.name for tool in llm_tools]},
+            "llm.prompt.tool_usage_notice.complete",
+        )
+        tool_usage_notice = self._build_tool_usage_notice(definition, llm_tools)
+        _record_prompt_step(
+            "llm.prompt.tool_usage_notice.complete",
+            "completed",
+            "工具使用注意事项提示词构造完成。",
+            {"tool_usage_notice_length": len(tool_usage_notice)},
+            "llm.prompt.assemble.complete",
+        )
+
+        # 5. 拼装当前 Agent 的差异系统提示词并执行占位符替换
+        assembled_parts = [text]
+        if tool_usage_notice.strip():
+            assembled_parts.append(tool_usage_notice)
 
         raw_system_prompt = "\n\n".join(item for item in assembled_parts if item.strip())
         system_prompt = render_prompt_variables(raw_system_prompt, variable_values) or None
@@ -4691,38 +4690,6 @@ def _mcp_service_ids(definition: AgentDefinition) -> list[str]:
     return service_ids
 
 
-def _build_runtime_context_prompt(
-    definition: AgentDefinition,
-    agent_instance_id: str,
-    current_working_directory: str,
-    skill_root_directory: str,
-) -> str:
-    working_directory = Path(current_working_directory).expanduser()
-    resolved_working_directory = working_directory.resolve(strict=False)
-    git_roots = _discover_git_roots_under(resolved_working_directory)
-    git_roots_lines = "\n".join(f"- `{git_root}`" for git_root in git_roots)
-    git_roots_section = (
-        f"\n当前工作目录下的 Git 仓库根目录：\n\n{git_roots_lines}\n"
-        if git_roots_lines
-        else ""
-    )
-    return textwrap.dedent(
-        f"""\
-# 身份id和工作空间
-
-你自己的 Agent 实例 ID：`{agent_instance_id}`
-当前工作目录：`{resolved_working_directory}`{git_roots_section}
-# 系统环境
-
-- Current working directory: `{resolved_working_directory}`
-- Operating system: `{platform.system()}`
-- OS release: `{platform.release()}`
-- OS version: `{platform.version()}`
-- Machine: `{platform.machine()}`
-"""
-    ).strip()
-
-
 def _discover_git_roots_under(root: Path) -> list[str]:
     if not root.exists() or not root.is_dir():
         return []
@@ -4749,69 +4716,6 @@ def _discover_git_roots_under(root: Path) -> list[str]:
             if name not in excluded
         ]
     return sorted(discovered)
-
-
-def _build_lifecycle_runtime_prompt(render_options: dict[str, Any]) -> str:
-    channel = str(
-        render_options.get("channel")
-        or render_options.get("frontend_channel")
-        or "unknown"
-    )
-    supported_formats = _format_render_option_values(
-        render_options.get("supported_text_formats")
-        or render_options.get("text_formats")
-        or ("html",)
-    )
-    preferred_format = str(
-        render_options.get("preferred_text_format")
-        or render_options.get("text_format")
-        or "html"
-    )
-    return (
-        "## Runtime lifecycle tool policy\n"
-        "- Use lifecycle tools for all user-facing communication instead of plain assistant text.\n"
-        "- `message_user` has two behavior modes via `action` field: "
-        "`notify` (non-blocking, send-and-continue) for progress updates, important findings, "
-        "or pre-announcing long-running operations; "
-        "`request_response` (blocks until user replies) covering ALL scenarios that need user "
-        "input — questions, confirmation, selection, reporting completion for review, "
-        "dangerous operation approval, asking for help, etc. "
-        "Do NOT use `notify` to ask questions or to wait for user reply.\n"
-        "- `pause_task` tool: pause execution without sending any message and wait for external "
-        "events (other Agent messages or system events). A positive `timeout_seconds` is a finite "
-        "checkpoint: whichever arrives first — the external event or timeout expiry — resumes the "
-        "next LLM loop. When waiting for a known delegated result from a local child Agent, remote "
-        "Agent, or definite async job, choose a positive checkpoint based on expected complexity "
-        "(often roughly 5–50 minutes). Do not use `-1` for that wait or assume the completion "
-        "notification is perfectly reliable. If the checkpoint expires without a result, inspect "
-        "the child/remote Agent or async-job status; if it is paused or silent, proactively ask "
-        "whether it is complete and request progress, blockers, and ETA to avoid a stuck system. "
-        "Use `timeout_seconds=-1` only when this Agent's assigned work is fully complete, the final "
-        "result has already been reported to a parent or remote upstream, and no known subtask or "
-        "result remains outstanding; this is indefinite dormant waiting for uncertain future "
-        "instructions. Do not use positive timeouts to create meaningless periodic wake loops. "
-        "For waiting on real user replies use `message_user(action=request_response)`, not "
-        "`pause_task`.\n"
-        "- `end_task` tool: end task session for SUCCESSFUL completion. Required sequence: "
-        "first call `message_user(action=request_response)` to report results and wait for "
-        "user verification; only after explicit user approval should you call `end_task`. "
-        "For task failure use `fail_task` instead.\n"
-        "- `fail_task` tool: declare unrecoverable failure and end the loop with a fail decision. Use only when "
-        "you as the Agent judge that the task cannot proceed (missing required tool/permission, "
-        "severely inconsistent input, repeated failures with no path forward). Routine tool "
-        "exceptions are wrapped automatically by the framework — do not call `fail_task` for them. "
-        "Recommended: first `message_user(action=notify)` to inform user of failure cause and "
-        "attempted approaches, then call `fail_task`.\n"
-        "- Do not call lifecycle tools in the same assistant turn as business tools unless the "
-        "user explicitly requires it.\n"
-        f"- Current frontend channel: `{channel}`.\n"
-        f"- Supported text formats: `{supported_formats}`.\n"
-        f"- Preferred text format: `{preferred_format}`.\n"
-        "- Set `message_user.text_format` explicitly to `html`; `message_user.message` must be an HTML fragment following the tool schema, not Markdown.\n"
-        "- For readable HTML, follow `message_user` schema guidance: prefer tables for comparison/range/status/plan/result information, and keep paragraph/list hierarchy to at most three levels (plain heading/paragraph, bullet main items, dash details) without forcing all three levels.\n"
-        "- `message_user` with `request_response`: `options` must be objects with `id`, `label`, "
-        "and optional `description`."
-    )
 
 
 def _format_render_option_values(value: Any) -> str:

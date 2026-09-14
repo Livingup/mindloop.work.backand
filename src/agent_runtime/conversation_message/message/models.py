@@ -282,6 +282,25 @@ class ConfigurationComponentEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class InstructionsSnapshot:
+    """会话的 Instructions 稳定前缀快照。
+
+    在首个 Agent 提示词解析时确定，并在会话全生命周期保持不可变。
+    template_names 记录已提升到 instructions 中的模板名称列表；
+    content 记录最终渲染后的 instructions 字符串文本。
+    """
+
+    template_names: tuple[str, ...] = field(default_factory=tuple)
+    content: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.template_names, tuple):
+            object.__setattr__(self, "template_names", tuple(self.template_names))
+        if not isinstance(self.content, str):
+            raise TypeError("InstructionsSnapshot.content 必须是字符串。")
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentPromptConfiguration:
     """上游本次按活动提示词 definition_id 解析出的实时内容。"""
 
@@ -690,6 +709,9 @@ class Conversation:
 
     # 当前生效的工具定义（由 Agent 实时设置，支持热更新）。
     tools: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+
+    # 全局 Instructions 稳定前缀快照（首次 Agent 初始化后冻结不可变）。
+    instructions_snapshot: InstructionsSnapshot | None = None
 
     def record_configuration_event(self, event: ConfigurationComponentEvent) -> None:
         """记录系统提示词或工具切换事件到会话时间线。

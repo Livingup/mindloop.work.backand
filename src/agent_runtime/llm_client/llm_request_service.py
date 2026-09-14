@@ -141,11 +141,14 @@ def _resolve_openai_request_configuration(
         effective_tools = ()
     else:
         effective_tools = _normalize_openai_tools(tools_override, field_name="request_overrides.tools")
-    effective_system = (
-        system_prompt
-        if instructions_override is _MISSING
-        else instructions_override
-    )
+    if instructions_override is not _MISSING:
+        if instructions_override is not None and not isinstance(instructions_override, str):
+            raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
+        params["instructions"] = instructions_override
+    elif conversation is not None and getattr(conversation, "instructions_snapshot", None):
+        params["instructions"] = conversation.instructions_snapshot.content
+
+    effective_system = system_prompt
     if effective_system is not None and not isinstance(effective_system, str):
         raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
 

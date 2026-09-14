@@ -580,6 +580,7 @@ class SubagentRuntime:
                 f"copy_count={conversation_history_copy_message_count} parent_message_count={parent_message_count}"
             )
         child_conversation = create_conversation()
+        child_conversation.instructions_snapshot = getattr(parent_conversation, "instructions_snapshot", None)
         copied_messages = parent_conversation.messages[:conversation_history_copy_message_count]
         for message in copied_messages:
             child_conversation.append_message(deepcopy(message))

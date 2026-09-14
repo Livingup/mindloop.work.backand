@@ -27,6 +27,7 @@ from agent_runtime.conversation_message.message.models import (
     Conversation,
     ConversationState,
     ImagePart,
+    InstructionsSnapshot,
     PdfPart,
     TextPart,
     ThinkingPart,
@@ -77,6 +78,33 @@ def _dict_to_configuration_event(d: dict[str, Any]) -> ConfigurationComponentEve
         component=d.get("component"),
         supplementary_prompts=tuple(d.get("supplementary_prompts") or ()),
     )
+
+
+def _snapshot_to_json(snapshot: InstructionsSnapshot | None) -> str | None:
+    """将 InstructionsSnapshot 序列化为 JSON 字符串。"""
+    if snapshot is None:
+        return None
+    return json.dumps(
+        {
+            "template_names": list(snapshot.template_names),
+            "content": snapshot.content,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _json_to_snapshot(raw: str | None) -> InstructionsSnapshot | None:
+    """将 JSON 字符串反序列化为 InstructionsSnapshot 对象。"""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return InstructionsSnapshot(
+            template_names=tuple(data.get("template_names") or ()),
+            content=str(data.get("content") or ""),
+        )
+    except Exception:
+        return None
 
 
 def _part_to_dict(part: UniPart) -> dict[str, Any]:
@@ -212,10 +240,11 @@ CREATE TABLE IF NOT EXISTS pending_tool_results (
 );
 
 CREATE TABLE IF NOT EXISTS conversation_configuration (
-    conversation_id   TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
-    timeline          TEXT NOT NULL DEFAULT '[]',
-    system_prompt     TEXT,
-    tools             TEXT NOT NULL DEFAULT '[]'
+    conversation_id       TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    timeline              TEXT NOT NULL DEFAULT '[]',
+    system_prompt         TEXT,
+    tools                 TEXT NOT NULL DEFAULT '[]',
+    instructions_snapshot TEXT
 );
 """
 
@@ -223,6 +252,7 @@ CREATE TABLE IF NOT EXISTS conversation_configuration (
 _TIMELINE_CACHE: dict[str, list[Any]] = {}
 _SYSTEM_PROMPT_CACHE: dict[str, str | None] = {}
 _TOOLS_CACHE: dict[str, tuple[dict[str, Any], ...]] = {}
+_INSTRUCTIONS_SNAPSHOT_CACHE: dict[str, InstructionsSnapshot | None] = {}
 
 
 class SqliteConversationRepository:
@@ -274,16 +304,19 @@ class SqliteConversationRepository:
                 (conv.id, task_id, thread_id, agent_id, agent_instance_id),
             )
             self._upsert_state(conv.id, conv.state)
+            instructions_snapshot = getattr(conv, "instructions_snapshot", None)
             self._upsert_configuration(
                 conv.id,
                 conv.timeline,
                 getattr(conv, "system_prompt", None),
                 getattr(conv, "tools", ()),
+                instructions_snapshot,
             )
             c.commit()
             _TIMELINE_CACHE[conv.id] = list(conv.timeline)
             _SYSTEM_PROMPT_CACHE[conv.id] = getattr(conv, "system_prompt", None)
             _TOOLS_CACHE[conv.id] = tuple(getattr(conv, "tools", ()))
+            _INSTRUCTIONS_SNAPSHOT_CACHE[conv.id] = instructions_snapshot
             # 写入已有消息（创建时通常为空）。
             if conv.messages:
                 self._write_messages_file(task_id, conv.id, conv.messages)
@@ -332,9 +365,10 @@ class SqliteConversationRepository:
 
             # 从 SQLite 读取会话配置与时间线（优先读取已持久化配置，保障重启后完整恢复）。
             cfg_row = c.execute(
-                "SELECT timeline, system_prompt, tools FROM conversation_configuration WHERE conversation_id = ?",
+                "SELECT timeline, system_prompt, tools, instructions_snapshot FROM conversation_configuration WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
+            instructions_snapshot: InstructionsSnapshot | None = None
             if cfg_row is not None:
                 try:
                     timeline = [
@@ -348,14 +382,20 @@ class SqliteConversationRepository:
                     tools = tuple(json.loads(cfg_row[2])) if cfg_row[2] else ()
                 except Exception:
                     tools = _TOOLS_CACHE.get(conversation_id, ())
+                try:
+                    instructions_snapshot = _json_to_snapshot(cfg_row[3]) if len(cfg_row) > 3 else None
+                except Exception:
+                    instructions_snapshot = _INSTRUCTIONS_SNAPSHOT_CACHE.get(conversation_id)
             else:
                 timeline = list(_TIMELINE_CACHE.get(conversation_id, []))
                 system_prompt = _SYSTEM_PROMPT_CACHE.get(conversation_id)
                 tools = _TOOLS_CACHE.get(conversation_id, ())
+                instructions_snapshot = _INSTRUCTIONS_SNAPSHOT_CACHE.get(conversation_id)
 
             _TIMELINE_CACHE[conversation_id] = list(timeline)
             _SYSTEM_PROMPT_CACHE[conversation_id] = system_prompt
             _TOOLS_CACHE[conversation_id] = tuple(tools)
+            _INSTRUCTIONS_SNAPSHOT_CACHE[conversation_id] = instructions_snapshot
 
             return Conversation(
                 id=conversation_id,
@@ -365,6 +405,7 @@ class SqliteConversationRepository:
                 timeline=list(timeline),
                 system_prompt=system_prompt,
                 tools=tools,
+                instructions_snapshot=instructions_snapshot,
             )
 
     async def save(self, conv: Conversation) -> None:
@@ -384,8 +425,14 @@ class SqliteConversationRepository:
             if len(valid_timeline) != len(conv.timeline):
                 conv.timeline = valid_timeline
 
+            instructions_snapshot = getattr(conv, "instructions_snapshot", None)
             # 若时间线及配置均为空，物理删除配置记录，避免残留无效数据
-            if not conv.timeline and not getattr(conv, "system_prompt", None) and not getattr(conv, "tools", ()):
+            if (
+                not conv.timeline
+                and not getattr(conv, "system_prompt", None)
+                and not getattr(conv, "tools", ())
+                and instructions_snapshot is None
+            ):
                 self._conn.execute(
                     "DELETE FROM conversation_configuration WHERE conversation_id = ?",
                     (cid,),
@@ -396,11 +443,13 @@ class SqliteConversationRepository:
                     conv.timeline,
                     getattr(conv, "system_prompt", None),
                     getattr(conv, "tools", ()),
+                    instructions_snapshot,
                 )
 
             _TIMELINE_CACHE[cid] = list(conv.timeline)
             _SYSTEM_PROMPT_CACHE[cid] = getattr(conv, "system_prompt", None)
             _TOOLS_CACHE[cid] = tuple(getattr(conv, "tools", ()))
+            _INSTRUCTIONS_SNAPSHOT_CACHE[cid] = instructions_snapshot
             # 覆写 JSONL 消息文件。
             self._write_messages_file(task_id, cid, conv.messages)
             # 覆写会话派生状态。
@@ -619,18 +668,20 @@ class SqliteConversationRepository:
         timeline: list[ConfigurationComponentEvent],
         system_prompt: str | None,
         tools: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+        instructions_snapshot: InstructionsSnapshot | None = None,
     ) -> None:
         timeline_data = [_configuration_event_to_dict(evt) for evt in timeline]
         tools_data = list(tools) if tools else []
         self._conn.execute(
             "INSERT OR REPLACE INTO conversation_configuration "
-            "(conversation_id, timeline, system_prompt, tools) "
-            "VALUES (?, ?, ?, ?)",
+            "(conversation_id, timeline, system_prompt, tools, instructions_snapshot) "
+            "VALUES (?, ?, ?, ?, ?)",
             (
                 cid,
                 json.dumps(timeline_data, ensure_ascii=False),
                 system_prompt,
                 json.dumps(tools_data, ensure_ascii=False),
+                _snapshot_to_json(instructions_snapshot),
             ),
         )
 
@@ -648,9 +699,17 @@ class SqliteConversationRepository:
         if "conversation_configuration" not in tables:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS conversation_configuration ("
-                "conversation_id   TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, "
-                "timeline          TEXT NOT NULL DEFAULT '[]', "
-                "system_prompt     TEXT, "
-                "tools             TEXT NOT NULL DEFAULT '[]'"
+                "conversation_id       TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, "
+                "timeline              TEXT NOT NULL DEFAULT '[]', "
+                "system_prompt         TEXT, "
+                "tools                 TEXT NOT NULL DEFAULT '[]', "
+                "instructions_snapshot TEXT"
                 ")"
             )
+        else:
+            cfg_columns = {
+                row[1]
+                for row in self._conn.execute("PRAGMA table_info(conversation_configuration)").fetchall()
+            }
+            if "instructions_snapshot" not in cfg_columns:
+                self._conn.execute("ALTER TABLE conversation_configuration ADD COLUMN instructions_snapshot TEXT")
