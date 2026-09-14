@@ -6,7 +6,7 @@ const DEFAULT_RUNTIME_URL = "http://127.0.0.1:8000"
 
 const RESOURCE_PATHS = Object.freeze({
   agent: "/api/agents",
-  mcp: "/api/mcp-config",
+  mcp: "/api/mcp-config/",
   "llm-model": "/api/llm-registry/models",
   "llm-provider": "/api/llm-registry/providers",
   "llm-policy": "/api/llm-registry/execution-policies",
@@ -331,9 +331,9 @@ function joinEndpoint(runtimeUrl, basePath, relative) {
     return `${runtimeUrl}${basePath}`
   }
   if (relative.startsWith("?")) {
-    return `${runtimeUrl}${normalizedBasePath}/${relative}`
+    return `${runtimeUrl}${basePath}${relative}`
   }
-  return `${runtimeUrl}${normalizedBasePath}/${relative}`
+  return `${runtimeUrl}${normalizedBasePath}/${relative.replace(/^\/+/, "")}`
 }
 
 async function resolveAuth(args, runtimeUrl, loginProperties) {
