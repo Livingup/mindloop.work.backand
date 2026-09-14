@@ -35,6 +35,8 @@ The formal Runtime/Agent entrypoint is the Node.js script:
 node scripts/manage-config.mjs <resource> <action> [options]
 ```
 
+Actions include: `list`, `get`, `create`, `update`, `patch`, `delete`, `enable`, `disable`, `resolved`, `reorder`, and `edit-content` (or alias `edit`, prompt-only).
+
 Node.js 18+ is the cross-platform runtime layer for Windows, macOS, and Linux. This Skill package intentionally does not provide Windows PowerShell, Windows CMD, or POSIX shell wrapper entrypoints for Runtime/Agent execution; avoiding OS-specific wrappers keeps the Skill contract identical on every platform and ensures all authentication, REST routing, payload parsing, and error handling stay in `manage-config.mjs`.
 
 # Authentication and payloads
@@ -46,3 +48,8 @@ The Node client calls `POST /api/auth/login`, uses the returned token only in me
 Advanced diagnostic token sources remain available: explicit `--token-file`, `--token-stdin`, and `--auth-file` take precedence over `--login-file`; environment token/token-file/auth-file variables are fallback paths after login-file. If no auth source is provided, the script returns structured JSON with `code: "auth_required"`. Login failure and rate limiting also return structured JSON errors without credential values.
 
 For writes, place UTF-8 JSON or supported YAML payloads in `--file <path>` or pass `--file -` to read the payload from stdin. JSON is the baseline cross-platform input format. The Node core owns the optional YAML parsing path; wrappers must not parse or transform complex payloads. Use `list` for summaries and `get --id <id>` for detail. Use `tool list` to discover public local Runtime tool IDs and `tool get --id <tool_name>` to read a tool's detail/schema before placing the name in an Agent definition `tool_ids` array. For child-resource operations such as provider model bindings, execution-policy candidates, Agent MCP/Skill relations, or prompt content, pass the parent `--id` and a slash-separated `--sub-path` that maps to the REST child path, then use `create`, `update`, `patch`, `delete`, or `reorder` as appropriate.
+
+For prompt snippet modifications, the Skill supports both full-text replacement and fine-grained line-based editing:
+- **Fine-grained line-based edits**: Use `node scripts/manage-config.mjs prompt edit-content --id <name> --file <path|->` (or alias `edit`). The payload requires an `edits` array with contiguous `search_lines` and `replace_lines` (use empty `[]` to delete matched lines), plus optional `expected_text_sha256` for optimistic concurrency checking. Each edit block must match uniquely in the current text. Edits are applied sequentially in memory and saved atomically without altering `name` or `category`.
+- **Full-text replacement**: Use `node scripts/manage-config.mjs prompt update --id <name> --sub-path content --file <path|->` with a `{"text": "..."}` payload, or update via root `prompt update --id <name> --file <path|->` to adjust `new_name`, `new_text`, or `new_category`.
+
