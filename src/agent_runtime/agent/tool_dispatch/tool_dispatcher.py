@@ -122,6 +122,8 @@ class AgentToolDispatcher:
         agent_definition: AgentDefinition,
         tool_use: ToolUsePart,
         communication_context: RuntimeCommunicationContext | None = None,
+        llm_call_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> ToolDispatchResult:
         """执行 LLM 返回的一次工具调用，并返回可写入会话的 ToolResultPart。"""
         source = "mcp" if tool_use.name.startswith(AGENT_MCP_TOOL_NAME_PREFIX) else "local"
@@ -129,6 +131,16 @@ class AgentToolDispatcher:
         started_at = time.perf_counter()
         metadata = communication_context.metadata if communication_context is not None else {}
         instance_id = str(metadata.get("agent_instance_id") or "")
+        effective_llm_call_id = (
+            llm_call_id
+            if isinstance(llm_call_id, str) and llm_call_id.strip()
+            else (metadata.get("llm_call_id") if isinstance(metadata.get("llm_call_id"), str) else None)
+        )
+        effective_llm_request_id = (
+            llm_request_id
+            if isinstance(llm_request_id, str) and llm_request_id.strip()
+            else (metadata.get("llm_request_id") if isinstance(metadata.get("llm_request_id"), str) else None)
+        )
         if instance_id:
             self._execution_loop_logger.record_step(
                 instance_id=instance_id,
@@ -162,6 +174,8 @@ class AgentToolDispatcher:
                 "tool_source": source,
                 "input": tool_use.input,
                 "arguments_preview": _preview_arguments(tool_use.input),
+                "llm_call_id": effective_llm_call_id,
+                "llm_request_id": effective_llm_request_id,
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,
@@ -218,6 +232,8 @@ class AgentToolDispatcher:
                         "error_type": exc.__class__.__name__,
                         "error_message": str(exc),
                     },
+                    "llm_call_id": effective_llm_call_id,
+                    "llm_request_id": effective_llm_request_id,
                 },
                 source="tool_dispatcher",
                 correlation_id=tool_call_id,
@@ -269,6 +285,8 @@ class AgentToolDispatcher:
                 "duration_ms": int((time.perf_counter() - started_at) * 1000),
                 "result_preview": _preview_tool_result(result.tool_result),
                 "ui_preview": _preview_tool_ui(result.tool_result),
+                "llm_call_id": effective_llm_call_id,
+                "llm_request_id": effective_llm_request_id,
             },
             source="tool_dispatcher",
             correlation_id=tool_call_id,

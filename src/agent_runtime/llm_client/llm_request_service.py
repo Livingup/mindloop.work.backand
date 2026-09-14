@@ -723,11 +723,14 @@ class LlmRequestService:
                         binding_id=resolved.binding_id,
                         model_id=resolved.model_id,
                         model_alias=resolved.model_alias,
+                        llm_call_id=llm_call_id,
+                        llm_request_id=llm_request_id,
                     )
         if last_error is not None:
             if request.next_resolved_model is None:
                 call_failed_payload = {
                     "llm_call_id": llm_call_id,
+                    "llm_request_id": llm_request_id,
                     "candidate_index": request.candidate_index,
                     "attempt_count": attempt_count,
                     "error_type": last_error.__class__.__name__,

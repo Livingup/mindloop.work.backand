@@ -1933,6 +1933,8 @@ class AgentExecutionEngine:
                             communication_context,
                             interrupt_state=interrupt_state,
                             phase="before_tool_start",
+                            llm_call_id=llm_response.llm_call_id,
+                            llm_request_id=llm_response.llm_request_id,
                         )
                         conversation.append_message(tool_result_message)
                         await self._conversation_repository.save(conversation)
@@ -2102,6 +2104,8 @@ class AgentExecutionEngine:
                         assistant_message_index=assistant_message_index,
                         interrupt_state=interrupt_state,
                         instance=instance,
+                        llm_call_id=llm_response.llm_call_id,
+                        llm_request_id=llm_response.llm_request_id,
                     ),
                     stage="tool_batch",
                     task_id=task.task_id,
@@ -3964,6 +3968,8 @@ class AgentExecutionEngine:
         communication_context: RuntimeCommunicationContext,
         *,
         instance: AgentInstance | None = None,
+        llm_call_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> ToolDispatchResult:
         """执行单个工具调用，调度层异常也转换为 LLM 可见的工具错误结果。"""
         try:
@@ -3986,6 +3992,8 @@ class AgentExecutionEngine:
                     actor_type="tool_dispatcher",
                     actor_id=tool_use.name,
                 ),
+                llm_call_id=llm_call_id,
+                llm_request_id=llm_request_id,
             )
         except asyncio.CancelledError:
             raise
@@ -4025,6 +4033,8 @@ class AgentExecutionEngine:
         assistant_message_index: int | None = None,
         interrupt_state: _AgentExecutionInterruptState,
         instance: AgentInstance | None = None,
+        llm_call_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         """执行 assistant 消息中的全部工具调用并生成 tool 消息。"""
         started_at = time.perf_counter()
@@ -4060,6 +4070,8 @@ class AgentExecutionEngine:
                     communication_context,
                     interrupt_state=interrupt_state,
                     phase="not_started",
+                    llm_call_id=llm_call_id,
+                    llm_request_id=llm_request_id,
                 )
                 results_by_ref[_tool_use_ref(tool_use)] = cancelled_result
                 await self._persist_pending_tool_result(
@@ -4111,6 +4123,8 @@ class AgentExecutionEngine:
                 tool_use,
                 communication_context,
                 instance=instance,
+                llm_call_id=llm_call_id,
+                llm_request_id=llm_request_id,
             ))
             tasks.append((tool_use, tool_task))
         if tasks:
@@ -4245,6 +4259,8 @@ class AgentExecutionEngine:
         *,
         interrupt_state: _AgentExecutionInterruptState,
         phase: str,
+        llm_call_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> tuple[UniMessage, list[BaseToolResult]]:
         results = [
             await self._build_cancelled_tool_dispatch_result(
@@ -4252,6 +4268,8 @@ class AgentExecutionEngine:
                 communication_context,
                 interrupt_state=interrupt_state,
                 phase=phase,
+                llm_call_id=llm_call_id,
+                llm_request_id=llm_request_id,
             )
             for tool_use in tool_uses
         ]
@@ -4267,6 +4285,8 @@ class AgentExecutionEngine:
         *,
         interrupt_state: _AgentExecutionInterruptState,
         phase: str,
+        llm_call_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> ToolDispatchResult:
         tool_call_id = _tool_use_ref(tool_use)
         tool_result = build_tool_error_result(
@@ -4284,6 +4304,8 @@ class AgentExecutionEngine:
                 "cancelled_by": "user",
                 "phase": phase,
                 "reason": interrupt_state.reason,
+                "llm_call_id": llm_call_id,
+                "llm_request_id": llm_request_id,
                 "result_preview": {
                     "error_message": tool_result.error_message or "Tool execution cancelled.",
                 },

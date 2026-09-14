@@ -115,3 +115,7 @@ class LlmPromptResponse:
     model_id: str | None = None
 
     model_alias: str | None = None
+
+    llm_call_id: str | None = None
+
+    llm_request_id: str | None = None
