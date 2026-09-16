@@ -358,7 +358,7 @@ def test_tools_only_or_empty_prompt_never_fabricates_marker(prompt):
             view = replace(view, prompt_events=(ConfigurationComponentEvent("p", "d", snapshot=prompt),))
         result = await OpenAIAdapter().render(conv, _Resolver(), {"openai_responses_configuration_view": view})
         assert "prompt_cache_breakpoint" not in json.dumps(result.input)
-        assert result.prompt_cache_options == {"mode": "implicit"}
+        assert result.prompt_cache_options is None
     asyncio.run(run())
 
 
@@ -626,7 +626,7 @@ def test_conversation_timeline_direct_rendering_and_cache_prefix_continuity():
 
         rendered = await OpenAIAdapter().render(conv, _Resolver())
         assert rendered.uses_input_configuration is True
-        assert rendered.prompt_cache_options == {"mode": "implicit"}
+        assert rendered.prompt_cache_options is None
 
         # 检查初始阶段（Stage 1）内容与断点
         assert rendered.input[0] == {
@@ -747,8 +747,8 @@ def test_send_prompt_automatically_uses_conversation_timeline_without_explicit_v
         # 1. 顶层 instructions 回退为固定默认值，tools 严禁存在
         assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
-        # 2. 服务端自动缓存断点模式 implicit
-        assert captured["prompt_cache_options"] == {"mode": "implicit"}
+        # 2. 默认不显式传递 prompt_cache_options，采用服务端默认值
+        assert "prompt_cache_options" not in captured
         # 3. input 中首部包含 Stage 1 的 additional_tools 与带显式断点的 developer 提示词
         assert captured["input"][0]["type"] == "additional_tools"
         assert captured["input"][0]["tools"] == [{"type": "function", "name": "initial_tool"}]
@@ -1172,8 +1172,8 @@ def test_send_prompt_clean_conversation_without_timeline_automatically_projects_
         # 1. 顶层 instructions 回退为固定默认值，tools 严禁存在
         assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
-        # 2. 服务端自动缓存断点模式 implicit
-        assert captured["prompt_cache_options"] == {"mode": "implicit"}
+        # 2. 默认不显式传递 prompt_cache_options，采用服务端默认值
+        assert "prompt_cache_options" not in captured
         # 3. input 内首部为 additional_tools（序0）与 developer（序1，默认无显式断点）
         assert len(captured["input"]) == 3
         assert captured["input"][0]["type"] == "additional_tools"
@@ -1595,7 +1595,7 @@ def test_send_prompt_subagent_with_subset_tools_succeeds_without_conflict(monkey
         )
 
         assert conv.messages[-1] is result.assistant_message
-        assert captured["prompt_cache_options"] == {"mode": "implicit"}
+        assert "prompt_cache_options" not in captured
         # 输入最前面有父历史工具
         assert captured["input"][0]["type"] == "additional_tools"
         assert captured["input"][0]["tools"] == [
@@ -1849,6 +1849,63 @@ def test_sqlite_conversation_repository_prunes_dangling_timeline_events_on_messa
         assert loaded.timeline[0].event_id == "e_start"
 
         repo.close()
+
+    asyncio.run(run())
+
+
+def test_responses_client_omits_prompt_cache_options_by_default_and_supports_explicit_pass(monkeypatch):
+    async def run():
+        captured = {}
+
+        async def fake_post(url, headers, body, **kwargs):
+            captured.clear()
+            captured.update(copy.deepcopy(body))
+            return {"output": []}
+
+        monkeypatch.setattr(
+            "agent_runtime.llm_client.llm_protocol_clients._post_json",
+            fake_post,
+        )
+        model = _model()
+        from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
+
+        # 1. 默认渲染结果中 prompt_cache_options 为 None，发送时不携带 prompt_cache_options
+        result_default = OpenAIRenderResult(
+            input=[{"type": "additional_tools", "role": "developer", "tools": []}],
+            uses_input_configuration=True,
+            prompt_cache_options=None,
+        )
+        await OpenAIResponsesProtocolClient().request(
+            resolved_model=model,
+            rendered_messages=result_default,
+            system_prompt=None,
+            tools=(),
+            request_params={},
+            api_key=None,
+        )
+        assert "prompt_cache_options" not in captured
+
+        # 2. 显式在 request_params 传递 prompt_cache_options 时能够正常透传
+        await OpenAIResponsesProtocolClient().request(
+            resolved_model=model,
+            rendered_messages=result_default,
+            system_prompt=None,
+            tools=(),
+            request_params={"prompt_cache_options": {"mode": "explicit"}},
+            api_key=None,
+        )
+        assert captured["prompt_cache_options"] == {"mode": "explicit"}
+
+        # 3. 显式传递 None 时不携带
+        await OpenAIResponsesProtocolClient().request(
+            resolved_model=model,
+            rendered_messages=result_default,
+            system_prompt=None,
+            tools=(),
+            request_params={"prompt_cache_options": None},
+            api_key=None,
+        )
+        assert "prompt_cache_options" not in captured
 
     asyncio.run(run())
 

@@ -187,7 +187,7 @@ class OpenAIAdapter:
         message_slice = conv.messages
         configuration_view = _get_openai_configuration_view(conv, options)
         prompt_cache_breakpoint = (options or {}).get("prompt_cache_breakpoint", None)
-        prompt_cache_options = (options or {}).get("prompt_cache_options", {"mode": "implicit"})
+        prompt_cache_options = (options or {}).get("prompt_cache_options", None)
         if prompt_cache_breakpoint is not None and not isinstance(prompt_cache_breakpoint, dict):
             raise TypeError("prompt_cache_breakpoint 必须是对象或 None。")
         if prompt_cache_options is not None and not isinstance(prompt_cache_options, dict):
