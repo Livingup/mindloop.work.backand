@@ -85,12 +85,12 @@ python scripts/build_desktop_runtime.py --output ..\agent-frontend\build-resourc
 #### 协议与时间线核心约束
 1. 统一会话模型的消息列表（`Conversation.messages`）是通用规范消息列表（只包含 `user`、`assistant`、`tool` 等通用角色），绝对不得直接追加任何 OpenAI Responses 协议的 `developer` 消息或 `additional_tools` 进行污染。
 2. 系统提示词与工具组件的变更记录（时间线）统一由 Agent 维护并记录在 `Conversation.timeline`；会话模型只负责记录，底层根据变更记录和当次请求上下文动态构建适合目标协议的请求结构。
-3. 针对 OpenAI Responses 协议：系统提示词和 tools 投影到 `input`（作为 `developer` 消息与 `additional_tools`）并在初始提示词末尾打上显式缓存断点（自定义断点+自动隐式断点模式），是该协议本身的强制要求，与会话是否存在时间线彻底解耦。未发生角色切换的纯净会话（无时间线）无条件自动投影为首部 input 配置；时间线仅在中途发生定义切换时记录历史快照并按锚点追加新事件以维持前缀缓存。
+3. 本项目 OpenAI Responses 路径将公共基座快照放在顶层 `instructions`，业务差异提示词与 tools 投影到 `input`（`developer` 消息与 `additional_tools`）；客户端禁止直接发送顶层 `tools`，但允许顶层 `instructions`。这是 Runtime 的请求构造策略，不是所有 Responses 端点的强制协议。未发生切换也可有 start 时间线事件；无时间线时由请求层构造初始配置视图，不能以时间线存在与否决定是否投影。默认不发送 `prompt_cache_options`，也不注入 `prompt_cache_breakpoint`；只有显式提供相应对象时才处理，不得把理论上的 implicit/explicit 模式、TTL 或多断点布局描述为 Runtime 默认行为。
 4. 针对非 OpenAI Responses 协议（Claude、Gemini、Chat Completions 等）：底层自动忽略配置时间线重放，直接按本次请求传入的最新的系统提示词和工具定义处理。
 5. 异构模型接力对话时，各协议适配器遵循“同协议无损原样回灌 raw、跨协议公共层安全降级”原则；跨协议时必须剥离平台私有签名或加密思维链（如 Claude signature、OpenAI encrypted_content），绝不得伪造成目标协议的思维链凭证。
-6. 子 Agent 继承父 Agent 会话前缀时，必须构建并继承配置时间线：将父会话配置冻结为 start 处的 historical 快照；子 Agent 的新配置作为 active 事件锚定在边界消息（boundary message）之后。子 Agent 系统提示词需在最开头挂载补充提示词（明确任务边界与可用工具范围），支持两阶段占位符替换（创建事件时替换父实例 ID，协议渲染时替换最新可用工具名列表）。子 Agent 工具若为父 Agent 工具子集，不追加新的 `additional_tools`，由提示词声明可用权限；若不包含，仅增量追加缺失的差集工具（$\Delta Tools = Tools_{child} \setminus Tools_{parent}$），确保最大化维持前缀缓存。
+6. 子 Agent 继承父 Agent 会话前缀时，继承复制消息范围内的父配置事件并冻结为 historical，保留其原锚点与顺序；仅父会话无时间线时才以 start 快照兜底，不得把全部父事件移到 start。子配置锚定在边界消息之后；工具属于父工具名称集合子集时不追加工具事件，否则只按历史名称差集追加，不能据此宣称同名 schema 更新会重发。补充提示词在事件创建时替换父实例 ID，协议渲染时替换当前可用工具名；即使事件已 historical，也不能保证这段动态补充文本不变。工具执行权限仍由当前 Agent allowlist 校验，不能只靠提示词撤权。子会话继承 `instructions_snapshot`，但不默认继承父 `provider_state` 或缓存路由 key，不得承诺跨子会话缓存命中。
 7. 时间线（`Conversation.timeline`）是唯一的位置依据，绝不引入自愈或消息扫描等推测逻辑。时间线生命周期严格跟随会话持久化与物理删除：仓储层通过 `conversation_configuration` 表完整物理持久化时间线与配置快照；当会话消息被截断或重置时，非 start 锚点的孤儿事件物理剔除；时间线与配置清空时物理删除配置记录。进入 Note 更新等运行子状态时，严格基于时间线锚定配置，杜绝在非初始会话中误注入 `anchor='start'`。
-8. 动态系统提示词稳定前缀与不可变快照约束：针对 OpenAI Responses 协议，会话顶层 `instructions` 作为跨轮次稳定缓存前缀。在首个 Agent 启动时构建 `InstructionsSnapshot`（提取基座模板 `General-purpose self-learning agent`、`MCP服务使用`、`生命周期工具调用规范` 渲染内容，未命中则兜底为 `"你是一个善于学习的AI。"`）；快照一旦建立在会话全生命周期及子 Agent 继承中终身不可变。后续任何定义切换、Note 更新或子 Agent 执行，必须从 Agent 定义中过滤掉快照已收录的基座模板，仅将增量差异内容与针对当前可见工具集的 `tool_usage_notice` 渲染进时间线 `developer` 消息，严禁修改顶层 instructions 或向 `developer` 消息重复注入已提升到 instructions 中的基座内容。
+8. 公共基座快照与业务差异提示词必须分离：会话首次渲染时构建 `InstructionsSnapshot`（基座模板为 `General-purpose self-learning agent`、`MCP服务使用`、`生命周期工具调用规范`，未命中则兜底为 `"你是一个善于学习的AI。"`），同一会话不因定义热更新重建快照；差异提示词须过滤已收录模板，避免重复注入。请求层支持显式 `instructions` 覆盖，这会改变实际前缀但不改写快照。时间线历史值使用冻结 snapshot，active 在原锚点取最新内容，不能宣称热更新仍保持整个 input 不变。进入 Note 更新阶段在旧会话冻结并追加配置；Note 完成后新建 Conversation、基座快照与 start 配置，不属于旧长前缀的无条件延续。
 
 ### 通用通信模块（communication）
 

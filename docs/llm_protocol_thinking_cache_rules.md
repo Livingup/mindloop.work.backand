@@ -2,13 +2,13 @@
 
 本文定义 AgentRuntime 新统一会话的目标设计：同一段对话可以反复切换模型/协议，Conversation 必须保存完整的对话事实，并独立生成各目标协议的合法请求。Thinking 原样回放和缓存复用是这一设计中的两项不同职责，不能彼此替代。
 
-**文档状态：实现阶段的统一会话契约与窄范围源码审阅稿。**当前工作区存在 Development Agent 的未提交源码变更；本文区分目标设计、阶段性已接线和仍未实现/未验证内容，不把源码静态变更视为测试、真实 API 验证或产品验收通过。本轮仅由需求/架构角色审阅并更新本文件：不修改生产源码、不提交 Git。
+**文档状态：统一会话目标设计与当前实现说明。**本文区分源码可核对的 Runtime 行为、尚待实现或验证的目标约束，以及外部协议指南的能力与示例。源码与请求结构一致，不等于真实 API 已接受或缓存已命中；外部示例也不是 Runtime 的默认请求。
 
-本轮实际范围：Conversation 消费上游 `RequestConfigurationView`，为 `openai_responses` 投影 developer、`additional_tools`、时间线锚点和请求期缓存 marker；保留其他协议和独立 `codex_responses` 的边界。上游 P/T 定义、切换事件、冻结 snapshot、definition_id 解析、业务 UI 与事件持久化不由 Conversation 创建或管理。
+当前 OpenAI Responses 路径：Agent 创建/冻结 P/T（提示词/工具）配置事件并记录到 `Conversation.timeline`；Conversation 保存事件、当前配置和 `instructions_snapshot`，仓储负责持久化/恢复；请求层构造 `RequestConfigurationView`，adapter 按锚点投影 developer/`additional_tools`。公共基座快照放顶层 `instructions`，业务差异配置放 input；默认不发送 `prompt_cache_options`，不注入 `prompt_cache_breakpoint`。其他协议及独立 `codex_responses` 的既有设计边界不因本文更正而扩大。
 
-阶段性已接线（以 working tree 为准）：稳定 `message_id` 及 JSONL 兼容迁移、Responses 配置视图类型、OpenAI 时间线投影、请求级缓存选项合并、Responses client 的顶层配置拒绝/输入配置校验、Codex 对新增 OpenAI 配置字段的隔离。
+已核对实现包括：稳定 `message_id` 及 JSONL 兼容迁移、会话基座快照、配置时间线的生产/继承/持久化、Responses 配置视图和 input 投影、显式缓存参数处理、客户端允许顶层 `instructions` 而拒绝直接顶层 `tools`。Note 更新与子 Agent 路径的会话/缓存边界见第七、八章。
 
-明确仍未完成或未被本轮验证：上游 P/T 事件生产与持久化、`call_ref`/`source_context`/通用 `metadata` 完整闭环、真实模型能力门控与 compatible endpoint 验证、既有 `request_overrides` 与新配置消费链的完整回归、单元/集成测试和真实 cached usage 验证。
+尚不能由此次源码核对证明：`call_ref`/`source_context`/通用 `metadata` 的目标闭环、所有调用方及跨协议回归、真实模型/compatible endpoint 能力与缓存效果。本次文档修订未运行程序测试或真实 API 请求；第三章沿用既有协议资料与用户确认示例，不重新认证其中的模型、TTL、价格或服务商支持范围。
 
 阅读路径：
 
@@ -33,16 +33,19 @@
 | 对象/行为 | 权威责任方 | Conversation 的职责 |
 | --- | --- | --- |
 | 提示词/tools 定义、业务实例切换、同实例热更新 | 上游 Agent 系统及定义/工具模块 | 接收已经解析好的配置输入，不自行选择定义或推断切换 |
-| P/T 各自的生效事件、位置锚点、历史冻结快照 | 上游 Agent 系统 | 只读校验和消费；不创建、冻结、重写或持久管理配置事件 |
+| P/T 各自的生效事件、位置锚点、历史冻结快照 | Agent 决定创建与冻结；Conversation 及仓储保存与恢复 | 用 `timeline` 承载事件；请求视图和 adapter 校验、消费，不从消息猜测切换或重新读取历史定义 |
+| 公共基座快照与当前业务配置 | Agent 渲染，Conversation 及仓储保存 | 保存 `instructions_snapshot`、`system_prompt`、`tools`；请求期将快照与差异配置分开表达 |
 | user/assistant/tool 历史与 assistant 原始响应 | Conversation | 保存公共语义和同源 raw，独立投影目标协议 |
 | 目标协议请求字段、历史结构合法性 | Conversation adapter 与 LLM 请求组装层 | adapter 负责消息/配置投影；组装层负责最终参数合并与完整请求校验 |
 | 模型、服务商、端点、凭据、重试及传输 | 上游模型解析与 LLM client | adapter 消费已解析能力，不选择模型、不发送网络请求 |
 | 本次允许调用的工具与执行授权 | 上游当前工具视图及执行端 | 请求表达与有效集合一致；历史工具事实不授予权限 |
 | 缓存布局、协议私有缓存句柄/usage | 目标协议策略与运行态 | 请求期加标、按目标作用域维护观测；不把缓存写成对话事实 |
 
-**配置时间线由上游管理，不是 Conversation 自有领域字段。**Conversation 的新增职责是消费上游提供的时间线/本次配置视图并保证协议转换正确，而不是接管 Agent 的提示词/tools 生命周期。
+**配置生命周期的业务决策由 Agent 管理，配置时间线的数据载体是 `Conversation.timeline`。**仓储把时间线、当前配置与基座快照写入 `conversation_configuration`；请求期的 `RequestConfigurationView` 不是持久字段。不要把“adapter 不决定切换”误写成“Conversation 不保存时间线”。
 
 ### 2. 一次调用的闭环
+
+以下为目标闭环；源位置映射、完整兼容性诊断等不因列入流程就代表已经全部实现。当前 Responses 默认跳过显式缓存加标，实际接线范围见第八章。
 
 ```text
 上游选择本次模型/协议，解析当前提示词和 tools
@@ -89,7 +92,7 @@ thinking 不属于统一公共语义的稳定全集。不同平台返回的 thin
 缓存不是统一消息语义，不能放进公共 content 层。缓存是目标协议请求构造策略：
 
 - **自动缓存平台**：客户端只需要保持稳定前缀，读取 usage 中的 cached tokens 指标。
-- **显式缓存平台**：客户端按目标协议要求创建/引用缓存，或使用协议自己的断点字段，例如 Claude 的 `cache_control`、OpenAI 的 `prompt_cache_breakpoint`；各协议字段不可混用。
+- **显式缓存平台**：客户端按目标协议要求创建/引用缓存，或使用目标端点支持的断点字段，例如 Claude 的 `cache_control`、支持自定义断点的 Responses 端点的 `prompt_cache_breakpoint`；各协议字段不可混用。
 - **状态锚点**：显式缓存需要记录目标协议自己的缓存状态，不能用另一个协议的缓存状态，也不能依赖不稳定的渲染后 messages 下标。
 
 ## 二、Anthropic Messages / Claude
@@ -180,20 +183,23 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 - 其它协议到 OpenAI Responses：普通文本转 assistant message item；工具调用转 `function_call` item；其它平台 thinking 默认舍去，除非显式策略允许把明文 thinking 作为普通 `output_text`。
 - OpenAI Responses 到其它协议：`message.output_text` 和 `function_call` 必须保留；`reasoning.encrypted_content` 只能供 OpenAI Responses 同协议回灌，跨协议舍去；`summary` 若被产品策略允许，可作为普通文本降级，但不能伪造成目标平台 thinking。
 
-### 3. 缓存规则与配置输入契约（核心协议要求）
+### 3. 缓存规则与配置输入契约（Runtime 实现与协议能力分开）
 
-**重要协议契约：系统提示词/tools 注入是 OpenAI Responses 的通用协议要求，跟时间线没有任何关系！**
-- **input 内注入**：OpenAI Responses 协议统一采用 `input` 中的 `developer` 消息来设置系统提示词，使用 `additional_tools` 条目来设置工具定义，严禁设置在最外层顶层字段中（`body["instructions"]` 与 `body["tools"]` 严禁传递）。
-- **与时间线彻底解耦**：时间线（Timeline）是指会话中系统提示词或 tools 发生了阶段性切换（例如 Agent 先以销售提示词工作，完成后切换到售后提示词和工具继续工作）；如果未发生切换，会话中就绝对没有时间线。但**无论会话是否存在时间线，只要转换为 OpenAI Responses 协议，都必须将当前系统的提示词和 tools 投影到 `input` 中**。绝不能把时间线作为 OpenAI Responses 配置投影的前置条件！
-- **自动断点优先策略（上游生态现状适配）**：当前上游服务端与服务商生态（包括主流中继平台与 gpt-6-astra 等模型）尚未开放自定义显式断点能力，若请求内容块中携带 `prompt_cache_breakpoint` 会直接被远端拒绝并报错（`400 invalid_parameter: prompt_cache_breakpoint is not supported on this model`）。因此系统当前统一采用**服务端自动隐式断点（`mode="implicit"`）**，默认不在内容块中附带 `prompt_cache_breakpoint` 显式断点。顶层保留下发 `prompt_cache_options: {"mode": "implicit"}`，由服务端依据规范自动完成稳定前缀缓存管理。系统底层依然保留接收显式断点 options 的能力，待未来上游服务端全面放开后再行开启。
+**当前 Runtime 的请求构造策略，不是所有 Responses 端点的通用强制要求：**
 
-按本次技术确认，OpenAI Responses 的显式缓存断点能力受上游服务商和模型白名单严格限制；当前实现中默认使用自动隐式断点模式，不主动向内容块注入显式断点。本节关于 `prompt_cache_breakpoint` 的规则描述为协议理论契约与预留能力。OpenAI Chat Completions 必须独立核实其目标端点能力，不能自动继承 Responses 的内容块 marker、`additional_tools` 或其它输入 item。显式断点是请求内容块上的标记，不是可以单独引用的缓存 ID，也不是可独立拼装的增量缓存切片。以下是协议使用规则，不表示 AgentRuntime 或任意 OpenAI-compatible 服务商已实现全部能力。
+- **固定基座与差异配置分离**：会话首次渲染时生成 `instructions_snapshot`，冻结公共模板及当时的变量值；后续请求把其 content 放顶层 `instructions`。业务差异提示词排除已收录基座，投影为 input 中的 `developer`；工具投影为 `additional_tools`。客户端允许顶层 `instructions`，仅禁止直接发送顶层 `tools`。
+- **覆盖入口**：请求层允许显式 `instructions` 覆盖快照在本次请求中的值，但不改写快照；最终 instructions 未提供、为 None 或空白时，客户端使用 `你是一个善于学习的AI。`。`request_params.tools` 覆盖先规范化为 input 配置，不直接发成顶层 tools；显式 `configuration_view` 不能与 instructions/tools 覆盖同时使用。
+- **时间线不以切换为存在前提**：初始会话即可有 start 工具/提示词事件；存在时间线时从历史快照与本次 active 值构造视图，无时间线但有当前业务配置时构造初始视图。两条路径都会投影业务 prompt/tools，而不是只有发生切换才投影。
+- **默认不声明缓存扩展参数**：`prompt_cache_options` 与 `prompt_cache_breakpoint` 默认均为 None，因此不发 options、不注入 marker，也不由 Runtime 默认指定 mode 或 TTL。省略字段后服务端实际采用的策略由目标端点决定，不能将其等同于客户端发送了 `mode="implicit"`。
+- **显式可选能力**：提供字典类型 options 时按请求参数合并/透传；提供 marker 字典时，只在 start 配置最后一个合法 developer `input_text` 内容块上重建标记。如果该文本后还有 `additional_tools`，或找不到合法文本块，就不放 marker；不会自动给全部历史、新阶段或分支尾部打点。
 
-请求级控制：
+以下请求级控制、断点语义及第 3.1～5 节示例，沿用已确认的协议资料，**仅适用于实际支持相应能力的模型/服务商端点，不是 Runtime 默认布局或全平台支持声明**。不能从某次端点拒绝推导所有服务商都不支持，也不能凭模型名称推导一定支持。OpenAI Chat Completions 须独立核实，不能继承 Responses 的 marker、`additional_tools` 或其他 input item。显式断点是请求内容块标记，不是可单独引用的缓存 ID 或可拼装的缓存切片。
 
-- `prompt_cache_options.mode = "implicit"`（默认）：保留服务端自动选择的 implicit breakpoint，同时可以使用开发者声明的显式断点。GPT-5.6+ 自动写入边界位于最新符合条件的 user/tool 消息末尾，不等于为所有内部前缀都建立独立缓存。
+请求级控制（下述默认值指所引用协议资料中的服务端规则，不是 Runtime 下发值）：
+
+- `prompt_cache_options.mode = "implicit"`（所引用指南的默认模式）：保留服务端自动选择的 implicit breakpoint，同时可以使用开发者声明的显式断点。该指南描述的 GPT-5.6+ 自动写入边界位于最新符合条件的 user/tool 消息末尾，不等于为所有内部前缀都建立独立缓存。
 - `prompt_cache_options.mode = "explicit"`：关闭自动断点，只使用请求中声明的显式断点；没有显式断点时不使用 prompt caching，也不产生缓存写入。自定义断点不要求启用此模式：只有想关闭自动断点时才需要设为 `explicit`。
-- `prompt_cache_options.ttl = "30m"`：GPT-5.6+ 当前默认且唯一支持的值；写入或命中复用后刷新有效期。不要与早期模型的 `prompt_cache_retention` 的 `in_memory`/`24h` 混用。
+- `prompt_cache_options.ttl = "30m"`：所引用 GPT-5.6+ 指南描述的默认且唯一支持值；写入或命中复用后刷新有效期。具体目标仍须核验，Runtime 不默认下发 TTL；不要与早期模型的 `prompt_cache_retention` 的 `in_memory`/`24h` 混用。
 - 每个请求最多 4 个缓存写入槽位；`explicit` 模式可使用最多 4 个显式断点，`implicit` 模式的自动断点占 1 个槽位，最多剩 3 个显式写入槽位。
 - 写入上限与读取窗口不同：读取寻找最长匹配的可用前缀。官方指南写最近 50 个断点，Responses API Reference 写最近 80 个；这是资料表述差异，不表示每请求可以写入 50 或 80 个断点，本文也不依赖其精确临界值。
 - GPT-5.6+ 的可缓存前缀需达到 1,024 个可见输入 tokens；短 JSON 示例仅展示结构，不能据此保证缓存写入或命中。
@@ -209,8 +215,9 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 
 路由键与 AgentRuntime 策略：
 
-- `prompt_cache_key` 应在同一个稳定前缀的多轮请求中保持稳定，例如使用 `conversation.id`；它只是路由/分组提示，不是缓存句柄、回滚句柄或 100% 命中保证。
-- stateless Responses 每次发送完整的本次 input，并重新附加本次选择保留的显式 marker，例如配置尾 B；marker 不由 Conversation 普通消息持久化。**这不意味着读取旧自动缓存时必须把旧自动边界重标为显式边界。**
+- 当前 `prompt_cache_key` 优先级为：render options 显式非空值 > 会话 OpenAI provider_state 已记录值 > `conversation.id`。它只是路由/分组提示，不是缓存句柄、回滚句柄、固定节点或 100% 命中保证。
+- Runtime 每轮发送完整 input，强制 `store=false`、include `reasoning.encrypted_content`，去除 `previous_response_id`；不是依靠 response ID 续接。仅显式选择 marker 时在请求副本重建合法标记，默认不加。**读取旧自动缓存并不要求把旧自动边界重标为显式边界。**
+- 统一 token usage 当前读取 `input_tokens_details.cached_tokens`（缺失为 0），没有在该分支统计 `cache_write_tokens`。协议示例的读/写 usage 不能视为 Runtime 已完成这两项观测。
 - 缓存字段属于目标协议请求构造策略，不写入统一消息公共 content，也不应污染持久化的 provider raw。
 
 #### 3.1 自定义断点到底有什么用
@@ -219,7 +226,7 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 
 - **自动断点**：为当前最新合格输入边界建立缓存，适合历史不断向后追加。
 - **自定义断点**：主动保留完整输入中的其他稳定累计前缀，适合配置复用、分支公共历史，以及后缀经常更换的场景。
-- **纯 explicit 模式**：只选择值得写入的前缀，不为断点之后的一次性后缀支付缓存写入成本；本设计默认的 `implicit + 配置尾显式 B` 则保留历史自动增长写入。
+- **纯 explicit 模式**：只选择值得写入的前缀，不为断点之后的一次性后缀支付缓存写入成本；本节用于对比的可选 `implicit + 配置尾显式 B` 则保留历史自动增长写入，二者均不是 Runtime 默认下发配置。
 
 假设配置为 8,000 tokens，而每次用户问题不同：
 
@@ -251,7 +258,7 @@ R2 = 配置【B】+ 问题 B【自动】 → 问题变化时仍可复用“配�
 
 #### 3.3 两轮 OpenAI → 三轮 Claude → 切回 OpenAI
 
-前提：相同 GPT-5.6 OpenAI Responses 路径；期间提示词/tools 不变；原请求已使用配置尾显式 B + `mode="implicit"`。P/T 有变更时见第七章，不为缓存恢复过期配置。
+协议示例前提：相同且已确认支持这些字段的 GPT-5.6 OpenAI Responses 路径；期间提示词/tools 不变；调用方显式选择了配置尾 B + `mode="implicit"`。这不是 Runtime 默认请求。P/T 有变更时见第七章，不为缓存恢复过期配置。
 
 ```text
 OpenAI R1 输入：配置【B】+ U1                 → 输出 O1
@@ -266,7 +273,7 @@ OpenAI R2 输入：配置【B】+ U1 + O1 + U2       → 输出 O2
          + U4 + C4(公共语义) + U5 + C5(公共语义) + U6
 ```
 
-切回时的默认步骤：
+在上述显式选择前提下，切回步骤如下；Runtime 未显式配置时仍不发送 options/marker，不因协议切回自动启用它们：
 
 1. 从规范历史重建 OpenAI input；O1/O2 回放原先保存且目标可接受的 OpenAI raw，C3/C4/C5 从公共文本/工具语义转换。不能把旧 OpenAI 历史先转 Claude 再转回来。
 2. 保持配置、工具定义顺序、相关模型/请求设置及原配置尾 B 的确定性渲染；继续使用原缓存路由 key 和 `mode="implicit"`。
@@ -279,7 +286,7 @@ OpenAI R2 输入：配置【B】+ U1 + O1 + U2       → 输出 O2
 
 ### 4. 自定义断点使用案例：多轮分支探索与回退
 
-以下案例只用于说明 OpenAI Responses 自定义断点的前缀匹配语义，不代表 AgentRuntime 必须实现分支状态机或回退功能。假设 Agent A 先用 Prompt 1 与 Tools 1 对话 10 轮；随后以 Prompt 2 与 Tools 2 探索方案一，再对话 5 轮；发现不可行后回到第 10 轮，恢复 Prompt 1 与 Tools 1 并执行方案二直到完成。
+以下案例只用于说明支持这些能力的 OpenAI Responses 端点的自定义断点匹配语义，不代表 AgentRuntime 已实现或必须实现分支状态机、回退功能或任意历史内容块加标。当前 Runtime 的显式 marker 入口仅处理 start 配置中的合法提示词块。假设 Agent A 先用 Prompt 1 与 Tools 1 对话 10 轮；随后以 Prompt 2 与 Tools 2 探索方案一，再对话 5 轮；发现不可行后回到第 10 轮，恢复 Prompt 1 与 Tools 1 并执行方案二直到完成。
 
 第 10 轮回复收到后，在下一次请求的 `input` 中重放这段历史，并在末尾 assistant 的 `output_text` 内容块上添加断点 B。以下是历史消息的内容结构片段，不是完整请求，也不是要求模型在第 10 轮输出中生成 marker；真实回传需保留原始 message item 的其他必要字段及 reasoning/function_call items，只在请求副本上补充标记：
 
@@ -563,34 +570,39 @@ Z.AI `chat/completions` 总接口支持 text、image、audio、video、file 等�
 
 ## 七、新统一会话模型与转换算法
 
-本章定义目标逻辑模型。现有字段与拟议新增字段明确区分；示意结构不是已存在的 Python 类型，也不要求本轮修改仓储或 API。
+本章保留统一会话的目标逻辑模型，并标明与本次核对源码的关系。`message_id`、时间线、配置视图和基座快照已存在；`call_ref`、`source_context`、通用 `metadata` 等仍按目标设计讨论。示意只列相关字段，不代表完整 Python 类型，也不要求因文档修订修改仓储或 API。
 
 ### 1. Conversation：一份规范历史，不绑定单个协议
 
 ```text
 Conversation
   ├─ id
-  ├─ messages: UniMessage[]          // 规范对话历史，append-only
+  ├─ messages: UniMessage[]          // 规范对话历史；压缩/裁剪由上游显式处理
   ├─ state: ConversationState        // 从消息派生的统计信息
-  └─ provider_state                 // 按目标协议及兼容/缓存作用域隔离的运行态
+  ├─ provider_state                 // 按协议记录运行态，不证明跨模型/账号兼容
+  ├─ timeline                       // Agent 创建/冻结的配置事件
+  ├─ system_prompt                  // 本次业务差异提示词
+  ├─ tools                          // 本次工具定义
+  └─ instructions_snapshot          // 会话级公共基座模板名及渲染内容
 
-RequestConfigurationView            // 上游持有并传入，非 Conversation 字段
+RequestConfigurationView            // 请求期只读视图，不作为 Conversation 持久字段
   ├─ prompt_events[]                // 提示词自己的历史/活动事件
   ├─ tool_events[]                  // 工具自己的历史/活动事件
-  ├─ current_prompt                 // 上游按活动定义 ID 解析的本次内容
-  └─ current_tools                  // 本次有序工具定义与有效授权集合
+  ├─ current_prompt                 // 本次 active 提示词内容
+  ├─ current_tools                  // 本次 active 工具名称差集的有序定义
+  └─ available_tool_names           // 当前完整可用工具名，供补充提示词渲染
 ```
 
 - `Conversation` 不新增一个必须固定的 `provider`，本次目标协议来自调用参数。
 - `state.providers` 是历史出现过的协议统计，不表示当前模型或多个同时活动模型。
-- `messages` 是对话事实的真相源；上游配置视图是配置的真相源，不能由 messages 反推业务配置。
+- `messages` 是对话事实；`timeline` 承载历史配置快照与位置，Agent 提供当前配置，二者共同构造本次视图。不能由 messages 反推业务配置或补造切换。
 - `provider_state` 不是服务端缓存目录，也不是已缓存 token 范围的保证；不能把业务配置时间线塞入此字段。
 
 ### 2. UniMessage 与内容块
 
 | 字段/结构 | 目标语义 | 与现状的关系 |
 | --- | --- | --- |
-| `UniMessage.message_id` | 持久、稳定的规范消息身份，供配置锚点、来源映射、工具引用与压缩使用 | 拟新增；现有 UniMessage 无此字段 |
+| `UniMessage.message_id` | 持久、稳定的规范消息身份；当前配置锚点依赖它，目标来源映射/规范调用身份可复用 | 已存在并随 JSONL 持久化，旧行有稳定 ID 迁移；不等于 call_ref 等目标闭环已实现 |
 | `role` | 仅 user / assistant / tool；developer、system、additional_tools 均不是新增公共消息角色 | 沿用 |
 | `content[]` | 保序的公共语义内容块 | 沿用 |
 | `source_provider` | 实际产生 assistant 响应的 api_format；不因渲染到另一协议而改写 | 沿用 |
@@ -640,7 +652,7 @@ assistant 采用“公共语义 + 原协议 raw”双层保存。user/tool 不�
 5. 历史调用/结果不会因当前工具撤权而删除；未来调用仍由当前 allowlist 和工具执行端硬校验。
 6. 无法解析的参数应保留原始值并暴露诊断；不能静默替换为 `{}` 后假装语义一致。
 
-### 4. 上游配置输入契约：P/T 独立，不由 Conversation 管理
+### 4. 配置输入契约：Agent 决定 P/T 生命周期，Conversation 承载事件
 
 术语：
 
@@ -648,58 +660,61 @@ assistant 采用“公共语义 + 原协议 raw”双层保存。user/tool 不�
 - **切换**：当前活动业务实例改变，例如 P1 → P2 或 T1 → T2。
 - **协议切换**：本次 target 改变，独立于以上两者；不能因此自动增加配置事件。
 
-上游需要提供两个独立事件序列，各自维护活动实例。单个组件事件的概念字段：
+Agent 将提示词/工具事件记录到同一 `Conversation.timeline`，请求视图按组件拆成两个序列，每类最多一个 active。当前相关字段如下（省略类型细节）：
 
 ```text
 ConfigurationComponentEvent
   event_id
   definition_id
+  component: prompt | tool
   anchor: start | before_message_id | after_message_id
+  anchor_message_id                // 非 start 锚点引用持久 message_id
   sequence                         // 同一位置的确定顺序
   status: historical | active
-  snapshot                         // 历史使用最后实际生效的冻结内容
-  revision                         // 快照版本/内容哈希，不能代替快照
+  snapshot                         // historical 必需，由 Agent 切换/继承路径冻结
+  revision                         // 可选版本信息，不能代替快照
+  supplementary_prompts            // 补充模板，工具名在请求期替换
 
 RequestConfigurationView
   conversation_id                  // 与本次历史作用域一致
-  view_revision                    // 本次解析完成的只读视图版本
+  view_revision                    // 本次请求期视图标识
   prompt_events: ConfigurationComponentEvent[]
   tool_events: ConfigurationComponentEvent[]
   current_prompt: {event_id, definition_id, resolved_content, revision}
-  current_tools:  {event_id, definition_id, ordered_definitions, allowlist, revision}
-  projection_policy                // 仅 Responses 路径控制时间线投影策略
+  current_tools:  {event_id, definition_id, ordered_definitions, revision}
+  available_tool_names             // 当前完整工具名；不是执行授权机制
 ```
 
-`RequestConfigurationView` 是上游持有的请求输入契约，不是 Conversation 的持久字段。它按目标协议提供不同内容：OpenAI Responses 需要 `prompt_events[]`/`tool_events[]` 及锚点，用于重放 developer/`additional_tools`；其他协议不消费这些历史事件，只需本次 Agent 解析出的 `current_prompt`/`current_tools`。
+`RequestConfigurationView` 是请求期契约，不是 Conversation 的持久字段；它可以由请求层从 `Conversation.timeline` 与当次 Agent 配置构造，也可显式传入。OpenAI Responses 消费其中的事件和锚点；其他协议不重放这些历史配置事件，直接使用当次 Agent 提供的最新系统提示词和 tools。
 
 输入契约规则：
 
-- **历史事件**只读上游提供的冻结 snapshot；定义当前内容变化不能污染历史快照。
-- **活动提示词/活动 tools 分别**由上游按各自 definition_id 解析本次最新内容，再以只读 current 视图传入；Conversation 不访问定义仓库主动重新解析，也不代替上游冻结事件。
-- 上游发生切换时，冻结旧组件最后实际生效快照并新建该组件事件。尚未实际生效的定义编辑，不能被追记成历史已使用版本。
+- **历史事件主值**使用冻结 snapshot，不重新读取定义；但事件的 `supplementary_prompts` 仍按本次 `available_tool_names` 替换占位符。因此冻结 snapshot 不等于整个历史 developer 块字节恒定。
+- **活动提示词/活动 tools**使用 Agent 当次解析的实时值，绑定原 active 事件与原锚点；热更新不追加切换事件。工具值再按全部历史工具名称做差集，不按 schema hash 比较；历史中已有同名工具时，新 schema 不进入这段增量。adapter 不自行访问定义仓库。
+- Agent 的切换/继承路径负责提供被冻结的配置主值并追加新 active 事件，仓储不代替 Agent 选择定义。Note 进入阶段冻结业务配置后在边界后追加；子会话继承时保留复制范围内的父锚点并冻结，不能一律移动到 start。
 - 同一次请求使用一份一致视图，渲染到一半不能再热读取定义；同一逻辑请求重试默认复用该视图。若上游显式重新解析，则是新的请求输入版本。
 - 提示词快照保存最终有序片段；工具快照保存工具模块提供的完整有序定义及必要的历史语义。schema 生成仍属工具模块，adapter 仅按目标协议包装。
-- 空提示词/空工具集必须显式表达；“没有传入配置视图”不是清空，也不是允许 adapter 自行补造业务事件。
-- `anchor` 依赖持久 message_id，不能依赖 `input[]`/`messages[]` 的渲染下标。初始事件用 start；同位置按 sequence 排列。
-- 上游决定分支/压缩后的事件视图和锚点重映射；Conversation 只验证作用域、顺序和引用完整性。
+- 空提示词/空工具集与未提供视图不是同一概念；没有 timeline 但存在当前 prompt/tools 时，请求层可以构造 start 初始视图，这不是猜测过去发生过的业务切换。
+- `anchor` 依赖持久 message_id，不能依赖渲染下标。初始事件用 start；同锚点按 `(sequence, 工具优先, event_id)` 确定顺序，渲染整体为 start 配置、消息前配置、消息、消息后配置。
+- Agent 决定分支/压缩的会话内容与配置；adapter 校验作用域和锚点。仓储保存时会删除非 start 且 message_id 已不存在的孤儿事件，不把孤儿事件移到首部。
 
-独立切换示例：
+P/T 独立切换示意（不是对所有业务切换入口均已实现的声明；工具列须遵守上述名称差集规则）：
 
 | 时刻 | 上游提示词事件 | 上游工具事件 | Conversation 本次消费结果 |
 | --- | --- | --- | --- |
 | 初始 | P1 活动 | T1 活动 | P1 最新内容 + T1 最新定义 |
 | 仅切提示词 | P1 冻结，P2 活动 | T1 仍活动 | P1 历史快照 + P2 当前；T1 仍可热更新 |
 | T1 热更新 | P2 仍活动 | 同一 T1 内容更新 | 不新增工具实例切换事件；原 T1 活动位置呈现新内容 |
-| 仅切工具 | P2 仍活动 | T1 冻结，T2 活动 | P2 仍可热更新；T1 历史快照 + T2 当前 |
+| 仅切工具 | P2 仍活动 | T1 冻结，T2 活动 | P2 仍可热更新；T1 历史快照 + T2 中历史未出现名称的定义 |
 | 只换到 Claude | 以上事件不变 | 以上事件不变 | 只改变协议投影，不创建 P/T 事件 |
 
-这也意味着：T1 虽仍活动但锚点在很早的位置，T1 热更新会改变其位置之后的 OpenAI 缓存前缀；不能因为 P2 刚切换，就把工具热更新错误地追加到 P2 后面以伪保缓存。
+这也意味着：active 位于 start 时，热更新可能改变 input 首部；位于后置锚点时，最多保持该变化之前的共同前缀，不能把更新挪到尾部以伪保缓存。若历史事件含动态工具名补充模板，当前工具变化还可能影响更早的 developer 块；同名 schema 被名称差集排除时，则不能声称它已经重发。
 
 ### 5. 配置时间线如何投影到目标协议
 
 **配置时间线的价值取决于目标协议是否能在配置变化后保持稳定缓存前缀。**它不是所有协议都要原样投影的通用请求历史。上游仍可维护统一的 P/T 事件事实，但各协议的请求构造策略不同：
 
-1. **OpenAI Responses 是需要消费配置时间线的特殊路径。**在支持的 Responses 模型上，历史位置的 developer 系统提示词与 `additional_tools` 可以按原顺序放回 input；后续切换业务系统提示词或 tools 时，通过在旧配置/公共历史之后追加新的 developer 或 additional_tools，保持断点 B 之前的累计前缀不变，从而尽可能复用缓存。若直接用新 system prompt/tools 覆盖旧配置，请求仍可能语义正确，但稳定缓存前缀会改变，命中机会下降。
+1. **OpenAI Responses 是当前消费配置时间线的特殊路径。**在支持这些 item 的端点上，历史 developer 与 `additional_tools` 按原位置重放，新阶段配置按边界追加，使未改变的累计前缀有机会复用；默认没有显式 B。active 热更新、动态补充文本或 instructions 覆盖仍可能改变前缀，不能只凭时间线存在就保证命中。
 
 2. **其他协议不支持同等的 developer + additional_tools 增量表达。**Claude、Gemini、OpenAI Chat Completions、Z.AI 以及独立的 `codex_responses`，不能把统一时间线中的多段系统提示词/工具事件按 Responses 的方式追加，同时保证旧缓存前缀不变。把历史上所有 P/T 事件全部拼进它们当前的 system/tools，既不能复现 Responses 的位置语义，也会改变缓存前缀，因此没有实际价值。
 
@@ -707,11 +722,20 @@ RequestConfigurationView
 
 4. 因此，时间线不是“所有协议都必须按事件投影”的要求，而是由目标协议能力决定的优化输入：Responses 为保持缓存前缀必须读取并按锚点重放；其他协议若没有等价能力，则跳过历史 P/T 重放，直接采用当前实时配置。协议切换本身仍不创建新的 P/T 事件。
 
-#### 5.1 OpenAI Responses：时间线表达与默认缓存布局
+#### 5.1 OpenAI Responses：当前默认布局与显式配置示例
 
-对确认支持能力的 GPT-5.6+ `openai_responses`，系统提示词与 tools 都必须投影到 `input` 时间线中的 developer-role 事件：提示词使用 `role="developer"` 内容项，工具使用 `type="additional_tools", role="developer"` 事件。初始配置（第一组系统提示词 + Tools）位于 input 顶部，并在这组配置的最后一个合法提示词内容块尾部始终保留显式自定义断点 B；B 是配置累计前缀的稳定边界。后续业务切换只在 B 或对应历史锚点之后追加新的 developer/`additional_tools` 事件，不把新配置覆盖回顶层。
+Runtime 把 `instructions_snapshot.content` 放顶层 `instructions`，业务差异提示词以 `role="developer"` 内容项、工具以 `type="additional_tools", role="developer"` 事件投影到 input。初始化顺序通常为工具 sequence=0、提示词 sequence=1；后续按原锚点投影。默认结构示意如下，省略模型/输出参数和消息细节：
 
-以下是短的、语法完整的布局示例，不足以达到缓存 token 阈值；也不代表对任意 compatible 端点已验证。
+```text
+instructions = 会话固定基座快照（显式覆盖除外）
+input = 初始 additional_tools + 初始 developer + 历史消息
+        + 边界后的配置事件 + 后续消息
+prompt_cache_key = 显式值 > provider_state 已记录值 > conversation.id
+store = false；include 包含 reasoning.encrypted_content
+不发送 previous_response_id；默认不发送 prompt_cache_options，不注入 marker
+```
+
+以下保留 **调用方显式选择** `implicit + 配置尾 B` 的 JSON 示例，并补示顶层基座；它不是默认请求采样。只有确认目标端点支持且提供相应 options/marker 时才适用；短示例不足以达到缓存 token 阈值，也不代表对任意 compatible 端点已验证。
 
 ```json
 {
@@ -719,6 +743,7 @@ RequestConfigurationView
   "store": false,
   "include": ["reasoning.encrypted_content"],
   "prompt_cache_key": "conversation-stable-key",
+  "instructions": "你是一个善于学习的AI。",
   "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
   "input": [
     {
@@ -754,23 +779,21 @@ RequestConfigurationView
 }
 ```
 
-- 初始配置尾 B 每次在请求副本重渲染；后续合法配置事件按上游锚点插入，不把旧快照解析成当前定义。B 不是一次性标记，而是每次 OpenAI Responses 请求都要在初始配置的最后一个合法提示词内容块上重新附加的请求副本 marker。
-- 初始配置的系统提示词与 tools 只在 input developer-role 事件中表达：tools 以 `additional_tools` 事件出现，不能改放为顶层 `tools`；系统提示词不能改放为顶层 `instructions`。
-- 只有 P 或 T 变化时只投影该组件事件，不重复插入未切换组件。历史上已有的元素及其顺序保持确定性；切换后的新 developer/`additional_tools` 追加在相应锚点之后，以保留 B 之前的累计前缀。
-- 初始 tools 事件必须位于初始 developer 提示词与其 B 之前，使 B 覆盖完整的初始 tools + 系统提示词累计配置；上游若指定不同历史顺序，不能为缓存擅自改顺序。
-- `additional_tools` 本身和工具 schema 不能直接承载内容块 marker。工具切换处若没有合法可标记内容块，不强造业务提示词来凑新断点；初始配置 B 仍然保留，可继续依赖 implicit 自动缓存或选择另一个合法边界。
-- 新设计不允许同一请求同时重复发送 input 中已投影配置的顶层 `instructions/tools`。旧 client 的 `request_params.instructions/tools` 覆盖行为必须在迁移时消除或明确隔离，不能让 client 在 adapter 渲染后偷偷覆盖 input、重新加回旧顶层配置。
-- 协议/模型不支持这些 item 时，按明确的配置折叠策略退回合法当前配置表达，或报不兼容；不能因模型名称相似而盲发字段。
+- 仅显式提供 marker 时才在请求副本重建 B：范围是 start 配置最后合法 developer `input_text`，不是任意历史消息或每个阶段；未提供时不加标。历史提示词内容块中的已有 marker 会在投影时移除。
+- 若候选内容块后面还有 `additional_tools`，或找不到合法文本块，则不附加 B。不能为得到联合断点擅自重排既有事件、强造业务提示词，或宣称工具-only 配置已被 marker 覆盖。
+- 公共基座与 input 业务提示词不是同一份内容的重复发送；后者应排除 snapshot.template_names 已收录模板。顶层 instructions 显式覆盖会改变前缀，但不会自动改写 input 历史或快照。
+- 请求层在渲染前处理 `request_params.instructions/tools` 覆盖：instructions 留在顶层，tools 转为配置视图；显式 view 与这两类覆盖冲突时会报错。客户端不接受渲染后绕过视图直接塞入顶层 tools 或 input。
+- `prompt_cache_options` 仅显式字典才合并/发送；值为 None 时删除该字段。源码没有默认 TTL 或多断点调度，不能把第三章的协议槽位预算描述为当前 Runtime 已实现的选择算法。
+- 端点是否支持这些字段需独立确认。当前源码没有据此自动折叠时间线为其他表达的能力门控，不能将目标兼容性策略写成已实现的 fallback。
 
 #### 5.2 OpenAI Responses：追加不等于严格替换
 
 本节只适用于 OpenAI Responses 的 developer/`additional_tools` 时间线。它们是保持旧缓存前缀的增量表达，不是通用的系统提示词/工具替换语义。
 
-- `additional_tools(T2)` 仅表示在对应历史位置追加工具声明，不自动删除 T1、撤权、覆盖同名函数或更换同名 schema。
-- 历史 developer(P1) 后追加 developer(P2)，不能笼统解释为“P1 已从上下文消失”；它的价值是让 B 之前的配置/公共历史保持不变。
-- 当前调用能力必须与 Agent 本次有效工具授权一致；工具追加不能重新授予已撤销权限，执行端仍需硬校验。
-- 如果旧配置与新配置同时存在会造成语义冲突，正确性优先：可以直接使用最新 system prompt/tools 覆盖旧配置，但必须明确接受稳定前缀改变和缓存命中机会下降；不能为了缓存伪造替换语义。
-- OpenAI Responses 不支持这些 item，或上游要求的时间线无法合法表达时，报能力不兼容；由上游决定改用最新配置覆盖的非时间线策略。
+- `additional_tools(T2)` 仅表示在对应历史位置追加工具声明，不自动删除 T1、撤权、覆盖同名函数或更换同名 schema。当前 Runtime 只追加历史名称集合之外的工具，同名 schema 更新不会通过这段差集重发。
+- 历史 developer(P1) 后追加 developer(P2)，不能笼统解释为“P1 已从上下文消失”；其作用是尽量保留既有配置/公共历史，而非保证默认存在 B 或整段历史不变。
+- 当前调用能力必须与 Agent 本次有效工具授权一致；工具追加不能重新授予已撤销权限，执行端仍按当前 allowlist 校验。
+- 目标正确性原则仍是：旧/新配置语义冲突或端点不支持时，不为缓存伪造替换语义；若要改用最新配置覆盖，必须接受前缀变化并明确新策略。当前 Runtime 未实现自动语义冲突检测、同名 schema 替换或按能力自动折叠/报错，不应把这些目标策略当成现有分支。
 
 #### 5.3 其他目标协议：只使用最新实时配置
 
@@ -788,7 +811,7 @@ RequestConfigurationView
 
 | 目标 | 当前配置表达 | 历史 assistant 回放/重建 | 工具结果表达 |
 | --- | --- | --- | --- |
-| OpenAI Responses | input 中初始 developer + `additional_tools`，初始配置尾显式 B；后续按锚点追加配置事件，直接覆盖是会损失前缀稳定性的备用路径 | 同源兼容 raw output items；异源 text/function_call | 顶层 function_call_output |
+| OpenAI Responses | 顶层基座 instructions + input 内 developer/`additional_tools`；按锚点投影历史和 active，默认无 options/marker，显式配置时仅处理合法初始 B | 同源 raw output items；异源 text/function_call，私有状态跨服务商兼容仍需核实 | 顶层 function_call_output |
 | Claude Messages | 顶层 system / tools | 同源兼容 content[] 含 thinking/signature；异源 text/tool_use | user.content[] 中 tool_result |
 | Gemini generateContent | systemInstruction / tools | 同源兼容 model.parts 含 thoughtSignature；异源 text/functionCall | user.parts 中 functionResponse |
 | OpenAI Chat Completions | 目标支持的 system/developer messages + 顶层 tools；不沿用 Responses 时间线 item | 同源兼容 content/tool_calls；异源按消息字段重建 | role=tool + tool_call_id |
@@ -799,26 +822,28 @@ RequestConfigurationView
 
 ### 6. 请求渲染与响应归一化的完整算法
 
+以下保留目标算法：完整能力门控、规范 call_ref、源位置映射及诊断并非都已实现。当前 Responses 的基座、配置投影和缓存默认行为在对应步骤明确标注，具体证据见第八章。
+
 #### 6.1 请求前输入
 
 - 一份不可原地改写的 Conversation 历史快照。
-- 目标为 OpenAI Responses 时，上游提供包含 P/T 事件、锚点和当前活动内容的 RequestConfigurationView；其他协议只提供本次 Agent 解析出的最新 `current_prompt`/`current_tools`。
+- 目标为 OpenAI Responses 时，请求层从 Conversation 的 timeline、基座快照和当次 Agent 配置派生视图，或消费显式 RequestConfigurationView；无 timeline 时可构造初始视图。其他协议直接使用本次最新提示词/tools，不消费历史 P/T 投影。
 - 已解析的 target/api_format、模型能力、私有状态兼容作用域及协议策略。
 - ResourceResolver 和目标缓存策略；模型网络凭据不进入消息模型或配置历史。
 
 #### 6.2 渲染步骤
 
 1. **校验规范输入**：角色/part 合法；message_id 唯一；Responses 时间线的事件锚点（若目标为 Responses）存在、P/T 当前活动项明确；工具调用/结果引用完整；资源可解析。
-2. **确定配置投影**：目标为 OpenAI Responses 时，读取 P/T 时间线并按锚点重放历史 developer/`additional_tools`，在初始配置尾部加 B；其他协议跳过历史 P/T 重放，直接使用 Agent 本次提供的最新 `current_prompt`/`current_tools`。任何目标都不能以缓存收益改变当前有效授权。
+2. **确定配置投影**：当前 OpenAI Responses 请求层将基座快照或显式覆盖放顶层 instructions；adapter 从配置视图按锚点投影 developer/`additional_tools`，历史主值取 snapshot，active 取实时值和工具名称差集，补充模板按当前工具名渲染。其他协议跳过历史 P/T 重放，直接用最新配置；缓存不能改变执行授权。
 3. **逐条渲染公共消息**：user/tool 由公共块转换；assistant 若有同源且目标兼容的 raw，复制后回放；否则按公共 text/tool-use 保序重建。
 4. **处理推理状态**：同源私有状态按目标规则保留；异源不伪造、不解密。明文 thinking 的展示/降级必须由明确策略允许。Z.AI 关闭 preserved thinking 时只改请求副本，不删持久 raw。
 5. **落实目标约束**：必要的角色分组、工具调用顺序、参数/结果格式、多模态能力校验。目标允许的消息边界不擅自合并；必要合并/拆分只影响请求副本，保留源位置映射。
-6. **插入配置、构造映射**：Responses 按 P/T 锚点记录事件到 developer/`additional_tools` 目标位置的映射，并保证初始 B 覆盖初始 tools+提示词；其他协议只记录本次最新 system/systemInstruction/tools 的请求位置，不把历史 P/T 事件映射进请求。raw 展开一条消息为多项、消息合并、首条占位都必须可追溯。
-7. **添加协议缓存元数据**：在合法内容块上按最终位置加标；汇总整份请求的槽位预算。OpenAI Responses 默认配置尾 B + implicit，不把切回补 U2 设为必需；其他协议只按各自协议支持的缓存机制处理。
+6. **插入配置、构造映射**：Responses 当前按 P/T 锚点插入 developer/`additional_tools`；完整源位置映射仍是目标，不应从有锚点推导已返回所有映射。其他协议不把历史 P/T 事件映射进请求；raw 展开、消息合并和占位的可追溯性仍需验证。
+7. **添加协议缓存元数据**：当前 Responses 默认既不发送 options 也不加 marker；显式 marker 仅尝试附加到 start 配置末尾合法文本，后有 tools 或无合法文本时跳过。协议切回不强制给旧 user 补点；协议资料中的多断点/槽位预算不是 Runtime 已实现调度。其他协议按各自机制处理。
 8. **完整请求校验**：client 合并模型/输出格式/reasoning 等设置后，检查无重复配置、无外来协议字段、无冲突覆盖；重用策略不能绕过当前授权。
 9. **返回或报错**：输出协议专属渲染结果、源位置映射、兼容性诊断和本次选用的缓存边界；错误应包含可定位 message/event/call 引用，不携带凭据或伪造结果。
 
-建议扩展渲染契约以显式承载 configuration view 与 target capabilities；可兼容现有 options 过渡，但不能让各 adapter 私下重新读取业务定义。`ProviderAdapter` 不负责 HTTP 传输。
+当前请求链已有 configuration view 的消费路径；统一 target capabilities 与完整诊断/映射仍属上述目标，不因已有视图就视为完成。各 adapter 不能私下重新读取业务定义，`ProviderAdapter` 不负责 HTTP 传输。
 
 #### 6.3 响应归一化与回写
 
@@ -845,14 +870,15 @@ RequestConfigurationView
 | 数据 | 所属位置 | 不代表什么 |
 | --- | --- | --- |
 | assistant raw / tool 事实 | Conversation.messages | 不是当前配置授权 |
-| 提示词/tools 时间线与活动定义 | 上游配置管理 | 不是协议缓存目录 |
+| 提示词/tools 时间线与当前配置 | Agent 决策，Conversation.timeline/system_prompt/tools 承载，仓储保存 | 不是协议缓存目录，也不是执行权限来源 |
+| instructions_snapshot | Conversation 及 conversation_configuration | 是基座内容快照，不是服务端缓存 ID 或永远不变的所有请求参数 |
 | prompt_cache_breakpoint / cache_control | 本次协议请求副本 | 不是普通历史消息，不是 OpenAI cache ID |
 | Gemini cachedContent | 目标缓存管理/协议运行态 | 不是其他模型或服务商可通用的引用 |
 | prompt_cache_key、实际请求边界、usage | 目标作用域运行态/受控请求观测 | 不是缓存存在、完整命中或固定路由的保证 |
 
 - `provider_state[api_format]` 下如保存可复用句柄/请求观测，必须进一步区分模型与服务端/账号或区域等兼容作用域；不能因 api_format 相同就交叉使用。
 - 可以记录最近实际提交的规范边界、配置视图版本、非敏感请求指纹和 usage，用于诊断。不要本地维护一个自称准确的“服务端已缓存到第 N 条”真相源。
-- 序列化必须稳定：工具数组/内容块保序、相同输入参数的编码稳定、同源 raw 不重新拼装、资源引用不无故变为不同 URL/表示。请求指纹是诊断信息，不是服务端缓存键。
+- 稳定性依赖工具/内容块保序、同源 raw 副本回放以及资源表示一致。当前 HTTP 使用 `json.dumps(body, ensure_ascii=False)`，没有对整份请求做 sort_keys 规范化；不能保证任意等价 JSON 或重新解析的资源 URL 都得到相同编码。请求指纹即使作为诊断信息，也不是服务端缓存键。
 - 源历史和 current 配置相同才尝试稳定重放；热更新/切换、压缩、资源版本变化或相关参数变化可能改变前缀。正确性优先，不恢复旧规则来换命中。
 - 缓存 marker 总是加到深拷贝的请求数据；多目标并行渲染不能互相写入 marker 或修改共享 raw。
 
@@ -860,68 +886,74 @@ RequestConfigurationView
 
 持久化责任：
 
-- Conversation 仓储保存 messages、原始来源信息和协议运行态；目标 message_id/call_ref/metadata 需支持序列化与恢复。现有 SQLite + JSONL 方案可继续承担该职责，本文不指定新的物理表迁移脚本。
-- 提示词/tools 定义与时间线的持久化仍由上游负责。Conversation 仓储不新增自有 configuration_timeline，不从恢复后的消息猜测 P/T 事件。
-- 上游保证配置视图与消息作用域/锚点可恢复地对应；丢失快照不能用定义最新内容伪补历史。
-- 旧消息缺少 ID 时，迁移建立持久稳定 ID；旧工具引用唯一解析后迁移，无法解析报告问题。旧会话没有配置时间线时，只能由上游提供当前有效视图并标明历史配置未知。
+- Conversation 仓储用 JSONL 保存消息、message_id、content 与 provider_extras，用 SQLite 保存 state/provider_state。旧消息有稳定 message_id 兼容迁移；call_ref/通用 metadata 的目标迁移不能据此宣称已完成。
+- 定义仓库仍由定义/工具模块负责；会话仓储的 `conversation_configuration` 表已保存 timeline、system_prompt、tools、instructions_snapshot，并优先从该表恢复。Agent 负责事件创建与冻结，不等于物理持久化不属于 Conversation 仓储。
+- 保存时裁掉引用已删除 message_id 的非 start 孤儿事件；时间线、当前配置和基座快照均为空时删除配置记录。adapter 不移动孤儿锚点、不扫描消息猜测切换。
+- 无 timeline 的旧会话可从本次 Agent 配置构造 start 初始视图，但不能据此声称恢复了未知历史配置；恢复出的 historical 事件仍用 snapshot，不以当前定义伪补。旧工具规范引用迁移是另行验证的目标。
 - user.provider_extras 中既有 context_compression 归档元数据应兼容迁移到通用 metadata；不要把它误认作 LLM provider raw 或删除归档关联。
 
 压缩/分支恢复：
 
 1. 普通协议切换不触发压缩、复制 Conversation 或清空其它协议运行态。
-2. 上游主动压缩时产生新的规范历史/窗口，保留尾部消息及 raw；摘要是新消息，不伪装成原协议 assistant。
-3. 对 OpenAI Responses，上游同时提供与新历史匹配的配置视图和锚点映射：保留历史快照，不把旧定义重新解析成当前内容。被删除锚点不得悬空，也不能由 adapter 擅自移动到首条消息；其他协议不重建这些历史 P/T 事件，只取最新实时配置。
+2. 压缩产生新历史/窗口，摘要是新消息，不伪装成原协议 assistant。既有 `conversation_rewriter` 可保留尾部消息；当前 Agent Note 更新完成路径则新建 Conversation、新 ID、基座快照与 start 业务配置，并注入 Note 摘要/唤醒消息，不能描述为原长历史全量延续。
+3. 若保留历史配置，锚点须与保留消息匹配，historical 仍用快照；被删除锚点不能悬空或由 adapter 移到首部。新建会话的初始配置是新会话配置，不是给旧历史重新赋义；其他协议仍只取本次最新配置。
 4. 不能把未闭合的工具调用/结果对截成非法历史；需要保留关联单元或由上游明确重建可接受上下文。
 5. 清除或重新验证与旧窗口绑定的协议缓存句柄/位置观测，重新计算请求期 marker；旧 input 下标不可继承。当前压缩实现新建 Conversation 并清空 provider_state，属于现状，不等于物理删除服务端缓存。
 6. 压缩改变了前缀时不能保证旧缓存复用；若仍有稳定配置前缀，可按真实请求尝试复用该段。
 7. 分支/回退是上游操作：选择正确历史及对应配置事件视图，不能由 Conversation 为命中缓存自行丢弃分支消息，也不能撤销已执行工具的副作用。
+8. 子 Agent 新建 Conversation 时继承父 `instructions_snapshot`、深拷贝指定消息前缀，继承并冻结复制范围内的父事件且保留原锚点；只有无父 timeline 时用 start 快照兜底。它不默认复制父 provider_state，所以相同内容不等于继承父 prompt_cache_key，也不保证跨会话缓存共享。
 
-## 八、当前实现阶段审阅与后续验收条件
+## 八、当前实现核对与后续验证条件
 
-### 1. 已核对的 working tree 阶段性状态
+### 1. 当前源码事实与证据边界
 
-以下路径以仓库根目录为基准；本节区分“本轮已在 working tree 接线”与“仍属上游/后续实现或尚未验证”的事实。Development Agent 的变更仍未提交；本节不是测试报告或验收结论。
+以下路径以仓库根目录为基准。本次按源码更正 OpenAI Responses 前缀、配置生命周期及持久化描述；其他协议行保留既有审阅范围，不代表此次重新完成全协议审计。本节不是测试报告、运行版本核验或上游缓存实测结论。
 
 | 源码位置/入口 | 当前事实 | 与本文目标设计的差距 |
 | --- | --- | --- |
-| `src/agent_runtime/conversation_message/message/models.py`：Conversation、UniMessage、ProviderAdapter | working tree 已增加稳定 `message_id`、`ConfigurationComponentEvent`、`RequestConfigurationView`、current P/T 配置视图；公共角色仍为 user/assistant/tool | `call_ref`、`source_context`、通用 `metadata` 尚未形成完整闭环；配置视图仍由上游契约输入，Conversation 不负责事件产生/冻结/持久管理 |
+| `src/agent_runtime/conversation_message/message/models.py`：Conversation、UniMessage、配置视图 | 已有 message_id、timeline、system_prompt/tools、instructions_snapshot；请求视图 historical 取 snapshot、active 取实时值，工具增量按历史名称差集 | 同名 schema 变化不通过差集重发；call_ref/source_context/通用 metadata 目标闭环另行验证，不能由 message_id 或时间线已落地推导完成 |
 | `src/agent_runtime/conversation_message/message/operations.py`：render_messages / ingest_response | 注册六类 adapter，渲染与响应归一化统一分发 | 需增加配置输入和目标能力的整体校验、诊断与映射契约；不能让每个 adapter 主动解析上游定义 |
-| `src/agent_runtime/conversation_message/message/openai_protocol.py`：OpenAIAdapter.render / normalize_response | working tree 已按配置视图在 Responses input 投影 developer、`additional_tools`、before/after message 锚点，并在初始 developer 尾部请求副本附加 marker；同源仍回放 reasoning/message/function_call | 尚未证明所有上游事件生产者都传入正确视图；工具-only 或非合法 developer 内容时不能保证联合 P/T 断点；未做真实 API/能力门控验证 |
-| `src/agent_runtime/llm_client/llm_protocol_clients.py`：OpenAIResponsesProtocolClient.request | working tree 已禁止顶层 `instructions/tools`，消费 input 配置并合并 `prompt_cache_options`；仍强制 store=false、include encrypted_content、去除 previous_response_id | 既有 request override（如 web native tools）是否已迁入配置视图必须单独回归；不能把 client 静态校验视为所有调用方已兼容 |
+| `src/agent_runtime/conversation_message/message/openai_protocol.py`：OpenAIAdapter.render / normalize_response | 按 message_id/sequence 投影配置；遍历全量消息，同源回放 reasoning/message/function_call raw；默认 options/marker 为 None，显式 marker 只处理合法 start 内容块 | supplementary_prompts 按当前工具名渲染，历史 developer 不一定字节不变；源码不证明端点支持或缓存效果 |
+| `src/agent_runtime/llm_client/llm_request_service.py`：_resolve_openai_request_configuration | 优先使用显式 instructions 覆盖，否则用基座 snapshot；有 timeline 时派生视图，无 timeline 时可建初始视图；tools 覆盖先转成 input 配置 | 显式 view 与 instructions/tools 覆盖冲突会报错；统一 usage 当前只读 cached_tokens，未在该分支统计 cache_write_tokens |
+| `src/agent_runtime/llm_client/llm_protocol_clients.py`：OpenAIResponsesProtocolClient.request | 允许/兜底顶层 instructions，拒绝直接顶层 tools；强制 store=false、include encrypted_content、去除 previous_response_id；仅显式 options 才发送 | 请求构造通过不等于全部调用方或目标端点兼容；不默认发送 mode/TTL，也没有自动能力折叠策略 |
+| `src/agent_runtime/agent/agent_execution_engine.py`：_render_system_prompt / Note 切换 | 首次建立基座快照，后续差异 prompt 排除已收录模板；初始化 start 事件；进入 Note 阶段冻结业务配置并在边界后追加，完成后新建会话/快照/start 配置 | 同会话快照固定不等于 Note 完成后还是同一缓存前缀；active 热更新和显式 instructions 覆盖可改变请求 |
+| `src/agent_runtime/subagent/subagent_runtime.py`：子会话创建 | 继承基座快照、复制消息前缀，范围内父事件冻结并保留锚点；子配置在边界后，按工具名称决定是否需新增工具事件 | 不复制父 provider_state/cache key；工具子集不追加声明也不代表拥有全部历史工具权限 |
 | `src/agent_runtime/conversation_message/message/claude_protocol.py`：render / _attach_cache_breakpoints | 复制同源 raw；不合并连续同角色消息；本次 messages 尾部打动态 cache_control | 新设计需与 client 的 system/tools 断点统一预算；现有最近 assistant/index 不足以证明输入边界已缓存 |
 | `src/agent_runtime/conversation_message/message/gemini_protocol.py`：normalize_response / _build_gemini_function_response | 已把 functionCall.id 带入 ToolUsePart，再回到 functionResponse.id；有 parts raw 回放和角色规范化 | 需校验跨轮缺 ID 时规范引用唯一性、签名兼容/缺失策略和 cachedContent 作用域；不能把已有 ID 透传误列为未实现 |
 | `src/agent_runtime/conversation_message/message/codex_protocol.py`：CodexAdapter | 复用 OpenAI 部分转换辅助，并保留独立 source_provider 与 provider_state | 新 OpenAI 字段不得通过共享辅助函数自动泄漏进 Codex；能力需要独立判断 |
-| `src/agent_runtime/conversation_message/infrastructure/sqlite_conversation_repository.py` | working tree 已为 JSONL 消息加入 `message_id` 写入、旧行稳定 UUID 迁移；SQLite 仍保存 state/provider_state | 配置事件不进入 Conversation SQLite/JSONL；上游事件生产与自身持久化未实现；旧工具引用/call_ref/source_context/metadata 迁移未完成 |
+| `src/agent_runtime/conversation_message/infrastructure/sqlite_conversation_repository.py` | JSONL 写 message_id 与消息；SQLite 保存 state/provider_state 及 conversation_configuration（timeline/system_prompt/tools/instructions_snapshot），优先从配置表恢复并在保存时裁剪孤儿锚点 | 当前机制可恢复会话配置，不证明 call_ref/source_context/通用 metadata 的目标迁移完整，也不证明真实上游缓存仍在 |
 | `src/agent_runtime/context_compression/conversation_rewriter.py`：rewrite_conversation_with_summary | 新建会话、加入 user 摘要、保留尾部消息、清空 provider_state；归档元数据在 user.provider_extras | 需与稳定消息身份/metadata 和上游配置锚点重映射契约衔接 |
 
-### 2. 当前阶段重大偏差与验收前置条件
+### 2. 当前边界与待验证事项
 
-- `LlmRequestService` 当前为普通 `openai_responses` 请求构造临时初始配置视图；只有上游显式传入 `configuration_view` 时，才可能重放真实 P/T 历史。该 helper 不是业务事件创建、冻结或持久化。
-- `OpenAIResponsesProtocolClient` 当前拒绝顶层 `instructions/tools`。因此凡是仍通过 `request_overrides` 传 OpenAI 原生工具（例如 web native search）的调用方，必须在后续接线中明确迁移为配置视图/输入事件，或保留合法的独立请求策略；否则会出现请求前校验失败。文档不能宣称所有现有调用方已经兼容。
-- `OpenAIAdapter._attach_initial_configuration_breakpoint` 只在初始配置中寻找最后一个合法 `input_text` developer block；当 P/T 顺序或内容不满足该位置条件时，不能宣称 marker 覆盖完整 tools+prompt。应保留真实顺序、显式报告没有联合断点的位置，不能为缓存重排业务事件。
-- 当前源码尚未见模型/端点能力门控。用户确认的显式断点能力不能无条件外推到早期模型、未知 compatible endpoint 或当前仍使用 gpt-5.5 的 Responses 图片 raw 调用；支持清单/未知模型策略需要在验收前明确。
-- 当前 working tree 尚未实现或验证 `call_ref`、`source_context`、通用 `metadata` 与上游 P/T 事件产生持久化；不应把新增 `message_id` 迁移误报为完整统一语义闭环。
-- 本轮未执行测试、真实 API 调用、usage/cache_write_tokens 观测、跨协议回归或运维验证。
+- **默认值与显式能力分开**：默认请求没有 options/marker；显式 marker 只在合法初始文本块上加一个，不自动标记任意历史或后续阶段。工具-only、文本后仍有 tools 时不加标，不重排事件。
+- **历史主值与整个请求分开**：historical snapshot 冻结，但动态补充工具名仍取当前视图；active 在原锚点热更新，工具仅按名称去重。不能把“snapshot 不重读”推导为历史 developer 全字节相等，也不能宣称同名 schema 更新已透传。
+- **请求覆盖与顶层字段分开**：顶层 instructions 合法且有稳定快照/兜底路径；tools 覆盖由请求层规范化成 input 配置。显式 view 冲突会报错，但不能据此推断每个既有调用方都经过完整回归。
+- **会话边界与缓存路由分开**：子会话和 Note 完成后的新会话不默认继承旧 provider_state；默认 key 随新 conversation.id 改变。固定 key 也不能证明固定路由节点或缓存存在。
+- **实现与端点能力分开**：源码尚未提供上述缓存扩展的模型/端点能力门控，不能从任意 compatible 名称判断支持；未知 output 类型、私有 raw 跨服务商兼容及 call_ref/source_context/通用 metadata 目标仍须独立验证。
+- 相关现有测试可用于后续验证：`tests/test_stable_prefix_prompt.py` 覆盖快照创建/复用/透传/持久化；`tests/test_openai_responses_configuration_timeline.py` 包含时间线热更新、恢复与默认不发缓存参数的 mock 请求检查。本次只核对内容，未执行测试、真实 API、usage/cache_write_tokens 观测、构建部署或跨协议回归。
 
-### 3. 后续实现验收矩阵（本轮未执行）
+### 3. 后续验证矩阵（本次未执行）
+
+与当前 Responses 实现相关的行按默认/显式场景分别验证；call_ref、完整兼容诊断等行仍是既有目标验收用例，不表示本次已实现或授权改造。
 
 | 场景 | 必须观察的结果 |
 | --- | --- |
-| OpenAI 两轮 → Claude 三轮 → OpenAI | O1/O2 保留同源 raw，Claude 历史语义转换；原配置尾 B + implicit；不强制 U2 显式点；原 OpenAI 累计输入保持一致 |
+| OpenAI 两轮 → Claude 三轮 → OpenAI | O1/O2 保留同源 raw，Claude 历史按公共语义转换；默认不加 options/marker，显式选择 B 时才按合法位置重建；不强制 U2 显式点；配置未变时检查原累计输入 |
 | OpenAI → Claude → Gemini → OpenAI → Z.AI 多次往返 | 不原地改写历史；每次有同源兼容 raw 的项仍可回放，异源从公共模型重建 |
 | 六协议中任意来源/目标的文本与工具历史 | 文本不丢、调用/结果一一关联，必要分组后顺序合法；不伪造私有推理 |
 | 并行同名调用、跨轮重复 wire ID、来源无 ID | canonical call_ref 唯一；目标映射稳定；结果不按函数名错配；不能合法映射时报错 |
-| 只切 P、只切 T、只热更新活动实例 | 两组件各自历史冻结/当前最新内容正确，未切换组件保持活动并可热更新 |
+| 只切 P、只切 T、只热更新活动实例 | 历史主值用快照，active 原锚点取当前值；工具按历史名称差集；另检查 supplementary_prompts 工具名变化对旧 developer 的影响 |
 | 切回原模型但活动配置已热更新 | 用最新有效配置；不得为了缓存回退旧内容，前缀失效范围如实报告 |
-| additional_tools 追加、工具撤权、同名 schema 替换 | 区分追加与严格替换；当前调用受机器授权约束；无法表达则折叠或报错，历史调用不删除 |
-| Responses 时间线 / 非 Responses 配置切换 | Responses 校验锚点并重放 developer/`additional_tools` 与初始 B；Claude/Gemini/Chat/Z.AI/Codex 直接使用 Agent 最新实时 system/tools，不重放 P/T 历史 |
+| additional_tools 追加、工具撤权、同名 schema 变化 | 新名称才进入当前差集，同名新 schema 不重发；历史调用保留，实际调用按当前 allowlist；不能以未实现的自动折叠/替换作为现状断言 |
+| Responses 时间线 / 非 Responses 配置切换 | Responses 顶层基座 + 按锚点投影 developer/`additional_tools`，默认无 B；无 timeline 时有配置仍建初始视图；其他协议直接使用最新 system/tools，不重放 P/T 历史 |
 | 同协议但更换服务商/模型兼容域 | 不盲用签名、加密推理或缓存句柄；策略明确且可诊断 |
 | 仅自动断点：原完整输入后追加 | 对照官方请求结构，旧末尾未重标仍可尝试缓存读取；不能把命中视为客户端必然保证 |
 | 动态后缀替换：有/无配置尾显式 B | 区分旧完整边界与内部共享前缀；有 B 时可独立尝试复用配置段 |
 | 缓存过期、参数/工具顺序变化、多模态表示变化 | 请求仍正确；usage 如实反映，不恢复旧配置或凭本地标记声称命中 |
-| marker 数量、合法位置与 raw 不变性 | OpenAI/Claude 分别服从目标总预算；marker 只在请求副本；渲染前后消息/raw 一致 |
+| marker 数量、合法位置与 raw 不变性 | Runtime Responses 默认零 marker，显式入口只在合法 start 文本块加标，无合法位置则零；多断点预算属于协议能力验证；各协议 marker 仅在请求副本，原消息/raw 不变 |
 | Gemini signature 缺失、Z.AI clear_thinking、模型不支持图片/PDF | 请求合法且降级策略明确，源 raw/资源身份不变；不声称完整推理/模态无损 |
-| 保存/恢复、旧数据、压缩后继续切协议 | 消息/调用 ID 与锚点一致，工具关联闭合；旧窗口缓存位置不盲继承，上游配置不被自行重建 |
+| 保存/恢复、旧数据、压缩后继续切协议 | 配置表恢复 timeline/当前配置/基座快照；非 start 孤儿被裁剪；子会话保留复制范围父锚点，Note 完成后新建快照/start；新会话不默认继承旧缓存 key |
 
 后续验证应区分三层证据：规范历史/请求结构检查、目标接口兼容性验证、真实 usage 的缓存观测。通过 JSON/单元校验不等于真实模型接受，也不等于缓存已命中；缓存实测要避免后一次试验被前一次预热所污染。
 
@@ -931,10 +963,10 @@ RequestConfigurationView
 
 - 本地忽略资料：`doc/claude_api.md`、`doc/openai_resposne_api.md`、`doc/gemini_generating_api.md`、`doc/api大小限制规则.md`。
 - Anthropic 参考：[Extended Thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)、[Prompt Caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching)。本稿沿用此前本地资料与官方搜索材料；具体模型、TTL 和读取范围在实现前按目标版本复核。
-- OpenAI [Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching)：本轮已直接读取页面正文，而非只读搜索摘要。`Request parameters and response usage` 展示 implicit 下不重标旧 user 边界仍读取 12,000 tokens 的成对请求；`A shared prefix is not always a cached prefix` 解释替换动态后缀时应单独保留稳定前缀断点。两类例子不能互相替代。
+- OpenAI [Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching)：沿用此前读取的页面材料。`Request parameters and response usage` 展示 implicit 下不重标旧 user 边界仍读取 12,000 tokens 的成对请求；`A shared prefix is not always a cached prefix` 解释替换动态后缀时应单独保留稳定前缀断点。两类例子不能互相替代，本次未重新联网核验其版本。
 - OpenAI [Responses Create](https://developers.openai.com/api/reference/resources/responses/methods/create)：与指南共同用于字段/能力校验；指南/参考的 50/80 读取窗口表述差异单独保留，不能据此改变每请求写入预算或宣称无限读取。
-- 第八章列出的 models、operations、各 adapter、LLM protocol client、SQLite 仓储及 conversation_rewriter 为本轮已核对源码入口。当前实现事实与目标设计分开叙述。
-- 本次用户确认的《OpenAI Responses API 自定义缓存断点与 `additional_tools` 技术指南》（`openai_responses_custom_cache_breakpoints_guide.md`）：作为支持内容块、assistant `output_text` 示例和 `additional_tools` 语义的补充依据。分支案例仅作为协议使用说明，不等同于 AgentRuntime 功能实现；不沿用资料中“100% 命中”“固定路由到同一节点”等绝对保证。
+- 本次更正依据第八章中的 Agent 执行器、子 Agent、models、OpenAI adapter、LLM 请求层/client 和 SQLite 仓储；其他协议与 conversation_rewriter 的既有设计说明不扩展为本次全量审计结论。
+- 此前用户确认的《OpenAI Responses API 自定义缓存断点与 `additional_tools` 技术指南》（`openai_responses_custom_cache_breakpoints_guide.md`）：作为支持内容块、assistant `output_text` 示例和 `additional_tools` 语义的补充依据。分支案例仅作为协议使用说明，不等同于 AgentRuntime 功能实现；不沿用资料中“100% 命中”“固定路由到同一节点”等绝对保证。
 - Google 官方文档：[Context Caching](https://ai.google.dev/gemini-api/docs/caching)、[Thought Signatures](https://ai.google.dev/gemini-api/docs/thought-signatures)。
 - Z.AI 官方文档：[Chat Completion](https://docs.z.ai/api-reference/llm/chat-completion)、[Thinking Mode](https://docs.z.ai/guides/capabilities/thinking)。
 - 外部协议材料的模型能力、阈值、价格、TTL 与限制可能更新；本稿不是所有兼容服务商的统一承诺。源码未验证的目标字段和真实 API 缓存命中，均不得因本文写入就宣称已实现或实测。
