@@ -81,7 +81,25 @@ _PROJECTED_OUTPUT_SEMANTIC_EVENTS = {
     "llm.tool_call.completed",
 }
 logger = logging.getLogger(__name__)
-_DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
+_DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS = 60 * 60
+
+
+def _resolve_default_llm_request_attempt_timeout_seconds() -> float:
+    raw = os.environ.get("SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS")
+    if raw is not None and raw.strip():
+        try:
+            val = float(raw.strip())
+            if val > 0:
+                return val
+        except ValueError:
+            logger.warning(
+                "无效的 SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS 环境变量: %s，回退默认值 %s 秒",
+                raw,
+                _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS,
+            )
+    return float(_DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS)
+
+
 _OPENAI_RESPONSES_INPUT_CONFIGURATION_OPT_IN = "openai_responses_input_configuration"
 _MISSING = object()
 
@@ -1224,8 +1242,13 @@ async def _await_client_request(
     awaitable: Any,
     request: LlmPromptRequest,
     *,
-    attempt_timeout_seconds: float = _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS,
+    attempt_timeout_seconds: float | None = None,
 ) -> Any:
+    effective_timeout = (
+        attempt_timeout_seconds
+        if attempt_timeout_seconds is not None
+        else _resolve_default_llm_request_attempt_timeout_seconds()
+    )
     task = asyncio.create_task(awaitable)
     observer = request.request_canceller_observer
     unregister: Callable[[], None] | None = None
@@ -1237,9 +1260,9 @@ async def _await_client_request(
 
         unregister = observer(cancel_request)
     try:
-        if attempt_timeout_seconds <= 0:
+        if effective_timeout <= 0:
             return await task
-        done, _pending = await asyncio.wait({task}, timeout=attempt_timeout_seconds)
+        done, _pending = await asyncio.wait({task}, timeout=effective_timeout)
         if task in done:
             return await task
         task.cancel()
@@ -1250,7 +1273,7 @@ async def _await_client_request(
                 raise
         except asyncio.CancelledError:
             pass
-        raise LlmRequestTimeoutError(timeout_seconds=attempt_timeout_seconds)
+        raise LlmRequestTimeoutError(timeout_seconds=effective_timeout)
     except asyncio.CancelledError:
         task.cancel()
         with suppress(Exception, asyncio.CancelledError):

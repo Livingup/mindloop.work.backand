@@ -184,6 +184,33 @@ class LlmRequestCancellationTests(unittest.TestCase):
 
         asyncio.run(run_case())
 
+    def test_llm_request_attempt_timeout_default_is_one_hour(self) -> None:
+        from agent_runtime.llm_client.llm_request_service import (
+            _DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS,
+            _resolve_default_llm_request_attempt_timeout_seconds,
+        )
+
+        self.assertEqual(_DEFAULT_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS, 3600)
+        self.assertEqual(_resolve_default_llm_request_attempt_timeout_seconds(), 3600.0)
+
+    def test_llm_request_attempt_timeout_supports_env_override(self) -> None:
+        import os
+        from agent_runtime.llm_client.llm_request_service import (
+            _resolve_default_llm_request_attempt_timeout_seconds,
+        )
+
+        old_val = os.environ.get("SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS")
+        try:
+            os.environ["SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS"] = "7200"
+            self.assertEqual(_resolve_default_llm_request_attempt_timeout_seconds(), 7200.0)
+            os.environ["SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS"] = "invalid"
+            self.assertEqual(_resolve_default_llm_request_attempt_timeout_seconds(), 3600.0)
+        finally:
+            if old_val is not None:
+                os.environ["SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS"] = old_val
+            else:
+                os.environ.pop("SPREAD_AI_LLM_REQUEST_ATTEMPT_TIMEOUT_SECONDS", None)
+
     def test_http_request_cancelled_before_response_headers(self) -> None:
         async def run_case() -> None:
             request_received = asyncio.Event()
