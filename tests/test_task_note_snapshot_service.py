@@ -74,3 +74,36 @@ def test_snapshot_service_mock_db() -> None:
     assert snapshot["agent_instance_id"] == "a-1"
     assert mock_cursor.execute.called
 
+    # 验证第一条 agent_user_mission 查询必须严格包含双 ID
+    first_call_sql, first_call_params = mock_cursor.execute.call_args_list[0][0]
+    assert "FROM agent_user_mission" in first_call_sql
+    assert "WHERE task_id = %s AND agent_instance_id = %s" in first_call_sql
+    assert first_call_params == ("t-1", "a-1")
+
+
+def test_snapshot_service_all_queries_enforce_dual_ids() -> None:
+    """验证 build_snapshot 对所有 15 张业务子表的查询均 100% 携带 task_id 与 agent_instance_id。"""
+    from unittest.mock import MagicMock
+    from contextlib import contextmanager
+
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchone.return_value = None
+
+    @contextmanager
+    def mock_conn():
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = mock_cursor
+        conn.cursor.return_value.__exit__.return_value = False
+        yield conn
+
+    service = TaskNoteSnapshotService(connection_factory=mock_conn)
+    service.build_snapshot(task_id="task-env-01", agent_instance_id="agent-worker-01")
+
+    # 快照涵盖 15 个查询
+    assert mock_cursor.execute.call_count >= 15
+    for call_item in mock_cursor.execute.call_args_list:
+        sql, params = call_item[0]
+        assert "WHERE task_id = %s AND agent_instance_id = %s" in sql
+        assert params == ("task-env-01", "agent-worker-01")
+

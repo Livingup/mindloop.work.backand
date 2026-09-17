@@ -251,7 +251,7 @@ Note 包含 **五大核心认知层级与一个贯穿基石**：
 - `task_agent_relationships`（拓扑关系与生命周期由系统维护）
 - `task_agent_messages`（专线消息内容由系统自动追加）
 - `task_remote_agent_messages`（远程消息由系统维护）
-- `task_artifact_records` 中由文件工具自动生成的物理内容（严禁修改 `file_path`、`edits`、`content_lines` 等底层物理编辑块；仅允许调用 `bind_resources_to_mission` 绑定 `mission_id` 归属）。
+- `task_artifact_records` 中由文件工具自动生成的物理内容（严禁修改 `file_path`、`edits`、`content_lines` 等底层物理编辑块，严禁删除文件物理产物；`delete_task_artifact_other` 严格仅针对 `type='other'` 的通用产物；仅允许调用 `bind_resources_to_mission` 绑定 `mission_id` 归属）。
 
 ---
 

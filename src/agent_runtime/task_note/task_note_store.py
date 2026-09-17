@@ -431,6 +431,7 @@ class TaskNoteStore:
                         )
                         ON CONFLICT (mission_id, agent_instance_id)
                         DO UPDATE SET
+                            task_id = EXCLUDED.task_id,
                             solution_content = EXCLUDED.solution_content,
                             solution_status = 'active'
                         """,
@@ -808,6 +809,7 @@ class TaskNoteStore:
                         )
                         ON CONFLICT (mission_id, agent_instance_id)
                         DO UPDATE SET
+                            task_id = EXCLUDED.task_id,
                             completed_summary = EXCLUDED.completed_summary,
                             current_work = EXCLUDED.current_work,
                             current_blockers = EXCLUDED.current_blockers,
@@ -1163,7 +1165,7 @@ class TaskNoteStore:
         agent_instance_id: str,
         artifact_id: str,
     ) -> bool:
-        """删除非代码文件的通用交付物 (严禁删除底层文件产物)。"""
+        """删除非代码文件的通用交付物 (严格仅限 type='other'，底层杜绝误删文件操作物理产物)。"""
         if self._connection_factory is None:
             return True
 
@@ -1173,7 +1175,7 @@ class TaskNoteStore:
                     cur.execute(
                         """
                         DELETE FROM task_artifact_records
-                        WHERE task_id = %s AND artifact_id = %s AND agent_instance_id = %s AND type != 'file'
+                        WHERE task_id = %s AND artifact_id = %s AND agent_instance_id = %s AND type = 'other'
                         """,
                         (task_id, artifact_id, agent_instance_id),
                     )
@@ -1453,10 +1455,10 @@ class TaskNoteStore:
                               AND target_agent_instance_id IN (
                                   SELECT target_agent_instance_id
                                   FROM task_agent_relationships
-                                  WHERE relationship_id = ANY(%s)
+                                  WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)
                               )
                             """,
-                            (mission_id, task_id, agent_instance_id, resource_ids),
+                            (mission_id, task_id, agent_instance_id, task_id, agent_instance_id, resource_ids),
                         )
                     else:
                         logger.warning("未知的 resource_type: %s", resource_type)

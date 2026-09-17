@@ -284,7 +284,7 @@ class CreateTaskArtifactOtherRequest(BaseToolRequest):
 class DeleteTaskArtifactOtherRequest(BaseToolRequest):
     """物理删除失效的非文件通用交付成果请求。"""
 
-    artifact_id: str = Field(min_length=1, description="目标通用产物主键 ID（仅限 type='other'，底层严禁删除文件产物）。")
+    artifact_id: str = Field(min_length=1, description="目标通用产物主键 ID（严格仅限 type='other'，底层杜绝删除任何 file_* 文件物理产物）。")
 
 
 # ── 9. 验证与检查结论维护工具模型 (task_validation_records) ───────

@@ -47,3 +47,9 @@
     - Note 状态（`execution_substate="note_update"`）下，执行循环仅允许过滤消费真实人类用户提交的消息（供 Note Agent 了解最新指引并辅助整理手记）；
     - 外部远程 Agent（LACP/remote_agent）或本地父/子 Agent（subagent/local_agent）发来的消息属于业务 Agent 的协作消息，严禁进入 Note 会话；
     - 该类外部业务协作消息必须保留在 `AgentInstance.pending_user_messages` 队列中，待调用 `note_update_end` 切换为全新业务会话并恢复正常业务状态后，在业务执行循环的第一轮开头全量消费并追加到新业务会话尾部。
+11. **双 ID 租户环境隔离与产物安全约束**：
+    - Task Note 15 张表全量以 `task_id`（班次/任务会期）和 `agent_instance_id`（执行实例）作为底层隔离归属字段。
+    - 无论是单表增删改查还是 Agent 实例读取自身手记快照（`build_snapshot`），所有 SQL 必须 100% 携带 `task_id` 与 `agent_instance_id` 双条件（包括 `agent_user_mission`），严禁遗漏任何一张表，杜绝跨班次与跨 Agent 实例数据混淆与泄露。
+    - 通用产物删除 `delete_task_artifact_other` 严格限定 `AND type = 'other'`，与 `create_task_artifact_other` 对称对齐；严禁删除底层文件工具自动捕获的 `file_*`（`file_create`, `file_modify`, `file_delete`, `file_move`）物理文件产物记录。
+    - 协作资源级联绑定（`bind_resources_to_mission`）的子查询必须限定当前 `task_id` 与 `agent_instance_id`，杜绝跨实例解析拓扑关系。
+    - 方案与进度 UPSERT 冲突分支必须同步更新 `task_id = EXCLUDED.task_id`，确保根实例跨班次复用时方案/进度归属于当前最新活跃班次。

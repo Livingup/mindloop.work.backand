@@ -1049,12 +1049,12 @@ def create_task_artifact_other(request: CreateTaskArtifactOtherRequest, ctx: Too
 
 @tool(
     name="delete_task_artifact_other",
-    description="物理删除非代码文件的通用交付产物（严禁删除代码文件物理产物）。",
+    description="物理删除非代码文件的通用交付产物（严格仅限 type='other'，底层绝对防止删除文件物理产物）。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### delete_task_artifact_other\n物理删除无效通用成果，保护底层文件产物。",
+    wiki="### delete_task_artifact_other\n物理删除无效通用成果，仅限 type='other'，底层绝对保护 file_* 文件物理产物。",
 )
 def delete_task_artifact_other(request: DeleteTaskArtifactOtherRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()

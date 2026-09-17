@@ -178,17 +178,17 @@ class TaskNoteSnapshotService:
                                     pass
                             return None
 
-                    # 1. agent_user_mission (该 task 下所有关联或当前 agent 创建的 mission)
+                    # 1. agent_user_mission (当前 agent 实例在该 task 下创建和维护的 mission)
                     snapshot["missions"] = _query_rows(
                         "agent_user_mission",
                         """
                         SELECT mission_id, task_id, scene_id, agent_instance_id, title,
                                raw_prompts, refined_requirement, status, sort_order, created_at
                         FROM agent_user_mission
-                        WHERE task_id = %s
+                        WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY sort_order ASC, created_at ASC
                         """,
-                        (task_id,),
+                        (task_id, agent_instance_id),
                     )
 
                     # 2. task_workspace_context

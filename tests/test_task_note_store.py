@@ -456,3 +456,55 @@ def test_create_workspace_context_with_pydantic_line_ranges(mock_db: Any):
     finally:
         set_task_note_store(None)
 
+
+def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -> None:
+    """验证 delete_artifact_other 严格限定 type='other'，UPSERT 同步 task_id，以及关系级联更新严格限制双 ID。"""
+    store, executed = mock_db
+
+    # 1. 验证 delete_artifact_other 严格限定 type = 'other'，杜绝误删 file_*
+    executed.clear()
+    store.delete_artifact_other(task_id="t_iso", agent_instance_id="a_iso", artifact_id="art_other_01")
+    assert len(executed) == 1
+    del_sql, del_params = executed[-1]
+    assert "DELETE FROM task_artifact_records" in del_sql
+    assert "WHERE task_id = %s AND artifact_id = %s AND agent_instance_id = %s AND type = 'other'" in del_sql
+    assert del_params == ("t_iso", "art_other_01", "a_iso")
+
+    # 2. 验证 upsert_solution 的 UPSERT 包含 task_id = EXCLUDED.task_id
+    executed.clear()
+    store.upsert_solution(task_id="t_iso", agent_instance_id="a_iso", mission_id="m_iso", solution_content="方案内容")
+    assert len(executed) == 1
+    sol_sql, _ = executed[-1]
+    assert "ON CONFLICT (mission_id, agent_instance_id)" in sol_sql
+    assert "task_id = EXCLUDED.task_id" in sol_sql
+
+    # 3. 验证 upsert_progress 的 UPSERT 包含 task_id = EXCLUDED.task_id
+    executed.clear()
+    store.upsert_progress(
+        task_id="t_iso",
+        agent_instance_id="a_iso",
+        mission_id="m_iso",
+        completed_summary="完成",
+        current_work="进行",
+        next_step="下一步",
+    )
+    assert len(executed) == 1
+    prog_sql, _ = executed[-1]
+    assert "ON CONFLICT (mission_id, agent_instance_id)" in prog_sql
+    assert "task_id = EXCLUDED.task_id" in prog_sql
+
+    # 4. 验证 bind_resources_to_mission 级联更新专线消息时，子查询严格带双 ID 约束
+    executed.clear()
+    store.bind_resources_to_mission(
+        task_id="t_iso",
+        agent_instance_id="a_iso",
+        mission_id="m_iso",
+        resource_type="agent_relationship",
+        resource_ids=["rel_01"],
+    )
+    msg_update = [stmt for stmt in executed if "UPDATE task_agent_messages" in stmt[0]][0]
+    msg_sql, msg_params = msg_update
+    assert "WHERE task_id = %s AND agent_instance_id = %s" in msg_sql
+    assert "WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)" in msg_sql
+    assert msg_params == ("m_iso", "t_iso", "a_iso", "t_iso", "a_iso", ["rel_01"])
+
