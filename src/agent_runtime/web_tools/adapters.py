@@ -28,9 +28,23 @@ class WebNativeToolAdapter(Protocol):
         ...
 
 
+DEFAULT_OPENAI_USER_LOCATION: dict[str, Any] = {
+    "type": "approximate",
+    "country": "US",
+    "region": "California",
+    "city": "Los Angeles",
+    "timezone": "America/Los_Angeles",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIWebNativeToolAdapter:
     api_format: str = API_FORMAT_OPENAI_RESPONSES
+    tool_type: str = "web_search"
+    external_web_access: bool = True
+    indexed_web_access: bool = True
+    search_context_size: str = "medium"
+    search_content_types: tuple[str, ...] = ("text", "image")
 
     def build_request_overrides(
         self,
@@ -38,15 +52,21 @@ class OpenAIWebNativeToolAdapter:
         operation: WebToolOperation,
         request: WebSearchRequest | ReadUrlContextRequest,
     ) -> dict[str, Any]:
-        tool: dict[str, Any] = {"type": "web_search_preview"}
+        tool: dict[str, Any] = {
+            "type": self.tool_type,
+            "external_web_access": self.external_web_access,
+            "indexed_web_access": self.indexed_web_access,
+            "search_context_size": self.search_context_size,
+            "search_content_types": list(self.search_content_types),
+            "user_location": dict(DEFAULT_OPENAI_USER_LOCATION),
+        }
         if isinstance(request, WebSearchRequest):
             filters = _domain_filters(request.allowed_domains, request.blocked_domains)
             if filters:
                 tool["filters"] = filters
-            tool["search_context_size"] = _openai_context_size(request.max_results)
         overrides = {
             "tools": [tool],
-            "tool_choice": {"type": "web_search_preview"},
+            "tool_choice": {"type": self.tool_type},
             "include": ["web_search_call.action.sources"],
         }
         if self.api_format == API_FORMAT_OPENAI_RESPONSES:
@@ -168,6 +188,13 @@ def build_web_tool_system_prompt(operation: WebToolOperation) -> str:
                 "published_at": "publication date if known, otherwise null",
             }
         ],
+        "images": [
+            {
+                "url": "direct image URL",
+                "title": "image title or caption if known",
+                "source_url": "page URL where the image was found if known",
+            }
+        ],
         "key_points": ["important source-grounded facts"],
         "citations": [
             {
@@ -179,7 +206,8 @@ def build_web_tool_system_prompt(operation: WebToolOperation) -> str:
     return (
         f"{task}\n"
         "Use only information obtained from the provider's native web search or URL context capability when available. "
-        "Return exactly one JSON object and no markdown fences. The JSON object must match this shape: "
+        "Return accurate search findings, citing real URLs and relevant images when available. "
+        "When returning JSON, output exactly one JSON object with this shape: "
         f"{json.dumps(schema, ensure_ascii=False)}"
     )
 

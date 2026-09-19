@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -205,7 +206,7 @@ class WebToolsService:
                 )
                 raw_content = _assistant_text(response.assistant_message.content)
                 data = _parse_result_data(raw_content)
-                _enrich_sources(data, response.raw_response)
+                _enrich_sources(data, response.raw_response, raw_content=raw_content)
                 content = _render_html_document(operation, request, data)
                 return WebToolResult(
                     operation=operation,
@@ -280,12 +281,15 @@ def _parse_result_data(content: str) -> dict[str, Any]:
         try:
             value = json.loads(extracted)
             if isinstance(value, dict):
+                if "images" not in value or not isinstance(value["images"], list):
+                    value["images"] = []
                 return value
         except json.JSONDecodeError:
             pass
     return {
         "summary": content,
         "results": [],
+        "images": [],
         "key_points": [],
         "citations": [],
     }
@@ -308,17 +312,141 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
-def _enrich_sources(data: dict[str, Any], raw_response: Any) -> None:
+def _enrich_sources(data: dict[str, Any], raw_response: Any, *, raw_content: str = "") -> None:
+    raw_sources, raw_images = _extract_raw_sources_and_images(raw_response)
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        results = []
+        data["results"] = results
+    existing_result_urls = {str(item.get("url") or "") for item in results if isinstance(item, dict)}
+    for s in raw_sources:
+        if s["url"] not in existing_result_urls:
+            results.append(s)
+            existing_result_urls.add(s["url"])
+
     citations = data.get("citations")
     if not isinstance(citations, list):
         citations = []
         data["citations"] = citations
-    existing = {item.get("url") for item in citations if isinstance(item, dict)}
+    existing_citations = {str(item.get("url") or "") for item in citations if isinstance(item, dict)}
+    for s in results:
+        url = str(s.get("url") or "")
+        if url and url not in existing_citations:
+            citations.append({"url": url, "title": s.get("title")})
+            existing_citations.add(url)
     for url in _collect_urls(raw_response):
-        if url in existing:
-            continue
-        citations.append({"url": url, "title": None})
-        existing.add(url)
+        if url not in existing_citations:
+            citations.append({"url": url, "title": None})
+            existing_citations.add(url)
+
+    images = data.get("images")
+    if not isinstance(images, list):
+        images = []
+        data["images"] = images
+    existing_img_urls = {str(item.get("url") or "") for item in images if isinstance(item, dict)}
+    for img in raw_images:
+        if img["url"] not in existing_img_urls:
+            images.append(img)
+            existing_img_urls.add(img["url"])
+    if raw_content:
+        for img in _extract_markdown_images(raw_content):
+            if img["url"] not in existing_img_urls:
+                images.append(img)
+                existing_img_urls.add(img["url"])
+
+
+def _extract_raw_sources_and_images(raw_response: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    sources: list[dict[str, Any]] = []
+    images: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    seen_images: set[str] = set()
+
+    def add_source(title: Any, url: Any, snippet: Any = None, source: Any = None, published_at: Any = None, img: Any = None) -> None:
+        u = str(url or "").strip()
+        if not u or not u.startswith(("http://", "https://")) or u in seen_urls:
+            return
+        seen_urls.add(u)
+        t = str(title or "").strip() or u
+        sources.append({
+            "title": t,
+            "url": u,
+            "snippet": str(snippet or "").strip(),
+            "source": str(source or "").strip(),
+            "published_at": str(published_at or "").strip() or None,
+        })
+        if img:
+            add_image(img, title=t, source_url=u)
+
+    def add_image(img_val: Any, title: Any = None, source_url: Any = None) -> None:
+        if isinstance(img_val, list):
+            for item in img_val:
+                add_image(item, title=title, source_url=source_url)
+            return
+        if isinstance(img_val, dict):
+            u = str(img_val.get("url") or img_val.get("image_url") or "").strip()
+            t = str(img_val.get("title") or img_val.get("caption") or title or "").strip()
+            s = str(img_val.get("source_url") or source_url or "").strip()
+            add_image(u, title=t, source_url=s)
+            return
+        u = str(img_val or "").strip()
+        if not u or not u.startswith(("http://", "https://")) or u in seen_images:
+            return
+        seen_images.add(u)
+        images.append({
+            "url": u,
+            "title": str(title or "").strip(),
+            "source_url": str(source_url or "").strip(),
+        })
+
+    def scan(node: Any, parent_url: str | None = None) -> None:
+        if isinstance(node, dict):
+            node_type = str(node.get("type") or "")
+            if node_type in ("web_search_call", "web_search"):
+                action = node.get("action")
+                if isinstance(action, dict) and isinstance(action.get("sources"), list):
+                    for s in action["sources"]:
+                        if isinstance(s, dict):
+                            s_url = s.get("url") or s.get("link")
+                            add_source(
+                                title=s.get("title"),
+                                url=s_url,
+                                snippet=s.get("snippet") or s.get("text") or s.get("content"),
+                                source=s.get("source") or s.get("site"),
+                                published_at=s.get("published_at") or s.get("date"),
+                                img=s.get("image") or s.get("images"),
+                            )
+            if "sources" in node and isinstance(node["sources"], list):
+                for s in node["sources"]:
+                    if isinstance(s, dict) and (s.get("url") or s.get("link")):
+                        add_source(
+                            title=s.get("title"),
+                            url=s.get("url") or s.get("link"),
+                            snippet=s.get("snippet") or s.get("text"),
+                            source=s.get("source"),
+                            published_at=s.get("published_at"),
+                            img=s.get("image") or s.get("images"),
+                        )
+            for img_key in ("image", "images", "image_url", "thumbnail", "img_url"):
+                if img_key in node and node[img_key]:
+                    add_image(node[img_key], title=node.get("title"), source_url=node.get("url") or parent_url)
+            current_url = node.get("url") or node.get("link") or parent_url
+            for v in node.values():
+                scan(v, parent_url=str(current_url) if current_url else None)
+        elif isinstance(node, list):
+            for item in node:
+                scan(item, parent_url=parent_url)
+
+    scan(raw_response)
+    return sources, images
+
+
+def _extract_markdown_images(text: str) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+    for match in re.finditer(r"!\[([^\]]*)\]\((https?://[^\s\)]+)\)", text):
+        caption, url = match.groups()
+        images.append({"url": url.strip(), "title": caption.strip(), "source_url": ""})
+    return images
 
 
 def _collect_urls(value: Any) -> list[str]:
@@ -378,6 +506,8 @@ def _merge_batch_results(
 ) -> WebToolResult:
     items: list[dict[str, Any]] = []
     merged_results: list[Any] = []
+    merged_images: list[dict[str, Any]] = []
+    image_urls: set[str] = set()
     merged_key_points: list[str] = []
     merged_citations: list[dict[str, Any]] = []
     citation_urls: set[str] = set()
@@ -390,11 +520,13 @@ def _merge_batch_results(
             success_count += 1
             if first_success is None:
                 first_success = output
+            images = output.data.get("images") if isinstance(output.data.get("images"), list) else []
             item = {
                 "target": target,
                 "success": True,
                 "summary": output.data.get("summary"),
                 "results": output.data.get("results") if isinstance(output.data.get("results"), list) else [],
+                "images": images,
                 "key_points": output.data.get("key_points") if isinstance(output.data.get("key_points"), list) else [],
                 "citations": output.data.get("citations") if isinstance(output.data.get("citations"), list) else [],
                 "provider": _result_provider(output),
@@ -402,6 +534,13 @@ def _merge_batch_results(
             items.append(item)
             if isinstance(item["results"], list):
                 merged_results.extend(item["results"])
+            if isinstance(images, list):
+                for img in images:
+                    if isinstance(img, dict):
+                        url = str(img.get("url") or "").strip()
+                        if url and url not in image_urls:
+                            image_urls.add(url)
+                            merged_images.append(img)
             if isinstance(item["key_points"], list):
                 merged_key_points.extend(str(value) for value in item["key_points"] if str(value).strip())
             if isinstance(item["citations"], list):
@@ -430,6 +569,7 @@ def _merge_batch_results(
     data = {
         "summary": f"{operation} completed {success_count}/{len(requests)} batch items.",
         "results": merged_results,
+        "images": merged_images,
         "key_points": merged_key_points,
         "citations": merged_citations,
         "items": items,
@@ -488,6 +628,7 @@ def _render_html_document(
     summary = str(data.get("summary") or "").strip()
     key_points = data.get("key_points") if isinstance(data.get("key_points"), list) else []
     results = data.get("results") if isinstance(data.get("results"), list) else []
+    images = data.get("images") if isinstance(data.get("images"), list) else []
     citations = data.get("citations") if isinstance(data.get("citations"), list) else []
     items = data.get("items") if isinstance(data.get("items"), list) else []
     reference_sources = _collect_reference_sources(results, citations)
@@ -514,6 +655,17 @@ def _render_html_document(
                 "</section>",
             ]
         )
+    if images:
+        rendered_images = _render_images(images)
+        if rendered_images:
+            sections.extend(
+                [
+                    "<section>",
+                    "<h2>Images</h2>",
+                    rendered_images,
+                    "</section>",
+                ]
+            )
     if key_points:
         sections.extend(
             [
@@ -529,6 +681,34 @@ def _render_html_document(
         sections.extend(["<footer>", "<h2>Sources</h2>", _render_sources(reference_sources), "</footer>"])
     sections.append("</article>")
     return "\n".join(sections)
+
+
+def _render_images(images: list[Any]) -> str:
+    rendered: list[str] = []
+    for item in images:
+        if not isinstance(item, dict):
+            continue
+        url = _clean_string(item.get("url"))
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        title = _clean_string(item.get("title")) or "Image"
+        source_url = _clean_string(item.get("source_url"))
+        caption_link = (
+            f'<a href="{html.escape(source_url, quote=True)}" target="_blank" rel="noreferrer">{html.escape(title)}</a>'
+            if source_url
+            else html.escape(title)
+        )
+        rendered.append(
+            f'<figure style="margin:8px 0;display:inline-block;max-width:100%;">'
+            f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noreferrer">'
+            f'<img src="{html.escape(url, quote=True)}" alt="{html.escape(title, quote=True)}" style="max-width:100%;max-height:300px;border-radius:8px;object-fit:cover;" loading="lazy" />'
+            f'</a>'
+            f'<figcaption style="font-size:12px;color:#64748b;margin-top:4px;">{caption_link}</figcaption>'
+            f'</figure>'
+        )
+    if not rendered:
+        return ""
+    return '<div style="display:flex;flex-wrap:wrap;gap:12px;">' + "".join(rendered) + "</div>"
 
 
 def _document_targets(operation: WebToolOperation, request: WebSearchRequest | ReadUrlContextRequest, data: dict[str, Any]) -> tuple[str, ...]:

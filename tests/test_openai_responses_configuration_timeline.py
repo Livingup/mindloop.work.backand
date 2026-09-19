@@ -484,10 +484,18 @@ def test_web_native_openai_override_is_projected_into_input(monkeypatch):
                 request=type("Request", (), {"allowed_domains": (), "blocked_domains": (), "max_results": 3})(),
             )))
         tools = [item for item in captured["input"] if item.get("type") == "additional_tools"]
-        assert tools and tools[0]["tools"][0]["type"] == "web_search_preview"
+        assert tools
+        tool_spec = tools[0]["tools"][0]
+        assert tool_spec["type"] == "web_search"
+        assert tool_spec["external_web_access"] is True
+        assert tool_spec["indexed_web_access"] is True
+        assert tool_spec["search_context_size"] == "medium"
+        assert tool_spec["search_content_types"] == ["text", "image"]
+        assert tool_spec["user_location"]["country"] == "US"
+        assert tool_spec["user_location"]["city"] == "Los Angeles"
         assert captured["instructions"] == "你是一个善于学习的AI。"
         assert "tools" not in captured
-        assert captured["tool_choice"] == {"type": "web_search_preview"}
+        assert captured["tool_choice"] == {"type": "web_search"}
         assert "web_search_call.action.sources" in captured["include"]
         assert result.assistant_message.role == "assistant"
     asyncio.run(run())
@@ -1908,4 +1916,186 @@ def test_responses_client_omits_prompt_cache_options_by_default_and_supports_exp
         assert "prompt_cache_options" not in captured
 
     asyncio.run(run())
+
+
+def test_extract_raw_sources_and_images_from_openai_responses_payload():
+    from agent_runtime.web_tools.service import _extract_raw_sources_and_images
+
+    raw_response = {
+        "id": "resp_123",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "call_1",
+                "action": {
+                    "query": "Linux logo and release",
+                    "sources": [
+                        {
+                            "title": "The Linux Kernel Archives",
+                            "url": "https://www.kernel.org/",
+                            "snippet": "Linux 6.14 is the latest stable kernel.",
+                            "source": "kernel.org",
+                            "published_at": "2026-03-01",
+                            "image": "https://www.kernel.org/theme/images/logos/tux.png",
+                        },
+                        {
+                            "title": "Kernel Documentation",
+                            "url": "https://docs.kernel.org/",
+                            "snippet": "Official documentation for Linux.",
+                            "source": "docs.kernel.org",
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+
+    sources, images = _extract_raw_sources_and_images(raw_response)
+    assert len(sources) == 2
+    assert sources[0]["title"] == "The Linux Kernel Archives"
+    assert sources[0]["url"] == "https://www.kernel.org/"
+    assert sources[0]["snippet"] == "Linux 6.14 is the latest stable kernel."
+    assert sources[0]["published_at"] == "2026-03-01"
+
+    assert len(images) == 1
+    assert images[0]["url"] == "https://www.kernel.org/theme/images/logos/tux.png"
+    assert images[0]["source_url"] == "https://www.kernel.org/"
+
+
+def test_enrich_sources_with_plain_text_submodel_output():
+    from agent_runtime.web_tools.service import _enrich_sources
+
+    data = {
+        "summary": "Latest Linux kernel is 6.14 with multiple improvements.",
+        "results": [],
+        "images": [],
+        "key_points": [],
+        "citations": [],
+    }
+    raw_response = {
+        "output": [
+            {
+                "type": "web_search_call",
+                "action": {
+                    "sources": [
+                        {
+                            "title": "Kernel News",
+                            "url": "https://kernelnewbies.org/Linux_6_14",
+                            "snippet": "Highlights of 6.14 kernel changes.",
+                            "image": "https://kernelnewbies.org/logo.jpg",
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+
+    _enrich_sources(data, raw_response, raw_content=data["summary"])
+
+    assert len(data["results"]) == 1
+    assert data["results"][0]["url"] == "https://kernelnewbies.org/Linux_6_14"
+    assert len(data["citations"]) == 1
+    assert data["citations"][0]["url"] == "https://kernelnewbies.org/Linux_6_14"
+    assert len(data["images"]) == 1
+    assert data["images"][0]["url"] == "https://kernelnewbies.org/logo.jpg"
+
+
+def test_render_html_document_contains_images_and_sources():
+    from agent_runtime.web_tools.models import WebSearchRequest
+    from agent_runtime.web_tools.service import _render_html_document
+
+    req = WebSearchRequest(query="Linux logo")
+    data = {
+        "summary": "Here is the Tux Linux mascot.",
+        "results": [
+            {
+                "title": "Kernel Org",
+                "url": "https://kernel.org",
+                "snippet": "Home of Linux kernel.",
+                "source": "kernel.org",
+                "published_at": "2026",
+            }
+        ],
+        "images": [
+            {
+                "url": "https://kernel.org/tux.png",
+                "title": "Tux Penguin",
+                "source_url": "https://kernel.org",
+            }
+        ],
+        "key_points": ["Tux was created by Larry Ewing."],
+        "citations": [{"url": "https://kernel.org", "title": "Kernel Org"}],
+    }
+
+    html = _render_html_document("web_search", req, data)
+
+    assert html.startswith("<article>")
+    assert html.endswith("</article>")
+    assert "<h1>Web Search Result</h1>" in html
+    assert "<h2>Summary</h2>" in html
+    assert "<h2>Images</h2>" in html
+    assert '<img src="https://kernel.org/tux.png"' in html
+    assert 'alt="Tux Penguin"' in html
+    assert "<h2>Key Points</h2>" in html
+    assert "<footer>" in html
+    assert "<h2>Sources</h2>" in html
+
+
+def test_merge_batch_results_merges_images_and_deduplicates():
+    from agent_runtime.web_tools.models import WebSearchRequest, WebToolResult
+    from agent_runtime.web_tools.service import _merge_batch_results
+
+    batch_req = WebSearchRequest(query="query1", additional_queries=("query2",))
+    req1 = WebSearchRequest(query="query1")
+    req2 = WebSearchRequest(query="query2")
+
+    res1 = WebToolResult(
+        operation="web_search",
+        content="<article>content1</article>",
+        data={
+            "summary": "summary 1",
+            "results": [{"title": "R1", "url": "https://r1.test"}],
+            "images": [{"url": "https://img.test/1.png", "title": "Img1"}],
+            "key_points": ["Point 1"],
+            "citations": [{"url": "https://r1.test"}],
+        },
+        provider_id="prov",
+        binding_id="bind",
+        model_id="mod",
+        model_alias="alias",
+        api_format="openai_responses",
+        candidate_index=0,
+        attempt_count=1,
+        api_key_index=0,
+    )
+    res2 = WebToolResult(
+        operation="web_search",
+        content="<article>content2</article>",
+        data={
+            "summary": "summary 2",
+            "results": [{"title": "R2", "url": "https://r2.test"}],
+            "images": [
+                {"url": "https://img.test/1.png", "title": "Img1 Duplicate"},
+                {"url": "https://img.test/2.png", "title": "Img2"},
+            ],
+            "key_points": ["Point 2"],
+            "citations": [{"url": "https://r2.test"}],
+        },
+        provider_id="prov",
+        binding_id="bind",
+        model_id="mod",
+        model_alias="alias",
+        api_format="openai_responses",
+        candidate_index=0,
+        attempt_count=1,
+        api_key_index=0,
+    )
+
+    merged = _merge_batch_results("web_search", batch_req, (req1, req2), [res1, res2])
+    images = merged.data["images"]
+    assert len(images) == 2
+    assert images[0]["url"] == "https://img.test/1.png"
+    assert images[1]["url"] == "https://img.test/2.png"
+    assert "<h2>Images</h2>" in merged.content
+
 
