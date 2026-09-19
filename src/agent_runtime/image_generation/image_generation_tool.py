@@ -12,15 +12,22 @@ from agent_runtime.tool import tool
 from agent_runtime.tool.tool_execution_models import BaseToolResult, ToolRuntimeContext
 
 
-GENERATE_IMAGE_TOOL_DESCRIPTION = """Generate, edit, or extend one or more images using the configured gpt-image-2 image generation policy, then store generated images as file resources.
+GENERATE_IMAGE_TOOL_DESCRIPTION = """Generate, edit, or extend one or more images using the configured image generation policy, then store generated images as file resources.
+
+Operational modes:
+- mode: optional execution mode, 'generate' (text-to-image) or 'edit' (image-to-image / inpainting / style transfer / extension).
+  * 'generate': pure text-to-image creation. Generates an image entirely from prompt. Does not accept input images.
+  * 'edit': image-to-image modification or extension. Requires at least one source image in image_urls or image_paths. Supports optional mask for localized editing.
+  * If omitted, automatically resolves to 'edit' when source images (image_urls/image_paths) are provided, otherwise defaults to 'generate'.
 
 Agent-controlled parameters:
 - prompt: required image description, generated from the user's visual intent.
-- image_urls/image_paths: optional source images for reference-image generation, image editing, or image extension. Use image URLs or local image file paths that are visible to the runtime. When provided, the tool calls the image edit endpoint.
-- mask_url/mask_path: optional mask image URL/path for localized editing. A mask requires at least one source image.
-- input_fidelity: optional edit fidelity, high or low, only when source images are provided.
+- mode: optional operation mode, 'generate' or 'edit'.
+- image_urls/image_paths: source images for reference-image generation, image editing, or image extension. Required when mode='edit'. Use http(s) URLs, data:image/... URLs, or local image file paths visible to the runtime.
+- mask_url/mask_path: optional mask image URL/path for localized editing. Requires at least one input image.
+- input_fidelity: optional edit fidelity, high or low, only applicable in edit mode.
 - n: optional image count, integer 1-10, defaults to 1.
-- size: optional output size, defaults to 1024x1024. For gpt-image-2, use auto, one of the standard sizes 1024x1024 / 1536x1024 / 1024x1536, or a custom WIDTHxHEIGHT string. For custom sizes, width and height must both be divisible by 16, aspect ratio must be between 1:3 and 3:1, maximum edge is 3840, maximum pixels are 3840x2160, and resolutions above 2560x1440 are experimental.
+- size: optional output size, defaults to 1024x1024. Use auto, standard sizes 1024x1024 / 1536x1024 / 1024x1536, or a custom WIDTHxHEIGHT string (both divisible by 16, max edge 3840, max pixels 3840x2160).
 - background: optional background mode, one of auto / transparent / opaque. Use transparent only when the user asks for transparent background; transparent output requires png or webp.
 - output_format: optional image format, one of png / jpeg / webp, defaults to png.
 - output_compression: optional compression level, integer 0-100, only for jpeg/webp output; do not set it for png.
@@ -33,8 +40,12 @@ Runtime-fixed parameters:
 
 class GenerateImageRequest(BaseModel):
     prompt: str = Field(description="Image description generated from the user's visual intent.")
-    image_urls: list[str] = Field(default_factory=list, description="Optional input/reference/edit image URLs. Use http(s) URLs or data:image/... URLs.")
-    image_paths: list[str] = Field(default_factory=list, description="Optional input/reference/edit local image file paths visible to the runtime.")
+    mode: Literal["generate", "edit"] | None = Field(
+        default=None,
+        description="Optional operation mode: 'generate' (text-to-image) or 'edit' (image-to-image / inpainting / style transfer / extension). If omitted, defaults to 'edit' when image_urls/image_paths are provided, otherwise 'generate'.",
+    )
+    image_urls: list[str] = Field(default_factory=list, description="Optional input/reference/edit image URLs. Required for mode='edit'. Use http(s) URLs or data:image/... URLs.")
+    image_paths: list[str] = Field(default_factory=list, description="Optional input/reference/edit local image file paths visible to the runtime. Required for mode='edit' if no image_urls.")
     mask_url: str | None = Field(default=None, description="Optional mask image URL for localized editing. Requires at least one input image.")
     mask_path: str | None = Field(default=None, description="Optional mask local image file path for localized editing. Requires at least one input image.")
     input_fidelity: Literal["high", "low"] | None = Field(default=None, description="Optional fidelity to input images for editing.")
@@ -56,6 +67,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
     result = await service.generate_image(
         ImageGenerationRequest(
             prompt=request.prompt,
+            mode=request.mode,
             size=request.size,
             background=request.background,
             output_format=request.output_format,
@@ -82,6 +94,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
     output = {
         "ui_kind": "image_generation",
         "prompt": request.prompt,
+        "mode": result.mode,
         "resources": resources,
         "provider_id": result.provider_id,
         "binding_id": result.binding_id,
@@ -106,6 +119,7 @@ async def generate_image(request: GenerateImageRequest, ctx: ToolRuntimeContext)
         metadata={
             "ui_kind": "image_generation",
             "preview_output": output,
+            "mode": result.mode,
             "request_id": ctx.request_id,
             "task_id": ctx.task_id,
             "agent_instance_id": ctx.agent_instance_id,

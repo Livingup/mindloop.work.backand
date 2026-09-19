@@ -87,3 +87,23 @@ class ImageGenerationToolResultTests(unittest.TestCase):
                 {"kind": "image", "resource_id": "resource-image-1"},
             ],
         )
+
+    def test_generate_image_tool_passes_mode_to_request_and_preserves_in_metadata(self) -> None:
+        async def run_case():
+            service = _ImageGenerationService(_result())
+            with patch("agent_runtime.image_generation.image_generation_tool.get_image_generation_service", lambda: service):
+                res = await generate_image(
+                    GenerateImageRequest(
+                        prompt="Edit this image",
+                        mode="edit",
+                        image_urls=["https://example.test/img.png"],
+                    ),
+                    ToolRuntimeContext(request_id="req-1", task_id="task-1", agent_instance_id="agent-1"),
+                )
+                return res, service
+
+        result, service = asyncio.run(run_case())
+        self.assertTrue(result.success)
+        self.assertEqual(service.requests[0].mode, "edit")
+        self.assertEqual(result.metadata["mode"], "generate")
+        self.assertEqual(result.metadata["preview_output"]["mode"], "generate")

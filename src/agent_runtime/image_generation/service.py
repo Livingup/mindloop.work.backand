@@ -12,7 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_runtime.file_resource.north_gateway.resource_create_contracts import Base64CreateRequest
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import (
+    Base64CreateRequest,
+    RemoteUrlCreateRequest,
+)
 from agent_runtime.file_resource.service import FileResourceService
 from agent_runtime.image_generation.models import (
     GeneratedImageResource,
@@ -29,6 +32,11 @@ from agent_runtime.llm_api_protocol import (
 from agent_runtime.llm_client.llm_request_service import LlmRequestService
 from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
 from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
+
+
+MODE_GENERATE = "generate"
+MODE_EDIT = "edit"
+_SUPPORTED_MODES = {MODE_GENERATE, MODE_EDIT}
 
 
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?\}$")
@@ -98,12 +106,13 @@ class ImageGenerationService:
     async def generate_image(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         if not request.prompt.strip():
             raise ValueError("prompt must not be empty.")
+        mode = _resolve_mode(request)
         settings = self._settings_repository.get_settings()
         if not settings.llm_policy_group_id:
             raise ImageGenerationConfigurationError("Image generation LLM policy is not configured.")
         policy = self._llm_registry_gateway.resolve_execution_policy(settings.llm_policy_group_id)
-        request_body = self._build_request_body(request)
-        use_edit_endpoint = "images" in request_body
+        request_body = self._build_request_body(request, mode=mode)
+        use_edit_endpoint = (mode == MODE_EDIT)
         last_error: Exception | None = None
         attempt_count = 0
         for candidate_index, candidate in enumerate(policy.candidates):
@@ -129,6 +138,7 @@ class ImageGenerationService:
                                 api_key=api_key,
                                 request=request,
                                 request_body=request_body,
+                                mode=mode,
                             )
                         elif use_edit_endpoint:
                             response = await self._images_client.edit(
@@ -151,7 +161,7 @@ class ImageGenerationService:
                         if not images:
                             raise RuntimeError("OpenAI Images API returned no image data.")
                         logger.info(
-                            "Image generation attempt succeeded: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s attempt_count=%s elapsed_ms=%s",
+                            "Image generation attempt succeeded: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s attempt_count=%s elapsed_ms=%s mode=%s",
                             settings.llm_policy_group_id,
                             candidate_index,
                             resolved.provider_id,
@@ -160,6 +170,7 @@ class ImageGenerationService:
                             retry_index,
                             attempt_count,
                             int((time.perf_counter() - attempt_started_at) * 1000),
+                            mode,
                         )
                         return ImageGenerationResult(
                             images=tuple(images),
@@ -172,6 +183,7 @@ class ImageGenerationService:
                             api_key_index=api_key_index,
                             attempt_count=attempt_count,
                             request_params=_sanitize_request_params(request_body),
+                            mode=mode,
                         )
                     except Exception as exc:
                         last_error = exc
@@ -204,6 +216,8 @@ class ImageGenerationService:
     def _build_request_body(
         self,
         request: ImageGenerationRequest,
+        *,
+        mode: str,
     ) -> dict[str, Any]:
         output_format = request.output_format or _DEFAULT_OUTPUT_FORMAT
         if request.background == "transparent" and output_format not in {"png", "webp"}:
@@ -216,21 +230,21 @@ class ImageGenerationService:
             "size": _normalize_size(request.size),
             "quality": _DEFAULT_QUALITY,
             "output_format": output_format,
+            "response_format": "b64_json",
         }
-        images = _image_references_from_request(request.image_urls, request.image_paths)
-        if images:
-            body["images"] = images
-        mask = _mask_reference_from_request(request.mask_url, request.mask_path)
-        if mask is not None:
+        if mode == MODE_EDIT:
+            images = _image_references_from_request(request.image_urls, request.image_paths)
             if not images:
-                raise ValueError("mask_url or mask_path requires at least one input image.")
-            body["mask"] = mask
-        if request.input_fidelity is not None and not images:
-            raise ValueError("input_fidelity requires at least one input image.")
+                raise ValueError("mode='edit' requires at least one source image in image_urls or image_paths.")
+            body["images"] = images
+            mask = _mask_reference_from_request(request.mask_url, request.mask_path)
+            if mask is not None:
+                body["mask"] = mask
+            if request.input_fidelity is not None:
+                body["input_fidelity"] = request.input_fidelity
         for key, value in {
             "background": request.background,
             "output_compression": request.output_compression,
-            "input_fidelity": request.input_fidelity,
         }.items():
             if value is not None:
                 body[key] = value
@@ -241,30 +255,60 @@ class ImageGenerationService:
         if not isinstance(data, list):
             raise RuntimeError("OpenAI Images API response data must be a list.")
         mime_type = _mime_type_for_output_format(output_format)
-        create_requests: list[Base64CreateRequest] = []
-        revised_prompts: list[str | None] = []
-        for item in data:
+        b64_entries: list[tuple[int, Base64CreateRequest, str | None]] = []
+        url_entries: list[tuple[int, RemoteUrlCreateRequest, str | None]] = []
+        for index, item in enumerate(data):
             if not isinstance(item, dict):
                 continue
-            b64_json = item.get("b64_json")
-            if not isinstance(b64_json, str) or not b64_json.strip():
-                continue
-            create_requests.append(Base64CreateRequest(resource_base64_content=b64_json, resource_mime_type=mime_type))
             revised_prompt = item.get("revised_prompt")
-            revised_prompts.append(str(revised_prompt) if revised_prompt is not None else None)
-        if not create_requests:
+            revised_prompt_str = str(revised_prompt) if revised_prompt is not None else None
+            b64_json = item.get("b64_json")
+            if isinstance(b64_json, str) and b64_json.strip():
+                b64_entries.append(
+                    (index, Base64CreateRequest(resource_base64_content=b64_json, resource_mime_type=mime_type), revised_prompt_str)
+                )
+                continue
+            url = item.get("url")
+            if isinstance(url, str) and url.strip():
+                url_entries.append(
+                    (index, RemoteUrlCreateRequest(resource_url=url, resource_mime_type=mime_type), revised_prompt_str)
+                )
+                continue
+        if not b64_entries and not url_entries:
             return []
-        created = self._file_resource_service.create_resources_from_base64_contents(create_requests)
-        return [
-            GeneratedImageResource(
-                resource_id=item.resource_id,
-                object_storage_url=item.object_storage_url,
-                local_storage_path=item.local_storage_path,
-                mime_type=mime_type,
-                revised_prompt=revised_prompts[index] if index < len(revised_prompts) else None,
+        indexed_results: list[tuple[int, GeneratedImageResource]] = []
+        if b64_entries:
+            created_b64 = self._file_resource_service.create_resources_from_base64_contents(
+                [req for _, req, _ in b64_entries]
             )
-            for index, item in enumerate(created)
-        ]
+            for (orig_idx, _, prompt_val), res in zip(b64_entries, created_b64):
+                indexed_results.append((
+                    orig_idx,
+                    GeneratedImageResource(
+                        resource_id=res.resource_id,
+                        object_storage_url=res.object_storage_url,
+                        local_storage_path=res.local_storage_path,
+                        mime_type=mime_type,
+                        revised_prompt=prompt_val,
+                    ),
+                ))
+        if url_entries:
+            created_urls = self._file_resource_service.create_resources_from_remote_urls(
+                [req for _, req, _ in url_entries]
+            )
+            for (orig_idx, _, prompt_val), res in zip(url_entries, created_urls):
+                indexed_results.append((
+                    orig_idx,
+                    GeneratedImageResource(
+                        resource_id=res.resource_id,
+                        object_storage_url=res.object_storage_url,
+                        local_storage_path=res.local_storage_path,
+                        mime_type=mime_type,
+                        revised_prompt=prompt_val,
+                    ),
+                ))
+        indexed_results.sort(key=lambda x: x[0])
+        return [res for _, res in indexed_results]
 
     def _require_usable_policy(self, policy_group_id: str) -> None:
         policy = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
@@ -293,12 +337,13 @@ class ImageGenerationService:
         api_key: str | None,
         request: ImageGenerationRequest,
         request_body: dict[str, Any],
+        mode: str,
     ) -> dict[str, Any]:
         conversation_id = (
             _normalize_relay_session_id(request.relay_session_id)
             or _fallback_gpt_image_agent_relay_session_id(resolved_model)
         )
-        input_items = _build_gpt_image_agent_initial_input(request, request_body)
+        input_items = _build_gpt_image_agent_initial_input(request, request_body, mode=mode)
         request_params = _merge_gpt_image_agent_request_params(resolved_model)
         for fixed_field in ("model", "input", "instructions", "tools"):
             request_params.pop(fixed_field, None)
@@ -475,25 +520,56 @@ def _merge_json_field(target: dict[str, Any], value: str | None, field_name: str
     target.update(parsed)
 
 
-def _build_gpt_image_agent_initial_input(request: ImageGenerationRequest, request_body: dict[str, Any]) -> list[dict[str, Any]]:
+def _resolve_mode(request: ImageGenerationRequest) -> str:
+    has_images = bool(request.image_urls or request.image_paths)
+    if request.mode is not None:
+        normalized = request.mode.strip().lower()
+        if normalized not in _SUPPORTED_MODES:
+            raise ValueError(f"mode must be one of: {', '.join(sorted(_SUPPORTED_MODES))}, got {request.mode!r}")
+        if normalized == MODE_EDIT and not has_images:
+            raise ValueError("mode='edit' requires at least one source image in image_urls or image_paths.")
+        if normalized == MODE_GENERATE and has_images:
+            raise ValueError("mode='generate' does not accept input images. Use mode='edit' for image-to-image or editing.")
+        return normalized
+    return MODE_EDIT if has_images else MODE_GENERATE
+
+
+def _build_gpt_image_agent_initial_input(
+    request: ImageGenerationRequest,
+    request_body: dict[str, Any],
+    *,
+    mode: str,
+) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": _build_gpt_image_agent_prompt(request, request_body),
+            "text": _build_gpt_image_agent_prompt(request, request_body, mode=mode),
         }
     ]
-    for image in request_body.get("images") or []:
-        if isinstance(image, dict) and isinstance(image.get("image_url"), str):
-            content.append({"type": "input_image", "image_url": image["image_url"]})
-    mask = request_body.get("mask")
-    if isinstance(mask, dict) and isinstance(mask.get("image_url"), str):
-        content.append({"type": "input_image", "image_url": mask["image_url"]})
+    if mode == MODE_EDIT:
+        for image in request_body.get("images") or []:
+            if isinstance(image, dict) and isinstance(image.get("image_url"), str):
+                content.append({"type": "input_image", "image_url": image["image_url"]})
+        mask = request_body.get("mask")
+        if isinstance(mask, dict) and isinstance(mask.get("image_url"), str):
+            content.append({"type": "input_image", "image_url": mask["image_url"]})
     return [{"type": "message", "role": "user", "content": content}]
 
 
-def _build_gpt_image_agent_prompt(request: ImageGenerationRequest, request_body: dict[str, Any]) -> str:
+def _build_gpt_image_agent_prompt(
+    request: ImageGenerationRequest,
+    request_body: dict[str, Any],
+    *,
+    mode: str,
+) -> str:
+    mode_desc = (
+        "全新图片生成（文生图）"
+        if mode == MODE_GENERATE
+        else "基于参考图的编辑/风格重绘/局部重绘（图生图）"
+    )
     lines = [
         "请根据以下 generate_image 工具参数直接生成图片，不要询问用户。",
+        f"任务模式: {mode_desc}",
         f"用户生图需求: {request.prompt}",
         f"输出数量: {request_body.get('n')}",
         f"输出尺寸: {request_body.get('size')}",
@@ -503,12 +579,13 @@ def _build_gpt_image_agent_prompt(request: ImageGenerationRequest, request_body:
     ]
     if request_body.get("output_compression") is not None:
         lines.append(f"输出压缩: {request_body.get('output_compression')}")
-    if request_body.get("input_fidelity") is not None:
-        lines.append(f"输入参考/编辑保真度: {request_body.get('input_fidelity')}")
-    if request_body.get("images"):
-        lines.append("已附加输入/参考/编辑图片，请结合这些图片完成生成或编辑。")
-    if request_body.get("mask"):
-        lines.append("已附加局部编辑 mask 图片，请按 mask 限定区域完成编辑。")
+    if mode == MODE_EDIT:
+        if request_body.get("input_fidelity") is not None:
+            lines.append(f"输入参考/编辑保真度: {request_body.get('input_fidelity')}")
+        if request_body.get("images"):
+            lines.append("已附加输入/参考/编辑图片，请务必结合这些图片完成风格转换或重绘。")
+        if request_body.get("mask"):
+            lines.append("已附加局部编辑 mask 图片，请按 mask 限定区域完成编辑。")
     return "\n".join(lines)
 
 

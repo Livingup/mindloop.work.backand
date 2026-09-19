@@ -7,6 +7,7 @@ from typing import Any
 @dataclass(frozen=True, slots=True)
 class ImageGenerationRequest:
     prompt: str
+    mode: str | None = None
     size: str | None = None
     background: str | None = None
     output_format: str | None = None
@@ -41,3 +42,4 @@ class ImageGenerationResult:
     api_key_index: int | None
     attempt_count: int
     request_params: dict[str, Any]
+    mode: str = "generate"
