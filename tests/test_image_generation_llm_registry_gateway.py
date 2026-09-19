@@ -12,6 +12,9 @@ from agent_runtime.llm_api_protocol import (
     API_FORMAT_OPENAI_IMAGES_GENERATIONS,
     API_FORMAT_OPENAI_RESPONSES,
 )
+from agent_runtime.llm_model_registry.builtin_models import (
+    builtin_image_generation_model_metadata,
+)
 from agent_runtime.llm_model_registry.llm_model_metadata import (
     LLM_MODEL_SOURCE_BUILTIN,
     LLM_MODEL_SOURCE_CUSTOM,
@@ -256,3 +259,16 @@ class ImageGenerationLlmRegistryGatewayTests(unittest.TestCase):
         resolved = gateway.resolve_provider_model("openai", "b-gpt6")
         self.assertEqual(resolved.model_id, "gpt-6")
         self.assertEqual(resolved.api_format, API_FORMAT_OPENAI_RESPONSES)
+
+    def test_builtin_image_generation_models_contain_flare_and_sunburst(self) -> None:
+        builtins = builtin_image_generation_model_metadata()
+        model_ids = {item.model_id for item in builtins}
+        self.assertIn("gpt-image-2", model_ids)
+        self.assertIn("gpt-image-2.5-flare", model_ids)
+        self.assertIn("gpt-image-2.5-sunburst", model_ids)
+        for item in builtins:
+            self.assertEqual(item.source, LLM_MODEL_SOURCE_BUILTIN)
+            self.assertEqual(item.group, "image_generation")
+            self.assertIn("image", item.supported_input_modalities)
+            self.assertIn("text", item.supported_input_modalities)
+
