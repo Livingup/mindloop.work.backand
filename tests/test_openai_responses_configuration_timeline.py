@@ -2099,6 +2099,10 @@ def test_merge_batch_results_merges_images_and_deduplicates():
     assert len(images) == 2
     assert images[0]["url"] == "https://img.test/1.png"
     assert images[1]["url"] == "https://img.test/2.png"
-    assert "<h2>Images</h2>" in merged.content
+    assert "<h2>1. query1</h2>" in merged.content
+    assert "<h2>2. query2</h2>" in merged.content
+    assert '<img src="https://img.test/1.png"' in merged.content
+    assert '<img src="https://img.test/2.png"' in merged.content
+
 
 

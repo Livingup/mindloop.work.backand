@@ -690,6 +690,18 @@ def _request_target(operation: WebToolOperation, request: WebSearchRequest | Rea
     return ""
 
 
+def _normalize_image_url(url: str) -> str:
+    url = url.strip()
+    if "commons.wikimedia.org/wiki/File:" in url:
+        file_name = url.split("commons.wikimedia.org/wiki/File:")[-1].split("?")[0].split("#")[0]
+        return f"https://commons.wikimedia.org/wiki/Special:FilePath/{file_name}"
+    if "/wiki/File:" in url and "wikipedia.org" in url:
+        domain_part = url.split("/wiki/File:")[0]
+        file_name = url.split("/wiki/File:")[-1].split("?")[0].split("#")[0]
+        return f"{domain_part}/wiki/Special:FilePath/{file_name}"
+    return url
+
+
 def _render_html_document(
     operation: WebToolOperation,
     request: WebSearchRequest | ReadUrlContextRequest,
@@ -697,15 +709,77 @@ def _render_html_document(
 ) -> str:
     title = "Web Search Result" if operation == "web_search" else "URL Context Result"
     target_label = "Query" if operation == "web_search" else "URL"
+    results = data.get("results") if isinstance(data.get("results"), list) else []
+    citations = data.get("citations") if isinstance(data.get("citations"), list) else []
+    reference_sources = _collect_reference_sources(results, citations)
+    reference_markers = _render_reference_markers(reference_sources)
+
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+
+    if items:
+        batch = data.get("batch") if isinstance(data.get("batch"), dict) else {}
+        success_count = batch.get("success_count", sum(1 for it in items if isinstance(it, dict) and it.get("success") is True))
+        total_count = batch.get("requested_count", len(items))
+        unit = "queries" if operation == "web_search" else "URLs"
+
+        sections = [
+            "<article>",
+            "<header>",
+            f"<h1>{html.escape(title)}</h1>",
+            f'<div style="font-size:12px;color:#64748b;margin-top:4px;">Completed {success_count}/{total_count} {unit}</div>',
+            "</header>",
+        ]
+
+        rendered_image_urls: set[str] = set()
+        for idx, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            item_target = str(item.get("target") or f"Item {idx}")
+            item_success = item.get("success") is True
+            item_sections = [
+                "<section>",
+                f"<h2>{idx}. {html.escape(item_target)}</h2>",
+            ]
+            if item_success:
+                item_summary = str(item.get("summary") or "").strip()
+                if item_summary:
+                    item_sections.append(f'<p style="white-space: pre-wrap;">{html.escape(item_summary)}</p>')
+                item_key_points = item.get("key_points") if isinstance(item.get("key_points"), list) else []
+                if item_key_points:
+                    item_sections.append(_render_text_list(item_key_points))
+                item_images = item.get("images") if isinstance(item.get("images"), list) else []
+                if item_images:
+                    for img in item_images:
+                        if isinstance(img, dict) and img.get("url"):
+                            rendered_image_urls.add(str(img["url"]).strip())
+                    rendered_imgs = _render_images(item_images)
+                    if rendered_imgs:
+                        item_sections.append(rendered_imgs)
+            else:
+                error_msg = str(item.get("error_message") or "Failed.")
+                item_sections.append(f'<p style="color:#ef4444;">Failed: {html.escape(error_msg)}</p>')
+            item_sections.append("</section>")
+            sections.extend(item_sections)
+
+        remaining_images = [
+            img for img in (data.get("images") or [])
+            if isinstance(img, dict) and str(img.get("url") or "").strip() not in rendered_image_urls
+        ]
+        if remaining_images:
+            rem_rendered = _render_images(remaining_images)
+            if rem_rendered:
+                sections.extend(["<section>", "<h2>Additional Images</h2>", rem_rendered, "</section>"])
+
+        if reference_sources:
+            sections.extend(["<footer>", "<h2>Sources</h2>", _render_sources(reference_sources), "</footer>"])
+        sections.append("</article>")
+        return "\n".join(sections)
+
+    # Single-target mode (default)
     targets = _document_targets(operation, request, data)
     summary = str(data.get("summary") or "").strip()
     key_points = data.get("key_points") if isinstance(data.get("key_points"), list) else []
-    results = data.get("results") if isinstance(data.get("results"), list) else []
     images = data.get("images") if isinstance(data.get("images"), list) else []
-    citations = data.get("citations") if isinstance(data.get("citations"), list) else []
-    items = data.get("items") if isinstance(data.get("items"), list) else []
-    reference_sources = _collect_reference_sources(results, citations)
-    reference_markers = _render_reference_markers(reference_sources)
 
     sections = [
         "<article>",
@@ -748,8 +822,6 @@ def _render_html_document(
                 "</section>",
             ]
         )
-    if items:
-        sections.extend(["<section>", "<h2>Batch Items</h2>", _render_batch_items(items), "</section>"])
     if reference_sources:
         sections.extend(["<footer>", "<h2>Sources</h2>", _render_sources(reference_sources), "</footer>"])
     sections.append("</article>")
@@ -761,9 +833,10 @@ def _render_images(images: list[Any]) -> str:
     for item in images:
         if not isinstance(item, dict):
             continue
-        url = _clean_string(item.get("url"))
-        if not url or not url.startswith(("http://", "https://")):
+        raw_url = _clean_string(item.get("url"))
+        if not raw_url or not raw_url.startswith(("http://", "https://")):
             continue
+        url = _normalize_image_url(raw_url)
         title = _clean_string(item.get("title")) or "Image"
         source_url = _clean_string(item.get("source_url"))
         caption_link = (
@@ -774,14 +847,14 @@ def _render_images(images: list[Any]) -> str:
         rendered.append(
             f'<figure style="margin:8px 0;display:inline-block;max-width:100%;">'
             f'<a href="{html.escape(url, quote=True)}" target="_blank" rel="noreferrer">'
-            f'<img src="{html.escape(url, quote=True)}" alt="{html.escape(title, quote=True)}" style="max-width:100%;max-height:300px;border-radius:8px;object-fit:cover;" loading="lazy" />'
+            f'<img src="{html.escape(url, quote=True)}" alt="{html.escape(title, quote=True)}" referrerpolicy="no-referrer" style="max-width:100%;max-height:300px;border-radius:8px;object-fit:cover;" loading="lazy" />'
             f'</a>'
             f'<figcaption style="font-size:12px;color:#64748b;margin-top:4px;">{caption_link}</figcaption>'
             f'</figure>'
         )
     if not rendered:
         return ""
-    return '<div style="display:flex;flex-wrap:wrap;gap:12px;">' + "".join(rendered) + "</div>"
+    return '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">' + "".join(rendered) + "</div>"
 
 
 def _document_targets(operation: WebToolOperation, request: WebSearchRequest | ReadUrlContextRequest, data: dict[str, Any]) -> tuple[str, ...]:

@@ -12,8 +12,10 @@ from agent_runtime.web_tools.service import (
     _extract_markdown_images,
     _extract_raw_sources_and_images,
     _is_image_url,
+    _normalize_image_url,
     _parse_result_data,
     _render_html_document,
+    _render_images,
 )
 
 
@@ -169,4 +171,89 @@ def test_enrich_sources_and_render_html():
     assert "<h2>Summary</h2>" in html_content
     assert "<h2>Images</h2>" in html_content
     assert '<img src="https://upload.wikimedia.org/photo.jpg"' in html_content
+    assert 'referrerpolicy="no-referrer"' in html_content
     assert "<h2>Sources</h2>" in html_content
+
+
+def test_normalize_image_url():
+    wiki_commons = "https://commons.wikimedia.org/wiki/File:Donald_Trump_official_portrait.jpg"
+    assert _normalize_image_url(wiki_commons) == "https://commons.wikimedia.org/wiki/Special:FilePath/Donald_Trump_official_portrait.jpg"
+
+    wikipedia = "https://en.wikipedia.org/wiki/File:Example_Photo.png?lang=en"
+    assert _normalize_image_url(wikipedia) == "https://en.wikipedia.org/wiki/Special:FilePath/Example_Photo.png"
+
+    normal_img = "https://example.com/photo.jpg"
+    assert _normalize_image_url(normal_img) == "https://example.com/photo.jpg"
+
+
+def test_render_images_includes_no_referrer():
+    images = [
+        {
+            "url": "https://commons.wikimedia.org/wiki/File:Test_Portrait.jpg",
+            "title": "Test Portrait",
+            "source_url": "https://commons.wikimedia.org/wiki/File:Test_Portrait.jpg",
+        }
+    ]
+    html_output = _render_images(images)
+    assert 'src="https://commons.wikimedia.org/wiki/Special:FilePath/Test_Portrait.jpg"' in html_output
+    assert 'referrerpolicy="no-referrer"' in html_output
+    assert 'alt="Test Portrait"' in html_output
+
+
+def test_render_html_document_batch_groups_query_and_results():
+    batch_data = {
+        "items": [
+            {
+                "target": "Donald Trump official biography",
+                "success": True,
+                "summary": "Donald Trump was born in New York...",
+                "images": [],
+                "key_points": ["45th and 47th President"],
+            },
+            {
+                "target": "Donald Trump official portrait",
+                "success": True,
+                "summary": "Official portrait from the White House.",
+                "images": [
+                    {
+                        "url": "https://commons.wikimedia.org/wiki/File:Official_portrait.jpg",
+                        "title": "White House Portrait",
+                    }
+                ],
+                "key_points": [],
+            },
+        ],
+        "batch": {
+            "requested_count": 2,
+            "success_count": 2,
+        },
+        "results": [
+            {"title": "White House Bio", "url": "https://whitehouse.gov/bio"},
+        ],
+        "citations": [
+            {"title": "White House Bio", "url": "https://whitehouse.gov/bio"},
+        ],
+    }
+    req = WebSearchRequest(query="Donald Trump official biography", additional_queries=("Donald Trump official portrait",))
+    html_content = _render_html_document("web_search", req, batch_data)
+
+    # 1. Header has summary count, not detached query list
+    assert "Completed 2/2 queries" in html_content
+    assert "<dt>Query</dt>" not in html_content
+
+    # 2. Item 1 has its query as header and its summary text right below
+    assert "<h2>1. Donald Trump official biography</h2>" in html_content
+    assert "<p style=\"white-space: pre-wrap;\">Donald Trump was born in New York...</p>" in html_content
+    assert "45th and 47th President" in html_content
+
+    # 3. Item 2 has its query as header, its summary text, and its portrait image right below
+    assert "<h2>2. Donald Trump official portrait</h2>" in html_content
+    assert "Official portrait from the White House." in html_content
+    assert '<img src="https://commons.wikimedia.org/wiki/Special:FilePath/Official_portrait.jpg"' in html_content
+    assert 'referrerpolicy="no-referrer"' in html_content
+
+    # 4. Global sources in footer
+    assert "<footer>" in html_content
+    assert "<h2>Sources</h2>" in html_content
+    assert "https://whitehouse.gov/bio" in html_content
+
