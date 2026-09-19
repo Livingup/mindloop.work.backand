@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from agent_runtime.conversation_message.message.models import TextPart, TextPartMeta
+from agent_runtime.conversation_message.message.models import TextPart, TextPartMeta, ThinkingPart
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
 from agent_runtime.llm_client.llm_request_models import LlmPromptRequest
@@ -267,12 +267,20 @@ def _build_user_prompt(
 
 
 def _assistant_text(parts: list[Any]) -> str:
-    texts: list[str] = []
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
     for part in parts:
         text = getattr(part, "text", None)
         if isinstance(text, str) and text:
-            texts.append(text)
-    return "\n".join(texts).strip()
+            if isinstance(part, TextPart):
+                text_parts.append(text)
+            elif isinstance(part, ThinkingPart):
+                thinking_parts.append(text)
+            else:
+                text_parts.append(text)
+    if text_parts:
+        return "\n".join(text_parts).strip()
+    return "\n".join(thinking_parts).strip()
 
 
 def _parse_result_data(content: str) -> dict[str, Any]:
@@ -312,6 +320,28 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
+IMAGE_EXTENSIONS: tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp")
+
+
+def _is_image_url(url: str) -> bool:
+    if not url:
+        return False
+    clean = url.split("?")[0].split("#")[0].strip().lower()
+    if any(clean.endswith(ext) for ext in IMAGE_EXTENSIONS):
+        return True
+    if "upload.wikimedia.org" in clean and any(ext in clean for ext in IMAGE_EXTENSIONS):
+        return True
+    return False
+
+
+def _clean_trailing_url_punct(url: str) -> str:
+    while url and url[-1] in ".,;:!?'\"":
+        url = url[:-1]
+    if url.endswith(")") and url.count("(") < url.count(")"):
+        url = url[:-1]
+    return url
+
+
 def _enrich_sources(data: dict[str, Any], raw_response: Any, *, raw_content: str = "") -> None:
     raw_sources, raw_images = _extract_raw_sources_and_images(raw_response)
 
@@ -339,6 +369,14 @@ def _enrich_sources(data: dict[str, Any], raw_response: Any, *, raw_content: str
         if url not in existing_citations:
             citations.append({"url": url, "title": None})
             existing_citations.add(url)
+
+    if raw_content:
+        for match in re.finditer(r"(?<!\!)\[([^\]]+)\]\((https?://[^\s\)]+)\)", raw_content):
+            caption, link_url = match.groups()
+            link_url = _clean_trailing_url_punct(link_url.strip())
+            if link_url and link_url not in existing_citations:
+                citations.append({"url": link_url, "title": caption.strip() or None})
+                existing_citations.add(link_url)
 
     images = data.get("images")
     if not isinstance(images, list):
@@ -377,6 +415,8 @@ def _extract_raw_sources_and_images(raw_response: Any) -> tuple[list[dict[str, A
         })
         if img:
             add_image(img, title=t, source_url=u)
+        elif _is_image_url(u):
+            add_image(u, title=t, source_url=u)
 
     def add_image(img_val: Any, title: Any = None, source_url: Any = None) -> None:
         if isinstance(img_val, list):
@@ -389,33 +429,46 @@ def _extract_raw_sources_and_images(raw_response: Any) -> tuple[list[dict[str, A
             s = str(img_val.get("source_url") or source_url or "").strip()
             add_image(u, title=t, source_url=s)
             return
-        u = str(img_val or "").strip()
+        u = _clean_trailing_url_punct(str(img_val or "").strip())
         if not u or not u.startswith(("http://", "https://")) or u in seen_images:
             return
         seen_images.add(u)
         images.append({
             "url": u,
-            "title": str(title or "").strip(),
+            "title": str(title or "").strip() or "Image",
             "source_url": str(source_url or "").strip(),
         })
 
     def scan(node: Any, parent_url: str | None = None) -> None:
         if isinstance(node, dict):
             node_type = str(node.get("type") or "")
-            if node_type in ("web_search_call", "web_search"):
+            if node_type == "url_citation":
+                c_url = node.get("url")
+                c_title = node.get("title")
+                if c_url:
+                    add_source(title=c_title, url=c_url)
+                    if _is_image_url(c_url) or (c_title and any(ext in str(c_title).lower() for ext in IMAGE_EXTENSIONS)):
+                        add_image(c_url, title=c_title, source_url=c_url)
+            elif node_type in ("web_search_call", "web_search"):
                 action = node.get("action")
-                if isinstance(action, dict) and isinstance(action.get("sources"), list):
-                    for s in action["sources"]:
-                        if isinstance(s, dict):
-                            s_url = s.get("url") or s.get("link")
-                            add_source(
-                                title=s.get("title"),
-                                url=s_url,
-                                snippet=s.get("snippet") or s.get("text") or s.get("content"),
-                                source=s.get("source") or s.get("site"),
-                                published_at=s.get("published_at") or s.get("date"),
-                                img=s.get("image") or s.get("images"),
-                            )
+                if isinstance(action, dict):
+                    if action.get("type") == "open_page" and action.get("url"):
+                        p_url = action.get("url")
+                        add_source(title=p_url, url=p_url)
+                        if _is_image_url(p_url):
+                            add_image(p_url, title=p_url, source_url=p_url)
+                    if isinstance(action.get("sources"), list):
+                        for s in action["sources"]:
+                            if isinstance(s, dict):
+                                s_url = s.get("url") or s.get("link")
+                                add_source(
+                                    title=s.get("title"),
+                                    url=s_url,
+                                    snippet=s.get("snippet") or s.get("text") or s.get("content"),
+                                    source=s.get("source") or s.get("site"),
+                                    published_at=s.get("published_at") or s.get("date"),
+                                    img=s.get("image") or s.get("images"),
+                                )
             if "sources" in node and isinstance(node["sources"], list):
                 for s in node["sources"]:
                     if isinstance(s, dict) and (s.get("url") or s.get("link")):
@@ -443,9 +496,29 @@ def _extract_raw_sources_and_images(raw_response: Any) -> tuple[list[dict[str, A
 
 def _extract_markdown_images(text: str) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(url: str, title: str = "", source_url: str = "") -> None:
+        url = _clean_trailing_url_punct(url.strip())
+        if not url or not url.startswith(("http://", "https://")) or url in seen:
+            return
+        seen.add(url)
+        images.append({"url": url, "title": title.strip() or "Image", "source_url": source_url.strip()})
+
     for match in re.finditer(r"!\[([^\]]*)\]\((https?://[^\s\)]+)\)", text):
         caption, url = match.groups()
-        images.append({"url": url.strip(), "title": caption.strip(), "source_url": ""})
+        add(url, title=caption)
+
+    for match in re.finditer(r"(?<!\!)\[([^\]]+)\]\((https?://[^\s\)]+)\)", text):
+        caption, url = match.groups()
+        if _is_image_url(url):
+            add(url, title=caption)
+
+    for match in re.finditer(r"(https?://[^\s\"'<>]+)", text):
+        raw_url = match.group(1)
+        if _is_image_url(raw_url):
+            add(raw_url)
+
     return images
 
 
@@ -651,7 +724,7 @@ def _render_html_document(
             [
                 "<section>",
                 "<h2>Summary</h2>",
-                f"<p>{html.escape(summary)}{reference_markers}</p>",
+                f'<p style="white-space: pre-wrap;">{html.escape(summary)}{reference_markers}</p>',
                 "</section>",
             ]
         )

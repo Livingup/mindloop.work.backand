@@ -129,6 +129,7 @@ Desktop.ini
 !/tests/test_note_state_message_isolation.py
 !/tests/test_prompt_snippet_line_edits.py
 !/tests/test_stable_prefix_prompt.py
+!/tests/test_web_tools.py
 
 /web-frontend/
 

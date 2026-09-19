@@ -205,28 +205,30 @@ def build_web_tool_system_prompt(operation: WebToolOperation) -> str:
         "Use only information obtained from the provider's native web search or URL context capability when available. "
         "Return accurate search findings, citing real URLs and relevant images when available. "
         "When returning JSON, output exactly one JSON object with this shape: "
-        f"{json.dumps(schema, ensure_ascii=False)}"
+        f"{json.dumps(schema, ensure_ascii=False)}\n"
+        "When images are found or requested, provide direct image links (ending in .png, .jpg, .jpeg, .webp, or official media source links)."
     )
 
 
 def build_web_search_user_prompt(request: WebSearchRequest) -> str:
-    payload = {
-        "query": request.query,
-        "max_results": _bounded_count(request.max_results),
-        "allowed_domains": list(request.allowed_domains),
-        "blocked_domains": list(request.blocked_domains),
-        "recency": request.recency,
-    }
-    return "Search the web for this request and return the required JSON object: " + json.dumps(payload, ensure_ascii=False)
+    query = request.query.strip()
+    constraints: list[str] = []
+    if request.allowed_domains:
+        constraints.append(f"Allowed domains: {', '.join(request.allowed_domains)}")
+    if request.blocked_domains:
+        constraints.append(f"Blocked domains: {', '.join(request.blocked_domains)}")
+    if request.recency:
+        constraints.append(f"Recency: {request.recency}")
+    if constraints:
+        return f"{query}\n\n({' | '.join(constraints)})"
+    return query
 
 
 def build_read_url_user_prompt(request: ReadUrlContextRequest) -> str:
-    payload = {
-        "url": request.url,
-        "question": request.question,
-        "max_summary_tokens": request.max_summary_tokens,
-    }
-    return "Read this URL and return the required JSON object: " + json.dumps(payload, ensure_ascii=False)
+    url = request.url.strip()
+    if request.question:
+        return f"Please read and extract information from {url}\nFocus / Question: {request.question.strip()}"
+    return f"Please read and summarize the content of {url}"
 
 
 def _domain_filters(allowed_domains: tuple[str, ...], blocked_domains: tuple[str, ...]) -> dict[str, Any]:
