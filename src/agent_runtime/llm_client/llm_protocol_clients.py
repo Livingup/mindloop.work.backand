@@ -16,7 +16,10 @@ import httpx
 from agent_runtime.conversation_message.message.claude_protocol import ClaudeRenderResult
 from agent_runtime.conversation_message.message.gemini_protocol import GeminiRenderResult
 from agent_runtime.conversation_message.message.openai_chat_protocol import OpenAIChatRenderResult
-from agent_runtime.conversation_message.message.openai_protocol import OpenAIRenderResult
+from agent_runtime.conversation_message.message.openai_protocol import (
+    OpenAIRenderResult,
+    is_openai_hosted_tool,
+)
 from agent_runtime.llm_api_protocol import (
     API_FORMAT_ANTHROPIC_MESSAGES,
     API_FORMAT_GEMINI_GENERATE_CONTENT,
@@ -93,16 +96,31 @@ class OpenAIResponsesProtocolClient:
             raise TypeError("openai_responses 渲染结果类型不正确。")
         if "input" in request_params or "prompt_cache_breakpoint" in request_params:
             raise ValueError("Responses input 和 prompt_cache_breakpoint 必须由消息渲染层提供。")
+        hosted_tools: list[dict[str, Any]] = [
+            copy.deepcopy(item) for item in tools if is_openai_hosted_tool(item)
+        ]
+        function_tools = [
+            item for item in tools if not is_openai_hosted_tool(item)
+        ]
         if "tools" in request_params:
-            raise ValueError(
-                "OpenAI Responses 的 tools 必须由配置视图投影到 input，"
-                "不能通过 request_params 发送顶层配置。"
-            )
+            param_tools = request_params.pop("tools")
+            if not isinstance(param_tools, (list, tuple)) or not all(
+                isinstance(item, dict) for item in param_tools
+            ):
+                raise ValueError(
+                    "OpenAI Responses 的 tools 必须是有效工具字典列表。"
+                )
+            if any(not is_openai_hosted_tool(item) for item in param_tools):
+                raise ValueError(
+                    "OpenAI Responses 的普通函数 tools 必须由配置视图投影到 input，"
+                    "不能通过 request_params 发送顶层函数配置。"
+                )
+            hosted_tools.extend(copy.deepcopy(item) for item in param_tools)
         if "instructions" in request_params:
             custom_instructions = request_params["instructions"]
             if custom_instructions is not None and not isinstance(custom_instructions, str):
                 raise TypeError("OpenAI Responses 的 instructions 必须是字符串或 None。")
-        if (system_prompt is not None or tools) and not rendered_messages.uses_input_configuration:
+        if (system_prompt is not None or function_tools) and not rendered_messages.uses_input_configuration:
             raise ValueError(
                 "OpenAI Responses 的 system_prompt/tools 必须先渲染为 developer/"
                 "additional_tools input 事件。"
@@ -114,6 +132,8 @@ class OpenAIResponsesProtocolClient:
             "include": rendered_messages.include,
             **request_params,
         }
+        if hosted_tools:
+            body["tools"] = hosted_tools
         custom_instructions = body.get("instructions")
         if isinstance(custom_instructions, str) and custom_instructions.strip():
             body["instructions"] = custom_instructions

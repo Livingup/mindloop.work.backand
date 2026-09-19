@@ -64,14 +64,11 @@ class OpenAIWebNativeToolAdapter:
             filters = _domain_filters(request.allowed_domains, request.blocked_domains)
             if filters:
                 tool["filters"] = filters
-        overrides = {
+        return {
             "tools": [tool],
             "tool_choice": {"type": self.tool_type},
             "include": ["web_search_call.action.sources"],
         }
-        if self.api_format == API_FORMAT_OPENAI_RESPONSES:
-            overrides["openai_responses_input_configuration"] = True
-        return overrides
 
 
 @dataclass(frozen=True, slots=True)

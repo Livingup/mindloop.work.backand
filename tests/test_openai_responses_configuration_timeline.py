@@ -483,9 +483,13 @@ def test_web_native_openai_override_is_projected_into_input(monkeypatch):
                 operation="web_search",
                 request=type("Request", (), {"allowed_domains": (), "blocked_domains": (), "max_results": 3})(),
             )))
-        tools = [item for item in captured["input"] if item.get("type") == "additional_tools"]
-        assert tools
-        tool_spec = tools[0]["tools"][0]
+        # Hosted tools must NOT be projected into input as additional_tools
+        additional_tools = [item for item in captured["input"] if item.get("type") == "additional_tools"]
+        assert not additional_tools
+        # Hosted tools must be placed in top-level tools
+        assert "tools" in captured
+        assert len(captured["tools"]) == 1
+        tool_spec = captured["tools"][0]
         assert tool_spec["type"] == "web_search"
         assert tool_spec["external_web_access"] is True
         assert tool_spec["indexed_web_access"] is True
@@ -494,7 +498,6 @@ def test_web_native_openai_override_is_projected_into_input(monkeypatch):
         assert tool_spec["user_location"]["country"] == "US"
         assert tool_spec["user_location"]["city"] == "Los Angeles"
         assert captured["instructions"] == "你是一个善于学习的AI。"
-        assert "tools" not in captured
         assert captured["tool_choice"] == {"type": "web_search"}
         assert "web_search_call.action.sources" in captured["include"]
         assert result.assistant_message.role == "assistant"

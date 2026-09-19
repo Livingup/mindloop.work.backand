@@ -67,14 +67,43 @@ _OPENAI_REPLAYABLE_OUTPUT_ITEM_TYPES = frozenset({
     "function_call",
 })
 
+OPENAI_HOSTED_TOOL_TYPES: frozenset[str] = frozenset({
+    "web_search",
+    "web_search_preview",
+    "file_search",
+    "computer",
+    "computer_20241022",
+    "bash",
+    "bash_20241022",
+    "code_interpreter",
+    "image_generation",
+})
+
+
+def is_openai_hosted_tool(tool: Any) -> bool:
+    """判断是否为 OpenAI Responses 模型内置/托管工具（非客户端自定义函数工具）。"""
+    if not isinstance(tool, dict):
+        return False
+    tool_type = tool.get("type")
+    if tool_type in OPENAI_HOSTED_TOOL_TYPES:
+        return True
+    if tool_type == "function":
+        return False
+    if "function" in tool or "parameters" in tool:
+        return False
+    if isinstance(tool_type, str) and tool_type != "function" and "name" not in tool:
+        return True
+    return False
+
 
 @dataclass(frozen=True, slots=True)
 class OpenAIRenderResult:
     """OpenAI 渲染结果。
 
     包含消息与配置事件组成的 input、缓存路由 key 和缓存选项。
-    调用方仅合并 model、reasoning 等请求参数；系统提示词和工具位于 input。
-    请求客户端强制 store=false，禁止注入顶层 tools，未指定 instructions 时回退为固定默认指令。
+    调用方仅合并 model、reasoning 等请求参数；系统提示词与自定义函数工具位于 input。
+    请求客户端强制 store=false，自定义函数工具由配置视图投影为 input.additional_tools，
+    平台内置托管工具（如 web_search）由客户端在顶层 tools 发送，未指定 instructions 时回退为固定默认指令。
     """
 
     # OpenAI Responses API 的 input 数组。
@@ -360,7 +389,14 @@ def _render_openai_configuration_timeline(
                     component_name="工具",
                 )
                 if tool_value:
-                    rendered.append(_build_openai_additional_tools(tool_value))
+                    # 只有客户端函数工具才投影为 input 中的 additional_tools 事件项；
+                    # 平台/模型内置托管工具（如 web_search、file_search 等）由客户端在顶层 tools 中发送。
+                    function_tools = [
+                        item for item in tool_value
+                        if isinstance(item, dict) and not is_openai_hosted_tool(item)
+                    ]
+                    if function_tools:
+                        rendered.append(_build_openai_additional_tools(function_tools))
         return rendered
 
     start_items = render_group("start", None)

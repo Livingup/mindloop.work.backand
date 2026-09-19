@@ -4,9 +4,9 @@
 
 **文档状态：统一会话目标设计与当前实现说明。**本文区分源码可核对的 Runtime 行为、尚待实现或验证的目标约束，以及外部协议指南的能力与示例。源码与请求结构一致，不等于真实 API 已接受或缓存已命中；外部示例也不是 Runtime 的默认请求。
 
-当前 OpenAI Responses 路径：Agent 创建/冻结 P/T（提示词/工具）配置事件并记录到 `Conversation.timeline`；Conversation 保存事件、当前配置和 `instructions_snapshot`，仓储负责持久化/恢复；请求层构造 `RequestConfigurationView`，adapter 按锚点投影 developer/`additional_tools`。公共基座快照放顶层 `instructions`，业务差异配置放 input；默认不发送 `prompt_cache_options`，不注入 `prompt_cache_breakpoint`。其他协议及独立 `codex_responses` 的既有设计边界不因本文更正而扩大。
+当前 OpenAI Responses 路径：Agent 创建/冻结 P/T（提示词/工具）配置事件并记录到 `Conversation.timeline`；Conversation 保存事件、当前配置和 `instructions_snapshot`，仓储负责持久化/恢复；请求层构造 `RequestConfigurationView`。对于工具定义，严格区分客户端函数工具（`type == "function"`）与模型内置托管工具（Hosted Tools，如 `web_search`、`file_search`、`computer` 等）：客户端函数工具由 adapter 按锚点投影为 input 中的 `additional_tools`，享受缓存断点；模型内置托管工具必须在最顶层 `tools: [...]` 中声明，不作为 `additional_tools` 塞入 input。公共基座快照放顶层 `instructions`，业务差异配置放 input；默认不发送 `prompt_cache_options`，不注入 `prompt_cache_breakpoint`。其他协议及独立 `codex_responses` 的既有设计边界不因本文更正而扩大。
 
-已核对实现包括：稳定 `message_id` 及 JSONL 兼容迁移、会话基座快照、配置时间线的生产/继承/持久化、Responses 配置视图和 input 投影、显式缓存参数处理、客户端允许顶层 `instructions` 而拒绝直接顶层 `tools`。Note 更新与子 Agent 路径的会话/缓存边界见第七、八章。
+已核对实现包括：稳定 `message_id` 及 JSONL 兼容迁移、会话基座快照、配置时间线的生产/继承/持久化、Responses 配置视图和 input 投影、顶层托管工具（web_search 等）提取下发与客户端自定义函数工具严格走 input 投影、显式缓存参数处理、客户端允许顶层 `instructions`。Note 更新与子 Agent 路径的会话/缓存边界见第七、八章。
 
 尚不能由此次源码核对证明：`call_ref`/`source_context`/通用 `metadata` 的目标闭环、所有调用方及跨协议回归、真实模型/compatible endpoint 能力与缓存效果。本次文档修订未运行程序测试或真实 API 请求；第三章沿用既有协议资料与用户确认示例，不重新认证其中的模型、TTL、价格或服务商支持范围。
 
@@ -187,8 +187,10 @@ AgentRuntime 当前设计采用 stateless 路径，因此规则是：
 
 **当前 Runtime 的请求构造策略，不是所有 Responses 端点的通用强制要求：**
 
-- **固定基座与差异配置分离**：会话首次渲染时生成 `instructions_snapshot`，冻结公共模板及当时的变量值；后续请求把其 content 放顶层 `instructions`。业务差异提示词排除已收录基座，投影为 input 中的 `developer`；工具投影为 `additional_tools`。客户端允许顶层 `instructions`，仅禁止直接发送顶层 `tools`。
-- **覆盖入口**：请求层允许显式 `instructions` 覆盖快照在本次请求中的值，但不改写快照；最终 instructions 未提供、为 None 或空白时，客户端使用 `你是一个善于学习的AI。`。`request_params.tools` 覆盖先规范化为 input 配置，不直接发成顶层 tools；显式 `configuration_view` 不能与 instructions/tools 覆盖同时使用。
+- **固定基座与差异配置分离**：会话首次渲染时生成 `instructions_snapshot`，冻结公共模板及当时的变量值；后续请求把其 content 放顶层 `instructions`。业务差异提示词排除已收录基座，投影为 input 中的 `developer`。工具严格按类别分别处理：
+  - **客户端自定义函数工具（Client Function Tools，`type == "function"`）**：投影为 input 中的 `additional_tools`，参与会话时间线配置演化与 Prompt Caching 断点；禁止直接绕过视图发送顶层自定义函数 tools。
+  - **模型内置/托管工具（Hosted Tools，如 `web_search`、`file_search`、`computer` 等）**：必须在请求体的最顶层 `tools: [...]` 中声明，禁止投影为 input 中的 `additional_tools`。OpenAI Responses API 规范中，服务端对 `tool_choice`（如 `{"type": "web_search"}`）的合法性校验以及模型自身的原生联网能力检测，均严格依赖顶层 `tools` 参数；若错误放置在 `input.additional_tools` 中，会导致服务端直接拒绝请求（报错 `Tool choice 'web_search_preview' not found in 'tools' parameter`）或模型判定为“缺乏原生联网搜索工具”从而跳过搜索执行。
+- **覆盖入口**：请求层允许显式 `instructions` 覆盖快照在本次请求中的值，但不改写快照；最终 instructions 未提供、为 None 或空白时，客户端使用 `你是一个善于学习的AI。`。`request_params.tools` 覆盖若包含客户端函数工具则规范化为 input 配置，若包含模型内置托管工具（如 `web_search`）则由请求客户端提取保留在顶层 `tools` 中发送；显式 `configuration_view` 不能与 instructions/tools 覆盖同时使用。
 - **时间线不以切换为存在前提**：初始会话即可有 start 工具/提示词事件；存在时间线时从历史快照与本次 active 值构造视图，无时间线但有当前业务配置时构造初始视图。两条路径都会投影业务 prompt/tools，而不是只有发生切换才投影。
 - **默认不声明缓存扩展参数**：`prompt_cache_options` 与 `prompt_cache_breakpoint` 默认均为 None，因此不发 options、不注入 marker，也不由 Runtime 默认指定 mode 或 TTL。省略字段后服务端实际采用的策略由目标端点决定，不能将其等同于客户端发送了 `mode="implicit"`。
 - **显式可选能力**：提供字典类型 options 时按请求参数合并/透传；提供 marker 字典时，只在 start 配置最后一个合法 developer `input_text` 内容块上重建标记。如果该文本后还有 `additional_tools`，或找不到合法文本块，就不放 marker；不会自动给全部历史、新阶段或分支尾部打点。
@@ -782,7 +784,7 @@ store = false；include 包含 reasoning.encrypted_content
 - 仅显式提供 marker 时才在请求副本重建 B：范围是 start 配置最后合法 developer `input_text`，不是任意历史消息或每个阶段；未提供时不加标。历史提示词内容块中的已有 marker 会在投影时移除。
 - 若候选内容块后面还有 `additional_tools`，或找不到合法文本块，则不附加 B。不能为得到联合断点擅自重排既有事件、强造业务提示词，或宣称工具-only 配置已被 marker 覆盖。
 - 公共基座与 input 业务提示词不是同一份内容的重复发送；后者应排除 snapshot.template_names 已收录模板。顶层 instructions 显式覆盖会改变前缀，但不会自动改写 input 历史或快照。
-- 请求层在渲染前处理 `request_params.instructions/tools` 覆盖：instructions 留在顶层，tools 转为配置视图；显式 view 与这两类覆盖冲突时会报错。客户端不接受渲染后绕过视图直接塞入顶层 tools 或 input。
+- 请求层在渲染前处理 `request_params.instructions/tools` 覆盖：instructions 留在顶层，自定义函数 tools 转为配置视图，模型内置托管 tools（如 `web_search`）提取并保留在顶层 tools 发送；显式 view 与这两类覆盖冲突时会报错。客户端不接受渲染后绕过视图直接塞入顶层自定义函数 tools 或 input。
 - `prompt_cache_options` 仅显式字典才合并/发送；值为 None 时删除该字段。源码没有默认 TTL 或多断点调度，不能把第三章的协议槽位预算描述为当前 Runtime 已实现的选择算法。
 - 端点是否支持这些字段需独立确认。当前源码没有据此自动折叠时间线为其他表达的能力门控，不能将目标兼容性策略写成已实现的 fallback。
 
@@ -915,7 +917,7 @@ store = false；include 包含 reasoning.encrypted_content
 | `src/agent_runtime/conversation_message/message/operations.py`：render_messages / ingest_response | 注册六类 adapter，渲染与响应归一化统一分发 | 需增加配置输入和目标能力的整体校验、诊断与映射契约；不能让每个 adapter 主动解析上游定义 |
 | `src/agent_runtime/conversation_message/message/openai_protocol.py`：OpenAIAdapter.render / normalize_response | 按 message_id/sequence 投影配置；遍历全量消息，同源回放 reasoning/message/function_call raw；默认 options/marker 为 None，显式 marker 只处理合法 start 内容块 | supplementary_prompts 按当前工具名渲染，历史 developer 不一定字节不变；源码不证明端点支持或缓存效果 |
 | `src/agent_runtime/llm_client/llm_request_service.py`：_resolve_openai_request_configuration | 优先使用显式 instructions 覆盖，否则用基座 snapshot；有 timeline 时派生视图，无 timeline 时可建初始视图；tools 覆盖先转成 input 配置 | 显式 view 与 instructions/tools 覆盖冲突会报错；统一 usage 当前只读 cached_tokens，未在该分支统计 cache_write_tokens |
-| `src/agent_runtime/llm_client/llm_protocol_clients.py`：OpenAIResponsesProtocolClient.request | 允许/兜底顶层 instructions，拒绝直接顶层 tools；强制 store=false、include encrypted_content、去除 previous_response_id；仅显式 options 才发送 | 请求构造通过不等于全部调用方或目标端点兼容；不默认发送 mode/TTL，也没有自动能力折叠策略 |
+| `src/agent_runtime/llm_client/llm_protocol_clients.py`：OpenAIResponsesProtocolClient.request | 允许/兜底顶层 instructions，允许顶层托管 tools（如 web_search）并下发给服务商，拒绝直接发送顶层自定义函数 tools；强制 store=false、include encrypted_content、去除 previous_response_id；仅显式 options 才发送 | 请求构造通过不等于全部调用方或目标端点兼容；不默认发送 mode/TTL，也没有自动能力折叠策略 |
 | `src/agent_runtime/agent/agent_execution_engine.py`：_render_system_prompt / Note 切换 | 首次建立基座快照，后续差异 prompt 排除已收录模板；初始化 start 事件；进入 Note 阶段冻结业务配置并在边界后追加，完成后新建会话/快照/start 配置 | 同会话快照固定不等于 Note 完成后还是同一缓存前缀；active 热更新和显式 instructions 覆盖可改变请求 |
 | `src/agent_runtime/subagent/subagent_runtime.py`：子会话创建 | 继承基座快照、复制消息前缀，范围内父事件冻结并保留锚点；子配置在边界后，按工具名称决定是否需新增工具事件 | 不复制父 provider_state/cache key；工具子集不追加声明也不代表拥有全部历史工具权限 |
 | `src/agent_runtime/conversation_message/message/claude_protocol.py`：render / _attach_cache_breakpoints | 复制同源 raw；不合并连续同角色消息；本次 messages 尾部打动态 cache_control | 新设计需与 client 的 system/tools 断点统一预算；现有最近 assistant/index 不足以证明输入边界已缓存 |
