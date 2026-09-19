@@ -19,7 +19,6 @@ from agent_runtime.image_generation.models import (
     ImageGenerationRequest,
     ImageGenerationResult,
 )
-from agent_runtime.image_generation.llm_registry_gateway import GPT_IMAGE_AGENT_MODEL_ID
 from agent_runtime.image_generation.openai_images_client import OpenAIImagesGenerationClient
 from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
 from agent_runtime.llm_api_protocol import (
@@ -124,7 +123,7 @@ class ImageGenerationService:
                     attempt_count += 1
                     attempt_started_at = time.perf_counter()
                     try:
-                        if _is_gpt_image_agent_model(resolved):
+                        if _is_responses_image_agent_model(resolved):
                             response = await self._run_gpt_image_agent(
                                 resolved_model=resolved,
                                 api_key=api_key,
@@ -277,19 +276,14 @@ class ImageGenerationService:
     def _assert_supported_model(self, resolved: ResolvedLlmProviderModel) -> None:
         if resolved.api_format == API_FORMAT_OPENAI_IMAGES_GENERATIONS:
             return
-        if _is_gpt_image_agent_model(resolved):
+        if _is_responses_image_agent_model(resolved):
             return
-        if resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}:
-            raise ImageGenerationConfigurationError(
-                f"Image generation only supports model_id={GPT_IMAGE_AGENT_MODEL_ID} for standard Responses: "
-                f"{resolved.provider_id}/{resolved.binding_id}/{resolved.api_format}"
-            )
         raise ImageGenerationConfigurationError(
             "Image generation only supports "
             f"{API_FORMAT_OPENAI_IMAGES_GENERATIONS}, "
-            f"{API_FORMAT_OPENAI_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}, or "
-            f"{API_FORMAT_CODEX_RESPONSES}/{GPT_IMAGE_AGENT_MODEL_ID}: "
-            f"{resolved.provider_id}/{resolved.binding_id}"
+            f"{API_FORMAT_OPENAI_RESPONSES}, or "
+            f"{API_FORMAT_CODEX_RESPONSES}: "
+            f"{resolved.provider_id}/{resolved.binding_id} ({resolved.api_format})"
         )
 
     async def _run_gpt_image_agent(
@@ -334,7 +328,7 @@ class ImageGenerationService:
                 return {"data": data}
             input_items.extend(_replayable_gpt_image_agent_output_items(raw_response))
             input_items.append(_build_gpt_image_agent_continue_input(round_index))
-        raise RuntimeError(f"gpt-5.5 image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
+        raise RuntimeError(f"{resolved_model.model_id} image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
 
 
 
@@ -444,11 +438,11 @@ def _sanitize_image_reference(value: Any) -> Any:
     return {"image_url": f"{image_url.split(',', 1)[0]},<base64 omitted>"}
 
 
-def _is_gpt_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
-    return (
-        resolved.model_id == GPT_IMAGE_AGENT_MODEL_ID
-        and resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}
-    )
+def _is_responses_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
+    return resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}
+
+
+_is_gpt_image_agent_model = _is_responses_image_agent_model
 
 
 def _normalize_relay_session_id(value: str | None) -> str | None:

@@ -73,7 +73,6 @@ class LlmModelRegistryFactory:
     @staticmethod
     def create_image_generation_registry():
         from agent_runtime.image_generation.llm_registry_gateway import (
-            GPT_IMAGE_AGENT_MODEL_ID,
             ImageGenerationLlmRegistryGateway,
         )
         from agent_runtime.codex_oauth.models import CODEX_PROVIDER_ID
@@ -89,8 +88,6 @@ class LlmModelRegistryFactory:
             try:
                 resolved = llm_registry_gateway.resolve_provider_model(provider_id, binding_id)
             except Exception:
-                return None
-            if resolved.model_id != GPT_IMAGE_AGENT_MODEL_ID:
                 return None
             if (
                 resolved.provider_id == CODEX_PROVIDER_ID

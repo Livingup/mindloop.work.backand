@@ -40,23 +40,26 @@ class ImageGenerationLlmRegistryGateway:
         self._llm_registry_gateway = llm_registry_gateway
 
     def list_model_metadata(self) -> list[LlmModelMetadata]:
+        supported_provider_model_ids = {
+            binding.model_id
+            for provider in self.list_providers()
+            for binding in provider.models
+        }
+        secondary_models = [
+            item
+            for item in self._llm_registry_gateway.list_model_metadata()
+            if item.model_id in supported_provider_model_ids
+        ]
         return _merge_by_model_id(
             self._image_registry_gateway.list_model_metadata(),
-            [
-                item
-                for item in self._llm_registry_gateway.list_model_metadata()
-                if _is_gpt_image_agent_model(item)
-            ],
+            secondary_models,
         )
 
     def get_model_metadata(self, model_id: str) -> LlmModelMetadata:
         try:
             return self._image_registry_gateway.get_model_metadata(model_id)
         except KeyError:
-            metadata = self._llm_registry_gateway.get_model_metadata(model_id)
-            if not _is_gpt_image_agent_model(metadata):
-                raise
-            return metadata
+            return self._llm_registry_gateway.get_model_metadata(model_id)
 
     def save_model_metadata(
         self, request: LlmModelMetadataSaveRequest
@@ -100,15 +103,18 @@ class ImageGenerationLlmRegistryGateway:
         raise KeyError(f"LLM 服务商不存在或不支持图片生成: {provider_id}")
 
     def save_provider(self, request: LlmProviderSaveRequest) -> LlmProviderDefinition:
+        allowed_formats = {
+            API_FORMAT_OPENAI_IMAGES_GENERATIONS,
+            API_FORMAT_OPENAI_RESPONSES,
+        }
         invalid_bindings = [
             f"{binding.id}: {binding.model_id}/{binding.api_format}"
             for binding in request.models
-            if binding.api_format != API_FORMAT_OPENAI_IMAGES_GENERATIONS
+            if binding.api_format not in allowed_formats
         ]
         if invalid_bindings:
             raise ValueError(
-                "图片生成独立 Registry 只能保存 openai_images_generations 服务商接入；"
-                "gpt-5.5 标准 Responses 接入请在主 LLM Registry 中维护: "
+                "图片生成独立 Registry 只能保存 openai_images_generations 或 openai_responses 服务商接入: "
                 + ", ".join(invalid_bindings)
             )
         return self._image_registry_gateway.save_provider(request)
@@ -227,11 +233,9 @@ def _is_gpt_image_agent_model(metadata: LlmModelMetadata) -> bool:
 
 def _is_supported_image_generation_binding(
     provider_id: str, binding: LlmProviderModelBinding
- ) -> bool:
+) -> bool:
     if binding.api_format == API_FORMAT_OPENAI_IMAGES_GENERATIONS:
         return provider_id != CODEX_PROVIDER_ID
-    if binding.model_id != GPT_IMAGE_AGENT_MODEL_ID:
-        return False
     if provider_id == CODEX_PROVIDER_ID:
         return binding.api_format == API_FORMAT_CODEX_RESPONSES
     return binding.api_format == API_FORMAT_OPENAI_RESPONSES
@@ -239,11 +243,9 @@ def _is_supported_image_generation_binding(
 
 def _is_supported_image_generation_resolved_model(
     resolved: ResolvedLlmProviderModel,
- ) -> bool:
+) -> bool:
     if resolved.api_format == API_FORMAT_OPENAI_IMAGES_GENERATIONS:
         return resolved.provider_id != CODEX_PROVIDER_ID
-    if resolved.model_id != GPT_IMAGE_AGENT_MODEL_ID:
-        return False
     if resolved.provider_id == CODEX_PROVIDER_ID:
         return resolved.api_format == API_FORMAT_CODEX_RESPONSES
     return resolved.api_format == API_FORMAT_OPENAI_RESPONSES

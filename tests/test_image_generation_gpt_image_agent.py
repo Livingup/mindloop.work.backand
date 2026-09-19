@@ -1,7 +1,6 @@
 import asyncio
 import unittest
 from dataclasses import dataclass
-from unittest.mock import patch
 
 from agent_runtime.image_generation.models import ImageGenerationRequest
 from agent_runtime.image_generation.service import ImageGenerationService
@@ -63,12 +62,40 @@ class _FileResourceService:
         ]
 
 
-def _resolved_gpt_image_agent() -> ResolvedLlmProviderModel:
+class _FakeLlmRequestService:
+    def __init__(self, handler) -> None:
+        self._handler = handler
+
+    async def request_standard_responses(
+        self,
+        *,
+        resolved_model,
+        conversation_id,
+        input_items,
+        system_prompt,
+        tools,
+        request_params,
+        api_key=None,
+        input_configuration_capability=True,
+    ):
+        return await self._handler(
+            resolved_model=resolved_model,
+            conversation_id=conversation_id,
+            input_items=input_items,
+            system_prompt=system_prompt,
+            tools=tools,
+            request_params=request_params,
+            api_key=api_key,
+            input_configuration_capability=input_configuration_capability,
+        )
+
+
+def _resolved_responses_model(model_id: str = "gpt-5.5", binding_id: str = "gpt-55") -> ResolvedLlmProviderModel:
     return ResolvedLlmProviderModel(
         provider_id="openai",
-        binding_id="gpt-55",
-        model_id="gpt-5.5",
-        model_alias="gpt-5.5",
+        binding_id=binding_id,
+        model_id=model_id,
+        model_alias=model_id,
         api_format="openai_responses",
         sdk_platform="openai",
         api_base_url="https://api.openai.test/v1",
@@ -91,10 +118,16 @@ class GptImageAgentGenerationTests(unittest.TestCase):
     def test_gpt_image_agent_loops_until_image_result_and_keeps_generation_contract(self) -> None:
         calls = []
 
-        async def fake_post_openai_responses_json(*, resolved_model, api_key, body):
-            calls.append(body)
+        async def fake_handler(*, resolved_model, conversation_id, input_items, system_prompt, tools, request_params, api_key, input_configuration_capability):
+            calls.append({
+                "conversation_id": conversation_id,
+                "input_items": input_items,
+                "system_prompt": system_prompt,
+                "tools": tools,
+                "request_params": request_params,
+            })
             self.assertEqual(resolved_model.model_id, "gpt-5.5")
-            self.assertEqual(resolved_model.custom_headers.get("x-relay-session-id"), "conversation-image-1")
+            self.assertEqual(conversation_id, "conversation-image-1")
             self.assertEqual(api_key, "test-key")
             if len(calls) == 1:
                 return {
@@ -120,8 +153,9 @@ class GptImageAgentGenerationTests(unittest.TestCase):
         async def run_case():
             service = ImageGenerationService(
                 settings_repository=_SettingsRepository(),
-                llm_registry_gateway=_RegistryGateway(_resolved_gpt_image_agent()),
+                llm_registry_gateway=_RegistryGateway(_resolved_responses_model("gpt-5.5")),
                 file_resource_service=_FileResourceService(),
+                llm_request_service=_FakeLlmRequestService(fake_handler),
             )
             return await service.generate_image(
                 ImageGenerationRequest(
@@ -132,8 +166,7 @@ class GptImageAgentGenerationTests(unittest.TestCase):
                 )
             )
 
-        with patch("agent_runtime.image_generation.service._post_openai_responses_json", fake_post_openai_responses_json):
-            result = asyncio.run(run_case())
+        result = asyncio.run(run_case())
 
         self.assertEqual(result.api_format, "openai_responses")
         self.assertEqual(result.model_id, "gpt-5.5")
@@ -145,26 +178,26 @@ class GptImageAgentGenerationTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
         first_call = calls[0]
-        self.assertIn("尽最大可能根据用户的需求描述来直接生成图片，不要询问用户", first_call["instructions"])
-        self.assertEqual(first_call["tools"], [{"type": "image_generation"}])
-        self.assertEqual(first_call["tool_choice"], {"type": "image_generation"})
-        self.assertIs(first_call["store"], False)
-        self.assertIs(first_call["stream"], True)
-        self.assertEqual(first_call["temperature"], 0.2)
-        self.assertEqual(first_call["input"][0]["role"], "user")
-        self.assertIn("画一张霓虹赛博朋克猫海报", first_call["input"][0]["content"][0]["text"])
+        self.assertIn("尽最大可能根据用户的需求描述来直接生成图片，不要询问用户", first_call["system_prompt"])
+        self.assertEqual(first_call["tools"], ({"type": "image_generation"},))
+        self.assertEqual(first_call["request_params"]["tool_choice"], {"type": "image_generation"})
+        self.assertIs(first_call["request_params"]["store"], False)
+        self.assertIs(first_call["request_params"]["stream"], True)
+        self.assertEqual(first_call["request_params"]["temperature"], 0.2)
+        self.assertEqual(first_call["input_items"][0]["role"], "user")
+        self.assertIn("画一张霓虹赛博朋克猫海报", first_call["input_items"][0]["content"][0]["text"])
 
         second_call = calls[1]
-        self.assertEqual(second_call["tools"], [{"type": "image_generation"}])
-        self.assertEqual(second_call["tool_choice"], {"type": "image_generation"})
-        self.assertEqual(second_call["input"][-1]["role"], "user")
-        self.assertIn("不要询问用户", second_call["input"][-1]["content"][0]["text"])
+        self.assertEqual(second_call["tools"], ({"type": "image_generation"},))
+        self.assertEqual(second_call["request_params"]["tool_choice"], {"type": "image_generation"})
+        self.assertEqual(second_call["input_items"][-1]["role"], "user")
+        self.assertIn("不要询问用户", second_call["input_items"][-1]["content"][0]["text"])
 
     def test_gpt_image_agent_uses_stable_fallback_relay_session_id_without_context(self) -> None:
-        seen_headers = []
+        seen_conversation_ids = []
 
-        async def fake_post_openai_responses_json(*, resolved_model, api_key, body):
-            seen_headers.append(dict(resolved_model.custom_headers))
+        async def fake_handler(*, resolved_model, conversation_id, input_items, system_prompt, tools, request_params, api_key, input_configuration_capability):
+            seen_conversation_ids.append(conversation_id)
             return {
                 "output": [
                     {
@@ -178,8 +211,9 @@ class GptImageAgentGenerationTests(unittest.TestCase):
         async def run_case():
             service = ImageGenerationService(
                 settings_repository=_SettingsRepository(),
-                llm_registry_gateway=_RegistryGateway(_resolved_gpt_image_agent()),
+                llm_registry_gateway=_RegistryGateway(_resolved_responses_model("gpt-5.5")),
                 file_resource_service=_FileResourceService(),
+                llm_request_service=_FakeLlmRequestService(fake_handler),
             )
             return await service.generate_image(
                 ImageGenerationRequest(
@@ -188,8 +222,46 @@ class GptImageAgentGenerationTests(unittest.TestCase):
                 )
             )
 
-        with patch("agent_runtime.image_generation.service._post_openai_responses_json", fake_post_openai_responses_json):
-            result = asyncio.run(run_case())
+        result = asyncio.run(run_case())
 
         self.assertEqual(result.model_id, "gpt-5.5")
-        self.assertEqual(seen_headers[0].get("x-relay-session-id"), "image-generation:openai:gpt-55")
+        self.assertEqual(seen_conversation_ids[0], "image-generation:openai:gpt-55")
+
+    def test_arbitrary_responses_models_like_gpt_6_supported_as_image_agent(self) -> None:
+        calls = []
+
+        async def fake_handler(*, resolved_model, conversation_id, input_items, system_prompt, tools, request_params, api_key, input_configuration_capability):
+            calls.append(resolved_model.model_id)
+            return {
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": "base64-image-result",
+                        "revised_prompt": "A futuristic city generated by gpt-6",
+                    }
+                ]
+            }
+
+        async def run_case():
+            service = ImageGenerationService(
+                settings_repository=_SettingsRepository(),
+                llm_registry_gateway=_RegistryGateway(_resolved_responses_model("gpt-6", "gpt-6-binding")),
+                file_resource_service=_FileResourceService(),
+                llm_request_service=_FakeLlmRequestService(fake_handler),
+            )
+            return await service.generate_image(
+                ImageGenerationRequest(
+                    prompt="画一座未来城市",
+                    output_format="png",
+                )
+            )
+
+        result = asyncio.run(run_case())
+
+        self.assertEqual(result.api_format, "openai_responses")
+        self.assertEqual(result.model_id, "gpt-6")
+        self.assertEqual(result.provider_id, "openai")
+        self.assertEqual(result.binding_id, "gpt-6-binding")
+        self.assertEqual(result.images[0].revised_prompt, "A futuristic city generated by gpt-6")
+        self.assertEqual(calls, ["gpt-6"])
