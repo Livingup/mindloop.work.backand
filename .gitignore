@@ -131,6 +131,7 @@ Desktop.ini
 !/tests/test_stable_prefix_prompt.py
 !/tests/test_web_tools.py
 !/tests/test_image_generation_*.py
+!/tests/test_llm_registry_api_key_restore.py
 
 /web-frontend/
 

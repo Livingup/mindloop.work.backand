@@ -1250,27 +1250,110 @@ def _body_to_provider_request(
     )
 
 
+def _is_masked_api_key(key: str) -> bool:
+    """检查是否为脱敏占位符 Key。"""
+    stripped = key.strip()
+    return "********" in stripped or (len(stripped) >= 4 and "****" in stripped)
+
+
+def _matches_api_key_mask(masked_key: str, real_key: str) -> bool:
+    """检查 masked_key 是否符合 real_key 脱敏后的模式。"""
+    mk = masked_key.strip()
+    rk = real_key.strip()
+    if len(rk) > 8:
+        expected = f"{rk[:4]}********{rk[-4:]}"
+        if mk == expected:
+            return True
+        if len(mk) >= 12 and mk.startswith(rk[:4]) and mk.endswith(rk[-4:]):
+            middle = mk[4:-4]
+            if middle and set(middle) == {"*"}:
+                return True
+        return False
+    return mk == "********" or (len(mk) >= 4 and set(mk) == {"*"})
+
+
 def _restore_api_keys_from_current(
     body_keys: list[LlmApiKeyBody] | None,
     current_keys: tuple[LlmApiKey, ...]
 ) -> list[LlmApiKeyBody] | None:
+    """将包含脱敏占位符的 API Key 还原为已有真实密钥。
+
+    支持场景：
+    1. 用户只修改了 Key 名称或备注，Key 值保留前端脱敏占位符；
+    2. 用户拖拽调整了多个 Key 的轮换顺序，各 Key 仍为脱敏占位符；
+    3. 用户新增或替换了某个 Key（明文），其他已有 Key 保留脱敏占位符；
+    4. 若存在无法匹配已有真实密钥的脱敏占位符，坚决抛出 ValueError，阻止脱敏字面量落库。
+    """
     if body_keys is None:
         return None
-    restored: list[LlmApiKeyBody] = []
-    unnamed_current_pool = [k for k in current_keys if not k.name]
-    named_current_map = {k.name: k for k in current_keys if k.name}
 
-    for bk in body_keys:
-        if "********" in bk.key:
-            if bk.name and bk.name in named_current_map:
-                restored.append(LlmApiKeyBody(key=named_current_map[bk.name].key, name=bk.name))
-            elif not bk.name and unnamed_current_pool:
-                original = unnamed_current_pool.pop(0)
-                restored.append(LlmApiKeyBody(key=original.key, name=bk.name))
-            else:
-                restored.append(bk)
+    restored: list[LlmApiKeyBody] = []
+    unmatched_current_indices = set(range(len(current_keys)))
+    matched_mapping: dict[int, LlmApiKey] = {}
+
+    for body_index, bk in enumerate(body_keys):
+        if not _is_masked_api_key(bk.key):
+            continue
+
+        matched_idx: int | None = None
+
+        # Pass 1: exact name AND mask pattern match
+        for i in sorted(unmatched_current_indices):
+            cur = current_keys[i]
+            if cur.name and cur.name == bk.name and _matches_api_key_mask(bk.key, cur.key):
+                matched_idx = i
+                break
+
+        # Pass 2: same index in list AND mask pattern match (e.g. user only modified key name)
+        if matched_idx is None and body_index in unmatched_current_indices:
+            cur = current_keys[body_index]
+            if _matches_api_key_mask(bk.key, cur.key):
+                matched_idx = body_index
+
+        # Pass 3: unique mask pattern match among remaining keys
+        if matched_idx is None:
+            pattern_candidates = [
+                i for i in unmatched_current_indices
+                if _matches_api_key_mask(bk.key, current_keys[i].key)
+            ]
+            if len(pattern_candidates) == 1:
+                matched_idx = pattern_candidates[0]
+            elif len(pattern_candidates) > 1:
+                pattern_candidates.sort(key=lambda i: abs(i - body_index))
+                matched_idx = pattern_candidates[0]
+
+        # Pass 4: if single current key remains, check if mask pattern matches
+        if matched_idx is None and len(unmatched_current_indices) == 1:
+            only_i = next(iter(unmatched_current_indices))
+            if _matches_api_key_mask(bk.key, current_keys[only_i].key):
+                matched_idx = only_i
+
+        # Pass 5: exact name match among remaining keys
+        if matched_idx is None and bk.name:
+            name_candidates = [
+                i for i in unmatched_current_indices
+                if current_keys[i].name == bk.name
+            ]
+            if len(name_candidates) == 1:
+                matched_idx = name_candidates[0]
+
+        if matched_idx is not None:
+            matched_mapping[body_index] = current_keys[matched_idx]
+            unmatched_current_indices.remove(matched_idx)
+        else:
+            key_label = bk.name or (f"{bk.key[:4]}...{bk.key[-4:]}" if len(bk.key) > 8 else bk.key)
+            raise ValueError(
+                f"API Key '{key_label}' 包含脱敏占位符且无法匹配已有真实密钥；"
+                "请重新填写完整 API Key，避免保存脱敏占位符。"
+            )
+
+    for body_index, bk in enumerate(body_keys):
+        if body_index in matched_mapping:
+            real_key = matched_mapping[body_index].key
+            restored.append(LlmApiKeyBody(key=real_key, name=bk.name))
         else:
             restored.append(bk)
+
     return restored
 
 
@@ -1304,8 +1387,9 @@ def _restore_provider_body(
     current_headers = current.custom_headers if current is not None else {}
     if body.custom_headers is not None:
         body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current_headers) or {}
-    if current is not None and body.api_keys is not None:
-        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
+    if body.api_keys is not None:
+        current_keys = current.api_keys if current is not None else ()
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current_keys) or []
     for mb in body.models:
         current_mb = (
             next((model for model in current.models if model.id == mb.id), None)
@@ -1315,8 +1399,9 @@ def _restore_provider_body(
         if mb.custom_headers is not None:
             binding_headers = current_mb.custom_headers if current_mb is not None else {}
             mb.custom_headers = _restore_custom_headers_from_current(mb.custom_headers, binding_headers) or {}
-        if current_mb is not None and mb.api_keys is not None:
-            mb.api_keys = _restore_api_keys_from_current(mb.api_keys, current_mb.api_keys) or []
+        if mb.api_keys is not None:
+            binding_keys = current_mb.api_keys if current_mb is not None else ()
+            mb.api_keys = _restore_api_keys_from_current(mb.api_keys, binding_keys) or []
     return body
 
 
@@ -1338,8 +1423,9 @@ def _restore_binding_body(
     if body.custom_headers is not None:
         current_headers = current.custom_headers if current is not None else {}
         body.custom_headers = _restore_custom_headers_from_current(body.custom_headers, current_headers) or {}
-    if current is not None and body.api_keys is not None:
-        body.api_keys = _restore_api_keys_from_current(body.api_keys, current.api_keys) or []
+    if body.api_keys is not None:
+        current_keys = current.api_keys if current is not None else ()
+        body.api_keys = _restore_api_keys_from_current(body.api_keys, current_keys) or []
     return body
 
 

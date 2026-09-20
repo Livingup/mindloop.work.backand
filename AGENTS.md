@@ -144,7 +144,8 @@ Phase-1 访问模型是单 Runtime 主机的多端接入：后端 runtime-local 
 
 ### LLM 服务商与模型注册模块（llm_model_registry）
 
-负责用户自定义的 LLM 模型型号元数据、服务商定义、服务商模型接入项和执行策略组管理。运行期权威数据存储在 `llm_model_registry.registry_dir/llm_model_registry.sqlite3`，legacy YAML 只作为一次性迁移输入。服务商级 API Key、模型接入项 API Key、模型接入项列表和执行策略候选项列表的顺序均有业务含义，仓储必须保序。对外管理入口是 REST `/api/llm-registry/models`、`/providers`、`/execution-policies` 与 provider model resolved 端点；list 支持 `summary=true`，provider/detail/resolved 默认脱敏 API Key，只有受控调用显式 `include_secrets=true` 才返回明文。
+负责用户自定义的 LLM 模型型号元数据、服务商定义、服务商模型接入项和执行策略组管理。运行期权威数据存储在 `llm_model_registry.registry_dir/llm_model_registry.sqlite3`，legacy YAML 只作为一次性迁移输入。服务商级 API Key、模型接入项 API Key、模型接入项列表和执行策略候选项列表的顺序均有业务含义，仓储必须保序。对外管理入口是 REST `/api/llm-registry/models`、`/providers`、`/execution-policies` 与 provider model resolved 端点；list 支持 `summary=true`，provider/detail/resolved 默认脱敏 API Key，只有受控调用显式 `include_secrets=true` 才返回明文。保存与更新操作中，客户端回传的脱敏占位符 API Key 必须通过智能消解机制安全还原为已有真实密钥；严禁将未成功还原的脱敏占位符字面量写入仓储，无法匹配时必须抛出校验错误阻止脏数据落库。
+
 
 ### 日志工作区与日志清理边界
 
