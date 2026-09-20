@@ -176,3 +176,82 @@ def test_restore_binding_body_integration():
     restored = _restore_binding_body(body, current_binding)
     assert restored.api_keys[0].key == "sk-model-binding-real-key-8888"
     assert restored.api_keys[0].name == "new-name"
+
+
+def test_modify_key_value_in_place_single_key():
+    """验证真正需要修改 Key 值时：在原有位置直接输入新 Key，新 Key 必须直接生效，绝不被旧 Key 覆盖。"""
+    current_keys = (LlmApiKey(key="sk-old-secret-11111111", name="刀-0.2pro"),)
+    # 用户把输入框的脱敏值清空，输入了全新的真实 Key
+    body_keys = [LlmApiKeyBody(key="sk-brand-new-secret-22222222", name="刀-0.2pro")]
+
+    restored = _restore_api_keys_from_current(body_keys, current_keys)
+    assert restored is not None
+    assert len(restored) == 1
+    assert restored[0].key == "sk-brand-new-secret-22222222"
+    assert restored[0].name == "刀-0.2pro"
+
+
+def test_modify_key_value_and_name_together():
+    """验证同时修改 Key 名和 Key 值时，新名和新 Key 均直接生效。"""
+    current_keys = (LlmApiKey(key="sk-old-secret-11111111", name="old-name"),)
+    body_keys = [LlmApiKeyBody(key="sk-brand-new-secret-22222222", name="new-name")]
+
+    restored = _restore_api_keys_from_current(body_keys, current_keys)
+    assert restored is not None
+    assert len(restored) == 1
+    assert restored[0].key == "sk-brand-new-secret-22222222"
+    assert restored[0].name == "new-name"
+
+
+def test_modify_one_key_value_while_leaving_other_keys_masked():
+    """验证多 Key 场景下，用户仅修改其中一个 Key 的值，其他未修改的 Key（脱敏态）保留真实值，被修改的 Key 换成新值。"""
+    current_keys = (
+        LlmApiKey(key="sk-AAAA-secret-1111", name="KeyA"),
+        LlmApiKey(key="sk-BBBB-secret-2222", name="KeyB"),
+    )
+    # KeyA 被替换为全新的明文 Key，KeyB 保持脱敏占位符
+    body_keys = [
+        LlmApiKeyBody(key="sk-NEW-FOR-A-99999999", name="KeyA"),
+        LlmApiKeyBody(key="sk-B********2222", name="KeyB"),
+    ]
+
+    restored = _restore_api_keys_from_current(body_keys, current_keys)
+    assert restored is not None
+    assert len(restored) == 2
+    # KeyA 成功修改为新值
+    assert restored[0].key == "sk-NEW-FOR-A-99999999"
+    assert restored[0].name == "KeyA"
+    # KeyB 成功还原旧真实值
+    assert restored[1].key == "sk-BBBB-secret-2222"
+    assert restored[1].name == "KeyB"
+
+
+def test_modify_key_to_environment_variable():
+    """验证用户将 Key 修改为环境变量占位符 ${ENV_VAR} 时直接生效。"""
+    current_keys = (LlmApiKey(key="sk-old-secret-11111111", name="KeyA"),)
+    body_keys = [LlmApiKeyBody(key="${OPENAI_API_KEY}", name="KeyA")]
+
+    restored = _restore_api_keys_from_current(body_keys, current_keys)
+    assert restored is not None
+    assert len(restored) == 1
+    assert restored[0].key == "${OPENAI_API_KEY}"
+    assert restored[0].name == "KeyA"
+
+
+def test_modify_all_keys_to_new_values():
+    """验证将所有 Key 全部换成新 Key 时，全部直接生效。"""
+    current_keys = (
+        LlmApiKey(key="sk-old-0", name="Key0"),
+        LlmApiKey(key="sk-old-1", name="Key1"),
+    )
+    body_keys = [
+        LlmApiKeyBody(key="sk-new-0", name="Key0"),
+        LlmApiKeyBody(key="sk-new-1", name="Key1"),
+    ]
+
+    restored = _restore_api_keys_from_current(body_keys, current_keys)
+    assert restored is not None
+    assert len(restored) == 2
+    assert restored[0].key == "sk-new-0"
+    assert restored[1].key == "sk-new-1"
+
