@@ -63,8 +63,11 @@ from agent_runtime.llm_http_trace.service import LlmHttpTraceService
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::-([^}]*))?\}$")
 _SUPPRESSED_FRONTEND_SEMANTIC_EVENTS = {
     # llm.response.completed 需要发给前端更新 token/context 与已有 execution bubble。
+    # 普通文本在流式阶段只通过 llm.content.started / llm.content.completed 通知右侧存在正文，
+    # 最终普通文本内容由 agent.assistant.message.received 推送给左侧独立渲染。
     "llm.response.failed",
     "llm.thinking.delta",
+    "llm.content.delta",
     "llm.tool_call.arguments.delta",
     "llm.tool_call.arguments.completed",
 }

@@ -622,7 +622,7 @@ def test_failed_sse_request_waits_for_admitted_request_handler_drain() -> None:
     asyncio.run(run_case())
 
 
-def test_request_stream_handler_coalesces_published_delta_but_preserves_observer_events() -> None:
+def test_request_stream_handler_publishes_content_presence_without_content_delta() -> None:
     async def run_case() -> None:
         publisher = _BlockingRuntimeEventPublisher()
         observed: list[tuple[str, dict[str, Any]]] = []
@@ -659,9 +659,18 @@ def test_request_stream_handler_coalesces_published_delta_but_preserves_observer
                     },
                 }
             )
+        await handler(
+            {
+                "event_type": "llm.response.stream.event",
+                "payload": {
+                    "event": "message",
+                    "data": {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                },
+            }
+        )
 
         completion = asyncio.create_task(
-            handler({"event_type": "llm.response.stream.completed", "payload": {"event_count": 3}})
+            handler({"event_type": "llm.response.stream.completed", "payload": {"event_count": 4}})
         )
         await asyncio.sleep(0)
         assert completion.done() is False
@@ -669,18 +678,22 @@ def test_request_stream_handler_coalesces_published_delta_but_preserves_observer
         publisher.gate.release.set()
         await asyncio.wait_for(completion, timeout=1)
 
-        published_deltas = [
-            payload["delta"]
-            for event_type, payload in publisher.gate.completed
-            if event_type == "llm.content.delta"
+        published_event_types = [event_type for event_type, _payload in publisher.gate.completed]
+        observed_event_types = [event_type for event_type, _payload in observed]
+        assert published_event_types == [
+            "llm.response.started",
+            "llm.content.started",
+            "llm.content.completed",
+            "llm.response.completed",
         ]
-        observed_deltas = [
-            payload["delta"]
-            for event_type, payload in observed
-            if event_type == "llm.content.delta"
+        assert observed_event_types == [
+            "llm.response.started",
+            "llm.content.started",
+            "llm.content.completed",
+            "llm.response.completed",
         ]
-        assert published_deltas == ["ABC"]
-        assert observed_deltas == ["A", "B", "C"]
         assert stream_state["response_started"] is True
+        assert stream_state["output_projected"] is True
 
     asyncio.run(run_case())
+

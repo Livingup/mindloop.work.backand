@@ -406,6 +406,11 @@ async def test_execution_engine_note_state_message_isolation_flow():
         record_event=MagicMock(),
         record_user_message=MagicMock(),
     )
+    published_events: list[tuple[str, dict[str, Any]]] = []
+    event_publisher = NoopRuntimeEventPublisher()
+    event_publisher.publish = AsyncMock(
+        side_effect=lambda _ctx, event_type, payload, **_kwargs: published_events.append((event_type, dict(payload)))
+    )
     engine = AgentExecutionEngine(
         runtime_gateway=gateway,
         conversation_repository=repo,
@@ -433,7 +438,7 @@ async def test_execution_engine_note_state_message_isolation_flow():
         llm_request_service=llm_service,
         trace_recorder=trace_recorder,
         tool_dispatcher=tool_dispatcher,
-        event_publisher=NoopRuntimeEventPublisher(),
+        event_publisher=event_publisher,
         task_note_snapshot_service=note_snapshot_service,
         task_note_prompt_provider=note_prompt_provider,
     )
@@ -459,6 +464,15 @@ async def test_execution_engine_note_state_message_isolation_flow():
         ),
         timeout=30.0,
     )
+
+    assistant_received_payloads = [
+        payload for event_type, payload in published_events if event_type == "agent.assistant.message.received"
+    ]
+    assert len(assistant_received_payloads) >= 2
+    assert assistant_received_payloads[0]["text"] == "Note 整理完成，准备退出。"
+    assert assistant_received_payloads[0]["frontend_message"]["text"] == "Note 整理完成，准备退出。"
+    assert assistant_received_payloads[1]["text"] == "收到子 Agent 与远程 Agent 的消息，继续推进业务。"
+    assert assistant_received_payloads[1]["frontend_message"]["text"] == "收到子 Agent 与远程 Agent 的消息，继续推进业务。"
 
     # 检查 1：旧 Note 会话（initial_conv）中的消息
     # 应该只包含了人类消息，绝不包含子 Agent 和远程 Agent 消息！

@@ -1899,17 +1899,26 @@ class AgentExecutionEngine:
                     expected_next="assistant_message.handle_tools",
                 )
                 self._trace_recorder.record_llm_response(trace_path, assistant_message)
+                tool_uses = _extract_tool_uses(assistant_message)
+                assistant_text = _message_text(assistant_message).strip()
+                assistant_event_payload: dict[str, Any] = {
+                    "part_count": len(assistant_message.content),
+                    "tool_use_count": len(tool_uses),
+                }
+                if assistant_text:
+                    assistant_event_payload["text"] = assistant_text
+                    assistant_event_payload["text_format"] = "markdown"
+                    assistant_event_payload["frontend_message"] = {
+                        "text": assistant_text,
+                        "text_format": "markdown",
+                        "channel": "web",
+                    }
                 await self._event_publisher.publish(
                     communication_context,
                     "agent.assistant.message.received",
-                    {
-                        "part_count": len(assistant_message.content),
-                        "tool_use_count": len(_extract_tool_uses(assistant_message)),
-                    },
+                    assistant_event_payload,
                     source="agent_execution_engine",
                 )
-
-                tool_uses = _extract_tool_uses(assistant_message)
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     frame_id=current_frame_id,
