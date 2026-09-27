@@ -10,11 +10,19 @@ from __future__ import annotations
 from html import escape
 
 
-def multimodal_file_open_marker(kind: str, url: str | None) -> str | None:
-    if not url:
-        return None
-    return f'<multimodal_file type="{escape(kind, quote=True)}" url="{escape(url, quote=True)}">'
+def multimodal_file_open_marker(
+    kind: str,
+    url: str | None = None,
+    *,
+    path: str | None = None,
+) -> str | None:
+    if url:
+        return f'<multimodal_file type="{escape(kind, quote=True)}" url="{escape(url, quote=True)}">'
+    if path:
+        return f'<multimodal_file type="{escape(kind, quote=True)}" path="{escape(path, quote=True)}">'
+    return None
 
 
 def multimodal_file_close_marker() -> str:
     return "</multimodal_file>"
+

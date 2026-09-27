@@ -20,6 +20,7 @@
 - `directory_explore`：递进式探索目录结构。
 - `file_name_search`：按文件名、正则、glob、扩展名定位候选文件或目录。
 - `text_search`：在 `search_root` 指定的目录或单个普通文件内执行文本/正则搜索；目录模式递归并应用 extensions/path_globs/exclude_names/include_hidden/respect_gitignore，文件模式只扫描该文件且这些目录候选过滤器全部 no-op。优先 `ripgrep`，无 `rg` 时降级 Python；成功输出含 `search_target_type`（`file`|`directory`）。
+- `image_read`：批量读取远程 `http(s)://` 图片 URL 或本地图片文件绝对路径，直接将轻量引用（`url` 或 `path`）写入 `ToolResultPart.output`，在协议渲染阶段按 `<multimodal_file type="image" url/path="...">` + `input_image` + `</multimodal_file>` 提供给模型；不经过 `FileResourceService` 建档或上传。
 
 ### 受控写入工具
 
@@ -27,8 +28,9 @@
 - `file_create`：在项目工作区内创建文本文件，默认禁止覆盖已有文件。
 - `file_delete`：在项目工作区内删除单个文件，不支持目录或递归删除。
 - `file_move`：在项目工作区内移动或重命名单个文件，`rename` 作为同目录移动处理。
+- `image_save`：在项目工作区内批量将远程 `http(s)://` 图片 URL 下载并原子保存到目标路径，默认支持覆盖已有普通文件；不经过 `FileResourceService` 建档。
 
-写入类工具必须显式声明 `project_root`，并在工具内部执行工作区沙箱、`.git` 保护、符号链接拒绝、内容 SHA256 并发校验和原子写入等安全策略。
+写入类工具必须显式声明 `project_root`，并在工具内部执行工作区沙箱、`.git` 保护、符号链接拒绝和原子写入等安全策略（文本写入类工具额外执行内容 SHA256 并发校验）。
 
 ### Workspace REST 边界
 

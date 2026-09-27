@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
+import urllib.parse
 
 from agent_runtime.conversation_message.message.models import ImagePart, PdfPart, TextPart
 from agent_runtime.conversation_message.message.multimodal_url_markers import (
@@ -58,18 +62,26 @@ async def tool_result_output_to_text(value: Any, resolver: ResourceResolver) -> 
             continue
         if kind in (_TOOL_OUTPUT_IMAGE, _TOOL_OUTPUT_PDF):
             resource_id = item.get("resource_id")
-            if not isinstance(resource_id, str) or not resource_id:
+            if isinstance(resource_id, str) and resource_id:
+                resource = await _try_resolve_resource(resolver, resource_id)
+                if resource is None:
+                    pieces.append(f"[{kind} file] resource_id={resource_id} unresolved")
+                    continue
+                locator = _resource_locator(resource)
+                if not locator:
+                    pieces.append(f"[{kind} file] resource_id={resource_id} resolved_without_url_or_path")
+                    continue
+                pieces.append(f"[{kind} file] resource_id={resource_id} locator={locator}")
+                continue
+            direct_locator = str(item.get("url") or item.get("path") or "").strip()
+            if not direct_locator:
                 pieces.append(f"[{kind} file] resource_id=<missing>")
                 continue
-            resource = await _try_resolve_resource(resolver, resource_id)
+            resource = await _try_resolve_output_resource(resolver, item)
             if resource is None:
-                pieces.append(f"[{kind} file] resource_id={resource_id} unresolved")
+                pieces.append(f"[{kind} file] locator={direct_locator} unresolved")
                 continue
-            locator = _resource_locator(resource)
-            if not locator:
-                pieces.append(f"[{kind} file] resource_id={resource_id} resolved_without_url_or_path")
-                continue
-            pieces.append(f"[{kind} file] resource_id={resource_id} locator={locator}")
+            pieces.append(f"[{kind} file] locator={_resource_locator(resource) or direct_locator}")
     return "\n".join(pieces)
 
 
@@ -95,7 +107,7 @@ async def tool_result_output_to_openai_responses_output(
                 if not data:
                     continue
                 image_url = f"data:{resource.mime_type};base64,{data}"
-            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            marker = _tool_output_open_marker("image", item, resource)
             if marker is not None:
                 items.append({"type": "input_text", "text": marker})
             items.append({"type": "input_image", "image_url": image_url})
@@ -116,7 +128,7 @@ async def tool_result_output_to_openai_responses_output(
                     "type": "input_file",
                     "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
                 }
-            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            marker = _tool_output_open_marker("pdf", item, resource)
             if marker is not None:
                 items.append({"type": "input_text", "text": marker})
             items.append(file_item)
@@ -144,8 +156,8 @@ async def tool_result_output_to_claude_content(
         if kind == _TOOL_OUTPUT_IMAGE:
             resource = await _try_resolve_output_resource(resolver, item)
             source = _try_claude_resource_source(resource) if resource is not None else None
-            if source is not None:
-                marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if source is not None and resource is not None:
+                marker = _tool_output_open_marker("image", item, resource)
                 if marker is not None:
                     blocks.append({"type": "text", "text": marker})
                 blocks.append({"type": "image", "source": source})
@@ -155,8 +167,8 @@ async def tool_result_output_to_claude_content(
         if kind == _TOOL_OUTPUT_PDF:
             resource = await _try_resolve_output_resource(resolver, item)
             source = _try_claude_resource_source(resource, default_mime="application/pdf") if resource is not None else None
-            if source is not None:
-                marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if source is not None and resource is not None:
+                marker = _tool_output_open_marker("pdf", item, resource)
                 if marker is not None:
                     blocks.append({"type": "text", "text": marker})
                 blocks.append({"type": "document", "source": source})
@@ -185,8 +197,8 @@ async def tool_result_output_to_gemini_response_parts(
         if kind == _TOOL_OUTPUT_IMAGE:
             resource = await _try_resolve_output_resource(resolver, item)
             media_part = _try_gemini_media_part(resource, default_mime=resource.mime_type) if resource is not None else None
-            if media_part is not None:
-                marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if media_part is not None and resource is not None:
+                marker = _tool_output_open_marker("image", item, resource)
                 if marker is not None:
                     text_pieces.append(f"{marker}{multimodal_file_close_marker()}")
                 media_parts.append(media_part)
@@ -194,8 +206,8 @@ async def tool_result_output_to_gemini_response_parts(
         if kind == _TOOL_OUTPUT_PDF:
             resource = await _try_resolve_output_resource(resolver, item)
             media_part = _try_gemini_media_part(resource, default_mime="application/pdf") if resource is not None else None
-            if media_part is not None:
-                marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if media_part is not None and resource is not None:
+                marker = _tool_output_open_marker("pdf", item, resource)
                 if marker is not None:
                     text_pieces.append(f"{marker}{multimodal_file_close_marker()}")
                 media_parts.append(media_part)
@@ -243,8 +255,21 @@ def _normalize_tool_output_part(value: dict[str, Any]) -> dict[str, Any]:
     if kind == _TOOL_OUTPUT_TEXT:
         return _text_part(str(value.get("text") or ""))
     if kind in (_TOOL_OUTPUT_IMAGE, _TOOL_OUTPUT_PDF):
-        resource_id = value.get("resource_id")
-        return _resource_part(str(kind), str(resource_id or ""))
+        resource_id = str(value.get("resource_id") or "").strip()
+        url = str(value.get("url") or "").strip()
+        path = str(value.get("path") or "").strip()
+        mime_type = str(value.get("mime_type") or "").strip()
+        if resource_id:
+            part = _resource_part(str(kind), resource_id)
+        elif url:
+            part = {"kind": str(kind), "url": url}
+        elif path:
+            part = {"kind": str(kind), "path": path}
+        else:
+            part = _resource_part(str(kind), "")
+        if mime_type:
+            part["mime_type"] = mime_type
+        return part
     return _text_part(_stable_json_text(value))
 
 
@@ -272,11 +297,114 @@ def _jsonable_value(value: Any) -> Any:
     return value
 
 
+def _tool_output_open_marker(
+    kind: str,
+    item: dict[str, Any],
+    resource: ResolvedResource,
+) -> str | None:
+    if resource.object_storage_url:
+        return multimodal_file_open_marker(kind, resource.object_storage_url)
+    raw_path = item.get("path")
+    if isinstance(raw_path, str) and raw_path.strip():
+        return multimodal_file_open_marker(kind, path=raw_path.strip())
+    return None
+
+
 async def _try_resolve_output_resource(resolver: ResourceResolver, item: dict[str, Any]) -> ResolvedResource | None:
     resource_id = item.get("resource_id")
-    if not isinstance(resource_id, str) or not resource_id:
+    if isinstance(resource_id, str) and resource_id.strip():
+        return await _try_resolve_resource(resolver, resource_id.strip())
+    kind = str(item.get("kind") or _TOOL_OUTPUT_IMAGE)
+    raw_url = item.get("url")
+    if isinstance(raw_url, str) and raw_url.strip():
+        url = raw_url.strip()
+        mime_type = _infer_mime_type(
+            kind=kind,
+            declared_mime_type=item.get("mime_type"),
+            url_or_path=urllib.parse.urlparse(url).path,
+            content=None,
+        )
+        return ResolvedResource(
+            resource_id="",
+            mime_type=mime_type,
+            resource_category=kind,
+            object_storage_url=url,
+            base64_content=None,
+            local_storage_path=None,
+        )
+    raw_path = item.get("path")
+    if isinstance(raw_path, str) and raw_path.strip():
+        return _try_resolve_local_file_resource(
+            path_str=raw_path.strip(),
+            kind=kind,
+            declared_mime_type=item.get("mime_type"),
+        )
+    return None
+
+
+def _try_resolve_local_file_resource(
+    *,
+    path_str: str,
+    kind: str,
+    declared_mime_type: Any,
+) -> ResolvedResource | None:
+    try:
+        file_path = Path(path_str).expanduser()
+        if not file_path.is_file():
+            return None
+        content = file_path.read_bytes()
+        if not content:
+            return None
+        mime_type = _infer_mime_type(
+            kind=kind,
+            declared_mime_type=declared_mime_type,
+            url_or_path=str(file_path),
+            content=content,
+        )
+        return ResolvedResource(
+            resource_id="",
+            mime_type=mime_type,
+            resource_category=kind,
+            object_storage_url=None,
+            base64_content=base64.b64encode(content).decode("ascii"),
+            local_storage_path=str(file_path.resolve()),
+        )
+    except Exception:
         return None
-    return await _try_resolve_resource(resolver, resource_id)
+
+
+def _infer_mime_type(
+    *,
+    kind: str,
+    declared_mime_type: Any,
+    url_or_path: str | None,
+    content: bytes | None,
+) -> str:
+    if isinstance(declared_mime_type, str) and declared_mime_type.strip():
+        return declared_mime_type.strip().lower()
+    if content:
+        magic_mime = _detect_magic_mime_type(content)
+        if magic_mime:
+            return magic_mime
+    if url_or_path:
+        guessed, _ = mimetypes.guess_type(url_or_path)
+        if guessed:
+            return guessed.lower()
+    return "application/pdf" if kind == _TOOL_OUTPUT_PDF else "image/png"
+
+
+def _detect_magic_mime_type(content: bytes) -> str | None:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if content.startswith(b"%PDF-"):
+        return "application/pdf"
+    return None
 
 
 async def _try_resolve_resource(resolver: ResourceResolver, resource_id: str) -> ResolvedResource | None:
@@ -321,3 +449,4 @@ def _try_gemini_media_part(resource: ResolvedResource, *, default_mime: str | No
             "data": data,
         }
     }
+
