@@ -2,9 +2,23 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
+from agent_runtime.conversation_message.message.tool_result_output import (
+    tool_result_output_to_claude_content,
+    tool_result_output_to_gemini_response_parts,
+    tool_result_output_to_openai_responses_output,
+)
+from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import ResolvedResource
 from agent_runtime.image_generation.image_generation_tool import GenerateImageRequest, generate_image
 from agent_runtime.image_generation.models import GeneratedImageResource, ImageGenerationResult
 from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
+
+
+class _StubResourceResolver:
+    def __init__(self, resources: dict[str, ResolvedResource]) -> None:
+        self._resources = resources
+
+    async def resolve_resource(self, resource_id: str) -> ResolvedResource:
+        return self._resources[resource_id]
 
 
 class _ImageGenerationService:
@@ -107,3 +121,55 @@ class ImageGenerationToolResultTests(unittest.TestCase):
         self.assertEqual(service.requests[0].mode, "edit")
         self.assertEqual(result.metadata["mode"], "generate")
         self.assertEqual(result.metadata["preview_output"]["mode"], "generate")
+
+    def test_tool_result_multimodal_outputs_are_wrapped_with_multimodal_file_markers(self) -> None:
+        resolver = _StubResourceResolver(
+            {
+                "resource-image-1": ResolvedResource(
+                    resource_id="resource-image-1",
+                    mime_type="image/png",
+                    resource_category="image",
+                    object_storage_url="https://example.test/image.png",
+                    base64_content=None,
+                    local_storage_path="D:/tmp/image.png",
+                ),
+            }
+        )
+        tool_output = [
+            {"kind": "text", "text": "Image generation prompt: Create an enterprise SaaS dashboard"},
+            {"kind": "image", "resource_id": "resource-image-1"},
+        ]
+
+        openai_items = asyncio.run(tool_result_output_to_openai_responses_output(tool_output, resolver))
+        self.assertEqual(
+            openai_items,
+            [
+                {"type": "input_text", "text": "Image generation prompt: Create an enterprise SaaS dashboard"},
+                {"type": "input_text", "text": '<multimodal_file type="image" url="https://example.test/image.png">'},
+                {"type": "input_image", "image_url": "https://example.test/image.png"},
+                {"type": "input_text", "text": "</multimodal_file>"},
+            ],
+        )
+
+        claude_blocks = asyncio.run(tool_result_output_to_claude_content(tool_output, resolver))
+        self.assertEqual(
+            claude_blocks,
+            [
+                {"type": "text", "text": "Image generation prompt: Create an enterprise SaaS dashboard"},
+                {"type": "text", "text": '<multimodal_file type="image" url="https://example.test/image.png">'},
+                {"type": "image", "source": {"type": "url", "url": "https://example.test/image.png"}},
+                {"type": "text", "text": "</multimodal_file>"},
+            ],
+        )
+
+        gemini_text, gemini_parts = asyncio.run(tool_result_output_to_gemini_response_parts(tool_output, resolver))
+        self.assertEqual(
+            gemini_text,
+            "Image generation prompt: Create an enterprise SaaS dashboard\n"
+            '<multimodal_file type="image" url="https://example.test/image.png"></multimodal_file>',
+        )
+        self.assertEqual(
+            gemini_parts,
+            [{"fileData": {"mimeType": "image/png", "fileUri": "https://example.test/image.png"}}],
+        )
+

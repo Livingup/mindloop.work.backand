@@ -5,6 +5,10 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from agent_runtime.conversation_message.message.models import ImagePart, PdfPart, TextPart
+from agent_runtime.conversation_message.message.multimodal_url_markers import (
+    multimodal_file_close_marker,
+    multimodal_file_open_marker,
+)
 from agent_runtime.conversation_message.south_gateway.resource_resolver.contracts import (
     ResourceResolver,
     ResolvedResource,
@@ -91,22 +95,33 @@ async def tool_result_output_to_openai_responses_output(
                 if not data:
                     continue
                 image_url = f"data:{resource.mime_type};base64,{data}"
+            marker = multimodal_file_open_marker("image", resource.object_storage_url)
+            if marker is not None:
+                items.append({"type": "input_text", "text": marker})
             items.append({"type": "input_image", "image_url": image_url})
+            if marker is not None:
+                items.append({"type": "input_text", "text": multimodal_file_close_marker()})
             continue
         if kind == _TOOL_OUTPUT_PDF:
             resource = await _try_resolve_output_resource(resolver, item)
             if resource is None:
                 continue
             if resource.object_storage_url:
-                items.append({"type": "input_file", "file_url": resource.object_storage_url})
+                file_item: dict[str, Any] = {"type": "input_file", "file_url": resource.object_storage_url}
             else:
                 data = resource.base64_content
                 if not data:
                     continue
-                items.append({
+                file_item = {
                     "type": "input_file",
                     "file_data": f"data:{resource.mime_type or 'application/pdf'};base64,{data}",
-                })
+                }
+            marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+            if marker is not None:
+                items.append({"type": "input_text", "text": marker})
+            items.append(file_item)
+            if marker is not None:
+                items.append({"type": "input_text", "text": multimodal_file_close_marker()})
     if not items:
         return ""
     if all(item.get("type") == "input_text" for item in items):
@@ -130,13 +145,23 @@ async def tool_result_output_to_claude_content(
             resource = await _try_resolve_output_resource(resolver, item)
             source = _try_claude_resource_source(resource) if resource is not None else None
             if source is not None:
+                marker = multimodal_file_open_marker("image", resource.object_storage_url)
+                if marker is not None:
+                    blocks.append({"type": "text", "text": marker})
                 blocks.append({"type": "image", "source": source})
+                if marker is not None:
+                    blocks.append({"type": "text", "text": multimodal_file_close_marker()})
             continue
         if kind == _TOOL_OUTPUT_PDF:
             resource = await _try_resolve_output_resource(resolver, item)
             source = _try_claude_resource_source(resource, default_mime="application/pdf") if resource is not None else None
             if source is not None:
+                marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+                if marker is not None:
+                    blocks.append({"type": "text", "text": marker})
                 blocks.append({"type": "document", "source": source})
+                if marker is not None:
+                    blocks.append({"type": "text", "text": multimodal_file_close_marker()})
     if not blocks:
         return ""
     if all(block.get("type") == "text" for block in blocks):
@@ -161,12 +186,18 @@ async def tool_result_output_to_gemini_response_parts(
             resource = await _try_resolve_output_resource(resolver, item)
             media_part = _try_gemini_media_part(resource, default_mime=resource.mime_type) if resource is not None else None
             if media_part is not None:
+                marker = multimodal_file_open_marker("image", resource.object_storage_url)
+                if marker is not None:
+                    text_pieces.append(f"{marker}{multimodal_file_close_marker()}")
                 media_parts.append(media_part)
             continue
         if kind == _TOOL_OUTPUT_PDF:
             resource = await _try_resolve_output_resource(resolver, item)
             media_part = _try_gemini_media_part(resource, default_mime="application/pdf") if resource is not None else None
             if media_part is not None:
+                marker = multimodal_file_open_marker("pdf", resource.object_storage_url)
+                if marker is not None:
+                    text_pieces.append(f"{marker}{multimodal_file_close_marker()}")
                 media_parts.append(media_part)
     return "\n".join(text_pieces), media_parts
 
