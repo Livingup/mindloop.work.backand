@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -24,6 +26,8 @@ from agent_runtime.file_resource.south_gateway.object_storage.runtime_configured
 from agent_runtime.file_resource.upload_task_service import FileResourceUploadTaskEvent, TERMINAL_UPLOAD_STATUSES
 
 logger = logging.getLogger(__name__)
+
+MAX_LOCAL_IMAGE_PREVIEW_BYTES = 50 * 1024 * 1024
 
 
 class CreateFileResourceItem(BaseModel):
@@ -289,6 +293,17 @@ def create_file_resource_router() -> APIRouter:
         )
         return _object_storage_settings_response(repository)
 
+    @router.get("/local-image/content")
+    def get_local_image_content(
+        path: str = Query(..., min_length=1, description="本地图片文件绝对路径"),
+    ) -> Response:
+        content, mime_type = _read_local_image_for_preview(path)
+        return Response(
+            content=content,
+            media_type=mime_type,
+            headers={"Cache-Control": "private, max-age=60"},
+        )
+
     @router.get("/{resource_id}", response_model=FileResourceResponse)
     def get_resource(resource_id: str) -> FileResourceResponse:
         service = get_file_resource_service()
@@ -310,6 +325,64 @@ def create_file_resource_router() -> APIRouter:
         return Response(content=content, media_type=resource.resource_mime_type)
 
     return router
+
+
+def _read_local_image_for_preview(raw_path: str) -> tuple[bytes, str]:
+    normalized = (raw_path or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="图片路径不能为空。")
+    file_path = Path(normalized).expanduser()
+    if not file_path.is_absolute():
+        raise HTTPException(status_code=400, detail=f"本地图片路径必须为绝对路径: {normalized}")
+    try:
+        resolved_path = file_path.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无效的本地图片路径: {normalized}") from exc
+
+    if not resolved_path.exists():
+        raise HTTPException(status_code=404, detail=f"图片文件不存在: {resolved_path}")
+    if not resolved_path.is_file():
+        raise HTTPException(status_code=400, detail=f"路径不是普通文件: {resolved_path}")
+
+    try:
+        file_size = resolved_path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取图片文件状态失败: {resolved_path}") from exc
+    if file_size <= 0:
+        raise HTTPException(status_code=400, detail=f"图片文件内容为空: {resolved_path}")
+    if file_size > MAX_LOCAL_IMAGE_PREVIEW_BYTES:
+        raise HTTPException(status_code=413, detail=f"图片文件大小超过预览上限: {resolved_path}")
+
+    try:
+        content = resolved_path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"读取图片文件失败: {resolved_path}") from exc
+
+    mime_type = _detect_local_preview_image_mime_type(resolved_path, content)
+    return content, mime_type
+
+
+def _detect_local_preview_image_mime_type(path: Path, content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if content.startswith(b"BM") and len(content) >= 14:
+        return "image/bmp"
+    if len(content) >= 12 and content[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    if content.startswith(b"\x00\x00\x01\x00"):
+        return "image/x-icon"
+
+    guessed_mime, _ = mimetypes.guess_type(str(path))
+    if guessed_mime == "image/svg+xml" and b"<svg" in content[:1024].lower():
+        return "image/svg+xml"
+
+    raise HTTPException(status_code=400, detail=f"文件不是受支持的图片格式: {path}")
 
 
 def _object_storage_settings_repository() -> ObjectStorageSettingsRepository:

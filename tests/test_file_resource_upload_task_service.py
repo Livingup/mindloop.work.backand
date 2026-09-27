@@ -101,6 +101,17 @@ def test_wait_for_event_async_wakes_on_terminal_status_without_newer_seq_require
     asyncio.run(run_case())
 
 
+from pathlib import Path
+import tempfile
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from agent_runtime.file_resource.north_gateway.file_resource_rest_adapter import (
+    _format_upload_task_sse,
+    create_file_resource_router,
+)
+
+
 def test_file_upload_task_sse_is_resource_scoped_and_legally_has_no_agent_owner() -> None:
     event = FileResourceUploadTaskEvent(
         task_id="file-upload-1",
@@ -115,3 +126,33 @@ def test_file_upload_task_sse_is_resource_scoped_and_legally_has_no_agent_owner(
     payload = json.loads(frame.splitlines()[2].removeprefix("data: "))
     assert payload["task_id"] == "file-upload-1"
     assert "agent_instance_id" not in payload
+
+
+def test_get_local_image_content_serves_valid_local_image_and_rejects_invalid_paths() -> None:
+    app = FastAPI()
+    app.include_router(create_file_resource_router(), prefix="/api/file-resources")
+    client = TestClient(app)
+    png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        image_path = tmp_root / "sample.png"
+        image_path.write_bytes(png_bytes)
+
+        text_path = tmp_root / "notes.txt"
+        text_path.write_text("not an image", encoding="utf-8")
+
+        res_ok = client.get("/api/file-resources/local-image/content", params={"path": str(image_path)})
+        assert res_ok.status_code == 200
+        assert res_ok.headers["content-type"].startswith("image/png")
+        assert res_ok.content == png_bytes
+
+        res_relative = client.get("/api/file-resources/local-image/content", params={"path": "relative/sample.png"})
+        assert res_relative.status_code == 400
+
+        res_missing = client.get("/api/file-resources/local-image/content", params={"path": str(tmp_root / "missing.png")})
+        assert res_missing.status_code == 404
+
+        res_non_image = client.get("/api/file-resources/local-image/content", params={"path": str(text_path)})
+        assert res_non_image.status_code == 400
+
