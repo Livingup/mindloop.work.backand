@@ -1,17 +1,23 @@
-"""面向 Agent 的多模态图片文件读取与保存工具（不经过 FileResourceService）。
+"""面向 Agent 的多模态图片文件读取与保存工具。
 
-本模块提供两个与统一文件资源服务（FileResourceService）解耦的图片文件工具：
+本模块提供两个图片文件工具：
 - `image_read`：批量读取远程 http(s):// 图片 URL 或本地图片文件绝对路径，以多模态图片输出项
   写入 ToolResultPart.output，使下一轮 LLM 请求通过 `<multimodal_file ...>` 标签包裹的
-  `input_image` 块直接读取图片视觉内容与位置信息。
-- `image_save`：批量将远程 http(s):// 图片 URL 下载并原子保存到项目工作区（project_root）内
-  的目标文件路径，默认支持覆盖已有普通文件。
+  `input_image` 块直接读取图片视觉内容与位置信息；不经过 FileResourceService 建档。
+- `image_save`：批量将远程 http(s):// 图片 URL 保存到项目工作区（project_root）内的目标文件路径，
+  默认支持覆盖已有普通文件，最大支持 4 并发（MAX_IMAGE_SAVE_CONCURRENCY = 4）。保存时优先向本地
+  FileResourceService 查询该 URL 是否已存在本地资源文件，若命中则直接从本地资源文件读取复制，
+  未命中时再通过 HTTP 下载（不向 FileResourceService 新建档案或上传 OSS）。
 """
 from __future__ import annotations
 
+import base64
+from concurrent.futures import ThreadPoolExecutor
 import mimetypes
 import os
 from pathlib import Path
+from threading import Lock
+import time
 from typing import Any
 import urllib.error
 import urllib.parse
@@ -35,8 +41,12 @@ from agent_runtime.tool.tool_execution_models import BaseToolRequest, BaseToolRe
 
 
 MAX_IMAGE_BATCH_COUNT = 20
+MAX_IMAGE_SAVE_CONCURRENCY = 4
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 30
+IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+IMAGE_DOWNLOAD_MAX_ATTEMPTS = 3
+IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS = 0.5
 SUPPORTED_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _EXTENSION_TO_IMAGE_MIME = {
     ".png": "image/png",
@@ -130,9 +140,6 @@ def _detect_local_image_mime_type(path: Path, header: bytes) -> str:
     if magic_mime in SUPPORTED_IMAGE_MIME_TYPES:
         return magic_mime
     guessed_mime = _guess_image_mime_from_name(str(path))
-    if guessed_mime in SUPPORTED_IMAGE_MIME_TYPES and b"\x00" not in header[:16]:
-        # 若文件既无图片魔数也不包含二进制特征，则拒绝将纯文本伪装文件当作图片读取。
-        pass
     if guessed_mime in SUPPORTED_IMAGE_MIME_TYPES and not header.startswith((b"<!DOCTYPE", b"<html", b"{", b"[")):
         return guessed_mime
     raise FileEditBusinessError(
@@ -176,59 +183,126 @@ def _resolve_downloaded_image_mime_type(
     )
 
 
+def _try_load_image_from_local_resource_service(
+    normalized_url: str,
+    *,
+    target_path: Path,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> tuple[bytes, str] | None:
+    """优先从本地 FileResourceService 查询 URL 是否已建档，若存在则直接读取本地资源文件。
+
+    仅执行只读查询与本地文件读取，不触发任何新建资源或 OSS 上传操作；
+    当资源服务未命中、未初始化或本地文件不存在时返回 None，由调用方回退到 HTTP 下载。
+    """
+
+    try:
+        from agent_runtime.file_resource.shared_service import get_file_resource_service
+
+        service = get_file_resource_service()
+        resources = service.get_resources_by_object_storage_urls([normalized_url])
+    except Exception:
+        return None
+
+    if not resources or resources[0] is None:
+        return None
+
+    resource = resources[0]
+    content: bytes | None = None
+    if resource.local_storage_path:
+        local_path = Path(resource.local_storage_path).expanduser()
+        if local_path.is_file():
+            try:
+                content = local_path.read_bytes()
+            except OSError:
+                content = None
+    if content is None and resource.resource_base64_content:
+        try:
+            content = base64.b64decode(resource.resource_base64_content)
+        except Exception:
+            content = None
+
+    if not content:
+        return None
+    if len(content) > max_bytes:
+        raise FileEditBusinessError(
+            "ImageFileTooLarge",
+            f"本地资源图片大小 {len(content)} bytes 超过上限 {max_bytes} bytes: {normalized_url}",
+        )
+
+    mime_type = _resolve_downloaded_image_mime_type(
+        content,
+        resource.resource_mime_type,
+        normalized_url,
+        target_path,
+    )
+    return content, mime_type
+
+
 def _download_remote_image(
     raw_url: str,
     *,
     target_path: Path,
     max_bytes: int = MAX_IMAGE_BYTES,
 ) -> tuple[str, bytes, str]:
-    """下载远程图片并校验大小与图片格式。"""
+    """下载远程图片并校验大小与图片格式，对临时网络超时/连接错误执行有限重试。"""
 
     normalized_url = _normalize_remote_http_url(raw_url)
-    req = urllib.request.Request(
-        normalized_url,
-        headers={"User-Agent": "AgentRuntimeImageTool/1.0"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as response:
-            response_content_type = response.headers.get("Content-Type") if response.headers else None
-            length_header = response.headers.get("Content-Length") if response.headers else None
-            if length_header:
-                try:
-                    content_length = int(length_header)
-                except ValueError:
-                    content_length = 0
-                if content_length > max_bytes:
-                    raise FileEditBusinessError(
-                        "ImageFileTooLarge",
-                        f"远程图片大小 {content_length} bytes 超过上限 {max_bytes} bytes: {normalized_url}",
-                    )
-            chunks: list[bytes] = []
-            downloaded = 0
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                downloaded += len(chunk)
-                if downloaded > max_bytes:
-                    raise FileEditBusinessError(
-                        "ImageFileTooLarge",
-                        f"远程图片大小超过上限 {max_bytes} bytes，已停止下载: {normalized_url}",
-                    )
-                chunks.append(chunk)
-    except FileEditBusinessError:
-        raise
-    except urllib.error.URLError as exc:
+    last_error: Exception | None = None
+    response_content_type: str | None = None
+    chunks: list[bytes] = []
+
+    for attempt in range(1, IMAGE_DOWNLOAD_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            normalized_url,
+            headers={"User-Agent": "AgentRuntimeImageTool/1.0"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as response:
+                response_content_type = response.headers.get("Content-Type") if response.headers else None
+                length_header = response.headers.get("Content-Length") if response.headers else None
+                if length_header:
+                    try:
+                        content_length = int(length_header)
+                    except ValueError:
+                        content_length = 0
+                    if content_length > max_bytes:
+                        raise FileEditBusinessError(
+                            "ImageFileTooLarge",
+                            f"远程图片大小 {content_length} bytes 超过上限 {max_bytes} bytes: {normalized_url}",
+                        )
+                chunks = []
+                downloaded = 0
+                while True:
+                    chunk = response.read(IMAGE_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise FileEditBusinessError(
+                            "ImageFileTooLarge",
+                            f"远程图片大小超过上限 {max_bytes} bytes，已停止下载: {normalized_url}",
+                        )
+                    chunks.append(chunk)
+            last_error = None
+            break
+        except FileEditBusinessError:
+            raise
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if exc.code < 500 and exc.code != 429:
+                break
+        except (urllib.error.URLError, OSError) as exc:
+            last_error = exc
+
+        if attempt < IMAGE_DOWNLOAD_MAX_ATTEMPTS:
+            time.sleep(IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS * attempt)
+
+    if last_error is not None:
         raise FileEditBusinessError(
             "ImageDownloadFailed",
-            f"远程图片下载失败: {normalized_url}: {exc}",
-        ) from exc
-    except OSError as exc:
-        raise FileEditBusinessError(
-            "ImageDownloadFailed",
-            f"远程图片下载失败: {normalized_url}: {exc}",
-        ) from exc
+            f"远程图片下载失败: {normalized_url}: {last_error}",
+        ) from last_error
 
     content = b"".join(chunks)
     if not content:
@@ -241,6 +315,32 @@ def _download_remote_image(
         target_path,
     )
     return normalized_url, content, mime_type
+
+
+def _resolve_or_download_image_for_save(
+    raw_url: str,
+    *,
+    target_path: Path,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> tuple[str, bytes, str, str]:
+    """先从本地 FileResourceService 查询复制，未命中时再从远程 URL 下载。"""
+
+    normalized_url = _normalize_remote_http_url(raw_url)
+    local_hit = _try_load_image_from_local_resource_service(
+        normalized_url,
+        target_path=target_path,
+        max_bytes=max_bytes,
+    )
+    if local_hit is not None:
+        content, mime_type = local_hit
+        return normalized_url, content, mime_type, "local_resource"
+
+    normalized_url, content, mime_type = _download_remote_image(
+        normalized_url,
+        target_path=target_path,
+        max_bytes=max_bytes,
+    )
+    return normalized_url, content, mime_type, "remote_download"
 
 
 def _write_bytes_atomically(path: Path, content: bytes) -> None:
@@ -328,6 +428,69 @@ def _read_single_image_item(raw_item: str) -> tuple[dict[str, Any], dict[str, An
     )
 
 
+def _save_single_image_item(
+    index: int,
+    project_root: str,
+    item: ImageSaveItem,
+    dir_lock: Lock,
+) -> dict[str, Any]:
+    """执行单张图片的本地资源查找/远程下载与工作区原子落盘。"""
+
+    item_base: dict[str, Any] = {
+        "index": index,
+        "url": item.url,
+        "file_path": item.file_path,
+    }
+    try:
+        target = _prepare_workspace_target(project_root, item.file_path, allow_missing=True)
+        item_base.update(
+            {
+                "file_path": str(target.path),
+                "relative_path": target.relative_path.as_posix(),
+            }
+        )
+        overwriting = target.path.exists()
+        if overwriting:
+            _ensure_existing_regular_file(target, directory_error_code="DirectoryOverwriteDenied")
+            if not item.overwrite:
+                raise FileEditBusinessError(
+                    "FileAlreadyExists",
+                    f"文件已存在且 overwrite=false: {target.path}",
+                )
+
+        normalized_url, content, mime_type, source = _resolve_or_download_image_for_save(
+            item.url,
+            target_path=target.path,
+            max_bytes=MAX_IMAGE_BYTES,
+        )
+        with dir_lock:
+            parent_directories = _ensure_parent_directory(
+                target,
+                create_parent_directories=item.create_parent_directories,
+                dry_run=False,
+            )
+        _write_bytes_atomically(target.path, content)
+        return {
+            **item_base,
+            "url": normalized_url,
+            "success": True,
+            "source": source,
+            "mime_type": mime_type,
+            "size_in_bytes": len(content),
+            "content_sha256": _sha256_bytes(content),
+            "created": not overwriting,
+            "overwritten": overwriting,
+            "created_parent_directory_count": len(parent_directories),
+        }
+    except FileEditBusinessError as exc:
+        return {
+            **item_base,
+            "success": False,
+            "error_code": exc.error_code,
+            "error_message": exc.error_message,
+        }
+
+
 @tool(
     name="image_read",
     description=(
@@ -392,8 +555,8 @@ def image_read(request: ImageReadRequest, ctx: ToolRuntimeContext) -> BaseToolRe
 @tool(
     name="image_save",
     description=(
-        f"批量将远程 http(s):// 图片 URL 下载保存到项目工作区（project_root）内的指定文件路径（一次最多 {MAX_IMAGE_BATCH_COUNT} 项）。"
-        "目标路径必须位于 project_root 内，默认支持覆盖已存在的同名文件并自动创建父目录；不经过资源系统建档。"
+        f"批量将远程 http(s):// 图片 URL 保存到项目工作区（project_root）内的指定文件路径（一次最多 {MAX_IMAGE_BATCH_COUNT} 项，最大 {MAX_IMAGE_SAVE_CONCURRENCY} 并发）。"
+        "若该 URL 已存在于本地资源系统中则直接从本地读取复制，否则并发下载；目标路径必须位于 project_root 内，默认支持覆盖已存在的同名文件并自动创建父目录。"
     ),
     group="file",
     category="business",
@@ -402,7 +565,7 @@ def image_read(request: ImageReadRequest, ctx: ToolRuntimeContext) -> BaseToolRe
     blocking_operation="tool.file.image_save",
 )
 def image_save(request: ImageSaveRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    """批量下载远程图片并原子保存到工作区目标路径。"""
+    """批量保存远程图片到工作区目标路径（优先复用本地 FileResourceService 缓存，未命中则最多 4 并发下载）。"""
 
     project_root_path = Path(request.project_root).expanduser().resolve()
     output_base: dict[str, Any] = {"project_root": str(project_root_path)}
@@ -425,66 +588,21 @@ def image_save(request: ImageSaveRequest, ctx: ToolRuntimeContext) -> BaseToolRe
             metadata=_runtime_metadata(ctx, "image_save"),
         )
 
-    item_results: list[dict[str, Any]] = []
-    failed_items: list[dict[str, Any]] = []
+    dir_lock = Lock()
+    max_workers = min(MAX_IMAGE_SAVE_CONCURRENCY, len(request.items))
+    if max_workers <= 1:
+        item_results = [
+            _save_single_image_item(0, request.project_root, request.items[0], dir_lock)
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="image-save") as executor:
+            futures = [
+                executor.submit(_save_single_image_item, index, request.project_root, item, dir_lock)
+                for index, item in enumerate(request.items)
+            ]
+            item_results = [future.result() for future in futures]
 
-    for index, item in enumerate(request.items):
-        item_base: dict[str, Any] = {
-            "index": index,
-            "url": item.url,
-            "file_path": item.file_path,
-        }
-        try:
-            target = _prepare_workspace_target(request.project_root, item.file_path, allow_missing=True)
-            item_base.update(
-                {
-                    "file_path": str(target.path),
-                    "relative_path": target.relative_path.as_posix(),
-                }
-            )
-            overwriting = target.path.exists()
-            if overwriting:
-                _ensure_existing_regular_file(target, directory_error_code="DirectoryOverwriteDenied")
-                if not item.overwrite:
-                    raise FileEditBusinessError(
-                        "FileAlreadyExists",
-                        f"文件已存在且 overwrite=false: {target.path}",
-                    )
-
-            normalized_url, content, mime_type = _download_remote_image(
-                item.url,
-                target_path=target.path,
-                max_bytes=MAX_IMAGE_BYTES,
-            )
-            parent_directories = _ensure_parent_directory(
-                target,
-                create_parent_directories=item.create_parent_directories,
-                dry_run=False,
-            )
-            _write_bytes_atomically(target.path, content)
-            item_results.append(
-                {
-                    **item_base,
-                    "url": normalized_url,
-                    "success": True,
-                    "mime_type": mime_type,
-                    "size_in_bytes": len(content),
-                    "content_sha256": _sha256_bytes(content),
-                    "created": not overwriting,
-                    "overwritten": overwriting,
-                    "created_parent_directory_count": len(parent_directories),
-                }
-            )
-        except FileEditBusinessError as exc:
-            failure_entry = {
-                **item_base,
-                "success": False,
-                "error_code": exc.error_code,
-                "error_message": exc.error_message,
-            }
-            item_results.append(failure_entry)
-            failed_items.append(failure_entry)
-
+    failed_items = [entry for entry in item_results if not entry.get("success")]
     output = {
         **output_base,
         "items": item_results,
