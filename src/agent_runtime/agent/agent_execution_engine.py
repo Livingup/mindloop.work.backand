@@ -3508,7 +3508,10 @@ class AgentExecutionEngine:
                 snapshot = (
                     business_system_prompt or ""
                     if evt.component == "prompt"
-                    else business_tool_schemas
+                    else tuple(
+                        t.name if hasattr(t, "name") else (t.get("name") if isinstance(t, dict) else str(t))
+                        for t in business_tools
+                    )
                 )
                 frozen_timeline.append(
                     replace(

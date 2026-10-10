@@ -1329,11 +1329,11 @@ def test_subagent_timeline_seeding_and_placeholder_replacement():
         assert child_conv is not None
         # 验证 timeline 事件
         assert len(child_conv.timeline) == 3
-        # 1. 历史 tool snapshot
+        # 1. 历史 tool snapshot（工具快照统一记录工具 ID 元组）
         assert child_conv.timeline[0].component == "tool"
         assert child_conv.timeline[0].status == "historical"
         assert child_conv.timeline[0].anchor == "start"
-        assert child_conv.timeline[0].snapshot == parent_conv.tools
+        assert child_conv.timeline[0].snapshot == ("read_file", "list_dir")
         # 2. 历史 prompt snapshot
         assert child_conv.timeline[1].component == "prompt"
         assert child_conv.timeline[1].status == "historical"
@@ -2103,6 +2103,123 @@ def test_merge_batch_results_merges_images_and_deduplicates():
     assert "<h2>2. query2</h2>" in merged.content
     assert '<img src="https://img.test/1.png"' in merged.content
     assert '<img src="https://img.test/2.png"' in merged.content
+
+
+def test_tool_id_snapshots_and_heterogeneous_schema_normalization():
+    """验证多协议模型切换场景下的工具快照统一语义与 Schema 自愈：
+    1. 工具快照记录纯工具 ID 时，OpenAIAdapter 能够动态解析为合法的 function tools；
+    2. 工具快照包含 Claude/Anthropic 格式字典（含 input_schema 且缺失 type="function"）时，
+       能够自愈补齐 type="function" 并将 input_schema 归一化为 parameters，
+       彻底避免上游 502/400 Missing required parameter: 'input[0].tools[0].type' 报错；
+    3. 工具快照包含 Chat Completions 嵌套格式时，自动扁平化。
+    """
+    import asyncio
+    from agent_runtime.conversation_message.message.models import (
+        Conversation,
+        ConfigurationComponentEvent,
+        UniMessage,
+        TextPart,
+    )
+    from agent_runtime.conversation_message.message.openai_protocol import OpenAIAdapter
+
+    class _MockResolver:
+        async def resolve_tool_definition(self, tool_id: str):
+            if tool_id == "tool_from_id":
+                return {
+                    "name": "tool_from_id",
+                    "description": "Resolved tool",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                }
+            return None
+
+    async def run():
+        conv = Conversation(
+            id="conv-multi-protocol-test",
+            system_prompt="System prompt",
+            tools=(
+                {
+                    "type": "function",
+                    "name": "tool_from_id",
+                    "description": "Resolved tool",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+                },
+            ),
+        )
+
+        # 构造包含了四种形态的历史工具快照：
+        # 1. 存在于当前环境目录的工具 ID 字符串
+        # 2. 未知/旧工具 ID 字符串（测试安全 fallback）
+        # 3. Claude/Anthropic 格式字典（无 type，含 input_schema，测试自愈）
+        # 4. Chat Completions 嵌套格式字典（测试扁平化）
+        claude_tool_dict = {
+            "name": "claude_tool",
+            "description": "Tool defined in Claude format",
+            "input_schema": {
+                "type": "object",
+                "properties": {"action": {"type": "string"}},
+                "required": ["action"],
+            },
+        }
+        nested_tool_dict = {
+            "type": "function",
+            "function": {
+                "name": "nested_tool",
+                "description": "Tool in nested chat completions format",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        conv.timeline.append(
+            ConfigurationComponentEvent(
+                event_id="e_tool_hist",
+                definition_id="def_tools",
+                component="tool",
+                status="historical",
+                anchor="start",
+                snapshot=("tool_from_id", "fallback_tool_id", claude_tool_dict, nested_tool_dict),
+            )
+        )
+        conv.append_message(UniMessage(role="user", content=[TextPart("Hello")]))
+
+        adapter = OpenAIAdapter()
+        rendered = await adapter.render(conv, _MockResolver())
+        items = rendered.input
+        assert len(items) >= 2
+        tool_item = items[0]
+        assert tool_item["type"] == "additional_tools"
+        tools = tool_item["tools"]
+        assert len(tools) == 4
+
+        # 检查工具 1：由工具 ID 从当前环境目录命中并解析
+        t1 = tools[0]
+        assert t1["type"] == "function"
+        assert t1["name"] == "tool_from_id"
+        assert t1["description"] == "Resolved tool"
+        assert t1["parameters"]["properties"]["q"]["type"] == "string"
+
+        # 检查工具 2：未在当前目录中定义的历史工具 ID，安全回退生成合法 function 结构，绝不缺少 type
+        t2 = tools[1]
+        assert t2["type"] == "function"
+        assert t2["name"] == "fallback_tool_id"
+        assert "parameters" in t2
+
+        # 检查工具 3：由 Claude 格式自愈而来，必须有 type="function"，input_schema 变为 parameters
+        t3 = tools[2]
+        assert t3["type"] == "function"
+        assert t3["name"] == "claude_tool"
+        assert "input_schema" not in t3
+        assert t3["parameters"]["properties"]["action"]["type"] == "string"
+        assert t3["parameters"]["required"] == ["action"]
+
+        # 检查工具 4：由嵌套格式扁平化而来
+        t4 = tools[3]
+        assert t4["type"] == "function"
+        assert t4["name"] == "nested_tool"
+        assert "function" not in t4
+        assert "parameters" in t4
+
+    asyncio.run(run())
+
 
 
 

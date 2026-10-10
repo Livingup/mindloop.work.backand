@@ -340,6 +340,19 @@ def _render_openai_configuration_timeline(
     known_message_ids = {message.message_id for message in conv.messages}
     if len(known_message_ids) != len(conv.messages):
         raise ValueError("Responses 配置锚点要求 Conversation.message_id 唯一。")
+    tool_catalog: dict[str, dict[str, Any]] = {}
+    if view.current_tools and view.current_tools.ordered_definitions:
+        for t in view.current_tools.ordered_definitions:
+            if isinstance(t, dict):
+                name = t.get("name") or t.get("function", {}).get("name")
+                if name:
+                    tool_catalog[str(name)] = t
+    if getattr(conv, "tools", None):
+        for t in conv.tools:
+            if isinstance(t, dict):
+                name = t.get("name") or t.get("function", {}).get("name")
+                if name and str(name) not in tool_catalog:
+                    tool_catalog[str(name)] = t
     grouped: dict[tuple[str, str | None], list[tuple[ConfigurationComponentEvent, str]]] = {}
     for component, events in (
         ("tool", view.tool_events),
@@ -391,10 +404,11 @@ def _render_openai_configuration_timeline(
                 if tool_value:
                     # 只有客户端函数工具才投影为 input 中的 additional_tools 事件项；
                     # 平台/模型内置托管工具（如 web_search、file_search 等）由客户端在顶层 tools 中发送。
-                    function_tools = [
-                        item for item in tool_value
-                        if isinstance(item, dict) and not is_openai_hosted_tool(item)
-                    ]
+                    function_tools = []
+                    for item in tool_value:
+                        resolved = _resolve_openai_function_tool(item, tool_catalog)
+                        if resolved is not None:
+                            function_tools.append(resolved)
                     if function_tools:
                         rendered.append(_build_openai_additional_tools(function_tools))
         return rendered
@@ -468,6 +482,69 @@ def _build_openai_developer_message(
     for block in content:
         block.pop("prompt_cache_breakpoint", None)
     return {"role": "developer", "content": content}
+
+
+def _normalize_openai_response_tool_dict(tool: dict[str, Any]) -> dict[str, Any]:
+    """将各种异构/旧协议格式的工具字典归一化为 OpenAI Responses 扁平结构。"""
+    # 1. Claude 格式：含 input_schema 且缺少 type
+    if "input_schema" in tool and "type" not in tool:
+        return {
+            "type": "function",
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema") or {},
+            "strict": False,
+        }
+    # 2. Chat Completions 嵌套格式：{"type": "function", "function": {...}}
+    if tool.get("type") == "function" and "function" in tool and isinstance(tool["function"], dict):
+        fn = tool["function"]
+        return {
+            "type": "function",
+            "name": fn.get("name", tool.get("name", "")),
+            "description": fn.get("description", tool.get("description", "")),
+            "parameters": fn.get("parameters") or {},
+            "strict": fn.get("strict", False),
+        }
+    # 3. 缺失 type 的扁平字典
+    if "type" not in tool:
+        return {
+            "type": "function",
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("parameters") or {},
+            "strict": tool.get("strict", False),
+        }
+    return clone_raw_value(tool)
+
+
+def _resolve_openai_function_tool(
+    item: Any,
+    tool_catalog: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """按统一语义将工具标识（ID 字符串或字典）解析为 OpenAI Responses 客户端函数工具。"""
+    if isinstance(item, str):
+        tool_name = item.strip()
+        if not tool_name:
+            return None
+        if tool_name in OPENAI_HOSTED_TOOL_TYPES:
+            return None
+        if tool_name in tool_catalog:
+            resolved = tool_catalog[tool_name]
+            if is_openai_hosted_tool(resolved):
+                return None
+            return _normalize_openai_response_tool_dict(resolved)
+        return {
+            "type": "function",
+            "name": tool_name,
+            "description": "",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": False,
+        }
+    if isinstance(item, dict):
+        if is_openai_hosted_tool(item):
+            return None
+        return _normalize_openai_response_tool_dict(item)
+    return None
 
 
 def _build_openai_additional_tools(value: Any) -> dict[str, Any]:

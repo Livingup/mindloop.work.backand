@@ -462,7 +462,7 @@ def _infer_component_type(event: ConfigurationComponentEvent) -> Literal["prompt
     ):
         return "prompt"
     if event.snapshot is not None:
-        if isinstance(event.snapshot, (list, tuple)) and event.snapshot and isinstance(event.snapshot[0], dict):
+        if isinstance(event.snapshot, (list, tuple)) and event.snapshot and isinstance(event.snapshot[0], (dict, str)):
             return "tool"
         if isinstance(event.snapshot, str):
             return "prompt"
@@ -527,12 +527,20 @@ def build_request_configuration_view_from_timeline(
         raise ValueError("工具配置事件最多只能有一个 active 事件。")
     if active_tool_events:
         active_t = active_tool_events[0]
+
+        def _extract_tool_name(t: Any) -> str:
+            if isinstance(t, str):
+                return t
+            if isinstance(t, dict):
+                return str(t.get("name") or t.get("function", {}).get("name") or "")
+            return str(getattr(t, "name", ""))
+
         existing_tool_names = {
-            str(t.get("name") or t.get("function", {}).get("name"))
+            _extract_tool_name(t)
             for ev in tool_events
             if ev.status == "historical" and ev.snapshot
             for t in (ev.snapshot if isinstance(ev.snapshot, (list, tuple)) else ())
-            if (t.get("name") or t.get("function", {}).get("name"))
+            if _extract_tool_name(t)
         }
         delta_tools = tuple(
             t for t in tools

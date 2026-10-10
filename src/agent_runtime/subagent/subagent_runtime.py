@@ -71,6 +71,28 @@ def _extract_tool_names_from_tools(tools: Any) -> set[str]:
     return names
 
 
+def _extract_tool_ids_tuple(tools: Any) -> tuple[str, ...]:
+    if not tools:
+        return ()
+    names: list[str] = []
+    for t in tools if isinstance(tools, (list, tuple)) else (tools,):
+        if isinstance(t, str):
+            tid = t.strip()
+            if tid and tid not in names:
+                names.append(tid)
+        elif isinstance(t, dict):
+            name = t.get("name") or t.get("function", {}).get("name")
+            if name:
+                s_name = str(name).strip()
+                if s_name and s_name not in names:
+                    names.append(s_name)
+        elif hasattr(t, "name") and t.name:
+            s_name = str(t.name).strip()
+            if s_name and s_name not in names:
+                names.append(s_name)
+    return tuple(names)
+
+
 
 class SubagentRuntime:
     """本地子 Agent 工具的运行时编排门面。
@@ -609,7 +631,9 @@ class SubagentRuntime:
                         if ev.component == "prompt":
                             snapshot = getattr(parent_conversation, "system_prompt", "") or ""
                         elif ev.component == "tool":
-                            snapshot = getattr(parent_conversation, "tools", ()) or ()
+                            snapshot = _extract_tool_ids_tuple(getattr(parent_conversation, "tools", ()))
+                    elif ev.component == "tool" and snapshot is not None:
+                        snapshot = _extract_tool_ids_tuple(snapshot)
                     child_timeline.append(
                         ConfigurationComponentEvent(
                             event_id=ev.event_id,
@@ -635,7 +659,7 @@ class SubagentRuntime:
                         anchor="start",
                         sequence=0,
                         status="historical",
-                        snapshot=parent_tools,
+                        snapshot=_extract_tool_ids_tuple(parent_tools),
                         component="tool",
                     )
                 )
