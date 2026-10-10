@@ -561,8 +561,8 @@ refresh token 和 token 轮换；会话表结构变更；过期会话清理任�
 | business/overview.md | 新增 | 领域清单：\| auth \| 支撑 \| 访问本机 Runtime 的本地账号、登录会话与认证判定 \| domains/auth.md \|；\| communication \| 支撑 \| 业务无关的逻辑通信流、消息持久化与 SSE 推送 \| domains/communication.md \|。域间关系：communication → auth：同步，通信流 SSE 按 COMMUNICATION-01 复核登录会话 | 本方案（描述性） |
 | business/domains/auth.md | 新增 | 边界：不负责云账号与跨 Runtime 同步，不负责远程访问通道。关键概念：登录会话是登录或首次初始化创建的设备会话，凭 Bearer token 访问 Runtime。状态流转：有效 →(空闲超过 AUTH-01 时限或到达 AUTH-02 上限) 已过期；有效 →(登出) 已撤销。需求约束：AUTH-01、AUTH-02、AUTH-03、AUTH-04（正文见第一节） | D1；用户原话同上 |
 | business/domains/communication.md | 新增 | 边界：不负责登录会话判定（→ auth）。需求约束：COMMUNICATION-01（正文见第一节） | D2；用户原话同上 |
-| tech/designs/auth.md | 新增 | ## 会话续期 / 方案：续期沿用原 token，在认证成功时与 last_seen_at 一并写入，不提供刷新接口 / 不变量：续期仅限 runtime_auth_middleware 与 /api/auth/me，bootstrap guard 与通信流复核只读校验 / 禁止：不得新增会话表字段记录绝对上限，上限由 created_at 推导 | 本方案（终审确认） |
-| tech/designs/communication.md | 新增 | ## 通信流会话复核 / 方案：communication 不依赖 auth，复核函数由 server.create_app 注入 create_communication_router / 禁止：communication.auth_invalid 帧不得带 id，不得推进业务 seq | 本方案（终审确认） |
+| tech/designs/auth.md | 新增 | ## 会话续期 / 方案：续期沿用原 token，不提供刷新接口 / 不变量：AUTH-01 的续期仅限认证中间件与 /api/auth/me 的认证成功触发；bootstrap 守卫与通信流 SSE 复核仅限只读校验 / 禁止：不得为 AUTH-02 的上限新增会话表字段，上限由会话创建时间推导 | 后端定稿终审，用户原话“通过，按此定稿（含规范性条目）”；文档终审，用户原话“文档通过，写入记忆并提交” |
+| tech/designs/communication.md | 新增 | ## 通信流会话复核 / 方案：COMMUNICATION-01 的会话复核由 Runtime 组合根注入校验能力，communication 不依赖 auth / 禁止：communication.auth_invalid 事件帧不得携带 id，不得推进业务 seq | 同上 |
 
 - **规范性变更（用户已显式确认）**：架构基线 6 项；AUTH-01~AUTH-04；COMMUNICATION-01；TECH-01。前端仓库引用时写 `agentruntime:AUTH-04`、`agentruntime:COMMUNICATION-01`，写入时会分配正式编号，届时替换。
 - **记忆与源码冲突**：没有（记忆还不存在）。与原问题报告不一致的有两处：/api/runtime-bootstrap/ 不在认证白名单内；认证 401 的 detail 文案不会命中前端的 fatalRestoreError 正则。
@@ -574,27 +574,49 @@ refresh token 和 token 轮换；会话表结构变更；过期会话清理任�
 | tech/overview.md 架构基线 | 新增 | 即“执行方案”中架构基线一条的原文 | 用户终审“通过，按此定稿” |
 | business/overview.md 领域清单 | 新增 | \| runtime-auth \| 支撑 \| 前端对本机 Runtime 登录会话的感知与登录态切换：Runtime Token 的本地存取，会话失效信号的统一感知（判定以后端返回的 code 为准），以及回到登录态；对应后端 agentruntime 的 auth 域，通信流 SSE 的失效事件对应后端 communication 域 \| domains/runtime-auth.md \| | 已确认定稿“一、业务映射”（用户原话“通过，按此定稿”） |
 | business/domains/runtime-auth.md | 新增 | RUNTIME-AUTH-01 收到 Runtime 会话失效信号后，前端必须清除本地 Runtime Token 并回到登录态，登录态下不得再发起需要鉴权的轮询、心跳或重连（依据 agentruntime:AUTH-04、agentruntime:COMMUNICATION-01）。RUNTIME-AUTH-02 会话失效、退出登录、重新登录只释放 scene presence（detach），不得停止 Agent 任务。 | 同上 |
-| tech/designs/runtime-auth.md | 新增 | ## 会话失效处理 / 方案：带 auth_ code 的 401、心跳 401、SSE auth_invalid 统一由 shared/api/runtimeAuthInvalidation 单点通知；RuntimeAuthGate 收到后切到 login，依靠子树卸载停止全部轮询 / 不变量：通知按请求发出时的 Token 去重 / 禁止：组件或 feature 不得自行根据 401 清除 Token 或跳转 | 同上 |
+| tech/designs/runtime-auth.md | 新增 | ## 会话失效处理 / 方案：仅限后端判定为 Runtime 会话失效的信号（REST 与心跳中 code 以 auth_ 开头的 401、通信流 SSE 失效事件，判定依据 agentruntime:AUTH-04；不带 code 的 401 不在此列）统一汇聚到一个共享失效通知点，由认证门禁统一切换登录态；轮询、心跳、重连随门禁子树卸载一并停止，不逐个改造轮询入口（依据 RUNTIME-AUTH-01） / 不变量：失效通知以请求发出时携带的 Runtime Token 为去重键，同一 Token 只触发一次 / 禁止：业务组件与 feature 不得自行根据 401 清除 Runtime Token 或切换登录态 | 前端定稿用户原话“通过，按此定稿”；组装文档用户原话“文档通过，写入记忆并提交” |
 
 - 跨仓引用：agentruntime:AUTH-04、agentruntime:COMMUNICATION-01 都是后端方案中的占位编号，写入时请替换为正式编号。
 - 记忆与源码冲突：无，记忆目前不存在。
 
-## 10. 架构记忆写入报告
+## 10. 架构记忆更新报告
 
-模式：设计定稿。实际写入者：系统设计编排 Agent。记忆描述的是设计落地后的状态，不表示业务代码已经实现。
+模式：设计定稿。实际写入者：系统设计编排 Agent。依据为用户确认的设计定稿；这一轮只纠正记忆条目的内容准入问题，不重新评审设计，也不执行代码落地校准。
 
-| 仓库 | 状态 | 文件数 | 正式约束编号 |
-|---|---|---|---|
-| agentruntime | 已更新 | 7 | AUTH-01、AUTH-02、AUTH-03、AUTH-04、COMMUNICATION-01、TECH-01 |
-| agent-frontend | 已更新 | 5 | RUNTIME-AUTH-01、RUNTIME-AUTH-02 |
+### agentruntime
+状态：已更新。
 
-- 后端：写入 business/overview.md、business/domains/auth.md、business/domains/communication.md、tech/overview.md、tech/designs/auth.md、tech/designs/communication.md、tech/structure.md。
-- 前端：写入 business/overview.md、business/domains/runtime-auth.md、tech/overview.md、tech/designs/runtime-auth.md、tech/structure.md。
-- 前端领域清单由前端设计师根据已确认业务映射补齐描述性登记；其回复明确“规范和方案都没有改动，其余清单保持原样”。
-- 编号按两个仓库的架构记忆历史分配；此前无架构记忆历史。前端正式编号的前缀采用域标识 runtime-auth 的大写形式。
-- 写入顺序为后端 → 前端。前端规则中的跨仓引用为 agentruntime:AUTH-04、agentruntime:COMMUNICATION-01。
-- 两份设计文档中的规则标识同步为正式编号，规则正文不改写。
-- 写入核对：编号、跨仓引用、领域登记与域文件、结构映射路径、文件篇幅及占位编号残留检查通过。
-- 既有架构记忆冲突：无（写入前两个仓库均不存在 .arch-memory/）。
-- 记忆写入环节未新增待用户裁决项；本报告不重新评审或变更已确认的设计方案。
-- 本次不修改业务代码、测试、配置或正式版数据；执行清单中的业务测试未在本任务运行。
+变更：
+- tech/designs/auth.md：照录后端设计师等义修整后的方案、不变量、禁止项；去掉具体列名和字段写入动作，保留续期入口、只读校验范围、不换 token、不提供刷新接口和不新增上限字段的决策。
+- tech/designs/communication.md：照录后端设计师等义修整后的组合根注入决策和协议禁止项；去掉具体函数接线，保留对外事件名、id、seq 限制。
+- 其余架构记忆文件及 AUTH-01、AUTH-02、AUTH-03、AUTH-04、COMMUNICATION-01、TECH-01 均保持不变。
+
+退回及处理：
+- 写入前，含字段写入动作、具体方法和函数接线的两份技术记忆整体退回给原后端设计师；返回合格条目前不作这一轮记忆写入。
+- 后端设计师提供完整正文、清单与逐条等义说明，明确“规范意义没变”，没有修改方案、源码或文件；编排重新校验后原文写入。
+
+### agent-frontend
+状态：已更新。
+
+变更：
+- tech/designs/runtime-auth.md：照录前端设计师修整后的单点通知、门禁子树卸载、请求 Token 去重及禁止业务组件自行退登录的条目，移除具体代码路径与收到消息后的逐步操作表述。
+- 保留带 auth_ 错误码的 401 这一适用前提；不带 code 的 401 仍明确排除，不改变已批准的错误判别范围。
+- 其余架构记忆文件及 RUNTIME-AUTH-01、RUNTIME-AUTH-02 均保持不变。
+
+退回及处理：
+- 写入前，原技术记忆的代码路径、具体接线及操作流程表述退回给原前端设计师。
+- 第一次修整遗漏原有 auth_ code 前提，按“准确保留适用范围、前提、例外”再次退回；没有把该不合格版本写入文件。
+- 第二次修整恢复原有适用前提。设计师明确“方案本身和能力范围都没动”，编排校验通过后原文写入。
+
+### 编号与跨仓引用
+- 本轮不分配新编号；后端正式编号 AUTH-01～AUTH-04、COMMUNICATION-01、TECH-01，前端正式编号 RUNTIME-AUTH-01、RUNTIME-AUTH-02 均沿用。
+- 跨仓引用仍为 agentruntime:AUTH-04、agentruntime:COMMUNICATION-01；只在前端本仓规则句内引用，不复制后端规则正文。
+- 本轮不新增领域、机制或结构映射，不修改已确认架构基线。
+
+### 校验范围与结果
+- 内容准入：逐条核对三份修正文件的依据、适用前提、强度、唯一来源、放置位置和写作要求；内容问题先退回，再校验，不以编号或路径检查替代内容检查。
+- 规范依据：原后端方案确认“通过，按此定稿（含规范性条目）”、原前端方案确认“通过，按此定稿”、文档终审“文档通过，写入记忆并提交”；两位设计师均提供规范意义不变的说明。
+- 写入核对：修正正文与设计师返回原文一致；正式编号及跨仓引用有效，无占位编号、空标题、设计规范引用或计划措辞；篇幅和修改范围检查通过。
+- 本轮受影响条目无未处理的退回项，无新增冲突或待澄清项。该结论仅针对本轮记忆表述修正，不是对业务实现或整个设计的重新验收。
+- 先前写入把机械检查结果概括为完整合规结论，不够准确；由本报告替换，前次提交保留在 Git 历史中。
+- 设计文档第 0～8 节、业务源码、测试、配置与正式版数据不在本轮修改范围；这次修正另作提交，不改写既有提交历史。
