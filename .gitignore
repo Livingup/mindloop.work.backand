@@ -81,6 +81,8 @@ Desktop.ini
 /tests/*
 !/tests/test_scene_session_registry.py
 !/tests/test_runtime_auth_token_transport.py
+!/tests/test_runtime_auth_session_lifecycle.py
+!/tests/test_runtime_network_auth_failure_sampling.py
 !/tests/test_system_settings_persistence_inventory.py
 !/tests/test_cloud_user_config_migration.py
 !/tests/test_cloud_user_config_config_center.py

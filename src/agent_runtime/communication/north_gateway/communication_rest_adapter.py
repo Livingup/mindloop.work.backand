@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from contextlib import suppress
 from typing import Any
@@ -38,7 +38,11 @@ def _gateway_runtime_boot_id(gateway: CommunicationGateway) -> str | None:
 
 COMMUNICATION_SSE_EVENT_TYPE = "communication.message"
 COMMUNICATION_SSE_PING_EVENT_TYPE = "communication.ping"
+COMMUNICATION_SSE_AUTH_INVALID_EVENT_TYPE = "communication.auth_invalid"
 COMMUNICATION_SSE_KEEPALIVE_SECONDS = 15
+COMMUNICATION_SSE_AUTH_RECHECK_SECONDS = 15
+
+CommunicationStreamAccessChecker = Callable[[Request], tuple[str, str] | None]
 
 
 class CommunicationStreamCreateBody(BaseModel):
@@ -94,7 +98,11 @@ class CommunicationMessageResponse(BaseModel):
     schema_version: str
 
 
-def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
+def create_communication_router(
+    gateway: CommunicationGateway,
+    *,
+    stream_access_checker: CommunicationStreamAccessChecker | None = None,
+) -> APIRouter:
     """根据通信网关创建 REST/SSE 路由。"""
     router = APIRouter()
 
@@ -218,6 +226,7 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
             keepalive_count = 0
             first_event_recorded = False
             close_reason = "completed"
+            last_access_check = time.monotonic()
             try:
                 while True:
                     done, _pending = await asyncio.wait(
@@ -228,6 +237,17 @@ def create_communication_router(gateway: CommunicationGateway) -> APIRouter:
                     if await request.is_disconnected():
                         close_reason = "client_disconnected"
                         return
+                    if (
+                        stream_access_checker is not None
+                        and (time.monotonic() - last_access_check) >= COMMUNICATION_SSE_AUTH_RECHECK_SECONDS
+                    ):
+                        last_access_check = time.monotonic()
+                        check_result = stream_access_checker(request)
+                        if check_result is not None:
+                            code, detail = check_result
+                            close_reason = "auth_invalid"
+                            yield _format_sse_auth_invalid(stream_id=stream_id, code=code, detail=detail)
+                            return
                     if done:
                         message = next_message.result()
                         sent_count += 1
@@ -350,6 +370,23 @@ def _format_sse_ping(
         body["runtime_boot_id"] = runtime_boot_id
     payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
     return f"event: {COMMUNICATION_SSE_PING_EVENT_TYPE}\ndata: {payload}\n\n"
+
+
+def _format_sse_auth_invalid(
+    *,
+    stream_id: str,
+    code: str,
+    detail: str,
+) -> str:
+    """格式化认证失效终端 SSE 事件。"""
+    body: dict[str, Any] = {
+        "stream_id": stream_id,
+        "code": code,
+        "detail": detail,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    }
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {COMMUNICATION_SSE_AUTH_INVALID_EVENT_TYPE}\ndata: {payload}\n\n"
 
 
 def _effective_after_seq(after_seq: int, last_event_id: str | None) -> int:

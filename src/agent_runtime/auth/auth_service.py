@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import os
 import secrets
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -14,13 +15,16 @@ from agent_runtime.auth.infrastructure.sqlite_auth_repository import SqliteRunti
 from agent_runtime.auth.models import (
     AuthenticatedRuntimeSession,
     RuntimeAccount,
+    RuntimeAuthCheckResult,
+    RuntimeAuthFailureReason,
     RuntimeDeviceSession,
 )
 
 ACCOUNT_STATUS_ACTIVE = "active"
 PASSWORD_HASH_ALGORITHM = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 200_000
-DEFAULT_SESSION_TTL_DAYS = 30
+SESSION_IDLE_TTL_DAYS = 30
+SESSION_ABSOLUTE_TTL_DAYS = 90
 MIN_RUNTIME_PASSWORD_LENGTH = 12
 PASSWORD_COMPLEXITY_MIN_CLASSES = 3
 
@@ -84,19 +88,41 @@ class RuntimeAuthService:
         self._repository.create_session(session)
         return AuthenticatedRuntimeSession(account=account, session=session), token
 
-    def authenticate_token(self, token: str | None) -> AuthenticatedRuntimeSession | None:
+    def check_token(self, token: str | None, *, renew: bool) -> RuntimeAuthCheckResult:
         if not token:
-            return None
+            return RuntimeAuthCheckResult(session=None, failure_reason=RuntimeAuthFailureReason.TOKEN_MISSING)
         session = self._repository.get_session_by_token_hash(_hash_token(token))
-        if session is None or session.revoked_at is not None:
-            return None
-        if _parse_datetime(session.expires_at) <= _now():
-            return None
+        if session is None:
+            return RuntimeAuthCheckResult(session=None, failure_reason=RuntimeAuthFailureReason.TOKEN_INVALID)
+        if session.revoked_at is not None:
+            return RuntimeAuthCheckResult(session=None, failure_reason=RuntimeAuthFailureReason.SESSION_REVOKED)
+        now = _now()
+        if _parse_datetime(session.expires_at) <= now or _parse_datetime(session.created_at) + timedelta(days=SESSION_ABSOLUTE_TTL_DAYS) <= now:
+            return RuntimeAuthCheckResult(session=None, failure_reason=RuntimeAuthFailureReason.SESSION_EXPIRED)
         account = self._repository.get_account_by_id(session.account_id)
         if account is None or account.status != ACCOUNT_STATUS_ACTIVE:
-            return None
-        self._repository.touch_session(session.session_id, _now_text())
-        return AuthenticatedRuntimeSession(account=account, session=session)
+            return RuntimeAuthCheckResult(session=None, failure_reason=RuntimeAuthFailureReason.TOKEN_INVALID)
+        if not renew:
+            return RuntimeAuthCheckResult(
+                session=AuthenticatedRuntimeSession(account=account, session=session),
+                failure_reason=None,
+            )
+        new_expires = _renewed_expires_at(session, now)
+        now_text = now.isoformat()
+        new_expires_text = new_expires.isoformat()
+        self._repository.touch_session(session.session_id, now_text, new_expires_text)
+        updated_session = replace(
+            session,
+            last_seen_at=now_text,
+            expires_at=new_expires_text,
+        )
+        return RuntimeAuthCheckResult(
+            session=AuthenticatedRuntimeSession(account=account, session=updated_session),
+            failure_reason=None,
+        )
+
+    def authenticate_token(self, token: str | None) -> AuthenticatedRuntimeSession | None:
+        return self.check_token(token, renew=True).session
 
     def revoke_token(self, token: str | None) -> bool:
         if not token:
@@ -133,7 +159,7 @@ class RuntimeAuthService:
         token = secrets.token_urlsafe(32)
         now = _now()
         now_text = now.isoformat()
-        expires_at = (now + timedelta(days=DEFAULT_SESSION_TTL_DAYS)).isoformat()
+        expires_at = (now + timedelta(days=SESSION_IDLE_TTL_DAYS)).isoformat()
         session = RuntimeDeviceSession(
             session_id=f"sess-{uuid4()}",
             account_id=account_id,
@@ -146,6 +172,14 @@ class RuntimeAuthService:
             expires_at=expires_at,
         )
         return token, session
+
+
+def _renewed_expires_at(session: RuntimeDeviceSession, now: datetime) -> datetime:
+    created_at = _parse_datetime(session.created_at)
+    return min(
+        now + timedelta(days=SESSION_IDLE_TTL_DAYS),
+        created_at + timedelta(days=SESSION_ABSOLUTE_TTL_DAYS),
+    )
 
 
 def _normalize_username(value: str) -> str:

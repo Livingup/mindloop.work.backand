@@ -95,11 +95,11 @@ class SqliteRuntimeAuthRepository:
             ).fetchone()
         return _session_from_row(row)
 
-    def touch_session(self, session_id: str, last_seen_at: str) -> None:
+    def touch_session(self, session_id: str, last_seen_at: str, expires_at: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE runtime_device_sessions SET last_seen_at = ? WHERE session_id = ?",
-                (last_seen_at, session_id),
+                "UPDATE runtime_device_sessions SET last_seen_at = ?, expires_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+                (last_seen_at, expires_at, session_id),
             )
             conn.commit()
 

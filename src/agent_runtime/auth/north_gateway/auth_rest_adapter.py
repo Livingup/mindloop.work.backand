@@ -58,6 +58,7 @@ class RuntimeAuthMeResponse(BaseModel):
     authenticated: bool
     account: RuntimeAuthAccountResponse | None = None
     session: RuntimeAuthDeviceSessionResponse | None = None
+    code: str | None = None
 
 
 def create_runtime_auth_router(
@@ -133,13 +134,17 @@ def create_runtime_auth_router(
     def me(
         authorization: Annotated[str | None, Header(alias="Authorization")] = None,
     ) -> RuntimeAuthMeResponse:
-        session = auth_service.authenticate_token(_bearer_token(authorization))
-        if session is None:
-            return RuntimeAuthMeResponse(authenticated=False)
+        result = auth_service.check_token(_bearer_token(authorization), renew=True)
+        if result.session is None:
+            return RuntimeAuthMeResponse(
+                authenticated=False,
+                code=result.failure_reason.value if result.failure_reason else None,
+            )
         return RuntimeAuthMeResponse(
             authenticated=True,
-            account=_account_response(session),
-            session=_session_response(session),
+            account=_account_response(result.session),
+            session=_session_response(result.session),
+            code=None,
         )
 
     return router

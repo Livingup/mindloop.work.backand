@@ -230,6 +230,97 @@ def test_adapter_keepalive_ping_and_disconnect_cleanup_do_not_advance_business_c
     asyncio.run(run_case())
 
 
+def test_adapter_sse_auth_recheck_terminates_stream_when_invalid(monkeypatch) -> None:
+    async def run_case() -> None:
+        subscription = _Subscription()
+        gateway = _Gateway(subscription)
+        checker_calls = []
+
+        def checker(request: Any) -> tuple[str, str] | None:
+            checker_calls.append(request)
+            return ("auth_session_expired", "未登录或登录已过期，请重新登录。")
+
+        router = create_communication_router(gateway, stream_access_checker=checker)
+        route = next(route for route in router.routes if getattr(route, "path", None) == "/streams/{stream_id}/events")
+
+        async def immediate_timeout(tasks: set[asyncio.Task[CommunicationMessage]], *, timeout: float, return_when: Any):
+            return set(), set(tasks)
+
+        monotonic_times = [100.0, 116.0, 116.0]
+
+        def fake_monotonic() -> float:
+            if len(monotonic_times) > 1:
+                return monotonic_times.pop(0)
+            return monotonic_times[0]
+
+        monkeypatch.setattr(adapter.asyncio, "wait", immediate_timeout)
+        monkeypatch.setattr(adapter.time, "monotonic", fake_monotonic)
+
+        response = await route.endpoint("stream-1", _Request(), after_seq=0)
+        body_iterator = response.body_iterator
+
+        frames = []
+        async for frame in body_iterator:
+            frames.append(frame)
+
+        assert len(checker_calls) == 1
+        assert len(frames) == 1
+        auth_invalid_frame = frames[0]
+        assert auth_invalid_frame.startswith("event: communication.auth_invalid\n")
+        assert "\nid: " not in auth_invalid_frame
+        payload = json.loads(auth_invalid_frame.splitlines()[1].removeprefix("data: "))
+        assert payload["stream_id"] == "stream-1"
+        assert payload["code"] == "auth_session_expired"
+        assert payload["detail"] == "未登录或登录已过期，请重新登录。"
+        assert "server_time" in payload
+        assert subscription.closed is True
+
+    asyncio.run(run_case())
+
+
+def test_adapter_sse_auth_recheck_not_called_before_interval(monkeypatch) -> None:
+    async def run_case() -> None:
+        subscription = _Subscription()
+        gateway = _Gateway(subscription)
+        checker_calls = []
+
+        def checker(request: Any) -> tuple[str, str] | None:
+            checker_calls.append(request)
+            return ("auth_session_expired", "未登录或登录已过期，请重新登录。")
+
+        router = create_communication_router(gateway, stream_access_checker=checker)
+        route = next(route for route in router.routes if getattr(route, "path", None) == "/streams/{stream_id}/events")
+
+        async def immediate_timeout(tasks: set[asyncio.Task[CommunicationMessage]], *, timeout: float, return_when: Any):
+            return set(), set(tasks)
+
+        current_time = [100.0]
+
+        def fake_monotonic() -> float:
+            t = current_time[0]
+            current_time[0] += 5.0
+            return t
+
+        monkeypatch.setattr(adapter.asyncio, "wait", immediate_timeout)
+        monkeypatch.setattr(adapter.time, "monotonic", fake_monotonic)
+
+        response = await route.endpoint("stream-1", _Request(), after_seq=0)
+        body_iterator = response.body_iterator
+
+        try:
+            comment_frame = await anext(body_iterator)
+            ping_frame = await anext(body_iterator)
+            assert comment_frame == ": keep-alive\n\n"
+            assert ping_frame.startswith("event: communication.ping\n")
+            assert len(checker_calls) == 0
+        finally:
+            await body_iterator.aclose()
+
+        assert subscription.closed is True
+
+    asyncio.run(run_case())
+
+
 def test_communication_service_replays_before_live_gap_fills_and_skips_duplicates() -> None:
     async def run_case() -> None:
         repository = _SequenceRepository(

@@ -6,7 +6,7 @@ import queue
 import tempfile
 import threading
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -18,6 +18,8 @@ NETWORK_LOG_BATCH_SIZE = 100
 NETWORK_LOG_FLUSH_INTERVAL_SECONDS = 1.0
 NETWORK_SNAPSHOT_INTERVAL_SECONDS = 10.0
 NETWORK_MAX_STRING_LENGTH = 500
+AUTH_FAILURE_LOG_SAMPLE_WINDOW_SECONDS = 60.0
+AUTH_FAILURE_LOG_SAMPLE_MAX_KEYS = 512
 
 
 class RuntimeNetworkMonitor:
@@ -33,6 +35,8 @@ class RuntimeNetworkMonitor:
         self._dropped_log_records = 0
         self._event_hub_subscribers = 0
         self._event_hub_queue_full_count = 0
+        self._auth_failure_windows: OrderedDict[str, tuple[float, int]] = OrderedDict()
+        self._suppressed_auth_failure_records = 0
 
     def start(self) -> None:
         with self._lock:
@@ -102,7 +106,24 @@ class RuntimeNetworkMonitor:
                 "event_hub_queue_full_count": self._event_hub_queue_full_count,
                 "dropped_log_records": self._dropped_log_records,
                 "queued_log_records": self._queue.qsize(),
+                "suppressed_auth_failure_records": self._suppressed_auth_failure_records,
             }
+
+    def admit_auth_failure_record(self, key: str, *, now: float | None = None) -> tuple[bool, int]:
+        with self._lock:
+            t = time.monotonic() if now is None else now
+            existing = self._auth_failure_windows.get(key)
+            if existing is None or (t - existing[0]) >= AUTH_FAILURE_LOG_SAMPLE_WINDOW_SECONDS:
+                prev_suppressed = existing[1] if existing is not None else 0
+                self._auth_failure_windows[key] = (t, 0)
+                self._auth_failure_windows.move_to_end(key)
+                if len(self._auth_failure_windows) > AUTH_FAILURE_LOG_SAMPLE_MAX_KEYS:
+                    self._auth_failure_windows.popitem(last=False)
+                return True, prev_suppressed
+            start_time, suppressed_count = existing
+            self._auth_failure_windows[key] = (start_time, suppressed_count + 1)
+            self._suppressed_auth_failure_records += 1
+            return False, 0
 
     def record(self, event: dict[str, Any]) -> None:
         record = _sanitize_record({

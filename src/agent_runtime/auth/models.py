@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,3 +40,20 @@ class AuthenticatedRuntimeSession:
 
     account: RuntimeAccount
     session: RuntimeDeviceSession
+
+
+class RuntimeAuthFailureReason(str, Enum):
+    """运行时认证失败原因枚举，枚举值对应对外错误码。"""
+
+    TOKEN_MISSING = "auth_token_missing"
+    TOKEN_INVALID = "auth_token_invalid"
+    SESSION_REVOKED = "auth_session_revoked"
+    SESSION_EXPIRED = "auth_session_expired"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeAuthCheckResult:
+    """认证校验结果：成功时包含会话，失败时包含失败原因。"""
+
+    session: AuthenticatedRuntimeSession | None
+    failure_reason: RuntimeAuthFailureReason | None

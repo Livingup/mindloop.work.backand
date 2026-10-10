@@ -21,6 +21,7 @@ from agent_runtime.logs_management.service import (
     run_pending_log_compactions_at_startup,
  )
 
+from agent_runtime.auth.models import RuntimeAuthFailureReason
 from agent_runtime.auth.runtime_access_policy import (
     LOCAL_BOOTSTRAP_REQUIRED_DETAIL,
     NO_ACCOUNT_API_RESTRICTED_DETAIL,
@@ -34,6 +35,15 @@ from agent_runtime.frontend_static import mount_frontend_static
 logger = logging.getLogger("agent_runtime.serve")
 _DEFAULT_RUNTIME_LOG_LEVEL = "DEBUG"
 _RUNTIME_LOG_LEVEL_ENV = "AGENT_RUNTIME_LOG_LEVEL"
+_RUNTIME_AUTH_FAILURE_DETAIL = "未登录或登录已过期，请重新登录。"
+
+
+def _runtime_auth_failure_body(reason: RuntimeAuthFailureReason) -> dict[str, str]:
+    code = reason.value if hasattr(reason, "value") else str(reason)
+    return {
+        "detail": _RUNTIME_AUTH_FAILURE_DETAIL,
+        "code": code,
+    }
 
 
 # 所有前端离开后，只有连续 30 分钟没有新的任务/执行活动，才允许自动释放 scene。
@@ -815,9 +825,11 @@ def create_app(
         if not runtime_auth_service.has_accounts():
             method = request.method.upper()
             if not is_no_account_api_allowed_path(path, method):
+                request.state.runtime_auth_failure_code = "auth_bootstrap_required"
                 return JSONResponse(
                     {
                         "detail": NO_ACCOUNT_API_RESTRICTED_DETAIL,
+                        "code": "auth_bootstrap_required",
                         "bootstrap_required": True,
                         "auth_required": False,
                     },
@@ -838,13 +850,15 @@ def create_app(
             return await call_next(request)
         if _is_runtime_auth_exempt_path(path):
             return await call_next(request)
-        auth_session = runtime_auth_service.authenticate_token(_runtime_auth_token_from_request(request))
-        if auth_session is None:
+        auth_check = runtime_auth_service.check_token(_runtime_auth_token_from_request(request), renew=True)
+        if auth_check.session is None:
+            failure_reason = auth_check.failure_reason
+            request.state.runtime_auth_failure_code = failure_reason.value if failure_reason is not None else "auth_token_invalid"
             return JSONResponse(
-                {"detail": "未登录或登录已过期，请重新登录。"},
+                _runtime_auth_failure_body(failure_reason),
                 status_code=401,
             )
-        request.state.runtime_auth_session = auth_session
+        request.state.runtime_auth_session = auth_check.session
         return await call_next(request)
 
     @app.middleware("http")
@@ -856,7 +870,7 @@ def create_app(
             # 和普通 401 登录态错误优先生效，避免用 bootstrap readiness 503 掩盖认证边界。
             if (
                 not runtime_auth_service.has_accounts()
-                or runtime_auth_service.authenticate_token(_runtime_auth_token_from_request(request)) is None
+                or runtime_auth_service.check_token(_runtime_auth_token_from_request(request), renew=False).session is None
             ):
                 return await call_next(request)
             try:
@@ -965,8 +979,18 @@ def create_app(
         active_after = runtime_network_monitor.end_http_request()
         duration_ms = round((time.perf_counter() - started_at) * 1000)
         event_loop_snapshot = event_loop_monitor.snapshot()
+        auth_code = getattr(request.state, "runtime_auth_failure_code", None) if response.status_code == 401 else None
+        suppressed_since_last_record = 0
+        if auth_code is not None:
+            endpoint_key = f"{request.method} {_redact_codex_network_path(request.url.path)}"
+            admitted, suppressed_count = runtime_network_monitor.admit_auth_failure_record(endpoint_key)
+            if not admitted:
+                response.headers["x-network-trace-id"] = trace_id
+                return response
+            suppressed_since_last_record = suppressed_count
+
         if should_record_start or duration_ms >= 1000 or response.status_code >= 400:
-            runtime_network_monitor.record({
+            record_payload = {
                 "layer": "backend",
                 "type": "http.request.end",
                 "trace_id": trace_id,
@@ -977,32 +1001,64 @@ def create_app(
                 "active_http_requests": active_after,
                 "event_loop": event_loop_snapshot,
                 **runtime_network_monitor.snapshot(),
-            })
+            }
+            if auth_code is not None:
+                record_payload["auth_failure_code"] = auth_code
+                record_payload["suppressed_since_last_record"] = suppressed_since_last_record
+            runtime_network_monitor.record(record_payload)
             log_level = logging.WARNING if duration_ms >= 1000 or response.status_code >= 400 else logging.DEBUG
-            logger.log(
-                log_level,
-                "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
-                "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
-                "status=%s method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
-                "event_loop_max_lag_ms=%s event_loop_blocked_tick_count=%s",
-                trace_id,
-                None,
-                "http.request",
-                None,
-                "http.request",
-                "response.completed",
-                _current_task_name(),
-                duration_ms,
-                None,
-                response.status_code,
-                request.method,
-                path,
-                active_after,
-                event_loop_snapshot.get("status"),
-                event_loop_snapshot.get("last_lag_ms"),
-                event_loop_snapshot.get("max_lag_ms"),
-                event_loop_snapshot.get("blocked_tick_count"),
-            )
+            if auth_code is not None:
+                logger.log(
+                    log_level,
+                    "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                    "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
+                    "status=%s method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
+                    "event_loop_max_lag_ms=%s event_loop_blocked_tick_count=%s auth_failure_code=%s suppressed_since_last_record=%s",
+                    trace_id,
+                    None,
+                    "http.request",
+                    None,
+                    "http.request",
+                    "response.completed",
+                    _current_task_name(),
+                    duration_ms,
+                    None,
+                    response.status_code,
+                    request.method,
+                    path,
+                    active_after,
+                    event_loop_snapshot.get("status"),
+                    event_loop_snapshot.get("last_lag_ms"),
+                    event_loop_snapshot.get("max_lag_ms"),
+                    event_loop_snapshot.get("blocked_tick_count"),
+                    auth_code,
+                    suppressed_since_last_record,
+                )
+            else:
+                logger.log(
+                    log_level,
+                    "Runtime HTTP request diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
+                    "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s "
+                    "status=%s method=%s path=%s active_http_requests=%s event_loop_status=%s event_loop_last_lag_ms=%s "
+                    "event_loop_max_lag_ms=%s event_loop_blocked_tick_count=%s",
+                    trace_id,
+                    None,
+                    "http.request",
+                    None,
+                    "http.request",
+                    "response.completed",
+                    _current_task_name(),
+                    duration_ms,
+                    None,
+                    response.status_code,
+                    request.method,
+                    path,
+                    active_after,
+                    event_loop_snapshot.get("status"),
+                    event_loop_snapshot.get("last_lag_ms"),
+                    event_loop_snapshot.get("max_lag_ms"),
+                    event_loop_snapshot.get("blocked_tick_count"),
+                )
         response.headers["x-network-trace-id"] = trace_id
         return response
 
@@ -1188,8 +1244,21 @@ def create_app(
         prefix="/api/workspaces",
         tags=["工作目录"],
     )
+    def _communication_stream_access_check(request) -> tuple[str, str] | None:
+        if not runtime_auth_service.has_accounts():
+            return None
+        token = _runtime_auth_token_from_request(request)
+        result = runtime_auth_service.check_token(token, renew=False)
+        if result.session is None:
+            failure_code = result.failure_reason.value if result.failure_reason is not None else "auth_token_invalid"
+            return (failure_code, _RUNTIME_AUTH_FAILURE_DETAIL)
+        return None
+
     app.include_router(
-        create_communication_router(communication_gateway),
+        create_communication_router(
+            communication_gateway,
+            stream_access_checker=_communication_stream_access_check,
+        ),
         prefix="/api/communication",
         tags=["通用通信"],
     )

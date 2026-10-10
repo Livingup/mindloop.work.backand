@@ -264,3 +264,19 @@ def test_runtime_cors_is_not_wildcard_and_only_allows_trusted_cross_origins() ->
     assert cors_regex.match("http://127.0.0.1:5173")
     assert cors_regex.match("http://[::1]:5173")
     assert not cors_regex.match("http://192.168.1.23:5173")
+
+
+def test_runtime_auth_failure_body_returns_fixed_detail_and_reason_code() -> None:
+    from agent_runtime.auth.models import RuntimeAuthFailureReason
+    from agent_runtime.server import _RUNTIME_AUTH_FAILURE_DETAIL, _runtime_auth_failure_body
+
+    for reason in (
+        RuntimeAuthFailureReason.TOKEN_MISSING,
+        RuntimeAuthFailureReason.TOKEN_INVALID,
+        RuntimeAuthFailureReason.SESSION_REVOKED,
+        RuntimeAuthFailureReason.SESSION_EXPIRED,
+    ):
+        body = _runtime_auth_failure_body(reason)
+        assert body["detail"] == _RUNTIME_AUTH_FAILURE_DETAIL
+        assert body["code"] == reason.value
+
