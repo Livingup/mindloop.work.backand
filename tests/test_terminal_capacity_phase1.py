@@ -306,7 +306,7 @@ def test_scene_terminal_listing_and_lookup_are_isolated_by_agent_owner() -> None
         owner_type="scene",
         owner_id="scene-1",
         cwd="D:/workspace",
-        shell="pwsh",
+        shell="powershell",
         metadata={"agent_instance_id": "agent-root"},
     )
     child_terminal = TerminalInstance(
@@ -314,7 +314,7 @@ def test_scene_terminal_listing_and_lookup_are_isolated_by_agent_owner() -> None
         owner_type="scene",
         owner_id="scene-1",
         cwd="D:/workspace",
-        shell="pwsh",
+        shell="powershell",
         metadata={"agent_instance_id": "agent-child"},
     )
     repo.save_terminal(root_terminal)
@@ -324,6 +324,15 @@ def test_scene_terminal_listing_and_lookup_are_isolated_by_agent_owner() -> None
     assert service._require_terminal(child_scope, "term-child").terminal_id == "term-child"
     with pytest.raises(KeyError):
         service._require_terminal(child_scope, "term-root")
+
+    async def run_execute_isolation() -> None:
+        # 验证 execute_command 必须校验调用方 agent 实例是终端创建者
+        with pytest.raises(KeyError):
+            await service.execute_command(child_scope, command_line="ls", terminal_id="term-root")
+        accepted = await service.execute_command(child_scope, command_line="ls", terminal_id="term-child")
+        assert accepted.accepted is True
+
+    asyncio.run(run_execute_isolation())
 
 
 def test_terminal_rest_requires_owner_and_routes_explicit_owner() -> None:
@@ -375,3 +384,63 @@ def test_terminal_rest_requires_owner_and_routes_explicit_owner() -> None:
     assert gateway.list_requests[0].scene_id == "scene-1"
     assert gateway.list_requests[0].agent_instance_id == "agent-child"
     assert gateway.list_requests[0].communication_stream_id == "stream-scene-scene-1"
+
+
+def test_terminal_execute_command_tool_rejects_foreign_agent_instance(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from agent_runtime.terminal.terminal_factory import TerminalFactory
+    from agent_runtime.terminal.north_gateway.terminal_gateway_impl import TerminalGatewayImpl
+    from agent_runtime.terminal.terminal_tool import (
+        terminal_create,
+        terminal_execute_command,
+        TerminalCreateToolRequest,
+        TerminalExecuteCommandToolRequest,
+    )
+    from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
+
+    service, _repo, _process_manager = _service()
+    gateway = TerminalGatewayImpl(service)
+    monkeypatch.setattr(TerminalFactory, "create", lambda: gateway)
+
+    async def run_case() -> None:
+        ctx_agent_1 = ToolRuntimeContext(
+            task_id="task-1",
+            agent_instance_id="agent-1",
+            communication_stream_id="stream-1",
+            request_id="req-1",
+            trace_id="trace-1",
+        )
+        ctx_agent_2 = ToolRuntimeContext(
+            task_id="task-1",
+            agent_instance_id="agent-2",
+            communication_stream_id="stream-1",
+            request_id="req-2",
+            trace_id="trace-2",
+        )
+
+        # 1. agent-1 创建终端
+        create_res = await terminal_create(
+            TerminalCreateToolRequest(cwd=str(tmp_path)),
+            ctx_agent_1,
+        )
+        assert create_res.success is True
+        term_id = create_res.output["terminal_id"]
+
+        # 2. agent-2 尝试在 agent-1 创建的终端执行命令，必须被校验拦截
+        exec_res_agent_2 = await terminal_execute_command(
+            TerminalExecuteCommandToolRequest(command_line="echo hello", terminal_id=term_id),
+            ctx_agent_2,
+        )
+        assert exec_res_agent_2.success is False
+        assert exec_res_agent_2.execution_status == "failed"
+        assert "终端不存在" in exec_res_agent_2.error_message
+
+        # 3. agent-1 自己调用该终端执行命令正常成功
+        exec_res_agent_1 = await terminal_execute_command(
+            TerminalExecuteCommandToolRequest(command_line="echo hello", terminal_id=term_id),
+            ctx_agent_1,
+        )
+        assert exec_res_agent_1.success is True
+        assert exec_res_agent_1.execution_status == "success"
+
+    asyncio.run(run_case())
+
