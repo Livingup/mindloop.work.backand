@@ -183,3 +183,43 @@ async def test_scheduler_invalid_covered_seq_rejected():
     # 水位保持为 0，不推进
     wm = store.get_watermark("agent-bad", "task-01")
     assert wm.covered_until_seq == 0
+
+
+def test_build_observer_user_payload():
+    from agent_runtime.task_note.task_note_models import TaskNoteUnit
+    from agent_runtime.task_note.task_note_observer_scheduler import (
+        build_observer_user_payload,
+    )
+
+    unit1 = TaskNoteUnit(
+        seq=1,
+        unit_type="tool_interaction",
+        messages=[
+            {"role": "assistant", "content": "正在执行创建文件", "tool_calls": [{"id": "c1", "function": {"name": "file_create"}}]},
+            {"role": "tool", "content": "ok", "auto_record": {"artifact_id": "art-999", "type": "artifact"}},
+        ],
+        token_count=50,
+        end_message_id="msg-tool-1",
+    )
+
+    session_input = ObserverSessionInput(
+        task_id="task-test-01",
+        agent_instance_id="agent-worker-01",
+        target_seq=1,
+        note_snapshot={"missions": [{"title": "实现支付模块", "status": "in_progress"}]},
+        incremental_units=[unit1],
+        is_subagent=True,
+        delegation_content="请独立负责支付对接",
+    )
+
+    payload = build_observer_user_payload(
+        session_input=session_input,
+        target_agent_definition_prompt="你是一个资深全栈工程师",
+    )
+
+    assert "agent-worker-01" in payload
+    assert "实现支付模块" in payload
+    assert "请独立负责支付对接" in payload
+    assert "art-999" in payload
+    assert "程序底层已自动插入 auto_record" in payload
+    assert "target_seq" not in payload or "seq=1" in payload

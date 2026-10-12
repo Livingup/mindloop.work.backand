@@ -63,7 +63,7 @@ class ObserverSessionResult:
 
 
 def format_units_for_observer(units: Sequence[TaskNoteUnit]) -> str:
-    """将消息切片单元格式化为带 seq 编号的高可读性观察日志文本。"""
+    """将消息切片单元格式化为带 seq 编号与 auto_record 提示的高可读性观察日志文本。"""
     if not units:
         return "（无新消息）"
 
@@ -74,23 +74,86 @@ def format_units_for_observer(units: Sequence[TaskNoteUnit]) -> str:
         for m in u.messages:
             role = ""
             content = ""
+            auto_records: list[str] = []
+
             if isinstance(m, dict):
                 role = str(m.get("role") or "").upper()
-                content = str(m.get("content") or "")
+                raw_c = m.get("content")
+                content = str(raw_c or "")
+                # 检查 output / content 中的 auto_record
+                ar = m.get("auto_record")
+                if ar:
+                    auto_records.append(json.dumps(ar, ensure_ascii=False))
                 tool_calls = m.get("tool_calls")
                 if tool_calls:
-                    content += f"\n[Tool Calls]: {json.dumps(tool_calls, ensure_ascii=False)}"
+                    content += f"\n  [Tool Calls]: {json.dumps(tool_calls, ensure_ascii=False)}"
             else:
                 role = str(getattr(m, "role", "") or "").upper()
                 content = str(getattr(m, "content", "") or "")
+                ar = getattr(m, "auto_record", None)
+                if ar:
+                    auto_records.append(json.dumps(ar, ensure_ascii=False, default=str))
                 tool_calls = getattr(m, "tool_calls", None)
                 if tool_calls:
-                    content += f"\n[Tool Calls]: {json.dumps(tool_calls, ensure_ascii=False, default=str)}"
-            msg_lines.append(f"【{role}】: {content}")
+                    content += f"\n  [Tool Calls]: {json.dumps(tool_calls, ensure_ascii=False, default=str)}"
+
+            line = f"【{role}】: {content}"
+            if auto_records:
+                line += f"\n  ⚡ [程序底层已自动插入 auto_record]: {', '.join(auto_records)} (请绑定 mission_id 或按主键清理)"
+            msg_lines.append(line)
+
         block_text = f"{header}\n" + "\n".join(msg_lines)
         blocks.append(block_text)
 
     return "\n\n".join(blocks)
+
+
+def build_observer_user_payload(
+    session_input: ObserverSessionInput,
+    target_agent_definition_prompt: str = "",
+) -> str:
+    """构造观察者会话启动时的首条 User 消息完整文本。"""
+    clean_snapshot = {k: v for k, v in session_input.note_snapshot.items() if k != "commands"}
+    snapshot_json_str = json.dumps(clean_snapshot, ensure_ascii=False, indent=2)
+
+    parts: list[str] = [
+        "# 观察任务输入上下文\n",
+        "## 1. 目标 Agent 身份与职责定义",
+        f"- 实例 ID: `{session_input.agent_instance_id}`",
+        f"- 所属任务 ID: `{session_input.task_id}`",
+        f"- 角色模式: `{'子 Agent (Subagent)' if session_input.is_subagent else '根业务 Agent'}`",
+    ]
+
+    if target_agent_definition_prompt:
+        parts.append(
+            "- 目标 Agent 业务职责定义 (用于理解其专业领域与产物，切勿代入该角色):\n"
+            f"> {target_agent_definition_prompt}\n"
+        )
+
+    parts.append(
+        "## 2. 当前 Task Note 基准线快照 (Baseline)\n"
+        "以下是数据库当前已落库的 Note 结构化快照。你必须以它为基准线进行增量或修订：\n"
+        f"```json\n{snapshot_json_str}\n```\n"
+    )
+
+    if session_input.is_subagent and (session_input.inherited_units or session_input.delegation_content):
+        inherited_text = format_units_for_observer(session_input.inherited_units)
+        parts.append(
+            "## 3. 继承历史与委派上下文 (子 Agent 首次专属)\n"
+            f"- 委派原文: {session_input.delegation_content or '（无单独委派原文）'}\n"
+            f"- 继承段历史消息:\n{inherited_text}\n"
+        )
+
+    inc_text = format_units_for_observer(session_input.incremental_units)
+    parts.append(
+        "## 4. 待观察的增量对话切片 (Incremental Units)\n"
+        f"以下是上一断点以来的新增对话。每个 Unit 是一个原子切片，其末尾标有合法断点 seq (本次最高目标断点为 seq={session_input.target_seq})：\n"
+        f"{inc_text}\n\n"
+        "---\n"
+        "请通读上述增量内容，调用专属 Note 工具维护 11 张 Note 业务表。完成后必须调用 `note_update_end(covered_until_seq=...)` 提交断点并安全退出。"
+    )
+
+    return "\n\n".join(parts)
 
 
 class TaskNoteObserverScheduler:
