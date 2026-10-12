@@ -79,12 +79,18 @@ async def create_subagent(request: CreateSubagentRequest, ctx: ToolRuntimeContex
     )
     task_id = output.get("task_id") or ctx.task_id
     child_id = output.get("child_agent_instance_id")
+    fork_message_id = output.get("fork_message_id")
     if task_id and ctx.agent_instance_id and child_id:
-        await get_task_note_event_recorder().async_record_subagent_relationship(
+        rel_id = await get_task_note_event_recorder().async_record_subagent_relationship(
             task_id=task_id,
             parent_instance_id=ctx.agent_instance_id,
             child_instance_id=child_id,
+            delegation_content=request.initial_message,
+            fork_message_id=fork_message_id,
         )
+        if rel_id:
+            output["auto_record"] = {"relationship_id": rel_id, "type": "agent_relationship"}
+
         if request.initial_message and request.initial_message.strip():
             await get_task_note_event_recorder().async_record_agent_message(
                 task_id=task_id,

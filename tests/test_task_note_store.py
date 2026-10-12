@@ -340,13 +340,13 @@ def test_snapshot_service_read_after_store_contract_alignment():
 
 
 def test_cleanup_agent_instance_note(mock_db: Any):
-    """测试非 Root Agent 调用 end_task 时物理删除该实例的 15 张表 Note 记录（含 task_command_records）。"""
+    """测试非 Root Agent 调用 end_task 时物理删除该实例的 16 张表 Note 记录（含 task_command_records 与 watermark）。"""
     store, executed = mock_db
     deleted = store.cleanup_agent_instance_note(task_id="task-cleanup-01", agent_instance_id="subagent-worker-01")
 
-    # 15 张表每个表执行一条 DELETE 语句，总共 15 条
-    assert len(executed) == 15
-    assert deleted == 15
+    # 16 张表每个表执行一条 DELETE 语句，总共 16 条
+    assert len(executed) == 16
+    assert deleted == 16
 
     executed_tables = []
     for sql, params in executed:
@@ -357,8 +357,9 @@ def test_cleanup_agent_instance_note(mock_db: Any):
         table_name = sql.split()[2]
         executed_tables.append(table_name)
 
-    # 重点验证：task_command_records 必须在内
+    # 重点验证：task_command_records 与 task_note_watermark 必须在内
     assert "task_command_records" in executed_tables
+    assert "task_note_watermark" in executed_tables
     assert "agent_user_mission" in executed_tables
     assert "task_solution_content" in executed_tables
     assert "task_todo_items" in executed_tables
@@ -368,12 +369,12 @@ def test_cleanup_agent_instance_note(mock_db: Any):
 
 
 def test_cleanup_task_note(mock_db: Any):
-    """测试 Root Agent 调用 end_task 时物理删除该 Task 下所有实例的 15 张表 Note 记录（含 task_command_records）。"""
+    """测试 Root Agent 调用 end_task 时物理删除该 Task 下所有实例的 16 张表 Note 记录（含 task_command_records 与 watermark）。"""
     store, executed = mock_db
     deleted = store.cleanup_task_note(task_id="task-cleanup-02")
 
-    assert len(executed) == 15
-    assert deleted == 15
+    assert len(executed) == 16
+    assert deleted == 16
 
     executed_tables = []
     for sql, params in executed:
@@ -383,8 +384,9 @@ def test_cleanup_task_note(mock_db: Any):
         table_name = sql.split()[2]
         executed_tables.append(table_name)
 
-    # 重点验证：task_command_records 必须在内
+    # 重点验证：task_command_records 与 task_note_watermark 必须在内
     assert "task_command_records" in executed_tables
+    assert "task_note_watermark" in executed_tables
     assert "agent_user_mission" in executed_tables
     assert "task_solution_content" in executed_tables
     assert "task_progress_content" in executed_tables
@@ -402,15 +404,15 @@ async def test_snapshot_service_async_cleanup(mock_db: Any):
 
     # 1. 异步清理子 Agent 实例 (支持关键字与位置传参)
     del_inst = await service.async_cleanup_agent_instance_note(task_id="t1", agent_instance_id="sub1")
-    assert del_inst == 15
+    assert del_inst == 16
     del_inst_pos = await service.async_cleanup_agent_instance_note("t1", "sub1")
-    assert del_inst_pos == 15
+    assert del_inst_pos == 16
 
     # 2. 异步清理 Task 全量 (支持关键字与位置传参)
     del_task = await service.async_cleanup_task_note(task_id="t1")
-    assert del_task == 15
+    assert del_task == 16
     del_task_pos = await service.async_cleanup_task_note("t1")
-    assert del_task_pos == 15
+    assert del_task_pos == 16
 
 
 def test_dump_json_serializes_pydantic_line_ranges():
@@ -512,4 +514,97 @@ def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -
     assert "WHERE task_id = %s AND agent_instance_id = %s" in msg_sql
     assert "WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)" in msg_sql
     assert msg_params == ("m_iso", "t_iso", "a_iso", "t_iso", "a_iso", ["rel_01"])
+
+
+def test_phase1_store_extensions(mock_db: Any):
+    """测试 Phase 1 新增的 Mission、Artifact 与 Watermark 核心持久化方法。"""
+    store, executed = mock_db
+
+    # 1. update_mission_prompts
+    executed.clear()
+    store.update_mission_prompts(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        raw_prompts=["用户诉求1", "用户诉求2"],
+    )
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert "UPDATE agent_user_mission" in sql
+    assert "SET raw_prompts = %s" in sql
+    assert params[1:] == ("t1", "m1", "a1")
+
+    # 2. update_mission_title
+    executed.clear()
+    store.update_mission_title(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        title="全新标题",
+    )
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert "SET title = %s" in sql
+    assert params == ("全新标题", "t1", "m1", "a1")
+
+    # 3. prune_mission
+    executed.clear()
+    store.prune_mission(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        outcome_summary="已成功交付所有接口",
+        keep_record_ids=["keep-art-01"],
+    )
+    prune_stmts = [s[0] for s in executed]
+    assert any("UPDATE agent_user_mission" in s and "outcome_summary = %s" in s for s in prune_stmts)
+    assert any("DELETE FROM task_workspace_context" in s for s in prune_stmts)
+    assert any("DELETE FROM task_artifact_records" in s and "NOT (artifact_id = ANY(%s))" in s for s in prune_stmts)
+
+    # 4. delete_mission
+    executed.clear()
+    store.delete_mission(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        reason="测试删除",
+        reassign_to_mission_id="m2",
+    )
+    del_stmts = [s[0] for s in executed]
+    assert any("UPDATE task_workspace_context" in s and "SET mission_id = %s" in s for s in del_stmts)
+    assert any("DELETE FROM agent_user_mission" in s for s in del_stmts)
+
+    # 5. delete_task_artifacts
+    executed.clear()
+    store.delete_task_artifacts(
+        task_id="t1",
+        agent_instance_id="a1",
+        artifact_ids=["art-1", "art-2"],
+    )
+    assert len(executed) == 1
+    sql, params = executed[0]
+    assert "DELETE FROM task_artifact_records" in sql
+    assert "artifact_id = ANY(%s)" in sql
+    assert params == ("t1", "a1", ["art-1", "art-2"])
+
+    # 6. watermark operations
+    executed.clear()
+    store.update_watermark(
+        agent_instance_id="a1",
+        task_id="t1",
+        covered_until_seq=42,
+        covered_until_message_id="msg-42",
+        note_version_inc=True,
+    )
+    assert len(executed) == 1
+    sql, _ = executed[0]
+    assert "INSERT INTO task_note_watermark" in sql
+    assert "ON CONFLICT (agent_instance_id) DO UPDATE" in sql
+
+    executed.clear()
+    store.set_inherited_processed(agent_instance_id="a1", task_id="t1")
+    assert len(executed) == 1
+    sql, _ = executed[0]
+    assert "inherited_processed = TRUE" in sql
+
 

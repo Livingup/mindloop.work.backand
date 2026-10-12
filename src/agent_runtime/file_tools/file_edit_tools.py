@@ -477,6 +477,7 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
         new_text = _render_text(current_lines, newline_info["newline_sequence"], final_newline=newline_info["has_final_newline"])
         new_sha256 = _sha256_bytes(new_text.encode(used_encoding))
         modified = old_text != new_text
+        art_id = None
         if modified and not request.dry_run:
             _write_text_atomically(target.path, new_text, used_encoding)
             if ctx.task_id and ctx.agent_instance_id:
@@ -492,7 +493,7 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
                     }
                     for edit, applied in zip(request.edits, applied_edits)
                 ]
-                get_task_note_event_recorder().record_file_artifact(
+                art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
                     op_type="modify",
@@ -510,6 +511,8 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
             "would_modify": modified and request.dry_run,
             "edit_count": len(applied_edits),
         }
+        if art_id:
+            output["auto_record"] = {"artifact_id": art_id, "type": "artifact"}
         return BaseToolResult(output=output, metadata=_runtime_metadata(ctx, "file_modify"))
     except FileEditBusinessError as exc:
         return _build_failure(exc, output_base)
@@ -554,12 +557,13 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
             raise FileEditBusinessError("InvalidEncoding", f"无效的文件编码: {request.encoding}") from exc
         new_sha256 = _sha256_bytes(new_bytes)
 
+        art_id = None
         if not request.dry_run:
             if target.path.exists() and not request.overwrite:
                 raise FileEditBusinessError("FileAlreadyExists", f"文件已存在，默认禁止覆盖: {target.path}")
             _write_text_atomically(target.path, new_text, request.encoding)
             if ctx.task_id and ctx.agent_instance_id:
-                get_task_note_event_recorder().record_file_artifact(
+                art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
                     op_type="create",
@@ -578,6 +582,8 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
             "new_content_sha256": new_sha256,
             "created_parent_directory_count": len(parent_directories),
         }
+        if art_id:
+            output["auto_record"] = {"artifact_id": art_id, "type": "artifact"}
         return BaseToolResult(output=output, metadata=_runtime_metadata(ctx, "file_create"))
     except FileEditBusinessError as exc:
         return _build_failure(exc, output_base)
@@ -602,6 +608,7 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
         _ensure_existing_regular_file(target, directory_error_code="DirectoryDeletionDenied")
         old_sha256 = _validate_expected_sha256(target.path, request.expected_content_sha256)
 
+        art_id = None
         if not request.dry_run:
             try:
                 target.path.unlink()
@@ -610,7 +617,7 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
             except OSError as exc:
                 raise FileEditBusinessError("FileDeleteFailed", f"删除文件失败: {target.path}: {exc}") from exc
             if ctx.task_id and ctx.agent_instance_id:
-                get_task_note_event_recorder().record_file_artifact(
+                art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
                     op_type="delete",
@@ -625,6 +632,8 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
             "would_delete": request.dry_run,
             "old_content_sha256": old_sha256,
         }
+        if art_id:
+            output["auto_record"] = {"artifact_id": art_id, "type": "artifact"}
         return BaseToolResult(output=output, metadata=_runtime_metadata(ctx, "file_delete", request.reason))
     except FileEditBusinessError as exc:
         return _build_failure(exc, output_base)
@@ -696,6 +705,7 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
         parent_directories = _ensure_parent_directory(target, create_parent_directories=request.create_parent_directories, dry_run=request.dry_run)
         operation_kind = "rename" if source.path.parent == target.path.parent else "move"
 
+        art_id = None
         if not request.dry_run:
             try:
                 if request.overwrite:
@@ -707,7 +717,7 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
             except OSError as exc:
                 raise FileEditBusinessError("FileMoveFailed", f"移动文件失败: {source.path} -> {target.path}: {exc}") from exc
             if ctx.task_id and ctx.agent_instance_id:
-                get_task_note_event_recorder().record_file_artifact(
+                art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
                     op_type="move",
@@ -728,6 +738,8 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
             "target_old_content_sha256": target_sha256,
             "created_parent_directory_count": len(parent_directories),
         }
+        if art_id:
+            output["auto_record"] = {"artifact_id": art_id, "type": "artifact"}
         return BaseToolResult(output=output, metadata=_runtime_metadata(ctx, "file_move", request.reason))
     except FileEditBusinessError as exc:
         return _build_failure(exc, output_base)

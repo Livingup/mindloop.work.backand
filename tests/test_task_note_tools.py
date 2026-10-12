@@ -17,18 +17,23 @@ from agent_runtime.task_note.task_note_models import (
     CreateTaskTodoRequest,
     CreateTaskValidationRequest,
     CreateTaskWorkspaceContextRequest,
+    DeleteMissionRequest,
     DeleteTaskArtifactOtherRequest,
+    DeleteTaskArtifactRequest,
     DeleteTaskDiscoveryRequest,
     DeleteTaskTodoRequest,
     DeleteTaskWorkspaceContextRequest,
     LineRange,
     NoteUpdateEndRequest,
+    PruneMissionRequest,
     ResolveTaskIssueRequest,
     SupersedeTaskDecisionRequest,
     SupersedeTaskSolutionRequest,
     TodoItemInput,
+    UpdateMissionPromptsRequest,
     UpdateMissionRequirementRequest,
     UpdateMissionStatusRequest,
+    UpdateMissionTitleRequest,
     UpdateTaskDecisionRequest,
     UpdateTaskDiscoveryRequest,
     UpdateTaskExternalStateRequest,
@@ -53,16 +58,21 @@ from agent_runtime.task_note.task_note_tool import (
     create_task_todo,
     create_task_validation,
     create_task_workspace_context,
+    delete_mission,
+    delete_task_artifact,
     delete_task_artifact_other,
     delete_task_discovery,
     delete_task_todo,
     delete_task_workspace_context,
     note_update_end,
+    prune_mission,
     resolve_task_issue,
     supersede_task_decision,
     supersede_task_solution,
+    update_mission_prompts,
     update_mission_requirement,
     update_mission_status,
+    update_mission_title,
     update_task_decision,
     update_task_discovery,
     update_task_external_state,
@@ -87,8 +97,12 @@ from agent_runtime.tool.tool_execution_models import (
 ALL_NOTE_TOOL_NAMES = [
     "create_mission",
     "append_mission_prompt",
+    "update_mission_prompts",
+    "update_mission_title",
     "update_mission_requirement",
     "update_mission_status",
+    "prune_mission",
+    "delete_mission",
     "create_task_workspace_context",
     "update_task_workspace_context",
     "delete_task_workspace_context",
@@ -110,6 +124,7 @@ ALL_NOTE_TOOL_NAMES = [
     "resolve_task_issue",
     "create_task_artifact_other",
     "delete_task_artifact_other",
+    "delete_task_artifact",
     "create_task_validation",
     "update_task_validation",
     "create_task_external_state",
@@ -126,10 +141,10 @@ def init_factory():
     LocalToolFactory.create()
 
 
-def test_all_32_note_tools_registered():
-    """验证所有 32 个 Note 工具成功注册至全局工具仓储中。"""
+def test_all_note_tools_registered():
+    """验证所有 37 个 Note 工具成功注册至全局工具仓储中。"""
     repo = get_global_repository()
-    assert len(ALL_NOTE_TOOL_NAMES) == 32
+    assert len(ALL_NOTE_TOOL_NAMES) == 37
 
     for name in ALL_NOTE_TOOL_NAMES:
         assert repo.contains(name), f"工具 {name} 未在仓储中注册"
@@ -359,7 +374,31 @@ def test_note_tools_execution_zero_redundancy():
     assert res31_cmd.output["bound_count"] == 2
     assert res31_cmd.output["resource_type"] == "command"
 
-    # 32. note_update_end
-    res32 = note_update_end(NoteUpdateEndRequest(), ctx)
-    assert res32.loop_control.decision == "complete"
-    assert "安全退出" in res32.output["message"]
+    # 33. update_mission_title
+    m_id = res1.output["mission_id"]
+    res33 = update_mission_title(UpdateMissionTitleRequest(mission_id=m_id, title="重构登录模块（包含手机验证码）"), ctx)
+    assert res33.output["title"] == "重构登录模块（包含手机验证码）"
+
+    # 34. update_mission_prompts
+    res34 = update_mission_prompts(UpdateMissionPromptsRequest(mission_id=m_id, raw_prompts=["合并后的完整用户需求"]), ctx)
+    assert res34.output["prompt_count"] == 1
+
+    # 35. delete_task_artifact
+    res35 = delete_task_artifact(DeleteTaskArtifactRequest(artifact_ids=["art-01"]), ctx)
+    assert res35.output["deleted_count"] >= 1
+
+    # 36. prune_mission
+    res36 = prune_mission(PruneMissionRequest(mission_id=m_id, outcome_summary="已完成手机号验证码登录并全量回归"), ctx)
+    assert "outcome_summary" in res36.output
+
+    # 37. delete_mission
+    res_temp_mission = create_mission(CreateMissionRequest(title="待删除临时任务"), ctx)
+    temp_m_id = res_temp_mission.output["mission_id"]
+    res37 = delete_mission(DeleteMissionRequest(mission_id=temp_m_id, reason="测试删除"), ctx)
+    assert res37.output["mission_id"] == temp_m_id
+
+    # 38. note_update_end
+    res38 = note_update_end(NoteUpdateEndRequest(covered_until_seq=15), ctx)
+    assert res38.loop_control.decision == "complete"
+    assert "安全退出" in res38.output["message"]
+    assert res38.output["covered_until_seq"] == 15

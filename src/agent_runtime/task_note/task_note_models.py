@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -78,6 +78,36 @@ class UpdateMissionStatusRequest(BaseToolRequest):
 
     mission_id: str | None = Field(default=None, description="目标任务 ID；缺省不传时默认绑定当前活跃任务。")
     status: MissionStatus = Field(description="目标任务状态；可选值仅限 pending、in_progress、completed、abandoned。")
+
+
+class UpdateMissionPromptsRequest(BaseToolRequest):
+    """整组覆盖替换任务原始诉求列表请求（支持在保持核心含义与需求不变的前提下优化措辞）。"""
+
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
+    raw_prompts: list[str] = Field(min_length=1, description="优化措辞后的完整用户原始诉求字符串数组。")
+
+
+class UpdateMissionTitleRequest(BaseToolRequest):
+    """更新业务任务简明标题请求。"""
+
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
+    title: str = Field(min_length=1, description="更新后的任务简明标题。")
+
+
+class PruneMissionRequest(BaseToolRequest):
+    """闭环任务卡片化裁剪请求（已完成或已废弃任务沉淀为极简结果卡片）。"""
+
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
+    outcome_summary: str = Field(min_length=1, description="核心交付结果摘要或废弃原因复盘（不超过200字）。")
+    keep_record_ids: list[str] | None = Field(default=None, description="可选白名单：保留的关键产物/决策/发现 ID 数组，其余级联删除。")
+
+
+class DeleteMissionRequest(BaseToolRequest):
+    """物理删除误创或无效的业务任务请求。"""
+
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
+    reason: str = Field(min_length=1, description="删除该任务的业务理由。")
+    reassign_to_mission_id: str | None = Field(default=None, description="可选的目标任务 ID；若指定，则将该任务下挂载的记录安全转移，否则直接级联物理删除。")
 
 
 # ── 2. 任务背景素材维护工具模型 (task_workspace_context) ──────────
@@ -281,8 +311,14 @@ class CreateTaskArtifactOtherRequest(BaseToolRequest):
     content: str = Field(min_length=1, description="通用交付成果内容、计算报告摘要或数据引用。")
 
 
+class DeleteTaskArtifactRequest(BaseToolRequest):
+    """物理批量删除失效的产物记录请求。"""
+
+    artifact_ids: list[str] = Field(min_length=1, description="待删除的产物记录 ID 数组。")
+
+
 class DeleteTaskArtifactOtherRequest(BaseToolRequest):
-    """物理删除失效的非文件通用交付成果请求。"""
+    """物理删除失效的非文件通用交付成果请求（兼容老接口）。"""
 
     artifact_id: str = Field(min_length=1, description="目标通用产物主键 ID（严格仅限 type='other'，底层杜绝删除任何 file_* 文件物理产物）。")
 
@@ -371,5 +407,58 @@ class BindResourcesToMissionRequest(BaseToolRequest):
 
 
 class NoteUpdateEndRequest(BaseToolRequest):
-    """退出 Note 更新状态请求（无入参）。"""
-    pass
+    """完成当前批次 Note 观察并推进检查点请求。"""
+
+    covered_until_seq: int = Field(
+        default=0,
+        ge=0,
+        description="当前观察批次覆盖到的最后一个合法断点 seq (含)；Runtime 将校验该 seq 的有效性并原子推进断点。",
+    )
+
+
+# ── 13. 系统状态与断点数据模型 ───────────────────────────────────────
+
+class TaskNoteWatermark(BaseModel):
+    """业务 Agent 观察断点与快照状态实体。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    agent_instance_id: str = Field(description="被观察的业务 Agent 实例 ID。")
+    task_id: str = Field(description="所属 Task ID。")
+    covered_until_seq: int = Field(default=0, description="快照覆盖到的合法断点 seq (含)。")
+    covered_until_message_id: str | None = Field(default=None, description="该断点对应的业务 Agent 消息 ID。")
+    note_version: int = Field(default=0, description="快照版本号，每次成功观察递增。")
+    inherited_processed: bool = Field(default=False, description="子 Agent 继承段是否已在首次观察中处理。")
+    updated_at: str | None = Field(default=None, description="最后更新时间戳。")
+
+
+class TaskNoteUnit(BaseModel):
+    """业务消息合法断点原子切片单元。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    seq: int = Field(description="全局断点序号，单调递增。")
+    unit_type: str = Field(description="单元类型: user_turn | tool_interaction | direct_response | snapshot | system。")
+    messages: list[Any] = Field(default_factory=list, description="该单元包含的连续消息列表。")
+    token_count: int = Field(default=0, description="该单元预估 Token 数量。")
+    end_message_id: str = Field(description="该单元末尾消息的主键 ID。")
+    is_snapshot: bool = Field(default=False, description="是否为前缀替换产生的手记快照（不计入增量统计）。")
+
+
+class SliceResult(BaseModel):
+    """切片器切片与增量分析结果。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    all_units: list[TaskNoteUnit] = Field(default_factory=list, description="完整 Unit 列表。")
+    inherited_units: list[TaskNoteUnit] = Field(default_factory=list, description="子 Agent 首次观察继承的历史 Unit 列表。")
+    incremental_units: list[TaskNoteUnit] = Field(default_factory=list, description="水位之后的增量 Unit 列表。")
+    incremental_tokens: int = Field(default=0, description="增量 Token 总数（排除快照手记）。")
+    should_trigger: bool = Field(default=False, description="是否达到观察触发阈值。")
+    max_seq: int = Field(default=0, description="本次可覆盖的最大合法断点 seq。")
+    watermark_covered_until_seq: int = Field(default=0, description="切片计算时采用的当前水位 seq。")
+
+
+TaskNoteUnit.model_rebuild()
+SliceResult.model_rebuild()
+

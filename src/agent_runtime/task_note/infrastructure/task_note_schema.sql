@@ -1,6 +1,6 @@
 -- =============================================================================
--- Agent Task Note 15 张核心表结构与索引定义 (PostgreSQL DDL)
--- 包含：业务任务实体、5大执行 Note 主题、4大客观事实记录与协作拓扑通信表
+-- Agent Task Note 16 张核心表结构与索引定义 (PostgreSQL DDL)
+-- 包含：业务任务实体、5大执行 Note 主题、4大客观事实记录、协作拓扑通信表与观察断点表
 -- =============================================================================
 
 -- 1. 业务任务单元表 (agent_user_mission)
@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS agent_user_mission (
     raw_prompts             JSONB NOT NULL DEFAULT '[]',  -- 用户或父 Agent 委派输入字符串数组 (可优化措辞使需求更清晰明确，保证核心含义与需求不变)
     refined_requirement     TEXT,
     status                  VARCHAR(32) NOT NULL DEFAULT 'in_progress',
+    outcome_summary         TEXT,                         -- 闭环结果摘要 (prune_mission 写入；裁剪后任务以卡片形式保留)
+    pruned_at               TIMESTAMP WITH TIME ZONE,     -- 裁剪时间；非 NULL 表示该任务已被裁剪为卡片
     sort_order              INT NOT NULL DEFAULT 1,
     created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -221,6 +223,8 @@ CREATE TABLE IF NOT EXISTS task_agent_relationships (
     agent_instance_id        VARCHAR(64) NOT NULL,
     target_agent_type        VARCHAR(32) NOT NULL,        -- 'child' / 'parent'
     target_agent_instance_id VARCHAR(64) NOT NULL,
+    delegation_content       TEXT,                         -- 创建子 Agent 时的委派任务原文 (create_subagent.initial_message，程序自动记录)
+    fork_message_id          VARCHAR(64),                  -- 子 Agent 对话分叉边界消息 ID (仅 target_agent_type='parent' 的行有值)
     status                   VARCHAR(32) NOT NULL DEFAULT 'unreleased', -- unreleased, released
     created_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_agent_rel UNIQUE (task_id, agent_instance_id, target_agent_instance_id)
@@ -260,4 +264,21 @@ CREATE TABLE IF NOT EXISTS task_remote_agent_messages (
 
 CREATE INDEX IF NOT EXISTS idx_remote_msg_tenant ON task_remote_agent_messages(task_id, agent_instance_id);
 CREATE INDEX IF NOT EXISTS idx_remote_msg_target ON task_remote_agent_messages(task_id, agent_instance_id, remote_agent_instance_id);
+
+-- =============================================================================
+-- 16. 观察断点表 (task_note_watermark)
+-- 程序维护，每个业务 Agent 实例一行；记录最新 Note 快照实际覆盖到的消息断点
+-- note_update_end(covered_until_seq) 校验通过后由程序推进
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS task_note_watermark (
+    agent_instance_id        VARCHAR(64) PRIMARY KEY,     -- 被观察的业务 Agent 实例 ID
+    task_id                  VARCHAR(64) NOT NULL,
+    covered_until_seq        BIGINT NOT NULL DEFAULT 0,   -- 快照覆盖到的合法断点 seq (含)
+    covered_until_message_id VARCHAR(64),                 -- 该断点对应的业务 Agent 消息 ID (组装时定位尾部起点)
+    note_version             INT NOT NULL DEFAULT 0,      -- 快照版本号，每次成功观察 +1
+    inherited_processed      BOOLEAN NOT NULL DEFAULT FALSE, -- 子 Agent 继承段是否已在首次观察中处理
+    updated_at               TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_watermark_task ON task_note_watermark(task_id);
 

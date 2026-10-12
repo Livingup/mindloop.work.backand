@@ -236,6 +236,230 @@ class TaskNoteStore:
             logger.error("update_mission_status 更新失败: %s", exc)
             raise
 
+    def update_mission_prompts(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+        mission_id: str,
+        raw_prompts: list[str],
+    ) -> bool:
+        """整组全量覆盖替换任务原始诉求列表（支持在保持核心含义与需求不变的前提下优化措辞）。"""
+        if self._connection_factory is None:
+            return True
+
+        items = [
+            {
+                "prompt": p.strip(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            for p in raw_prompts
+            if p and p.strip()
+        ]
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE agent_user_mission
+                        SET raw_prompts = %s
+                        WHERE task_id = %s AND mission_id = %s AND agent_instance_id = %s
+                        """,
+                        (_dump_json(items), task_id, mission_id, agent_instance_id),
+                    )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("update_mission_prompts 更新失败: %s", exc)
+            raise
+
+    def update_mission_title(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+        mission_id: str,
+        title: str,
+    ) -> bool:
+        """更新业务任务简明标题。"""
+        if self._connection_factory is None:
+            return True
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE agent_user_mission
+                        SET title = %s
+                        WHERE task_id = %s AND mission_id = %s AND agent_instance_id = %s
+                        """,
+                        (title, task_id, mission_id, agent_instance_id),
+                    )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("update_mission_title 更新失败: %s", exc)
+            raise
+
+    def prune_mission(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+        mission_id: str,
+        outcome_summary: str,
+        keep_record_ids: list[str] | None = None,
+    ) -> bool:
+        """闭环任务卡片化裁剪：清空庞大需求与过程描述，写入结果摘要与裁剪时间，级联清理过程记录。"""
+        if self._connection_factory is None:
+            return True
+
+        keep_set = set(keep_record_ids or [])
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT status FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                        (task_id, agent_instance_id, mission_id),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        logger.warning("prune_mission 目标任务不存在: mission_id=%s", mission_id)
+                        return False
+
+                    current_status = row.get("status") if isinstance(row, dict) else row[0]
+                    new_status = current_status if current_status in ("completed", "abandoned") else "completed"
+
+                    cur.execute(
+                        """
+                        UPDATE agent_user_mission
+                        SET outcome_summary = %s,
+                            pruned_at = CURRENT_TIMESTAMP,
+                            status = %s,
+                            refined_requirement = NULL,
+                            raw_prompts = '[]'::jsonb
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                        """,
+                        (outcome_summary, new_status, task_id, agent_instance_id, mission_id),
+                    )
+
+                    table_pk_map = [
+                        ("task_workspace_context", "context_id"),
+                        ("task_solution_content", "solution_id"),
+                        ("task_decision_records", "decision_id"),
+                        ("task_todo_items", "todo_id"),
+                        ("task_progress_content", "progress_id"),
+                        ("task_discovery_records", "discovery_id"),
+                        ("task_issue_records", "issue_id"),
+                        ("task_artifact_records", "artifact_id"),
+                        ("task_validation_records", "validation_id"),
+                        ("task_external_state_records", "external_state_id"),
+                    ]
+
+                    for table_name, pk_col in table_pk_map:
+                        if keep_set:
+                            cur.execute(
+                                f"""
+                                DELETE FROM {table_name}
+                                WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                                  AND NOT ({pk_col} = ANY(%s))
+                                """,
+                                (task_id, agent_instance_id, mission_id, list(keep_set)),
+                            )
+                        else:
+                            cur.execute(
+                                f"""
+                                DELETE FROM {table_name}
+                                WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                                """,
+                                (task_id, agent_instance_id, mission_id),
+                            )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("prune_mission 执行失败: %s", exc)
+            raise
+
+    def delete_mission(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+        mission_id: str,
+        reason: str,
+        reassign_to_mission_id: str | None = None,
+    ) -> bool:
+        """物理删除业务任务：支持将挂载的记录转移到目标任务，或直接级联物理删除。"""
+        if self._connection_factory is None:
+            return True
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                        (task_id, agent_instance_id, mission_id),
+                    )
+                    if not cur.fetchone():
+                        logger.warning("delete_mission 目标任务不存在: mission_id=%s", mission_id)
+                        return False
+
+                    related_tables = [
+                        "task_workspace_context",
+                        "task_solution_content",
+                        "task_decision_records",
+                        "task_todo_items",
+                        "task_progress_content",
+                        "task_discovery_records",
+                        "task_issue_records",
+                        "task_artifact_records",
+                        "task_validation_records",
+                        "task_external_state_records",
+                    ]
+
+                    if reassign_to_mission_id:
+                        cur.execute(
+                            "SELECT 1 FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, reassign_to_mission_id),
+                        )
+                        if not cur.fetchone():
+                            raise ValueError(f"转移目标任务不存在: reassign_to_mission_id={reassign_to_mission_id}")
+
+                        for table_name in related_tables:
+                            if table_name in ("task_solution_content", "task_progress_content"):
+                                cur.execute(
+                                    f"DELETE FROM {table_name} WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                    (task_id, agent_instance_id, mission_id),
+                                )
+                            else:
+                                cur.execute(
+                                    f"""
+                                    UPDATE {table_name}
+                                    SET mission_id = %s
+                                    WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                                    """,
+                                    (reassign_to_mission_id, task_id, agent_instance_id, mission_id),
+                                )
+                    else:
+                        for table_name in related_tables:
+                            cur.execute(
+                                f"DELETE FROM {table_name} WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                (task_id, agent_instance_id, mission_id),
+                            )
+
+                    cur.execute(
+                        "DELETE FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                        (task_id, agent_instance_id, mission_id),
+                    )
+                conn.commit()
+            logger.info("已成功删除任务: mission_id=%s, reason=%s", mission_id, reason)
+            return True
+        except Exception as exc:
+            logger.error("delete_mission 执行失败: %s", exc)
+            raise
+
     # ── 2. 任务背景素材 (task_workspace_context) ──────────────────────
 
     def create_workspace_context(
@@ -1197,6 +1421,36 @@ class TaskNoteStore:
             logger.error("delete_artifact_other 删除失败: %s", exc)
             raise
 
+    def delete_task_artifacts(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+        artifact_ids: list[str],
+    ) -> int:
+        """根据主键批量物理删除产物记录。"""
+        if not artifact_ids:
+            return 0
+        if self._connection_factory is None:
+            return len(artifact_ids)
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        DELETE FROM task_artifact_records
+                        WHERE task_id = %s AND agent_instance_id = %s AND artifact_id = ANY(%s)
+                        """,
+                        (task_id, agent_instance_id, list(artifact_ids)),
+                    )
+                    deleted_count = cur.rowcount
+                conn.commit()
+            return deleted_count
+        except Exception as exc:
+            logger.error("delete_task_artifacts 删除失败: %s", exc)
+            raise
+
     # ── 10. 验证与检查结论 (task_validation_records) ──────────────────
 
     def create_validation(
@@ -1540,12 +1794,343 @@ class TaskNoteStore:
             logger.error("get_all_command_lines_for_tenant 查询失败: %s", exc)
             return {}
 
+    # ── 13. 观察断点与快照状态 (task_note_watermark) ─────────────────
+
+    def get_watermark(
+        self,
+        *,
+        agent_instance_id: str,
+    ) -> dict[str, Any] | None:
+        """获取指定业务 Agent 实例的最新观察断点记录。"""
+        if self._connection_factory is None:
+            return None
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT agent_instance_id, task_id, covered_until_seq,
+                               covered_until_message_id, note_version,
+                               inherited_processed, updated_at
+                        FROM task_note_watermark
+                        WHERE agent_instance_id = %s
+                        """,
+                        (agent_instance_id,),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    if isinstance(row, dict):
+                        return dict(row)
+                    if row and len(row) >= 7:
+                        return {
+                            "agent_instance_id": row[0],
+                            "task_id": row[1],
+                            "covered_until_seq": row[2],
+                            "covered_until_message_id": row[3],
+                            "note_version": row[4],
+                            "inherited_processed": row[5],
+                            "updated_at": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
+                        }
+                    return None
+        except Exception as exc:
+            logger.error("get_watermark 查询失败: %s", exc)
+            return None
+
+    def update_watermark(
+        self,
+        *,
+        agent_instance_id: str,
+        task_id: str,
+        covered_until_seq: int,
+        covered_until_message_id: str | None = None,
+        note_version_inc: bool = True,
+        inherited_processed: bool | None = None,
+    ) -> dict[str, Any]:
+        """原子插入或推进观察断点水位。"""
+        if self._connection_factory is None:
+            return {
+                "agent_instance_id": agent_instance_id,
+                "task_id": task_id,
+                "covered_until_seq": covered_until_seq,
+                "covered_until_message_id": covered_until_message_id,
+                "note_version": 1,
+                "inherited_processed": bool(inherited_processed),
+            }
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO task_note_watermark (
+                            agent_instance_id, task_id, covered_until_seq,
+                            covered_until_message_id, note_version,
+                            inherited_processed, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP
+                        )
+                        ON CONFLICT (agent_instance_id) DO UPDATE
+                        SET covered_until_seq = EXCLUDED.covered_until_seq,
+                            covered_until_message_id = COALESCE(EXCLUDED.covered_until_message_id, task_note_watermark.covered_until_message_id),
+                            note_version = CASE WHEN %s THEN task_note_watermark.note_version + 1 ELSE task_note_watermark.note_version END,
+                            inherited_processed = CASE WHEN %s IS NOT NULL THEN %s ELSE task_note_watermark.inherited_processed END,
+                            updated_at = CURRENT_TIMESTAMP
+                        RETURNING agent_instance_id, task_id, covered_until_seq, covered_until_message_id, note_version, inherited_processed, updated_at
+                        """,
+                        (
+                            agent_instance_id,
+                            task_id,
+                            covered_until_seq,
+                            covered_until_message_id,
+                            1 if note_version_inc else 0,
+                            bool(inherited_processed),
+                            note_version_inc,
+                            inherited_processed,
+                            inherited_processed,
+                        ),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+                if isinstance(row, dict):
+                    return dict(row)
+                if row and len(row) >= 7:
+                    return {
+                        "agent_instance_id": row[0],
+                        "task_id": row[1],
+                        "covered_until_seq": row[2],
+                        "covered_until_message_id": row[3],
+                        "note_version": row[4],
+                        "inherited_processed": row[5],
+                        "updated_at": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
+                    }
+                return {
+                    "agent_instance_id": agent_instance_id,
+                    "task_id": task_id,
+                    "covered_until_seq": covered_until_seq,
+                    "covered_until_message_id": covered_until_message_id,
+                    "note_version": 1 if note_version_inc else 0,
+                    "inherited_processed": bool(inherited_processed),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+        except Exception as exc:
+            logger.error("update_watermark 写入失败: %s", exc)
+            raise
+
+    def set_inherited_processed(
+        self,
+        *,
+        agent_instance_id: str,
+        task_id: str,
+    ) -> bool:
+        """标记子 Agent 继承段已在首次观察中处理完成。"""
+        if self._connection_factory is None:
+            return True
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO task_note_watermark (
+                            agent_instance_id, task_id, inherited_processed, updated_at
+                        ) VALUES (
+                            %s, %s, TRUE, CURRENT_TIMESTAMP
+                        )
+                        ON CONFLICT (agent_instance_id) DO UPDATE
+                        SET inherited_processed = TRUE,
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (agent_instance_id, task_id),
+                    )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("set_inherited_processed 失败: %s", exc)
+            raise
+
+    def get_note_snapshot(
+        self,
+        *,
+        task_id: str,
+        agent_instance_id: str,
+    ) -> dict[str, Any]:
+        """获取当前业务 Agent 实例在当前 Task 下的完整 Note 结构化快照。"""
+        snapshot: dict[str, Any] = {
+            "watermark": self.get_watermark(agent_instance_id=agent_instance_id),
+            "missions": [],
+            "unbound_artifacts": [],
+            "relationships": [],
+            "agent_messages": [],
+        }
+        if self._connection_factory is None:
+            return snapshot
+
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT mission_id, task_id, scene_id, agent_instance_id,
+                               title, raw_prompts, refined_requirement, status,
+                               outcome_summary, pruned_at, sort_order, created_at
+                        FROM agent_user_mission
+                        WHERE task_id = %s AND agent_instance_id = %s
+                        ORDER BY sort_order ASC, created_at ASC
+                        """,
+                        (task_id, agent_instance_id),
+                    )
+                    mission_rows = cur.fetchall()
+                    missions_by_id: dict[str, dict[str, Any]] = {}
+                    for row in mission_rows:
+                        m_data = dict(row) if isinstance(row, dict) else {
+                            "mission_id": row[0],
+                            "task_id": row[1],
+                            "scene_id": row[2],
+                            "agent_instance_id": row[3],
+                            "title": row[4],
+                            "raw_prompts": row[5],
+                            "refined_requirement": row[6],
+                            "status": row[7],
+                            "outcome_summary": row[8],
+                            "pruned_at": row[9].isoformat() if row[9] else None,
+                            "sort_order": row[10],
+                            "created_at": row[11].isoformat() if row[11] else None,
+                        }
+                        m_data["workspace_contexts"] = []
+                        m_data["solution"] = None
+                        m_data["decisions"] = []
+                        m_data["todos"] = []
+                        m_data["progress"] = None
+                        m_data["discoveries"] = []
+                        m_data["issues"] = []
+                        m_data["artifacts"] = []
+                        m_data["validations"] = []
+                        m_data["external_states"] = []
+                        missions_by_id[m_data["mission_id"]] = m_data
+
+                    mission_ids = list(missions_by_id.keys())
+                    if mission_ids:
+                        cur.execute(
+                            "SELECT * FROM task_workspace_context WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["workspace_contexts"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_solution_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s)",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["solution"] = d
+
+                        cur.execute(
+                            "SELECT * FROM task_decision_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["decisions"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_todo_items WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY priority ASC, created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["todos"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_progress_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s)",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["progress"] = d
+
+                        cur.execute(
+                            "SELECT * FROM task_discovery_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["discoveries"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_issue_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["issues"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_artifact_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["artifacts"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_validation_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["validations"].append(d)
+
+                        cur.execute(
+                            "SELECT * FROM task_external_state_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s) ORDER BY created_at ASC",
+                            (task_id, agent_instance_id, mission_ids),
+                        )
+                        for r in cur.fetchall():
+                            d = dict(r)
+                            if d["mission_id"] in missions_by_id:
+                                missions_by_id[d["mission_id"]]["external_states"].append(d)
+
+                    snapshot["missions"] = list(missions_by_id.values())
+
+                    cur.execute(
+                        "SELECT * FROM task_artifact_records WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NULL ORDER BY created_at ASC",
+                        (task_id, agent_instance_id),
+                    )
+                    snapshot["unbound_artifacts"] = [dict(r) for r in cur.fetchall()]
+
+                    cur.execute(
+                        "SELECT * FROM task_agent_relationships WHERE task_id = %s AND agent_instance_id = %s ORDER BY created_at ASC",
+                        (task_id, agent_instance_id),
+                    )
+                    snapshot["relationships"] = [dict(r) for r in cur.fetchall()]
+
+                    cur.execute(
+                        "SELECT * FROM task_agent_messages WHERE task_id = %s AND agent_instance_id = %s ORDER BY created_at ASC",
+                        (task_id, agent_instance_id),
+                    )
+                    snapshot["agent_messages"] = [dict(r) for r in cur.fetchall()]
+
+            return snapshot
+        except Exception as exc:
+            logger.error("get_note_snapshot 查询失败: %s", exc)
+            return snapshot
+
     def cleanup_agent_instance_note(
         self,
         task_id: str,
         agent_instance_id: str,
     ) -> int:
-        """物理清除指定子 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。
+        """物理清除指定子 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records 与水位记录）。
 
         用于非 Root Agent 调用 end_task 完成会话时的垃圾回收。
         """
@@ -1557,10 +2142,16 @@ class TaskNoteStore:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
                     for table in ALL_NOTE_TABLES:
-                        cur.execute(
-                            f"DELETE FROM {table} WHERE task_id = %s AND agent_instance_id = %s",
-                            (task_id, agent_instance_id),
-                        )
+                        if table == "task_note_watermark":
+                            cur.execute(
+                                "DELETE FROM task_note_watermark WHERE task_id = %s AND agent_instance_id = %s",
+                                (task_id, agent_instance_id),
+                            )
+                        else:
+                            cur.execute(
+                                f"DELETE FROM {table} WHERE task_id = %s AND agent_instance_id = %s",
+                                (task_id, agent_instance_id),
+                            )
                         total_deleted += cur.rowcount if cur.rowcount > 0 else 0
                 conn.commit()
             logger.info(
@@ -1583,7 +2174,7 @@ class TaskNoteStore:
         self,
         task_id: str,
     ) -> int:
-        """物理清除指定 Task 下所有 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records）。
+        """物理清除指定 Task 下所有 Agent 实例的全部 Note 记录（含高频辅助表 task_command_records 与水位记录）。
 
         用于 Root Agent 调用 end_task 结束全任务时的垃圾回收。
         """
@@ -1632,6 +2223,7 @@ ALL_NOTE_TABLES: tuple[str, ...] = (
     "task_agent_relationships",
     "task_agent_messages",
     "task_remote_agent_messages",
+    "task_note_watermark",
 )
 
 

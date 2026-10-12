@@ -28,15 +28,20 @@ from agent_runtime.task_note.task_note_models import (
     CreateTaskValidationRequest,
     CreateTaskWorkspaceContextRequest,
     DeleteTaskArtifactOtherRequest,
+    DeleteTaskArtifactRequest,
     DeleteTaskDiscoveryRequest,
     DeleteTaskTodoRequest,
     DeleteTaskWorkspaceContextRequest,
+    DeleteMissionRequest,
     NoteUpdateEndRequest,
+    PruneMissionRequest,
     ResolveTaskIssueRequest,
     SupersedeTaskDecisionRequest,
     SupersedeTaskSolutionRequest,
+    UpdateMissionPromptsRequest,
     UpdateMissionRequirementRequest,
     UpdateMissionStatusRequest,
+    UpdateMissionTitleRequest,
     UpdateTaskDecisionRequest,
     UpdateTaskDiscoveryRequest,
     UpdateTaskExternalStateRequest,
@@ -230,6 +235,177 @@ def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeC
             execution_status="failed",
             error_code="DatabaseError",
             error_message=f"推进任务状态失败: {exc}",
+            output={"error": str(exc)},
+        )
+
+
+@tool(
+    name="update_mission_prompts",
+    description="整组全量覆盖替换任务原始诉求列表（支持在保持核心含义与需求不变的前提下优化措辞，使需求更明确清晰）。",
+    group="task_note",
+    category="business",
+    public=True,
+    execution_mode="direct",
+    wiki="### update_mission_prompts\n覆盖更新用户诉求列表，支持语义等价的措辞清晰化优化。",
+)
+def update_mission_prompts(request: UpdateMissionPromptsRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_mission_prompts(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            raw_prompts=request.raw_prompts,
+        )
+        output = {
+            "mission_id": target_mission_id,
+            "prompt_count": len(request.raw_prompts),
+            "message": "任务原始诉求列表已覆盖更新",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_mission_prompts 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新任务原始诉求失败: {exc}",
+            output={"error": str(exc)},
+        )
+
+
+@tool(
+    name="update_mission_title",
+    description="更新业务任务的简明标题。",
+    group="task_note",
+    category="business",
+    public=True,
+    execution_mode="direct",
+    wiki="### update_mission_title\n按 mission_id 更新任务标题。",
+)
+def update_mission_title(request: UpdateMissionTitleRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        store.update_mission_title(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            title=request.title,
+        )
+        output = {
+            "mission_id": target_mission_id,
+            "title": request.title,
+            "message": "任务标题已成功更新",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("update_mission_title 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"更新任务标题失败: {exc}",
+            output={"error": str(exc)},
+        )
+
+
+@tool(
+    name="prune_mission",
+    description="闭环任务卡片化裁剪：将已完成(completed)或已废弃(abandoned)的任务沉淀为极简结果卡片，写入交付结果摘要并级联清理过程记录。",
+    group="task_note",
+    category="business",
+    public=True,
+    execution_mode="direct",
+    wiki="### prune_mission\n闭环任务卡片化裁剪，写入 outcome_summary 并清理中间过程细节。",
+)
+def prune_mission(request: PruneMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        ok = store.prune_mission(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            outcome_summary=request.outcome_summary,
+            keep_record_ids=request.keep_record_ids,
+        )
+        if not ok:
+            return BaseToolResult(
+                success=False,
+                execution_status="failed",
+                error_code="MissionNotFound",
+                error_message=f"目标任务不存在: {target_mission_id}",
+                output={"mission_id": target_mission_id},
+            )
+        output = {
+            "mission_id": target_mission_id,
+            "outcome_summary": request.outcome_summary,
+            "keep_record_count": len(request.keep_record_ids or []),
+            "message": "已完成任务卡片化裁剪，过程细节已安全压缩清理",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("prune_mission 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"任务裁剪失败: {exc}",
+            output={"error": str(exc)},
+        )
+
+
+@tool(
+    name="delete_mission",
+    description="物理删除误创或无效的业务任务。支持将挂载的记录转移到目标任务，或直接级联物理删除。",
+    group="task_note",
+    category="business",
+    public=True,
+    execution_mode="direct",
+    wiki="### delete_mission\n删除业务任务单元，支持记录安全转移。",
+)
+def delete_mission(request: DeleteMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    target_mission_id = _resolve_mission_id(request.mission_id, ctx)
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        ok = store.delete_mission(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            mission_id=target_mission_id,
+            reason=request.reason,
+            reassign_to_mission_id=request.reassign_to_mission_id,
+        )
+        if not ok:
+            return BaseToolResult(
+                success=False,
+                execution_status="failed",
+                error_code="MissionNotFound",
+                error_message=f"目标任务不存在: {target_mission_id}",
+                output={"mission_id": target_mission_id},
+            )
+        output = {
+            "mission_id": target_mission_id,
+            "reassign_to_mission_id": request.reassign_to_mission_id,
+            "message": f"任务已安全删除 (理由: {request.reason})",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_mission 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"删除任务失败: {exc}",
             output={"error": str(exc)},
         )
 
@@ -1085,6 +1261,42 @@ def delete_task_artifact_other(request: DeleteTaskArtifactOtherRequest, ctx: Too
         )
 
 
+@tool(
+    name="delete_task_artifact",
+    description="批量物理删除产物记录（传入 artifact_ids 数组）。可用于删除无效或误创建的产物项。",
+    group="task_note",
+    category="business",
+    public=True,
+    execution_mode="direct",
+    wiki="### delete_task_artifact\n批量物理删除产物记录。",
+)
+def delete_task_artifact(request: DeleteTaskArtifactRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    try:
+        deleted_count = store.delete_task_artifacts(
+            task_id=task_id,
+            agent_instance_id=agent_instance_id,
+            artifact_ids=request.artifact_ids,
+        )
+        output = {
+            "deleted_count": deleted_count,
+            "artifact_ids": request.artifact_ids,
+            "message": f"成功物理删除 {deleted_count} 条产物记录",
+        }
+        return BaseToolResult(output=output)
+    except Exception as exc:
+        logger.error("delete_task_artifact 失败: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"批量删除产物记录失败: {exc}",
+            output={"error": str(exc)},
+        )
+
+
 # ── 9. 测试与验证结论维护工具 (task_validation_records) ─────────────
 
 @tool(
@@ -1345,19 +1557,37 @@ def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolR
 
 @tool(
     name="note_update_end",
-    description="Note 更新流程全部完成后调用，通知系统所有 Note 主题更新完毕，安全退出 Note 更新状态，切换回业务 Agent 运行态。",
+    description="Note 观察更新流程全部完成后调用，通知系统当前观察批次已完成，提交覆盖到的合法断点 seq，并安全退出观察者会话。",
     group="task_note",
     category="business",
     public=True,
     execution_mode="direct",
     allowed_loop_decisions=("continue", "complete"),
-    wiki="### note_update_end\n结束 Note 更新流程，向系统发出完成信号并切回业务运行态。",
+    wiki="### note_update_end\n结束 Note 观察流程，提交 covered_until_seq 水位并安全退出观察者。",
 )
 def note_update_end(request: NoteUpdateEndRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
+    store = get_task_note_store()
+    task_id = ctx.task_id or "task-default"
+    agent_instance_id = ctx.agent_instance_id or "inst-default"
+
+    watermark_info = None
+    if request.covered_until_seq > 0:
+        try:
+            watermark_info = store.update_watermark(
+                agent_instance_id=agent_instance_id,
+                task_id=task_id,
+                covered_until_seq=request.covered_until_seq,
+                note_version_inc=True,
+            )
+        except Exception as exc:
+            logger.warning("note_update_end 推进 watermark 异常: %s", exc)
+
     output = {
-        "message": "Note 更新流程已结束，系统安全退出 Note 状态并切回业务运行态",
+        "covered_until_seq": request.covered_until_seq,
+        "watermark": watermark_info,
+        "message": f"Note 观察流程已结束，成功提交断点 seq={request.covered_until_seq}，系统安全退出 Note 状态并切回业务运行态",
     }
     return BaseToolResult(
         output=output,
-        loop_control=LoopControl(decision="complete", reason="Note 更新流程完成"),
+        loop_control=LoopControl(decision="complete", reason="Note 观察流程完成"),
     )

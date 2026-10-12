@@ -125,6 +125,9 @@ Desktop.ini
 !/tests/test_task_note_prompt_provider.py
 !/tests/test_task_note_tools.py
 !/tests/test_task_note_update_events.py
+!/tests/test_task_note_unit_slicer.py
+!/tests/test_task_note_observer_scheduler.py
+!/tests/test_task_note_context_assembler.py
 !/tests/test_logging_setup.py
 !/tests/test_agent_instance_note_substate.py
 !/tests/test_note_context_compression_flow.py

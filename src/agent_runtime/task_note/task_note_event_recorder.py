@@ -171,11 +171,13 @@ class TaskNoteEventRecorder:
         task_id: str | None,
         parent_instance_id: str | None,
         child_instance_id: str | None,
+        delegation_content: str | None = None,
+        fork_message_id: str | None = None,
         mission_id: str | None = None,
-    ) -> bool:
-        """记录子 Agent 协作拓扑关系到 task_agent_relationships（面向父子双方双向记录）。"""
+    ) -> str | None:
+        """记录子 Agent 协作拓扑关系到 task_agent_relationships（面向父子双方双向记录），返回父视角关系 ID。"""
         if not task_id or not parent_instance_id or not child_instance_id or self._connection_factory is None:
-            return False
+            return None
 
         try:
             rel_id_parent = _generate_id("rel")
@@ -183,15 +185,17 @@ class TaskNoteEventRecorder:
 
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
-                    # 1. 父视角: 目标是 child
+                    # 1. 父视角: 目标是 child，包含委派任务原文
                     cur.execute(
                         """
                         INSERT INTO task_agent_relationships (
                             relationship_id, task_id, mission_id, agent_instance_id,
-                            target_agent_type, target_agent_instance_id, status
+                            target_agent_type, target_agent_instance_id, delegation_content,
+                            fork_message_id, status
                         ) VALUES (
                             %s, %s, %s, %s,
-                            %s, %s, %s
+                            %s, %s, %s,
+                            %s, %s
                         )
                         ON CONFLICT (task_id, agent_instance_id, target_agent_instance_id) DO NOTHING
                         """,
@@ -202,18 +206,22 @@ class TaskNoteEventRecorder:
                             parent_instance_id,
                             "child",
                             child_instance_id,
+                            delegation_content,
+                            None,
                             "unreleased",
                         ),
                     )
-                    # 2. 子视角: 目标是 parent
+                    # 2. 子视角: 目标是 parent，包含委派原文与分叉消息边界
                     cur.execute(
                         """
                         INSERT INTO task_agent_relationships (
                             relationship_id, task_id, mission_id, agent_instance_id,
-                            target_agent_type, target_agent_instance_id, status
+                            target_agent_type, target_agent_instance_id, delegation_content,
+                            fork_message_id, status
                         ) VALUES (
                             %s, %s, %s, %s,
-                            %s, %s, %s
+                            %s, %s, %s,
+                            %s, %s
                         )
                         ON CONFLICT (task_id, agent_instance_id, target_agent_instance_id) DO NOTHING
                         """,
@@ -224,14 +232,16 @@ class TaskNoteEventRecorder:
                             child_instance_id,
                             "parent",
                             parent_instance_id,
+                            delegation_content,
+                            fork_message_id,
                             "unreleased",
                         ),
                     )
                 conn.commit()
-            return True
+            return rel_id_parent
         except Exception as exc:
             logger.warning("记录 task_agent_relationships 异常 (已忽略): %s", exc)
-            return False
+            return None
 
     async def async_record_subagent_relationship(
         self,
@@ -239,14 +249,18 @@ class TaskNoteEventRecorder:
         task_id: str | None,
         parent_instance_id: str | None,
         child_instance_id: str | None,
+        delegation_content: str | None = None,
+        fork_message_id: str | None = None,
         mission_id: str | None = None,
-    ) -> bool:
+    ) -> str | None:
         """异步记录子 Agent 协作拓扑关系。"""
         return await asyncio.to_thread(
             self.record_subagent_relationship,
             task_id=task_id,
             parent_instance_id=parent_instance_id,
             child_instance_id=child_instance_id,
+            delegation_content=delegation_content,
+            fork_message_id=fork_message_id,
             mission_id=mission_id,
         )
 
