@@ -221,7 +221,8 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     modalities      TEXT    NOT NULL DEFAULT '[]',
     image_count     INTEGER NOT NULL DEFAULT 0,
     pdf_page_count  INTEGER NOT NULL DEFAULT 0,
-    last_context_usage TEXT
+    last_context_usage TEXT,
+    task_note_tracking TEXT
 );
 
 CREATE TABLE IF NOT EXISTS provider_state (
@@ -343,7 +344,7 @@ class SqliteConversationRepository:
 
             # 从 SQLite 读取会话派生状态。
             sr = c.execute(
-                "SELECT providers, vendors, modalities, image_count, pdf_page_count, last_context_usage "
+                "SELECT providers, vendors, modalities, image_count, pdf_page_count, last_context_usage, task_note_tracking "
                 "FROM conversation_state WHERE conversation_id = ?",
                 (conversation_id,),
             ).fetchone()
@@ -354,6 +355,7 @@ class SqliteConversationRepository:
                 image_count=sr[3],
                 pdf_page_count=sr[4],
                 last_context_usage=json.loads(sr[5]) if sr[5] else None,
+                task_note_tracking=json.loads(sr[6]) if len(sr) > 6 and sr[6] else None,
             ) if sr else ConversationState()
 
             # 从 SQLite 读取各 LLM 供应商的会话状态。
@@ -647,8 +649,8 @@ class SqliteConversationRepository:
     def _upsert_state(self, cid: str, state: ConversationState) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO conversation_state "
-            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count, last_context_usage) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count, last_context_usage, task_note_tracking) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cid,
                 json.dumps(state.providers, ensure_ascii=False),
@@ -658,6 +660,9 @@ class SqliteConversationRepository:
                 state.pdf_page_count,
                 json.dumps(state.last_context_usage, ensure_ascii=False)
                 if state.last_context_usage is not None
+                else None,
+                json.dumps(getattr(state, "task_note_tracking", None), ensure_ascii=False)
+                if getattr(state, "task_note_tracking", None) is not None
                 else None,
             ),
         )
@@ -692,6 +697,8 @@ class SqliteConversationRepository:
         }
         if "last_context_usage" not in columns:
             self._conn.execute("ALTER TABLE conversation_state ADD COLUMN last_context_usage TEXT")
+        if "task_note_tracking" not in columns:
+            self._conn.execute("ALTER TABLE conversation_state ADD COLUMN task_note_tracking TEXT")
         tables = {
             row[0]
             for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

@@ -89,11 +89,13 @@ class TaskNoteContextAssembler:
         # 2. 对当前会话进行原子断点切片
         slice_res = self.slicer.slice_messages(
             messages=current_messages,
-            watermark_covered_until_seq=0,
+            watermark_covered_until_seq=watermark.covered_until_seq,
+            covered_until_message_id=watermark.covered_until_message_id,
         )
 
-        covered_units = [u for u in slice_res.all_units if u.seq <= watermark.covered_until_seq]
-        tail_units = [u for u in slice_res.all_units if u.seq > watermark.covered_until_seq]
+        effective_seq = slice_res.watermark_covered_until_seq
+        covered_units = [u for u in slice_res.all_units if u.seq <= effective_seq]
+        tail_units = [u for u in slice_res.all_units if u.seq > effective_seq]
 
         # 若当前没有任何历史 Unit 满足 <= watermark，说明消息序列中已被替换过或无老消息
         if not covered_units:

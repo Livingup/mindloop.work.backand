@@ -675,6 +675,9 @@ class ConversationState:
 
     last_context_usage: dict[str, Any] | None = None
 
+    # Task Note 观察与切片跟踪状态 (持久化到 SQLite conversation_state 表)
+    task_note_tracking: dict[str, Any] | None = None
+
 
 @dataclass(slots=True)
 class Conversation:

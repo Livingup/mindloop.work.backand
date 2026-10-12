@@ -34,11 +34,17 @@ class MockTaskNoteStore:
         return self.watermarks[key]
 
     def update_watermark(
-        self, agent_instance_id: str, task_id: str, covered_until_seq: int, note_version_inc: bool = True
+        self,
+        agent_instance_id: str,
+        task_id: str,
+        covered_until_seq: int,
+        covered_until_message_id: str | None = None,
+        note_version_inc: bool = True,
     ) -> dict:
         key = f"{agent_instance_id}:{task_id}"
         wm = self.get_watermark(agent_instance_id, task_id)
         wm.covered_until_seq = covered_until_seq
+        wm.covered_until_message_id = covered_until_message_id
         if note_version_inc:
             wm.note_version += 1
         return {"covered_until_seq": wm.covered_until_seq, "note_version": wm.note_version}
@@ -130,7 +136,7 @@ async def test_scheduler_subagent_inherited_marking():
     messages = [
         {"id": "m1", "role": "user", "content": "父会话初始化"},
         {"id": "m_fork", "role": "user", "content": "委派边界"},
-        {"id": "m3", "role": "assistant", "content": "子 Agent 工作中"},
+        {"id": "m3", "role": "assistant", "content": "子 Agent 工作中执行详细业务逻辑" * 5},
     ]
 
     triggered = await scheduler.check_and_trigger(

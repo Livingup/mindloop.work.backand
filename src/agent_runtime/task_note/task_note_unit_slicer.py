@@ -173,6 +173,7 @@ class TaskNoteUnitSlicer:
         self,
         messages: Sequence[Any],
         watermark_covered_until_seq: int = 0,
+        covered_until_message_id: str | None = None,
         is_subagent: bool = False,
         inherited_processed: bool = False,
         fork_message_id: str | None = None,
@@ -277,35 +278,50 @@ class TaskNoteUnitSlicer:
         if current_batch:
             commit_unit(unit_type="trailing_execution")
 
-        # 划分 inherited_units（子 Agent 首次观察）
+        # ── 确定基线水位 effective_covered_seq ────────────────────────
+        effective_covered_seq = watermark_covered_until_seq
+
+        # 1. 优先根据物理 message_id 定位断点，避免相对 seq 位移错乱
+        if covered_until_message_id:
+            for u in all_units:
+                if u.end_message_id == covered_until_message_id or any(
+                    _get_msg_id(m, 0) == covered_until_message_id for m in u.messages
+                ):
+                    effective_covered_seq = u.seq
+                    break
+
+        # 2. 若首个 Unit 是快照单元，且历史断点已被裁剪（当前 max_seq < watermark），以快照作为基线
+        if all_units and all_units[0].is_snapshot:
+            if effective_covered_seq > all_units[-1].seq or effective_covered_seq <= 0:
+                effective_covered_seq = all_units[0].seq
+
+        # 3. 划分 inherited_units（子 Agent 首次观察）
         inherited_units: list[TaskNoteUnit] = []
         if is_subagent and not inherited_processed:
+            fork_unit_idx = -1
             if fork_message_id:
-                # 寻找包含 fork_message_id 的 Unit
-                fork_unit_idx = -1
                 for idx, u in enumerate(all_units):
-                    for m in u.messages:
-                        if _get_msg_id(m, 0) == fork_message_id:
-                            fork_unit_idx = idx
-                            break
-                    if fork_unit_idx != -1:
+                    if any(_get_msg_id(m, 0) == fork_message_id for m in u.messages):
+                        fork_unit_idx = idx
                         break
-                if fork_unit_idx != -1:
-                    inherited_units = all_units[: fork_unit_idx + 1]
+            if fork_unit_idx != -1:
+                inherited_units = all_units[: fork_unit_idx + 1]
+                # 关键修复：子 Agent 增量严格从 fork_unit 之后起算
+                if effective_covered_seq < all_units[fork_unit_idx].seq:
+                    effective_covered_seq = all_units[fork_unit_idx].seq
             else:
-                # 若未指定 fork_message_id 但为首次子 Agent，将第一个 user 之前的 Unit 视为继承
-                inherited_units = [u for u in all_units if u.seq <= watermark_covered_until_seq]
+                inherited_units = [u for u in all_units if u.seq <= effective_covered_seq]
 
-        # 划分 incremental_units (seq > watermark)
-        incremental_units = [u for u in all_units if u.seq > watermark_covered_until_seq]
+        # 4. 划分 incremental_units (seq > effective_covered_seq)
+        incremental_units = [u for u in all_units if u.seq > effective_covered_seq]
 
-        # 统计增量 Token（严格排除快照手记 is_snapshot）
+        # 5. 统计增量 Token（严格排除快照手记 is_snapshot）
         incremental_tokens = sum(
             u.token_count for u in incremental_units if not u.is_snapshot
         )
 
         should_trigger = incremental_tokens >= self.trigger_threshold_tokens
-        max_seq = max([u.seq for u in incremental_units], default=watermark_covered_until_seq)
+        max_seq = max([u.seq for u in incremental_units], default=effective_covered_seq)
 
         logger.debug(
             "TaskNoteUnitSlicer 完成切片: total_units=%d, incremental_units=%d, incremental_tokens=%d, trigger=%s",
@@ -322,5 +338,5 @@ class TaskNoteUnitSlicer:
             incremental_tokens=incremental_tokens,
             should_trigger=should_trigger,
             max_seq=max_seq,
-            watermark_covered_until_seq=watermark_covered_until_seq,
+            watermark_covered_until_seq=effective_covered_seq,
         )

@@ -124,6 +124,9 @@ def build_observer_user_payload(
         f"- 角色模式: `{'子 Agent (Subagent)' if session_input.is_subagent else '根业务 Agent'}`",
     ]
 
+    if session_input.delegation_content:
+        parts.append(f"- 直接父级委派原文: `{session_input.delegation_content}`")
+
     if target_agent_definition_prompt:
         parts.append(
             "- 目标 Agent 业务职责定义 (用于理解其专业领域与产物，切勿代入该角色):\n"
@@ -136,21 +139,28 @@ def build_observer_user_payload(
         f"```json\n{snapshot_json_str}\n```\n"
     )
 
-    if session_input.is_subagent and (session_input.inherited_units or session_input.delegation_content):
+    # 3. 对话消息流（自然呈现）
+    if session_input.is_subagent and session_input.inherited_units:
         inherited_text = format_units_for_observer(session_input.inherited_units)
+        inc_text = format_units_for_observer(session_input.incremental_units)
         parts.append(
-            "## 3. 继承历史与委派上下文 (子 Agent 首次专属)\n"
-            f"- 委派原文: {session_input.delegation_content or '（无单独委派原文）'}\n"
-            f"- 继承段历史消息:\n{inherited_text}\n"
+            "## 3. 会话消息流水（含分叉背景与增量执行）\n"
+            "### (1) 上层继承背景消息 (Inherited Units - 仅作为事实与硬约束参考，勿当作当前 Agent 的产物):\n"
+            f"{inherited_text}\n\n"
+            "### (2) 目标 Agent 增量对话切片 (Incremental Units - 本次重点观察与提炼范围):\n"
+            f"{inc_text}\n"
+        )
+    else:
+        inc_text = format_units_for_observer(session_input.incremental_units)
+        parts.append(
+            "## 3. 待观察的增量对话切片 (Incremental Units)\n"
+            f"以下是上一断点以来的新增对话。每个 Unit 是一个原子切片，其末尾标有合法断点 seq (本次最高目标断点为 seq={session_input.target_seq})：\n"
+            f"{inc_text}\n"
         )
 
-    inc_text = format_units_for_observer(session_input.incremental_units)
     parts.append(
-        "## 4. 待观察的增量对话切片 (Incremental Units)\n"
-        f"以下是上一断点以来的新增对话。每个 Unit 是一个原子切片，其末尾标有合法断点 seq (本次最高目标断点为 seq={session_input.target_seq})：\n"
-        f"{inc_text}\n\n"
         "---\n"
-        "请通读上述增量内容，调用专属 Note 工具维护 11 张 Note 业务表。完成后必须调用 `note_update_end(covered_until_seq=...)` 提交断点并安全退出。"
+        "请通读上述内容，调用专属 Note 工具维护 11 张 Note 业务表。完成后必须调用 `note_update_end(covered_until_seq=...)` 提交断点并安全退出。"
     )
 
     return "\n\n".join(parts)
@@ -214,6 +224,7 @@ class TaskNoteObserverScheduler:
             slice_res = self.slicer.slice_messages(
                 messages=messages,
                 watermark_covered_until_seq=watermark.covered_until_seq,
+                covered_until_message_id=watermark.covered_until_message_id,
                 is_subagent=is_subagent,
                 inherited_processed=watermark.inherited_processed,
                 fork_message_id=fork_message_id,
@@ -298,10 +309,18 @@ class TaskNoteObserverScheduler:
                 result.covered_until_seq = session_input.target_seq
 
             # 校验通过：原子推进 Watermark
+            covered_msg_id = None
+            all_input_units = session_input.inherited_units + session_input.incremental_units
+            for u in all_input_units:
+                if u.seq == result.covered_until_seq:
+                    covered_msg_id = u.end_message_id
+                    break
+
             wm_info = self.store.update_watermark(
                 agent_instance_id=agent_id,
                 task_id=task_id,
                 covered_until_seq=result.covered_until_seq,
+                covered_until_message_id=covered_msg_id,
                 note_version_inc=True,
             )
             result.note_version = wm_info.get("note_version", current_watermark.note_version + 1)

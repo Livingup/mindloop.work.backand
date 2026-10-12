@@ -1948,6 +1948,50 @@ class TaskNoteStore:
             logger.error("set_inherited_processed 失败: %s", exc)
             raise
 
+    def reset_watermark(
+        self,
+        *,
+        agent_instance_id: str,
+        task_id: str | None = None,
+    ) -> bool:
+        """重置指定 Agent 实例的观察断点水位为初始状态（用于会话重置/清空时同步）。"""
+        if self._connection_factory is None:
+            return True
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    if task_id:
+                        cur.execute(
+                            """
+                            UPDATE task_note_watermark
+                            SET covered_until_seq = 0,
+                                covered_until_message_id = NULL,
+                                note_version = 0,
+                                inherited_processed = FALSE,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE agent_instance_id = %s AND task_id = %s
+                            """,
+                            (agent_instance_id, task_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE task_note_watermark
+                            SET covered_until_seq = 0,
+                                covered_until_message_id = NULL,
+                                note_version = 0,
+                                inherited_processed = FALSE,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE agent_instance_id = %s
+                            """,
+                            (agent_instance_id,),
+                        )
+                conn.commit()
+            return True
+        except Exception as exc:
+            logger.error("reset_watermark 失败: %s", exc)
+            return False
+
     def get_note_snapshot(
         self,
         *,
