@@ -7,11 +7,13 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from agent_runtime.infrastructure.sqlite_maintenance import (
     SQLITE_MAINTENANCE_BUSY_TIMEOUT_MS,
@@ -211,6 +213,53 @@ def pending_sqlite_compaction_summaries(db_paths: Iterable[Path]) -> list[dict[s
     return summaries
 
 
+@contextmanager
+def _compaction_startup_progress_reporter(store_id: str | None = None) -> Iterator[None]:
+    runtime_dir_env = os.environ.get("SPREAD_AI_BACKEND_RUNTIME_DIR")
+    if runtime_dir_env:
+        progress_dir = Path(runtime_dir_env).expanduser()
+    else:
+        data_root = os.environ.get("SPREAD_AI_DATA_ROOT") or "~/.spread-ai"
+        progress_dir = Path(data_root).expanduser() / "backend-runtime"
+
+    progress_file = progress_dir / "startup-progress.json"
+    stop_event = threading.Event()
+
+    def update_heartbeat() -> None:
+        try:
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "pid": os.getpid(),
+                "phase": "database_compaction",
+                "store_id": store_id,
+                "heartbeatAt": int(time.time() * 1000),
+                "message": "SQLite 离线紧凑压缩执行中",
+            }
+            tmp_file = progress_file.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp_file), str(progress_file))
+        except Exception:
+            pass
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            update_heartbeat()
+            stop_event.wait(2.0)
+
+    thread = threading.Thread(target=worker, daemon=True, name="compaction-startup-heartbeat")
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=1.0)
+        try:
+            if progress_file.exists():
+                progress_file.unlink()
+        except Exception:
+            pass
+
+
 def run_pending_sqlite_compactions(
     db_paths: Iterable[Path],
     *,
@@ -225,19 +274,27 @@ def run_pending_sqlite_compactions(
     """
     results: list[dict[str, Any]] = []
     coordinator = coordinator or get_sqlite_maintenance_coordinator()
+    pending_items: list[tuple[Path, dict[str, Any]]] = []
     for db_path in sorted({Path(path).expanduser().resolve() for path in db_paths}, key=lambda path: str(path).casefold()):
         manifest_path = compaction_manifest_path(db_path)
         payload = _read_manifest(manifest_path)
-        if payload is None:
-            continue
-        results.append(
-            _run_one_pending_compaction(
-                db_path,
-                payload,
-                coordinator=coordinator,
-                timeout_seconds=timeout_seconds,
+        if payload is not None:
+            pending_items.append((db_path, payload))
+
+    if not pending_items:
+        return results
+
+    store_ids = ", ".join(str(p.get("store_id") or db.name) for db, p in pending_items)
+    with _compaction_startup_progress_reporter(store_id=store_ids):
+        for db_path, payload in pending_items:
+            results.append(
+                _run_one_pending_compaction(
+                    db_path,
+                    payload,
+                    coordinator=coordinator,
+                    timeout_seconds=timeout_seconds,
+                )
             )
-        )
     return results
 
 
@@ -329,8 +386,14 @@ def _compact_copy_and_swap(db_path: Path, payload: dict[str, Any]) -> dict[str, 
     backup = db_path.parent / f".{db_path.name}.old-{epoch}"
     compact_started = False
     try:
-        if target.exists() or backup.exists():
-            raise FileExistsError("managed compaction target or backup already exists")
+        if backup.exists():
+            raise FileExistsError("managed compaction backup already exists")
+        if target.exists():
+            logger.warning("发现未完成的 SQLite 紧凑临时副本残留，安全清理后重试: %s", target)
+            try:
+                target.unlink()
+            except OSError:
+                raise FileExistsError("managed compaction target already exists and cannot be unlinked")
         compact_started = True
         _vacuum_into(db_path, target)
         output_measurement = measure_sqlite_store(target)
