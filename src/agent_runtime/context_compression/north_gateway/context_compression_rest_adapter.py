@@ -101,11 +101,17 @@ def _evaluate_policy_status(
         if not policy.enabled:
             return "disabled", f"策略组 '{policy_group_id}' 已被禁用。", None
         resolved = gateway.resolve_execution_policy(policy_group_id)
+        candidates = getattr(resolved, "candidates", ()) or ()
+        if not candidates:
+            return "no_candidates", f"策略组 '{policy_group_id}' 未解析出可用候选模型。", None
+        first = candidates[0]
+        resolved_model = getattr(first, "resolved_model", None)
         candidate_info = {
-            "provider_id": resolved.provider_id,
-            "model_binding_id": resolved.binding_id,
-            "model_id": resolved.model_id,
-            "model_alias": resolved.model_alias,
+            "candidate_id": getattr(first, "candidate_id", ""),
+            "provider_id": getattr(first, "provider_id", ""),
+            "model_binding_id": getattr(first, "model_binding_id", ""),
+            "model_id": getattr(resolved_model, "model_id", "") if resolved_model else "",
+            "model_alias": getattr(resolved_model, "model_alias", "") if resolved_model else "",
         }
         return "valid", None, candidate_info
     except Exception as exc:
