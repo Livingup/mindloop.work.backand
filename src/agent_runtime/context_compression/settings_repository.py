@@ -113,6 +113,13 @@ class ContextCompressionSettingsRepository:
             active_profile_id=current.active_profile_id,
         )
 
+    def update_settings(
+        self,
+        *,
+        llm_policy_group_id: str | None = None,
+    ) -> ContextCompressionRuntimeSettings:
+        return self.set_llm_policy_group_id(llm_policy_group_id)
+
     def get_active_profile_id(self) -> str | None:
         return self.get_settings().active_profile_id
 
@@ -187,6 +194,13 @@ class PostgresContextCompressionSettingsRepository:
             input_mode=current.input_mode,
             active_profile_id=current.active_profile_id,
         )
+
+    def update_settings(
+        self,
+        *,
+        llm_policy_group_id: str | None = None,
+    ) -> ContextCompressionRuntimeSettings:
+        return self.set_llm_policy_group_id(llm_policy_group_id)
 
     def save_settings_snapshot(
         self,

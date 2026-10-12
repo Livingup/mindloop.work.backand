@@ -97,18 +97,23 @@ def create_context_compression_router(
     ) -> ContextCompressionSettingsResponse:
         """更新观察者绑定的 LLM 执行策略组。"""
         policy_id = body.llm_policy_group_id.strip() if body.llm_policy_group_id else None
+        enabled = True
+        if config_accessor is not None:
+            try:
+                enabled = config_accessor().enabled
+            except Exception:
+                pass
+
+        updated_at = None
         if settings_repository is not None:
-            saved = settings_repository.update_settings(llm_policy_group_id=policy_id)
-            return ContextCompressionSettingsResponse(
-                enabled=saved.enabled,
-                llm_policy_group_id=saved.llm_policy_group_id,
-                updated_at=saved.updated_at,
-            )
+            saved = settings_repository.set_llm_policy_group_id(policy_id)
+            policy_id = saved.llm_policy_group_id
+            updated_at = saved.updated_at
 
         return ContextCompressionSettingsResponse(
-            enabled=True,
+            enabled=enabled,
             llm_policy_group_id=policy_id,
-            updated_at=None,
+            updated_at=updated_at,
         )
 
     @router.get("/observer-prompt", response_model=ObserverPromptResponse)
