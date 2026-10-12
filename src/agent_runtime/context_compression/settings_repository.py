@@ -280,12 +280,7 @@ def _normalize_input_mode(value: str | None) -> str | None:
 def _normalize_active_profile_id(value: Any) -> str | None:
     if value is None:
         return None
-    normalized = _normalize_optional_text(str(value))
-    if normalized is None:
-        return None
-    from agent_runtime.context_compression.profiles import normalize_profile_id
-
-    return normalize_profile_id(normalized)
+    return _normalize_optional_text(str(value))
 
 
 def _utc_now_text() -> str:
