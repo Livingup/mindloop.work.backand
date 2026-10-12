@@ -97,3 +97,75 @@ def test_assemble_context_does_not_repeat_swap():
     )
     assert res.swapped is False
     assert len(res.messages) == 2
+
+
+def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
+    """验证：当业务 Agent 自身总上下文未达系统阈值时，即使后台 Note 已更新，也绝不替换历史。"""
+    assembler = TaskNoteContextAssembler()
+    messages = [
+        {"id": "m1", "role": "user", "content": "问题一：重构登录"},
+        {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
+    ]
+    # 后台 Note 已经更新推进到了 seq=2
+    wm = TaskNoteWatermark(
+        agent_instance_id="agent-01",
+        task_id="task-01",
+        covered_until_seq=2,
+        note_version=1,
+    )
+    fake_snapshot = {
+        "missions": [{"title": "重构登录模块", "status": "completed", "outcome_summary": "登录已完成重构"}],
+        "progress": {"completed_summary": "完成登录重构", "next_step": "下一步"},
+    }
+
+    # 设定系统压缩门禁为 50,000 Tokens，而当前对话仅几十 Token
+    res = assembler.assemble_context(
+        messages=messages,
+        watermark=wm,
+        note_snapshot=fake_snapshot,
+        context_window_threshold=50000,
+    )
+
+    # 核心断言：未达阈值，严禁破坏性替换，保持完整原始会话！
+    assert res.swapped is False
+    assert len(res.messages) == 2
+    assert res.messages[0]["id"] == "m1"
+    assert res.messages[1]["id"] == "m2"
+    assert res.context_window_threshold == 50000
+    assert res.total_tokens < 50000
+
+
+def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
+    """验证：当业务 Agent 自身总上下文达到系统阈值时，消费后台就绪快照进行热替换。"""
+    assembler = TaskNoteContextAssembler()
+    messages = [
+        {"id": "m1", "role": "user", "content": "问题一：重构登录"},
+        {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
+        {"id": "m3", "role": "user", "content": "问题二：残差尾巴"},
+    ]
+    wm = TaskNoteWatermark(
+        agent_instance_id="agent-01",
+        task_id="task-01",
+        covered_until_seq=2,
+        note_version=1,
+    )
+    fake_snapshot = {
+        "missions": [{"title": "重构登录模块", "status": "completed", "outcome_summary": "登录已完成重构"}],
+        "progress": {"completed_summary": "完成登录重构", "next_step": "下一步"},
+    }
+
+    # 设定阈值为 10 Tokens（当前消息远超 10 Tokens）
+    res = assembler.assemble_context(
+        messages=messages,
+        watermark=wm,
+        note_snapshot=fake_snapshot,
+        context_window_threshold=10,
+    )
+
+    # 核心断言：超过阈值，成功触发热置换！
+    assert res.swapped is True
+    assert res.covered_until_seq == 2
+    assert len(res.messages) == 2  # 1条快照 + 1条尾部残差 (m3)
+    assert res.messages[0]["is_snapshot"] is True
+    assert res.messages[1]["id"] == "m3"
+
