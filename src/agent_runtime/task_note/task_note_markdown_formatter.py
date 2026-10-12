@@ -288,6 +288,7 @@ def format_task_note_to_markdown(
             rat = d.get("rationale")
             alt = d.get("alternatives")
             imp = d.get("impact")
+            sup_reason = d.get("superseded_reason")
             d_lines.append(f"- **决策**: {content} (ID: `{did}`, 状态: `{status}`)")
             if rat:
                 d_lines.append(f"  - 决策理由: {rat}")
@@ -295,6 +296,8 @@ def format_task_note_to_markdown(
                 d_lines.append(f"  - 备选考量: {alt}")
             if imp:
                 d_lines.append(f"  - 影响范围: {imp}")
+            if sup_reason:
+                d_lines.append(f"  - 废弃理由: {sup_reason}")
         sections.append("\n".join(d_lines))
 
     # ── 6. 工作区重点代码与上下文 (Workspace Context) ─────────────────

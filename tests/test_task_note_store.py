@@ -161,7 +161,7 @@ def test_task_note_store_no_db_fallback():
 
     did = store.create_decision(task_id="t1", mission_id=mid, agent_instance_id="a1", decision_content="决策", rationale="理由")
     assert did.startswith("dec_")
-    assert store.supersede_decision(task_id="t1", agent_instance_id="a1", decision_id=did) is True
+    assert store.supersede_decision(task_id="t1", agent_instance_id="a1", decision_id=did, superseded_reason="新方案替换") is True
     assert store.update_decision(task_id="t1", agent_instance_id="a1", decision_id=did, rationale="新理由") is True
 
     tid = store.create_todo(task_id="t1", mission_id=mid, agent_instance_id="a1", todo_content="工作内容")
@@ -257,6 +257,11 @@ def test_task_note_store_crud_with_mock_db(mock_db):
     store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="artifact", resource_ids=["art-1", "art-2"])
     sql, params = executed[-1]
     assert "UPDATE task_artifact_records" in sql
+    assert "mission_id = %s" in sql
+
+    store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="command", resource_ids=["cmd-1", "cmd-2"])
+    sql, params = executed[-1]
+    assert "UPDATE task_command_records" in sql
     assert "mission_id = %s" in sql
 
     store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="agent_relationship", resource_ids=["rel-1"])

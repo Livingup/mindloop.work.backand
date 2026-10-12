@@ -495,7 +495,7 @@ def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeCon
     category="business",
     public=True,
     execution_mode="direct",
-    wiki="### supersede_task_decision\n软废弃决策留痕，必须指定 decision_id。",
+    wiki="### supersede_task_decision\n软废弃决策留痕，必须指定 decision_id，支持记录废弃理由 superseded_reason。",
 )
 def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
@@ -506,11 +506,14 @@ def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRunt
             task_id=task_id,
             agent_instance_id=agent_instance_id,
             decision_id=request.decision_id,
+            superseded_reason=request.superseded_reason,
         )
-        output = {
+        output: dict[str, Any] = {
             "decision_id": request.decision_id,
             "message": "决策已标记为软废弃留痕",
         }
+        if request.superseded_reason:
+            output["superseded_reason"] = request.superseded_reason
         return BaseToolResult(output=output)
     except Exception as exc:
         logger.error("supersede_task_decision 失败: %s", exc)

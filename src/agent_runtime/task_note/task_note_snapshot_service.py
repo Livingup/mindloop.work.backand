@@ -225,7 +225,8 @@ class TaskNoteSnapshotService:
                         "task_decision_records",
                         """
                         SELECT decision_id, task_id, mission_id, agent_instance_id,
-                               decision_content, rationale, alternatives, impact, decision_status, created_at
+                               decision_content, rationale, alternatives, impact, decision_status,
+                               superseded_reason, created_at
                         FROM task_decision_records
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at ASC
@@ -336,7 +337,7 @@ class TaskNoteSnapshotService:
                     snapshot["commands"] = _query_rows(
                         "task_command_records",
                         """
-                        SELECT command_id, task_id, agent_instance_id,
+                        SELECT command_id, task_id, mission_id, agent_instance_id,
                                command_line, created_at
                         FROM task_command_records
                         WHERE task_id = %s AND agent_instance_id = %s

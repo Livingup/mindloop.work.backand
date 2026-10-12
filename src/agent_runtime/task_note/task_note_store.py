@@ -535,6 +535,7 @@ class TaskNoteStore:
         task_id: str,
         agent_instance_id: str,
         decision_id: str,
+        superseded_reason: str | None = None,
     ) -> bool:
         """软废弃决策记录。"""
         if self._connection_factory is None:
@@ -543,14 +544,25 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE task_decision_records
-                        SET decision_status = 'superseded'
-                        WHERE task_id = %s AND decision_id = %s AND agent_instance_id = %s
-                        """,
-                        (task_id, decision_id, agent_instance_id),
-                    )
+                    if superseded_reason is not None:
+                        cur.execute(
+                            """
+                            UPDATE task_decision_records
+                            SET decision_status = 'superseded',
+                                superseded_reason = %s
+                            WHERE task_id = %s AND decision_id = %s AND agent_instance_id = %s
+                            """,
+                            (superseded_reason, task_id, decision_id, agent_instance_id),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE task_decision_records
+                            SET decision_status = 'superseded'
+                            WHERE task_id = %s AND decision_id = %s AND agent_instance_id = %s
+                            """,
+                            (task_id, decision_id, agent_instance_id),
+                        )
                 conn.commit()
             return True
         except Exception as exc:
@@ -1432,6 +1444,16 @@ class TaskNoteStore:
                             UPDATE task_artifact_records
                             SET mission_id = %s
                             WHERE task_id = %s AND agent_instance_id = %s AND artifact_id = ANY(%s)
+                            """,
+                            (mission_id, task_id, agent_instance_id, resource_ids),
+                        )
+                        bound_count = cur.rowcount
+                    elif resource_type in ("command", "commands"):
+                        cur.execute(
+                            """
+                            UPDATE task_command_records
+                            SET mission_id = %s
+                            WHERE task_id = %s AND agent_instance_id = %s AND command_id = ANY(%s)
                             """,
                             (mission_id, task_id, agent_instance_id, resource_ids),
                         )

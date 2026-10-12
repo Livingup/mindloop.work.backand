@@ -226,8 +226,9 @@ def test_note_tools_execution_zero_redundancy():
     assert "decision_id" in res10.output
 
     # 11. supersede_task_decision
-    res11 = supersede_task_decision(SupersedeTaskDecisionRequest(decision_id=res10.output["decision_id"]), ctx)
+    res11 = supersede_task_decision(SupersedeTaskDecisionRequest(decision_id=res10.output["decision_id"], superseded_reason="性能瓶颈，重构成 JWT"), ctx)
     assert res11.output["decision_id"] == res10.output["decision_id"]
+    assert res11.output["superseded_reason"] == "性能瓶颈，重构成 JWT"
 
     # 12. update_task_decision
     res12 = update_task_decision(UpdateTaskDecisionRequest(decision_id=res10.output["decision_id"], rationale="修正理由"), ctx)
@@ -346,6 +347,17 @@ def test_note_tools_execution_zero_redundancy():
     )
     assert res31.output["bound_count"] == 2
     assert res31.output["resource_type"] == "artifact"
+
+    res31_cmd = bind_resources_to_mission(
+        BindResourcesToMissionRequest(
+            resource_type="command",
+            resource_ids=["cmd-01", "cmd-02"],
+            mission_id="mission-01",
+        ),
+        ctx,
+    )
+    assert res31_cmd.output["bound_count"] == 2
+    assert res31_cmd.output["resource_type"] == "command"
 
     # 32. note_update_end
     res32 = note_update_end(NoteUpdateEndRequest(), ctx)

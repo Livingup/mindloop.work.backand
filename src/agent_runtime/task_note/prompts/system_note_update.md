@@ -61,12 +61,12 @@ Note 包含 **五大核心认知层级与一个贯穿基石**：
 ### 3.1 业务工具执行时由程序钩子自动记录（严禁篡改与重复记录）
 以下信息在底层工具执行成功后，**由程序钩子直接写入数据库**，保留确定性物理事实。底层工具执行时无法获知上层业务任务语义，因此自动记录时其 `mission_id` 初始为 NULL。此类物理记录无需你从历史中重新总结，更严禁你调用 Note 工具重复创建：
 1. **`task_artifact_records` 中的文件工具产出**：成功执行 `file_create`、`file_modify`、`file_delete`、`file_move` 后，程序原样记录路径、替换行与编辑块（`mission_id` 初始为 NULL）；
-2. **终端命令执行记录 (`task_command_records`)**：终端命令执行由系统在后台自动记录命令索引（纯技术辅助表，直接复用 `terminal_execute_command` 返回的 `command_id` 与 `command_line`，无 `mission_id` 字段）；此类客观执行流无需你重复记录，在 Note 各主题中仅记录 `command_id` 作为命令行执行 ID 进行关联索引，切回业务状态时由系统自动反查命令行指令，极大节约上下文 Token；
+2. **终端命令执行记录 (`task_command_records`)**：终端命令执行由系统在后台自动记录命令索引（直接复用 `terminal_execute_command` 返回的 `command_id` 与 `command_line`，`mission_id` 初始为 NULL）；此类客观执行流无需你重复记录，终端输出通过 `terminal_read_output` 按 `command_id` 反查，在 Note 各主题中通过 `command_id` 关联引用；
 3. **`task_agent_relationships`**：子 Agent 创建与释放的拓扑关系，面向 `agent_instance_id`（记录所属租户）双向记录（记录所属租户、目标角色 `target_agent_type`、目标实例 `target_agent_instance_id`，`mission_id` 初始为 NULL）；
 4. **`task_agent_messages`**：父子 Agent 专线消息，一条消息一行记录，面向 `agent_instance_id`（记录所属租户），包含 `target_agent_instance_id`、`target_agent_type`、`message_type`（`send`/`receive`）和消息正文 `message`；
 5. **`task_remote_agent_messages`**：与外部远程 Agent 沟通的消息，一条消息一行记录，面向 `agent_instance_id`（记录所属租户），包含 `remote_agent_instance_id`、`message_type`（`send`/`receive`）和消息正文 `message`。
 
-- **通用延迟归属绑定职责**：程序已保真记录了物理事实，严禁你重复创建；但你拥有**延迟归属绑定（Delayed Attribution Binding）**的职责：在分析对话历史后，调用通用的 `bind_resources_to_mission` 工具，将属于某一业务任务的底层资源（文件产物 `artifact`、子 Agent 派生关系 `agent_relationship`）批量绑定到对应的 `mission_id`。专线消息（`task_agent_messages`）会在你绑定协作关系后由系统底层自动级联关联，无需你逐条操作。终端命令索引无需绑定。
+- **通用延迟归属绑定职责**：程序已保真记录了物理事实，严禁你重复创建；但你拥有**延迟归属绑定（Delayed Attribution Binding）**的职责：在分析对话历史后，调用通用的 `bind_resources_to_mission` 工具，将属于某一业务任务的底层资源（文件产物 `artifact`、关键终端命令 `command`、子 Agent 派生关系 `agent_relationship`）批量绑定到对应的 `mission_id`。专线消息（`task_agent_messages`）会在你绑定协作关系后由系统底层自动级联关联，无需你逐条操作。
 
 **禁止项**：
 - 严禁将文件工具已成功的结果再次创建为 `type='other'` 的 Artifact；
