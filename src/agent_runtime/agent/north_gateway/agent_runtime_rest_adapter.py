@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -472,7 +475,11 @@ def create_agent_runtime_router(
         }
         observing = tracking.observing is not None
 
-        markdown = format_task_note_to_markdown(snapshot, current_working_directory=cwd)
+        try:
+            markdown = format_task_note_to_markdown(snapshot, current_working_directory=cwd)
+        except Exception as exc:
+            logger.warning("格式化 Task Note Markdown 异常: %s", exc)
+            markdown = ""
 
         # 4. Phase 3 契约返回
         return {

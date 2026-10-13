@@ -287,6 +287,7 @@ ALTER TABLE agent_user_mission ADD COLUMN IF NOT EXISTS outcome_summary TEXT;
 ALTER TABLE agent_user_mission ADD COLUMN IF NOT EXISTS pruned_at TIMESTAMP WITH TIME ZONE;
 ALTER TABLE task_agent_relationships ADD COLUMN IF NOT EXISTS delegation_content TEXT;
 ALTER TABLE task_agent_relationships ADD COLUMN IF NOT EXISTS fork_message_id VARCHAR(64);
+ALTER TABLE task_decision_records ADD COLUMN IF NOT EXISTS superseded_reason TEXT;
 DROP INDEX IF EXISTS idx_command_mission;
 ALTER TABLE task_command_records DROP COLUMN IF EXISTS mission_id;
 """
@@ -307,6 +308,7 @@ REQUIRED_MIGRATION_COLUMNS = frozenset({
     ("agent_user_mission", "pruned_at"),
     ("task_agent_relationships", "delegation_content"),
     ("task_agent_relationships", "fork_message_id"),
+    ("task_decision_records", "superseded_reason"),
 })
 
 
@@ -315,7 +317,7 @@ def ensure_task_note_schema(config_registry: Any = None) -> bool:
 
     1. PG 未启用返回 False；
     2. 获取连接调用 init_task_note_schema(conn)；
-    3. 查询 information_schema.columns 断言 outcome_summary、pruned_at、delegation_content、fork_message_id 四列存在；
+    3. 查询 information_schema.columns 断言 outcome_summary、pruned_at、delegation_content、fork_message_id、superseded_reason 存在；
     4. 成功返回 True；任何异常记 error 日志（含异常类型）并返回 False，不抛出。
     """
     try:
@@ -346,7 +348,8 @@ def ensure_task_note_schema(config_registry: Any = None) -> bool:
                     WHERE table_schema = 'public' 
                       AND (
                         (table_name = 'agent_user_mission' AND column_name IN ('outcome_summary', 'pruned_at')) OR
-                        (table_name = 'task_agent_relationships' AND column_name IN ('delegation_content', 'fork_message_id'))
+                        (table_name = 'task_agent_relationships' AND column_name IN ('delegation_content', 'fork_message_id')) OR
+                        (table_name = 'task_decision_records' AND column_name IN ('superseded_reason'))
                       );
                 """)
                 existing_cols = frozenset((row[0], row[1]) for row in cur.fetchall())
