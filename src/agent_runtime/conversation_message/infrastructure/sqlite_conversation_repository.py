@@ -15,12 +15,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
 from pathlib import Path
 from threading import RLock
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from agent_runtime.conversation_message.message.models import (
     ConfigurationComponentEvent,
@@ -222,7 +225,8 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     image_count     INTEGER NOT NULL DEFAULT 0,
     pdf_page_count  INTEGER NOT NULL DEFAULT 0,
     last_context_usage TEXT,
-    task_note_tracking TEXT
+    task_note_tracking TEXT,
+    task_note_tracking_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS provider_state (
@@ -595,6 +599,54 @@ class SqliteConversationRepository:
             ).fetchall()
             return [r[0] for r in rows]
 
+    # ── Task Note 增量跟踪状态 (CAS 乐观锁) ──────────────────────────
+
+    async def get_task_note_tracking(self, conversation_id: str) -> tuple[dict | None, int]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_note_tracking, task_note_tracking_version FROM conversation_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                return None, 0
+            tracking_json, version = row[0], int(row[1] or 0)
+            tracking_dict = json.loads(tracking_json) if tracking_json else None
+            return tracking_dict, version
+
+    async def cas_task_note_tracking(
+        self, conversation_id: str, expected_version: int, tracking: dict
+    ) -> bool:
+        with self._lock:
+            new_version = expected_version + 1
+            tracking_to_save = dict(tracking)
+            tracking_to_save["version"] = new_version
+            tracking_json = json.dumps(tracking_to_save, ensure_ascii=False)
+
+            cur = self._conn.execute(
+                """
+                UPDATE conversation_state
+                SET task_note_tracking = ?, task_note_tracking_version = ?
+                WHERE conversation_id = ? AND task_note_tracking_version = ?
+                """,
+                (tracking_json, new_version, conversation_id, expected_version),
+            )
+            self._conn.commit()
+            if cur.rowcount == 1:
+                return True
+
+            row = self._conn.execute(
+                "SELECT task_note_tracking_version FROM conversation_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                logger.warning("cas_task_note_tracking 失败: conversation_state 不存在 (cid=%s)", conversation_id)
+            else:
+                logger.debug(
+                    "cas_task_note_tracking 乐观锁版本冲突 (cid=%s): 期望版本 %d, 当前版本 %d",
+                    conversation_id, expected_version, row[0]
+                )
+            return False
+
     # ── 内部辅助方法 ─────────────────────────────────────────────
 
     def _msg_path(self, task_id: str, conversation_id: str) -> Path:
@@ -647,10 +699,22 @@ class SqliteConversationRepository:
         os.replace(tmp_path, path)
 
     def _upsert_state(self, cid: str, state: ConversationState) -> None:
+        tracking_json = (
+            json.dumps(state.task_note_tracking, ensure_ascii=False)
+            if state.task_note_tracking is not None
+            else None
+        )
         self._conn.execute(
-            "INSERT OR REPLACE INTO conversation_state "
-            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count, last_context_usage, task_note_tracking) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO conversation_state "
+            "(conversation_id, providers, vendors, modalities, image_count, pdf_page_count, last_context_usage, task_note_tracking, task_note_tracking_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET "
+            "providers = excluded.providers, "
+            "vendors = excluded.vendors, "
+            "modalities = excluded.modalities, "
+            "image_count = excluded.image_count, "
+            "pdf_page_count = excluded.pdf_page_count, "
+            "last_context_usage = excluded.last_context_usage",
             (
                 cid,
                 json.dumps(state.providers, ensure_ascii=False),
@@ -661,9 +725,7 @@ class SqliteConversationRepository:
                 json.dumps(state.last_context_usage, ensure_ascii=False)
                 if state.last_context_usage is not None
                 else None,
-                json.dumps(getattr(state, "task_note_tracking", None), ensure_ascii=False)
-                if getattr(state, "task_note_tracking", None) is not None
-                else None,
+                tracking_json,
             ),
         )
 
@@ -699,6 +761,8 @@ class SqliteConversationRepository:
             self._conn.execute("ALTER TABLE conversation_state ADD COLUMN last_context_usage TEXT")
         if "task_note_tracking" not in columns:
             self._conn.execute("ALTER TABLE conversation_state ADD COLUMN task_note_tracking TEXT")
+        if "task_note_tracking_version" not in columns:
+            self._conn.execute("ALTER TABLE conversation_state ADD COLUMN task_note_tracking_version INTEGER NOT NULL DEFAULT 0")
         tables = {
             row[0]
             for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()

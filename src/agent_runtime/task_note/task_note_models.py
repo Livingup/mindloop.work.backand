@@ -462,3 +462,85 @@ class SliceResult(BaseModel):
 TaskNoteUnit.model_rebuild()
 SliceResult.model_rebuild()
 
+
+class ObservingRun(BaseModel):
+    """当前正在后台运行的观察者会话元数据。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: str = Field(description="观察运行全局唯一标识。")
+    start_after_message_id: str | None = Field(default=None, description="本次增量切片起点的消息 ID。")
+    end_message_id: str = Field(description="本次增量切片终点的消息 ID。")
+    started_at: str = Field(description="观察启动时间戳 (ISO 8601)。")
+
+
+class TaskNoteTracking(BaseModel):
+    """会话级 Task Note 增量跟踪状态唯一权威实体 (ConversationState.task_note_tracking)。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    version: int = Field(default=0, description="乐观锁版本号，每次 CAS 写入 +1。")
+    prefix_end_message_id: str | None = Field(default=None, description="前缀边界消息 ID (子 Agent 边界或快照消息 ID)。")
+    snapshot_message_id: str | None = Field(default=None, description="当前快照消息 ID。")
+    covered_until_message_id: str | None = Field(default=None, description="上一次观察实际覆盖到的最后一条消息 ID。")
+    note_version: int = Field(default=0, description="成功观察的次数。")
+    inherited_processed: bool = Field(default=True, description="子 Agent 继承段是否已处理；根 Agent 恒为 True。")
+    observing: ObservingRun | None = Field(default=None, description="当前运行中的观察；无运行中观察时为 None。")
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None, *, is_subagent: bool = False) -> TaskNoteTracking:
+        """从字典还原 TaskNoteTracking，d 为空时返回根据角色初始化的默认值。"""
+        if not d:
+            return cls(
+                version=0,
+                prefix_end_message_id=None,
+                snapshot_message_id=None,
+                covered_until_message_id=None,
+                note_version=0,
+                inherited_processed=not is_subagent,
+                observing=None,
+            )
+
+        obs_val = d.get("observing")
+        obs_obj: ObservingRun | None = None
+        if isinstance(obs_val, dict):
+            obs_obj = ObservingRun(**obs_val)
+        elif isinstance(obs_val, ObservingRun):
+            obs_obj = obs_val
+
+        return cls(
+            version=int(d.get("version", 0)),
+            prefix_end_message_id=d.get("prefix_end_message_id"),
+            snapshot_message_id=d.get("snapshot_message_id"),
+            covered_until_message_id=d.get("covered_until_message_id"),
+            note_version=int(d.get("note_version", 0)),
+            inherited_processed=bool(d.get("inherited_processed", not is_subagent)),
+            observing=obs_obj,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为存储字典。"""
+        obs_dict: dict[str, Any] | None = None
+        if self.observing is not None:
+            obs_dict = {
+                "run_id": self.observing.run_id,
+                "start_after_message_id": self.observing.start_after_message_id,
+                "end_message_id": self.observing.end_message_id,
+                "started_at": self.observing.started_at,
+            }
+
+        return {
+            "version": self.version,
+            "prefix_end_message_id": self.prefix_end_message_id,
+            "snapshot_message_id": self.snapshot_message_id,
+            "covered_until_message_id": self.covered_until_message_id,
+            "note_version": self.note_version,
+            "inherited_processed": self.inherited_processed,
+            "observing": obs_dict,
+        }
+
+
+ObservingRun.model_rebuild()
+TaskNoteTracking.model_rebuild()
+
+

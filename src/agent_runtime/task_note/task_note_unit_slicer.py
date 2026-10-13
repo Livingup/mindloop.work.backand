@@ -172,11 +172,11 @@ class TaskNoteUnitSlicer:
     def slice_messages(
         self,
         messages: Sequence[Any],
-        watermark_covered_until_seq: int = 0,
-        covered_until_message_id: str | None = None,
-        is_subagent: bool = False,
-        inherited_processed: bool = False,
-        fork_message_id: str | None = None,
+        *,
+        start_after_message_id: str | None = None,
+        end_message_id: str | None = None,
+        snapshot_message_id: str | None = None,
+        inherited_until_message_id: str | None = None,
     ) -> SliceResult:
         """对消息序列进行原子切片，并统计增量 Token 及触发条件。"""
         if not messages:
@@ -186,163 +186,81 @@ class TaskNoteUnitSlicer:
                 incremental_units=[],
                 incremental_tokens=0,
                 should_trigger=False,
-                max_seq=watermark_covered_until_seq,
-                watermark_covered_until_seq=watermark_covered_until_seq,
+                max_seq=0,
+                watermark_covered_until_seq=0,
             )
 
-        all_units: list[TaskNoteUnit] = []
-        current_batch: list[Any] = []
-
-        # 1. 如果指定了 covered_until_message_id，定位断点消息索引，只切其之后的新增消息
-        start_idx = 0
-        if covered_until_message_id:
+        # 1. 划分 inherited_units（若指定 inherited_until_message_id）
+        inherited_units: list[TaskNoteUnit] = []
+        if inherited_until_message_id:
+            inh_end_idx = -1
             for idx, msg in enumerate(messages):
-                if _get_msg_id(msg, idx) == covered_until_message_id:
+                if _get_msg_id(msg, idx) == inherited_until_message_id:
+                    inh_end_idx = idx
+                    break
+            if inh_end_idx != -1:
+                inh_items = [(messages[i], i) for i in range(inh_end_idx + 1)]
+                inherited_units = self._slice_segment(inh_items, snapshot_message_id=None)
+
+        # 2. 定位增量起点 start_idx 与终点 end_idx
+        start_idx = 0
+        if start_after_message_id:
+            found_start = False
+            for idx, msg in enumerate(messages):
+                if _get_msg_id(msg, idx) == start_after_message_id:
+                    # 若起点正好是快照消息且该快照与 user 消息合并（content > 1），
+                    # 该快照消息本身需要保留在切片范围内以便提取 content[1:] 的 user_turn
+                    if snapshot_message_id and _get_msg_id(msg, idx) == snapshot_message_id:
+                        content = getattr(msg, "content", None)
+                        if content is None and isinstance(msg, dict):
+                            content = msg.get("content")
+                        if isinstance(content, list) and len(content) > 1:
+                            start_idx = idx
+                            found_start = True
+                            break
                     start_idx = idx + 1
+                    found_start = True
+                    break
+            if not found_start:
+                # 容灾：退回到最后一条首个 TextPart 以 "# 任务手记快照" 开头的消息
+                last_snap_idx = -1
+                for idx, msg in enumerate(messages):
+                    content = getattr(msg, "content", None)
+                    if isinstance(content, list) and content:
+                        first = content[0]
+                        text = getattr(first, "text", "") if hasattr(first, "text") else (first.get("text", "") if isinstance(first, dict) else str(first))
+                        if str(text).startswith("# 任务手记快照"):
+                            last_snap_idx = idx
+                    elif isinstance(msg, dict):
+                        c = msg.get("content")
+                        if isinstance(c, list) and c:
+                            first = c[0]
+                            text = first.get("text", "") if isinstance(first, dict) else str(first)
+                            if str(text).startswith("# 任务手记快照"):
+                                last_snap_idx = idx
+                        elif isinstance(c, str) and c.startswith("# 任务手记快照"):
+                            last_snap_idx = idx
+                if last_snap_idx != -1:
+                    start_idx = last_snap_idx + 1
+
+        end_idx = len(messages)
+        if end_message_id:
+            for idx, msg in enumerate(messages):
+                if _get_msg_id(msg, idx) == end_message_id:
+                    end_idx = idx + 1
                     break
 
-        if covered_until_message_id and start_idx > 0:
-            target_messages = messages[start_idx:]
-            seq_counter = watermark_covered_until_seq + 1
-            has_filtered_by_watermark = True
+        # 3. 切片增量段
+        if start_idx < end_idx:
+            inc_items = [(messages[i], i) for i in range(start_idx, end_idx)]
+            incremental_units = self._slice_segment(inc_items, snapshot_message_id=snapshot_message_id)
         else:
-            target_messages = messages
-            seq_counter = 1
-            has_filtered_by_watermark = False
+            incremental_units = []
 
-        def commit_unit(unit_type: str, is_snapshot: bool = False) -> None:
-            nonlocal seq_counter, current_batch
-            if not current_batch:
-                return
-            end_mid = _get_msg_id(current_batch[-1], len(current_batch) - 1)
-            unit_tokens = sum(estimate_message_tokens(m) for m in current_batch)
-            unit = TaskNoteUnit(
-                seq=seq_counter,
-                unit_type=unit_type,
-                messages=list(current_batch),
-                token_count=unit_tokens,
-                end_message_id=end_mid,
-                is_snapshot=is_snapshot or any(_is_snapshot_msg(m) for m in current_batch),
-            )
-            all_units.append(unit)
-            seq_counter += 1
-            current_batch = []
-
-        i = 0
-        n = len(target_messages)
-        while i < n:
-            msg = target_messages[i]
-            role = _get_msg_role(msg)
-            is_snap = _is_snapshot_msg(msg)
-
-            # 1. 如果是手记快照消息，单独形成一个快照单元
-            if is_snap:
-                if current_batch:
-                    commit_unit(unit_type="mixed_execution")
-                current_batch.append(msg)
-                commit_unit(unit_type="snapshot", is_snapshot=True)
-                i += 1
-                continue
-
-            # 2. 如果是 system 消息，单独形成系统单元
-            if role == "system":
-                if current_batch:
-                    commit_unit(unit_type="mixed_execution")
-                current_batch.append(msg)
-                commit_unit(unit_type="system")
-                i += 1
-                continue
-
-            # 3. 如果是 user 消息：
-            if role == "user":
-                if current_batch:
-                    commit_unit(unit_type="mixed_execution")
-                current_batch.append(msg)
-                # 用户消息自成一个断点
-                commit_unit(unit_type="user_turn")
-                i += 1
-                continue
-
-            # 4. 如果是 assistant 消息：
-            if role == "assistant":
-                if not _has_tool_calls(msg):
-                    # 纯文本 assistant 消息（无工具调用）：直接自成回复断点
-                    current_batch.append(msg)
-                    commit_unit(unit_type="direct_response")
-                    i += 1
-                    continue
-                else:
-                    # assistant 包含工具调用：必须与随后的所有 tool 结果打包在同一 Unit 中
-                    current_batch.append(msg)
-                    i += 1
-                    # 贪婪吸收紧随其后的所有 tool 结果
-                    while i < n and _is_tool_result(target_messages[i]):
-                        current_batch.append(target_messages[i])
-                        i += 1
-                    # 一批 tool 结果全部返回齐备后，形成一个合法断点
-                    commit_unit(unit_type="tool_interaction")
-                    continue
-
-            # 5. 如果是孤立的 tool 结果或其他未知消息
-            current_batch.append(msg)
-            # 检查下一条消息是否还是 tool 结果，若不是则闭合该断点
-            if i + 1 >= n or not _is_tool_result(target_messages[i + 1]):
-                commit_unit(unit_type="tool_interaction")
-            i += 1
-
-        # 若末尾残留未提交的消息，收口提交
-        if current_batch:
-            commit_unit(unit_type="trailing_execution")
-
-        # ── 确定基线水位与增量单元 ─────────────────────────────────
-        if has_filtered_by_watermark:
-            inherited_units = []
-            incremental_units = all_units
-            effective_covered_seq = watermark_covered_until_seq
-        else:
-            effective_covered_seq = watermark_covered_until_seq
-
-            # 1. 优先根据物理 message_id 定位断点，避免相对 seq 位移错乱
-            if covered_until_message_id:
-                for u in all_units:
-                    if u.end_message_id == covered_until_message_id or any(
-                        _get_msg_id(m, 0) == covered_until_message_id for m in u.messages
-                    ):
-                        effective_covered_seq = u.seq
-                        break
-
-            # 2. 若首个 Unit 是快照单元，且历史断点已被裁剪（当前 max_seq < watermark），以快照作为基线
-            if all_units and all_units[0].is_snapshot:
-                if effective_covered_seq > all_units[-1].seq or effective_covered_seq <= 0:
-                    effective_covered_seq = all_units[0].seq
-
-            # 3. 划分 inherited_units（子 Agent 首次观察）
-            inherited_units: list[TaskNoteUnit] = []
-            if is_subagent and not inherited_processed:
-                fork_unit_idx = -1
-                if fork_message_id:
-                    for idx, u in enumerate(all_units):
-                        if any(_get_msg_id(m, 0) == fork_message_id for m in u.messages):
-                            fork_unit_idx = idx
-                            break
-                if fork_unit_idx != -1:
-                    inherited_units = all_units[: fork_unit_idx + 1]
-                    # 关键修复：子 Agent 增量严格从 fork_unit 之后起算
-                    if effective_covered_seq < all_units[fork_unit_idx].seq:
-                        effective_covered_seq = all_units[fork_unit_idx].seq
-                else:
-                    inherited_units = [u for u in all_units if u.seq <= effective_covered_seq]
-
-            # 4. 划分 incremental_units (seq > effective_covered_seq)
-            incremental_units = [u for u in all_units if u.seq > effective_covered_seq]
-
-        # 5. 统计增量 Token（严格排除快照手记 is_snapshot）
-        incremental_tokens = sum(
-            u.token_count for u in incremental_units if not u.is_snapshot
-        )
-
+        all_units = inherited_units + incremental_units
+        incremental_tokens = sum(u.token_count for u in incremental_units if not u.is_snapshot)
         should_trigger = incremental_tokens >= self.trigger_threshold_tokens
-        max_seq = max([u.seq for u in incremental_units], default=effective_covered_seq)
+        max_seq = max([u.seq for u in incremental_units], default=0)
 
         logger.debug(
             "TaskNoteUnitSlicer 完成切片: total_units=%d, incremental_units=%d, incremental_tokens=%d, trigger=%s",
@@ -359,5 +277,135 @@ class TaskNoteUnitSlicer:
             incremental_tokens=incremental_tokens,
             should_trigger=should_trigger,
             max_seq=max_seq,
-            watermark_covered_until_seq=effective_covered_seq,
+            watermark_covered_until_seq=0,
         )
+
+    def _slice_segment(
+        self,
+        items: list[tuple[Any, int]],
+        *,
+        snapshot_message_id: str | None = None,
+    ) -> list[TaskNoteUnit]:
+        """将带有原列表绝对下标的消息序列切分为一组 TaskNoteUnit，seq 从 1 开始独立编号。"""
+        units: list[TaskNoteUnit] = []
+        seq_counter = 1
+        current_batch: list[tuple[Any, int]] = []
+
+        def commit_unit(unit_type: str, is_snapshot: bool = False) -> None:
+            nonlocal seq_counter, current_batch
+            if not current_batch:
+                return
+            last_msg, last_abs_idx = current_batch[-1]
+            end_mid = _get_msg_id(last_msg, last_abs_idx)
+            batch_msgs = [m for m, _ in current_batch]
+            unit_tokens = sum(estimate_message_tokens(m) for m in batch_msgs)
+            unit = TaskNoteUnit(
+                seq=seq_counter,
+                unit_type=unit_type,
+                messages=batch_msgs,
+                token_count=unit_tokens,
+                end_message_id=end_mid,
+                is_snapshot=is_snapshot or any(_is_snapshot_msg(m) for m in batch_msgs),
+            )
+            units.append(unit)
+            seq_counter += 1
+            current_batch = []
+
+        i = 0
+        n = len(items)
+        while i < n:
+            msg, abs_idx = items[i]
+            msg_id = _get_msg_id(msg, abs_idx)
+            role = _get_msg_role(msg)
+            is_snap = _is_snapshot_msg(msg)
+
+            # 遇到 snapshot_message_id 那条消息：content 只有一项时跳过；否则生成 user_turn unit 保留 content[1:]
+            if snapshot_message_id and msg_id == snapshot_message_id:
+                if current_batch:
+                    commit_unit(unit_type="mixed_execution")
+                content = getattr(msg, "content", None)
+                if content is None and isinstance(msg, dict):
+                    content = msg.get("content")
+
+                if isinstance(content, list) and len(content) > 1:
+                    tail_content = list(content[1:])
+                    if isinstance(msg, dict):
+                        tail_msg = dict(msg)
+                        tail_msg["role"] = "user"
+                        tail_msg["content"] = tail_content
+                    else:
+                        try:
+                            from agent_runtime.conversation.uni_message import UniMessage
+                            tail_msg = UniMessage(
+                                message_id=msg_id,
+                                role="user",
+                                content=tail_content,
+                                created_at=getattr(msg, "created_at", None),
+                            )
+                        except Exception:
+                            import copy
+                            tail_msg = copy.copy(msg)
+                            setattr(tail_msg, "role", "user")
+                            setattr(tail_msg, "content", tail_content)
+                    current_batch.append((tail_msg, abs_idx))
+                    commit_unit(unit_type="user_turn", is_snapshot=False)
+                i += 1
+                continue
+
+            # 1. 普通手记快照消息特征
+            if is_snap:
+                if current_batch:
+                    commit_unit(unit_type="mixed_execution")
+                current_batch.append((msg, abs_idx))
+                commit_unit(unit_type="snapshot", is_snapshot=True)
+                i += 1
+                continue
+
+            # 2. 系统消息
+            if role == "system":
+                if current_batch:
+                    commit_unit(unit_type="mixed_execution")
+                current_batch.append((msg, abs_idx))
+                commit_unit(unit_type="system")
+                i += 1
+                continue
+
+            # 3. 用户消息
+            if role == "user":
+                if current_batch:
+                    commit_unit(unit_type="mixed_execution")
+                current_batch.append((msg, abs_idx))
+                commit_unit(unit_type="user_turn")
+                i += 1
+                continue
+
+            # 4. 助手消息
+            if role == "assistant":
+                if not _has_tool_calls(msg):
+                    if current_batch:
+                        commit_unit(unit_type="mixed_execution")
+                    current_batch.append((msg, abs_idx))
+                    commit_unit(unit_type="direct_response")
+                    i += 1
+                    continue
+                else:
+                    if current_batch:
+                        commit_unit(unit_type="mixed_execution")
+                    current_batch.append((msg, abs_idx))
+                    i += 1
+                    while i < n and _is_tool_result(items[i][0]):
+                        current_batch.append((items[i][0], items[i][1]))
+                        i += 1
+                    commit_unit(unit_type="tool_interaction")
+                    continue
+
+            # 5. 孤立 tool 结果或其他未知消息
+            current_batch.append((msg, abs_idx))
+            if i + 1 >= n or not _is_tool_result(items[i + 1][0]):
+                commit_unit(unit_type="tool_interaction")
+            i += 1
+
+        if current_batch:
+            commit_unit(unit_type="trailing_execution")
+
+        return units

@@ -42,6 +42,10 @@ from agent_runtime.task_note.task_note_snapshot_service import (
 from agent_runtime.task_note.task_note_observer_runner import TaskNoteObserverRunner
 from agent_runtime.task_note.task_note_observer_scheduler import TaskNoteObserverScheduler
 from agent_runtime.task_note.task_note_context_assembler import TaskNoteContextAssembler
+from agent_runtime.task_note.task_note_tracking_coordinator import (
+    TaskNoteTrackingCoordinator,
+    set_task_note_tracking_coordinator,
+)
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
 
 
@@ -191,6 +195,11 @@ class AgentExecutionFactory:
             local_tool_gateway=local_tool_gateway,
         )
         task_note_snapshot_service = get_task_note_snapshot_service()
+        task_note_tracking_coordinator = TaskNoteTrackingCoordinator(
+            conversation_repository=conversation_repository,
+            trigger_threshold_tokens=config.context_compression.observer_trigger_tokens,
+        )
+        set_task_note_tracking_coordinator(task_note_tracking_coordinator)
         task_note_observer_runner = TaskNoteObserverRunner(
             llm_request_service=llm_request_service,
             prompt_provider=task_note_prompt_provider,
@@ -205,10 +214,7 @@ class AgentExecutionFactory:
             prompt_provider=task_note_prompt_provider,
             trigger_threshold_tokens=config.context_compression.observer_trigger_tokens,
         )
-        task_note_context_assembler = TaskNoteContextAssembler(
-            scheduler=task_note_observer_scheduler,
-            swap_wait_timeout_seconds=config.context_compression.swap_wait_timeout_seconds,
-        )
+        task_note_context_assembler = TaskNoteContextAssembler()
         engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
             agent_definition_gateway=agent_definition_gateway,
@@ -229,8 +235,8 @@ class AgentExecutionFactory:
             task_note_prompt_provider=task_note_prompt_provider,
             task_note_snapshot_service=task_note_snapshot_service,
             task_note_observer_scheduler=task_note_observer_scheduler,
+            task_note_tracking_coordinator=task_note_tracking_coordinator,
             task_note_context_assembler=task_note_context_assembler,
-            swap_wait_timeout_seconds=config.context_compression.swap_wait_timeout_seconds,
         )
         LacpFactory.create_bridge(
             runtime_gateway=runtime_gateway,

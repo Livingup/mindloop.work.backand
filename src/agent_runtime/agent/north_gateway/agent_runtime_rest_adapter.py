@@ -420,9 +420,11 @@ def create_agent_runtime_router(
         """获取指定 task_id 和 agent_instance_id 的 Task Note 结构化快照与 Markdown 视图。"""
         # 1. 校验 Agent 实例是否存在 (404 AGENT_INSTANCE_NOT_FOUND)
         cwd = ""
+        conversation_id = None
         try:
             instance = gateway.get_agent_instance(agent_instance_id)
             cwd = getattr(instance, "current_working_directory", "") or ""
+            conversation_id = getattr(instance, "conversation_id", None)
         except (KeyError, Exception) as exc:
             logger.warning("获取 Task Note 时未找到 Agent 实例: %s", exc)
             raise HTTPException(
@@ -430,12 +432,12 @@ def create_agent_runtime_router(
                 detail=f"Agent 实例不存在: {agent_instance_id} (AGENT_INSTANCE_NOT_FOUND)",
             )
 
-        # 2. 从底层服务构建快照与读取水位 (503 TASK_NOTE_STORAGE_UNAVAILABLE)
-        from agent_runtime.task_note.task_note_store import TaskNoteStorageUnavailableError, get_task_note_store
+        # 2. 从底层服务构建快照与读取 tracking (503 TASK_NOTE_STORAGE_UNAVAILABLE)
+        from agent_runtime.task_note.task_note_store import TaskNoteStorageUnavailableError
         from agent_runtime.task_note.task_note_snapshot_service import get_task_note_snapshot_service
         from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+        from agent_runtime.task_note.task_note_models import TaskNoteTracking
 
-        store = get_task_note_store()
         snapshot_service = get_task_note_snapshot_service()
 
         try:
@@ -443,7 +445,11 @@ def create_agent_runtime_router(
                 task_id=task_id,
                 agent_instance_id=agent_instance_id,
             )
-            raw_wm = store.get_watermark(agent_instance_id)
+            tracking = TaskNoteTracking()
+            if conversation_id and conversation_repository is not None:
+                data, _ = await conversation_repository.get_task_note_tracking(conversation_id)
+                if data:
+                    tracking = TaskNoteTracking.from_dict(data)
         except TaskNoteStorageUnavailableError as exc:
             logger.warning("获取 Task Note 存储不可用: %s", exc)
             raise HTTPException(
@@ -458,18 +464,13 @@ def create_agent_runtime_router(
             )
 
         # 3. 组织水位字段
-        if raw_wm and isinstance(raw_wm, dict):
-            watermark = {
-                "covered_until_seq": raw_wm.get("covered_until_seq", 0),
-                "note_version": raw_wm.get("note_version", 0),
-                "updated_at": raw_wm.get("updated_at"),
-            }
-        else:
-            watermark = {
-                "covered_until_seq": 0,
-                "note_version": 0,
-                "updated_at": None,
-            }
+        watermark = {
+            "covered_until_seq": 0,
+            "covered_until_message_id": tracking.covered_until_message_id,
+            "note_version": tracking.note_version,
+            "updated_at": None,
+        }
+        observing = tracking.observing is not None
 
         markdown = format_task_note_to_markdown(snapshot, current_working_directory=cwd)
 
@@ -479,7 +480,7 @@ def create_agent_runtime_router(
             "agent_instance_id": agent_instance_id,
             "mission_id": mission_id,
             "watermark": watermark,
-            "observing": False,
+            "observing": observing,
             "snapshot": snapshot,
             "unbound": {
                 "artifacts": [],

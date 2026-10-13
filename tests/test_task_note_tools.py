@@ -492,7 +492,7 @@ def test_note_tools_execution_zero_redundancy():
     try:
         res38 = note_update_end(NoteUpdateEndRequest(covered_until_seq=15), ctx)
         assert res38.loop_control.decision == "complete"
-        assert "安全退出" in res38.output["message"]
+        assert "断点校验通过" in res38.output["message"]
         assert res38.output["covered_until_seq"] == 15
     finally:
         reset_current_observer_binding(token)

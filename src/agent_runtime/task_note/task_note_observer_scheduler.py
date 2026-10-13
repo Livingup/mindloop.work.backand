@@ -28,6 +28,10 @@ from agent_runtime.task_note.task_note_store import (
     TaskNoteStore,
     get_task_note_store,
 )
+from agent_runtime.task_note.task_note_tracking_coordinator import (
+    ObserveTicket,
+    get_task_note_tracking_coordinator,
+)
 from agent_runtime.task_note.task_note_unit_slicer import (
     DEFAULT_OBSERVER_TRIGGER_TOKENS,
     TaskNoteUnitSlicer,
@@ -44,6 +48,8 @@ class ObserverSessionInput:
     agent_instance_id: str
     target_seq: int
     note_snapshot: dict[str, Any]
+    run_id: str = ""
+    conversation_id: str = ""
     incremental_units: list[TaskNoteUnit] = field(default_factory=list)
     inherited_units: list[TaskNoteUnit] = field(default_factory=list)
     delegation_content: str | None = None
@@ -120,9 +126,45 @@ def serialize_units_to_list(units: Sequence[TaskNoteUnit]) -> list[dict[str, Any
                     msg_dict["source"] = m.source
                 if hasattr(m, "source_id") and m.source_id:
                     msg_dict["source_id"] = m.source_id
-                text = _extract_msg_text(m)
-                if text:
-                    msg_dict["text"] = text
+
+                content = getattr(m, "content", None)
+                if isinstance(content, list):
+                    text_parts: list[str] = []
+                    for part in content:
+                        part_type = type(part).__name__
+                        if part_type == "ToolUsePart" or hasattr(part, "tool_use_id"):
+                            tid = getattr(part, "tool_use_id", None) or getattr(part, "id", "")
+                            tname = getattr(part, "name", "")
+                            targs = (
+                                getattr(part, "input", None)
+                                if getattr(part, "input", None) is not None
+                                else (
+                                    getattr(part, "arguments", None)
+                                    if getattr(part, "arguments", None) is not None
+                                    else getattr(part, "args", {}) or {}
+                                )
+                            )
+                            msg_dict["tool_use"] = {"id": tid, "name": tname, "input": targs}
+                        elif part_type == "ToolResultPart" or hasattr(part, "tool_use_ref"):
+                            ref = getattr(part, "tool_use_ref", None) or getattr(part, "ref", "")
+                            is_err = getattr(part, "is_error", False)
+                            out = getattr(part, "output", None)
+                            msg_dict["tool_result"] = {"ref": ref, "is_error": is_err, "output": out}
+                            if isinstance(out, dict) and out.get("auto_record"):
+                                msg_dict["auto_record"] = out["auto_record"]
+                        elif hasattr(part, "text"):
+                            t = getattr(part, "text", "")
+                            if t:
+                                text_parts.append(str(t))
+                        else:
+                            text_parts.append(str(part))
+                    if text_parts:
+                        msg_dict["text"] = "\n".join(text_parts)
+                else:
+                    text = _extract_msg_text(m)
+                    if text:
+                        msg_dict["text"] = text
+
                 if hasattr(m, "tool_calls") and m.tool_calls:
                     msg_dict["tool_calls"] = m.tool_calls
                 if hasattr(m, "call_id") and m.call_id:
@@ -133,7 +175,7 @@ def serialize_units_to_list(units: Sequence[TaskNoteUnit]) -> list[dict[str, Any
                     msg_dict["result"] = str(m.result)
                 if hasattr(m, "truncated") and m.truncated:
                     msg_dict["truncated"] = m.truncated
-                if hasattr(m, "auto_record") and m.auto_record:
+                if hasattr(m, "auto_record") and m.auto_record and "auto_record" not in msg_dict:
                     msg_dict["auto_record"] = m.auto_record
             unit_dict["messages"].append(msg_dict)
         result.append(unit_dict)
@@ -235,7 +277,6 @@ class TaskNoteObserverScheduler:
         self.prompt_provider = prompt_provider or TaskNotePromptProvider()
         self._running_tasks: dict[str, asyncio.Task[ObserverSessionResult]] = {}
         self._latest_results: dict[str, ObserverSessionResult] = {}
-        self._lock = asyncio.Lock()
 
     def is_observer_running(self, agent_instance_id: str) -> bool:
         """检查目标业务 Agent 是否已有观察者正在后台运行。"""
@@ -248,194 +289,125 @@ class TaskNoteObserverScheduler:
         """获取当前后台正在运行的观察者数量。"""
         return sum(1 for t in self._running_tasks.values() if not t.done())
 
-    async def check_and_trigger(
+    def get_latest_result(self, agent_instance_id: str) -> ObserverSessionResult | None:
+        return self._latest_results.get(agent_instance_id)
+
+    def start(
         self,
+        ticket: ObserveTicket,
         *,
-        agent_instance_id: str,
-        task_id: str,
-        messages: Sequence[Any],
-        is_subagent: bool = False,
-        fork_message_id: str | None = None,
-        delegation_content: str | None = None,
+        target_agent_definition_prompt: str | None = None,
         parent_agent_instance_id: str | None = None,
         ancestor_chain: list[str] | None = None,
-        target_agent_definition_prompt: str | None = None,
         scene_id: str | None = None,
-    ) -> bool:
-        """检查增量 Token 是否满足触发条件；若满足且当前无观察者运行，则异步触发后台观察。
-
-        返回 True 表示已成功触发后台观察；False 表示未达阈值或已有观察者运行中。
-        """
-        async with self._lock:
-            # 1. 并发保护：若已有运行中的观察者，跳过
-            if self.is_observer_running(agent_instance_id):
-                logger.debug("业务 Agent %s 观察者已在运行中，跳过重复触发", agent_instance_id)
-                return False
-
-            # 2. 读取当前 watermark
-            watermark = self.store.get_watermark(agent_instance_id=agent_instance_id, task_id=task_id)
-            watermark_seq = watermark.covered_until_seq if watermark else 0
-            watermark_msg_id = watermark.covered_until_message_id if watermark else None
-            watermark_inherited = watermark.inherited_processed if watermark else False
-
-            # 3. 切片并计算增量
+    ) -> asyncio.Task[ObserverSessionResult]:
+        """为已获取 ticket 的观察创建并启动异步后台任务。不进行 await。"""
+        async def _execute_task() -> ObserverSessionResult:
+            # 1. 增量与继承段切片
             slice_res = self.slicer.slice_messages(
-                messages=messages,
-                watermark_covered_until_seq=watermark_seq,
-                covered_until_message_id=watermark_msg_id,
-                is_subagent=is_subagent,
-                inherited_processed=watermark_inherited,
-                fork_message_id=fork_message_id,
+                ticket.messages,
+                start_after_message_id=ticket.start_after_message_id,
+                end_message_id=ticket.end_message_id,
+                snapshot_message_id=ticket.snapshot_message_id,
+                inherited_until_message_id=ticket.inherited_until_message_id,
             )
 
-            # 4. 判断触发条件
-            if not slice_res.should_trigger:
-                logger.debug(
-                    "业务 Agent %s 增量 Token (%d) 未达阈值 (%d)，无需触发观察",
-                    agent_instance_id,
-                    slice_res.incremental_tokens,
-                    self.slicer.trigger_threshold_tokens,
-                )
-                return False
+            # 2. 异步在线程池读取快照，避免阻塞主循环
+            snapshot = await asyncio.to_thread(
+                self.store.get_note_snapshot,
+                task_id=ticket.task_id,
+                agent_instance_id=ticket.agent_instance_id,
+            )
 
-            # 5. 组装输入
-            snapshot = self.store.get_note_snapshot(task_id=task_id, agent_instance_id=agent_instance_id)
+            # 3. 组装 ObserverSessionInput
             session_input = ObserverSessionInput(
-                task_id=task_id,
-                agent_instance_id=agent_instance_id,
+                task_id=ticket.task_id,
+                agent_instance_id=ticket.agent_instance_id,
+                run_id=ticket.run_id,
+                conversation_id=ticket.conversation_id,
                 target_seq=slice_res.max_seq,
                 note_snapshot=snapshot,
                 incremental_units=slice_res.incremental_units,
                 inherited_units=slice_res.inherited_units,
-                delegation_content=delegation_content,
-                fork_message_id=fork_message_id,
-                is_subagent=is_subagent,
+                is_subagent=ticket.is_subagent,
                 parent_agent_instance_id=parent_agent_instance_id,
                 ancestor_chain=ancestor_chain or [],
                 target_agent_definition_prompt=target_agent_definition_prompt,
                 scene_id=scene_id,
             )
 
-            # 6. 后台并行启动观察任务
-            task = asyncio.create_task(self._run_observer_session(session_input))
-            self._running_tasks[agent_instance_id] = task
-            logger.info(
-                "已为业务 Agent %s 触发后台观察: 增量 Tokens=%d, 目标 seq=%d",
-                agent_instance_id,
-                slice_res.incremental_tokens,
-                slice_res.max_seq,
-            )
-            return True
+            return await self._run_observer_session(session_input)
+
+        task = asyncio.create_task(_execute_task())
+        self._running_tasks[ticket.agent_instance_id] = task
+        logger.info(
+            "已为业务 Agent %s 启动后台观察任务: run_id=%s",
+            ticket.agent_instance_id,
+            ticket.run_id,
+        )
+        return task
+
+    async def run_sync(
+        self,
+        ticket: ObserveTicket,
+        *,
+        target_agent_definition_prompt: str | None = None,
+        parent_agent_instance_id: str | None = None,
+        ancestor_chain: list[str] | None = None,
+        scene_id: str | None = None,
+    ) -> ObserverSessionResult:
+        """同步启动并等待观察会话完成。"""
+        task = self.start(
+            ticket,
+            target_agent_definition_prompt=target_agent_definition_prompt,
+            parent_agent_instance_id=parent_agent_instance_id,
+            ancestor_chain=ancestor_chain,
+            scene_id=scene_id,
+        )
+        return await task
+
+    async def cancel(self, agent_instance_id: str) -> None:
+        """取消指定 Agent 实例正在运行的观察任务，吞掉 CancelledError。"""
+        task = self._running_tasks.get(agent_instance_id)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _run_observer_session(self, session_input: ObserverSessionInput) -> ObserverSessionResult:
         """执行单个观察者会话全生命周期并收尾。"""
         agent_id = session_input.agent_instance_id
-        task_id = session_input.task_id
+        try:
+            coordinator = get_task_note_tracking_coordinator()
+        except RuntimeError:
+            coordinator = None
+        result: ObserverSessionResult | None = None
         try:
             result = await self._observer_runner(session_input)
             self._latest_results[agent_id] = result
-            if not result.success:
-                logger.warning("观察者会话执行失败: %s", result.error_message)
-                return result
-
-            # 校验 covered_until_seq 合法性 (D04: 必须大于 0)
-            if result.covered_until_seq <= 0:
-                result.success = False
-                result.error_message = f"非法覆盖水位 seq={result.covered_until_seq}，未向前推进"
-                logger.warning("观察者返回非法覆盖水位: seq=%d", result.covered_until_seq)
-                return result
-
-            # 若 watermark 尚未持久化推进到 covered_until_seq，尝试更新 store
-            try:
-                current_watermark = self.store.get_watermark(agent_instance_id=agent_id, task_id=task_id)
-                current_seq = current_watermark.covered_until_seq if current_watermark else 0
-                if current_seq < result.covered_until_seq:
-                    self.store.update_watermark(
-                        agent_instance_id=agent_id,
-                        task_id=task_id,
-                        covered_until_seq=result.covered_until_seq,
-                        note_version_inc=True,
-                    )
-
-                # 子 Agent 首次观察完成后标记 inherited_processed
-                if session_input.is_subagent and current_watermark and not current_watermark.inherited_processed:
-                    self.store.set_inherited_processed(agent_instance_id=agent_id, task_id=task_id)
-            except Exception as store_exc:
-                logger.warning("观察完成自动推进 watermark 异常 (存储可能不可用): %s", store_exc)
-
-            logger.info(
-                "观察者会话完成: agent=%s, 水位 seq=%d, version=%d",
-                agent_id,
-                result.covered_until_seq,
-                result.note_version,
-            )
             return result
+        except asyncio.CancelledError:
+            logger.info("观察者任务被取消: agent_instance_id=%s, run_id=%s", agent_id, session_input.run_id)
+            raise
         except Exception as exc:
             logger.error("观察者会话执行发生未捕获异常: %s", exc, exc_info=True)
-            res = ObserverSessionResult(success=False, error_message=str(exc))
-            self._latest_results[agent_id] = res
-            return res
+            result = ObserverSessionResult(success=False, error_message=str(exc))
+            self._latest_results[agent_id] = result
+            return result
         finally:
-            async with self._lock:
-                self._running_tasks.pop(agent_id, None)
-
-    async def wait_for_observer(
-        self, agent_instance_id: str, timeout: float | None = None
-    ) -> ObserverSessionResult | None:
-        """等待目标 Agent 的观察任务执行完成（用于测试或安全点同步）。"""
-        task = self._running_tasks.get(agent_instance_id)
-        if task is None:
-            return self._latest_results.get(agent_instance_id)
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.warning("等待 Agent %s 的观察者超时 (timeout=%s)", agent_instance_id, timeout)
-            return None
-
-    async def wait_observation_done(
-        self, agent_instance_id: str, timeout: float | None = None
-    ) -> ObserverSessionResult | None:
-        """等待目标 Agent 观察完成别名 (M6-1)。"""
-        return await self.wait_for_observer(agent_instance_id, timeout=timeout)
-
-    async def trigger_and_await_observation(
-        self,
-        *,
-        agent_instance_id: str,
-        task_id: str,
-        messages: Sequence[Any],
-        is_subagent: bool = False,
-        fork_message_id: str | None = None,
-        delegation_content: str | None = None,
-        timeout: float = 60.0,
-    ) -> ObserverSessionResult | None:
-        """强制同步执行一次观察并等待完成 (M6-2)。"""
-        if self.is_observer_running(agent_instance_id):
-            return await self.wait_for_observer(agent_instance_id, timeout=timeout)
-
-        watermark = self.store.get_watermark(agent_instance_id=agent_instance_id, task_id=task_id)
-        slice_res = self.slicer.slice_messages(
-            messages=messages,
-            watermark_covered_until_seq=watermark.covered_until_seq,
-            covered_until_message_id=watermark.covered_until_message_id,
-            is_subagent=is_subagent,
-            inherited_processed=watermark.inherited_processed,
-            fork_message_id=fork_message_id,
-        )
-        snapshot = self.store.get_note_snapshot(task_id=task_id, agent_instance_id=agent_instance_id)
-        session_input = ObserverSessionInput(
-            task_id=task_id,
-            agent_instance_id=agent_instance_id,
-            target_seq=slice_res.max_seq,
-            note_snapshot=snapshot,
-            incremental_units=slice_res.incremental_units,
-            inherited_units=slice_res.inherited_units,
-            delegation_content=delegation_content,
-            fork_message_id=fork_message_id,
-            is_subagent=is_subagent,
-        )
-        async with self._lock:
-            task = asyncio.create_task(self._run_observer_session(session_input))
-            self._running_tasks[agent_instance_id] = task
-
-        return await self.wait_for_observer(agent_instance_id, timeout=timeout)
+            self._running_tasks.pop(agent_id, None)
+            # runner 返回 success=False、抛异常或被取消时，在 finally 里通知 coordinator.complete(success=False)
+            # success=True 时 runner 已经调用过 complete，这里不再调用（complete 幂等）
+            if result is None or not result.success:
+                try:
+                    if coordinator:
+                        await coordinator.complete(
+                            instance_id=agent_id,
+                            conversation_id=session_input.conversation_id,
+                            run_id=session_input.run_id,
+                            success=False,
+                        )
+                except Exception as ce:
+                    logger.warning("观察者异常收尾通知 coordinator 失败: %s", ce)

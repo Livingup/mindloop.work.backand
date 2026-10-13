@@ -14,7 +14,6 @@ class ContextCompressionConfig:
     archive_data_dir: str = "~/.spread-ai/context-compression"
     observer_trigger_tokens: int = 80000
     observer_min_advance_ratio: float = 0.5
-    swap_wait_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         if not 0 < self.default_threshold_ratio <= 1:
@@ -27,5 +26,3 @@ class ContextCompressionConfig:
             raise ValueError("observer_trigger_tokens 必须大于 0。")
         if not 0 < self.observer_min_advance_ratio <= 1:
             raise ValueError("observer_min_advance_ratio 必须在 0 到 1 之间。")
-        if self.swap_wait_timeout_seconds < 0:
-            raise ValueError("swap_wait_timeout_seconds 不能为负数。")

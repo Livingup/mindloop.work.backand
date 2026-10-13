@@ -95,6 +95,11 @@ from agent_runtime.task_note.task_note_snapshot_service import (
 )
 from agent_runtime.task_note.task_note_context_assembler import TaskNoteContextAssembler
 from agent_runtime.task_note.task_note_observer_scheduler import TaskNoteObserverScheduler
+from agent_runtime.task_note.task_note_tracking_coordinator import (
+    TaskNoteTrackingCoordinator,
+    get_task_note_tracking_coordinator,
+)
+from agent_runtime.task_note.task_note_unit_slicer import estimate_message_tokens
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -375,6 +380,7 @@ class AgentExecutionEngine:
         task_note_snapshot_service: TaskNoteSnapshotService | None = None,
         task_note_observer_scheduler: TaskNoteObserverScheduler | None = None,
         task_note_context_assembler: TaskNoteContextAssembler | None = None,
+        task_note_tracking_coordinator: TaskNoteTrackingCoordinator | None = None,
         swap_wait_timeout_seconds: float = 10.0,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
@@ -407,13 +413,20 @@ class AgentExecutionEngine:
             prompt_snippet_gateway=prompt_snippet_gateway,
             local_tool_gateway=local_tool_gateway,
         )
-        self._task_note_snapshot_service = task_note_snapshot_service or get_task_note_snapshot_service()
         self._task_note_observer_scheduler = task_note_observer_scheduler
+        if task_note_tracking_coordinator is not None:
+            self._task_note_tracking_coordinator = task_note_tracking_coordinator
+        else:
+            try:
+                from agent_runtime.task_note.task_note_tracking_coordinator import (
+                    get_task_note_tracking_coordinator,
+                )
+
+                self._task_note_tracking_coordinator = get_task_note_tracking_coordinator()
+            except RuntimeError:
+                self._task_note_tracking_coordinator = None
         self._swap_wait_timeout_seconds = swap_wait_timeout_seconds
-        self._task_note_context_assembler = task_note_context_assembler or TaskNoteContextAssembler(
-            scheduler=task_note_observer_scheduler,
-            swap_wait_timeout_seconds=swap_wait_timeout_seconds,
-        )
+        self._task_note_context_assembler = task_note_context_assembler or TaskNoteContextAssembler()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
@@ -438,21 +451,36 @@ class AgentExecutionEngine:
         )
 
     async def _cleanup_task_notes_with_wait(self, task_id: str) -> None:
-        if self._task_note_observer_scheduler is not None:
-            try:
-                task_obj = self._runtime_gateway.get_task(task_id)
-                if task_obj and hasattr(task_obj, "agent_instances"):
-                    for inst_item in task_obj.agent_instances:
-                        if self._task_note_observer_scheduler.is_observer_running(inst_item.instance_id):
-                            await self._task_note_observer_scheduler.wait_for_observer(
-                                inst_item.instance_id,
-                                timeout=self._swap_wait_timeout_seconds,
-                            )
-            except Exception as exc:
-                logger.debug("等待 Task Observer 完成异常: %s", exc)
+        try:
+            task_obj = self._runtime_gateway.get_task(task_id)
+            if task_obj and hasattr(task_obj, "agent_instances"):
+                for inst_item in task_obj.agent_instances:
+                    tid = inst_item.instance_id
+                    if self._task_note_observer_scheduler is not None:
+                        await self._task_note_observer_scheduler.cancel(tid)
+                    if self._task_note_tracking_coordinator is not None:
+                        self._task_note_tracking_coordinator.forget_instance(tid)
+        except Exception as exc:
+            logger.debug("GC 清理 Task Observer 异常: %s", exc)
         await self._task_note_snapshot_service.async_cleanup_task_note(task_id)
 
-    def _trigger_background_observer_if_needed(
+    def _ancestor_chain(self, instance: AgentInstance) -> list[str]:
+        """沿 parent_instance_id 向上追溯祖先链，最多 32 层防止成环。"""
+        chain: list[str] = []
+        curr = instance.parent_instance_id
+        depth = 0
+        seen = {instance.instance_id}
+        while curr and depth < 32 and curr not in seen:
+            seen.add(curr)
+            chain.append(curr)
+            parent_inst = self._runtime_gateway.get_agent_instance(curr)
+            if not parent_inst:
+                break
+            curr = getattr(parent_inst, "parent_instance_id", None)
+            depth += 1
+        return chain
+
+    async def _trigger_background_observer_if_needed(
         self,
         *,
         task_id: str,
@@ -460,22 +488,25 @@ class AgentExecutionEngine:
         conversation: Conversation,
         scene_id: str | None = None,
     ) -> None:
-        """在业务 Agent 每轮 LLM 或工具批次完成后，非阻塞检查并触发后台观察者 (D02)。"""
-        if self._task_note_observer_scheduler is None:
+        """在业务 Agent 每轮 LLM 或工具批次完成后，检查并触发后台观察者 (D02, U1)。"""
+        if self._task_note_observer_scheduler is None or self._task_note_tracking_coordinator is None:
             return
         try:
-            asyncio.create_task(
-                self._task_note_observer_scheduler.check_and_trigger(
-                    agent_instance_id=instance.instance_id,
-                    task_id=task_id,
-                    messages=conversation.messages,
-                    is_subagent=(instance.parent_instance_id is not None),
-                    fork_message_id=getattr(instance, "fork_message_id", None),
-                    delegation_content=getattr(instance, "delegation_content", None),
+            is_sub = instance.parent_instance_id is not None
+            ticket = await self._task_note_tracking_coordinator.on_round(
+                task_id=task_id,
+                instance_id=instance.instance_id,
+                conversation=conversation,
+                is_subagent=is_sub,
+            )
+            if ticket is not None:
+                self._task_note_observer_scheduler.start(
+                    ticket,
+                    target_agent_definition_prompt=conversation.system_prompt,
                     parent_agent_instance_id=instance.parent_instance_id,
+                    ancestor_chain=self._ancestor_chain(instance),
                     scene_id=scene_id,
                 )
-            )
         except Exception as exc:
             logger.debug("触发后台观察者异常 (静默容错): %s", exc)
 
@@ -2087,7 +2118,7 @@ class AgentExecutionEngine:
                         task, instance, request, conversation, communication_context, trace_path = next_execution
                         plain_text_fallback_count = 0
                         continue
-                    self._trigger_background_observer_if_needed(
+                    await self._trigger_background_observer_if_needed(
                         task_id=task.task_id,
                         instance=instance,
                         conversation=conversation,
@@ -2240,8 +2271,8 @@ class AgentExecutionEngine:
                 )
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
-                # 每轮工具执行完成后，非阻塞检查并触发后台观察者 (D02)
-                self._trigger_background_observer_if_needed(
+                # 每轮工具执行完成后，检查并触发后台观察者 (D02, U1)
+                await self._trigger_background_observer_if_needed(
                     task_id=task.task_id,
                     instance=instance,
                     conversation=conversation,
@@ -3028,26 +3059,80 @@ class AgentExecutionEngine:
             try:
                 compression_decision = self._check_compression_gate(conversation, resolved_model)
                 if compression_decision.should_compress:
-                    if self._task_note_context_assembler is not None:
+                    if self._task_note_context_assembler is not None and self._task_note_tracking_coordinator is not None:
+                        coordinator = self._task_note_tracking_coordinator
+                        scheduler = self._task_note_observer_scheduler
+                        is_sub = instance.parent_instance_id is not None
+
+                        # 1. 等待当前运行中的观察者结束
+                        await coordinator.await_running(
+                            instance_id=instance.instance_id,
+                            conversation_id=conversation.id,
+                        )
+
+                        # 2. 获取当前 tracking
+                        tracking = await coordinator.get(conversation.id, is_subagent=is_sub)
+
+                        # 3. 如果 note_version == 0 或起点之后的 token >= 门禁阈值，强制执行一次同步观察
+                        start_mid = tracking.covered_until_message_id or tracking.prefix_end_message_id
+                        tokens_after_start = 0
+                        start_found = (start_mid is None)
+                        for m in conversation.messages:
+                            if not start_found:
+                                if getattr(m, "message_id", None) == start_mid or getattr(m, "id", None) == start_mid:
+                                    start_found = True
+                                continue
+                            if tracking.snapshot_message_id and (getattr(m, "message_id", None) == tracking.snapshot_message_id or getattr(m, "id", None) == tracking.snapshot_message_id):
+                                content = getattr(m, "content", None)
+                                if isinstance(content, list) and len(content) > 1:
+                                    tokens_after_start += sum(estimate_message_tokens(p) for p in content[1:])
+                            else:
+                                tokens_after_start += estimate_message_tokens(m)
+
+                        if tracking.note_version == 0 or tokens_after_start >= compression_decision.threshold:
+                            ticket = await coordinator.on_round(
+                                task_id=task.task_id,
+                                instance_id=instance.instance_id,
+                                conversation=conversation,
+                                is_subagent=is_sub,
+                                force=True,
+                            )
+                            if ticket is not None and scheduler is not None:
+                                await scheduler.run_sync(
+                                    ticket,
+                                    target_agent_definition_prompt=conversation.system_prompt,
+                                    parent_agent_instance_id=instance.parent_instance_id,
+                                    ancestor_chain=self._ancestor_chain(instance),
+                                    scene_id=getattr(task, "scene_id", None),
+                                )
+                            tracking = await coordinator.get(conversation.id, is_subagent=is_sub)
+
+                        # 4. 执行上下文热组装替换
                         swap_result = await self._task_note_context_assembler.assemble_context(
                             messages=conversation.messages,
+                            tracking=tracking,
                             task_id=task.task_id,
                             agent_instance_id=instance.instance_id,
                             current_working_directory=instance.current_working_directory,
-                            context_window_threshold=compression_decision.threshold,
-                            current_tokens=compression_decision.used_tokens,
                         )
+
+                        # 5. swapped 为真时推进并持久化
                         if swap_result.swapped:
                             conversation.messages = list(swap_result.messages)
                             await self._conversation_repository.save(conversation)
+                            await coordinator.apply_swap(
+                                instance_id=instance.instance_id,
+                                conversation_id=conversation.id,
+                                snapshot_message_id=swap_result.snapshot_message_id,
+                            )
                             self._trace_recorder.record_event(
                                 trace_path,
                                 "task_note_context_swapped",
                                 {
                                     "task_id": task.task_id,
                                     "agent_instance_id": instance.instance_id,
-                                    "covered_until_seq": swap_result.covered_until_seq,
                                     "note_version": swap_result.note_version,
+                                    "snapshot_message_id": swap_result.snapshot_message_id,
                                     "tail_message_count": swap_result.tail_message_count,
                                 },
                             )
@@ -3058,10 +3143,20 @@ class AgentExecutionEngine:
                                     "task_id": task.task_id,
                                     "agent_instance_id": instance.instance_id,
                                     "conversation_id": conversation.id,
-                                    "covered_until_seq": swap_result.covered_until_seq,
                                     "note_version": swap_result.note_version,
+                                    "snapshot_message_id": swap_result.snapshot_message_id,
                                 },
                                 source="agent_execution_engine",
+                            )
+                        elif tracking.note_version == 0:
+                            self._trace_recorder.record_event(
+                                trace_path,
+                                "task_note.swap_skipped",
+                                {
+                                    "task_id": task.task_id,
+                                    "agent_instance_id": instance.instance_id,
+                                    "reason": "no_note",
+                                },
                             )
                 if interrupt_state.requested:
                     raise LlmRequestCancelled("LLM request cancelled.")
@@ -4224,9 +4319,12 @@ class AgentExecutionEngine:
                     for tid in targets:
                         if self._task_note_observer_scheduler is not None:
                             try:
-                                await self._task_note_observer_scheduler.wait_for_observer(
-                                    tid, timeout=self._swap_wait_timeout_seconds
-                                )
+                                await self._task_note_observer_scheduler.cancel(tid)
+                            except Exception:
+                                pass
+                        if self._task_note_tracking_coordinator is not None:
+                            try:
+                                self._task_note_tracking_coordinator.forget_instance(tid)
                             except Exception:
                                 pass
                         try:
@@ -4273,6 +4371,16 @@ class AgentExecutionEngine:
                 if self._task_note_snapshot_service is not None:
                     targets = set(released_agent_instance_ids) | {instance_id}
                     for tid in targets:
+                        if self._task_note_observer_scheduler is not None:
+                            try:
+                                await self._task_note_observer_scheduler.cancel(tid)
+                            except Exception:
+                                pass
+                        if self._task_note_tracking_coordinator is not None:
+                            try:
+                                self._task_note_tracking_coordinator.forget_instance(tid)
+                            except Exception:
+                                pass
                         try:
                             await self._task_note_snapshot_service.async_cleanup_agent_instance_note(
                                 task_id=task_id, agent_instance_id=tid

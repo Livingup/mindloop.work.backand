@@ -43,6 +43,9 @@ from agent_runtime.task_note.task_note_observer_scheduler import (
     build_observer_user_payload,
 )
 from agent_runtime.task_note.task_note_prompt_provider import TaskNotePromptProvider
+from agent_runtime.task_note.task_note_tracking_coordinator import (
+    get_task_note_tracking_coordinator,
+)
 from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
     ToolRuntimeContext,
@@ -71,7 +74,6 @@ class TaskNoteObserverRunner:
         llm_registry_gateway: Any | None = None,
         runtime_gateway: Any | None = None,
         event_publisher: Any | None = None,
-        max_turns: int = 30,
         observer_min_advance_ratio: float = 0.5,
     ) -> None:
         if llm_request_service is None:
@@ -82,7 +84,6 @@ class TaskNoteObserverRunner:
         self._llm_registry_gateway = llm_registry_gateway
         self._runtime_gateway = runtime_gateway
         self._event_publisher = event_publisher
-        self._max_turns = max_turns
         self._observer_min_advance_ratio = observer_min_advance_ratio
 
     def _resolve_model(self, agent_instance_id: str) -> Any:
@@ -229,6 +230,8 @@ class TaskNoteObserverRunner:
             scene_id=scene_id,
             units=session_input.incremental_units,
             observer_min_advance_ratio=self._observer_min_advance_ratio,
+            run_id=session_input.run_id,
+            conversation_id=session_input.conversation_id,
         )
         token = set_current_observer_binding(binding)
 
@@ -242,7 +245,7 @@ class TaskNoteObserverRunner:
         turns = 0
 
         try:
-            while turns < self._max_turns:
+            while True:
                 turns += 1
                 try:
                     prompt_req = LlmPromptRequest(
@@ -265,9 +268,6 @@ class TaskNoteObserverRunner:
 
                 tool_uses = _extract_tool_uses(assistant_msg)
                 if not tool_uses:
-                    # 若没有工具调用，提示继续调用工具
-                    if turns >= self._max_turns:
-                        break
                     reminder_msg = UniMessage(
                         role=ROLE_USER,
                         content=[TextPart(text="请调用相应的 Note 工具维护知识库，最后必须调用 note_update_end 提交断点。")],
@@ -285,7 +285,15 @@ class TaskNoteObserverRunner:
                 for tu in tool_uses:
                     call_ref = _tool_use_ref(tu)
                     t_name = tu.name
-                    t_args = tu.arguments if hasattr(tu, "arguments") and tu.arguments is not None else getattr(tu, "args", {}) or {}
+                    t_args = (
+                        getattr(tu, "input", None)
+                        if getattr(tu, "input", None) is not None
+                        else (
+                            tu.arguments
+                            if hasattr(tu, "arguments") and tu.arguments is not None
+                            else getattr(tu, "args", {}) or {}
+                        )
+                    )
 
                     tool_res: BaseToolResult = await self._execute_tool_call(
                         tool_name=t_name,
@@ -323,11 +331,25 @@ class TaskNoteObserverRunner:
 
                     # 检查 note_update_end 决策
                     if t_name == "note_update_end" and tool_res.success:
-                        decision = getattr(tool_res.loop_control, "decision", None) if tool_res.loop_control else None
-                        if decision == "complete" or (tool_res.output and tool_res.output.get("covered_until_seq", 0) > 0):
-                            completed_by_note_update_end = True
-                            completed_covered_seq = tool_res.output.get("covered_until_seq", 0)
-                            completed_note_version = tool_res.output.get("note_version", 1)
+                        coordinator = get_task_note_tracking_coordinator()
+                        covered_mid = (tool_res.output or {}).get("covered_until_message_id")
+                        nv = await coordinator.complete(
+                            instance_id=target_agent_id,
+                            conversation_id=session_input.conversation_id,
+                            run_id=session_input.run_id,
+                            success=True,
+                            covered_until_message_id=covered_mid,
+                        )
+                        if nv is None:
+                            logger.warning("note_update_end 提交时 run_id 已过期或已被抢占: run_id=%s", session_input.run_id)
+                            return ObserverSessionResult(
+                                success=False,
+                                error_message="STALE_OBSERVATION",
+                                tools_executed_count=tools_executed_count,
+                            )
+                        completed_by_note_update_end = True
+                        completed_covered_seq = (tool_res.output or {}).get("covered_until_seq", 0)
+                        completed_note_version = nv
 
                     output_payload = tool_res.output if tool_res.output is not None else {"message": tool_res.error_message or "ok"}
                     result_parts.append(
@@ -354,20 +376,40 @@ class TaskNoteObserverRunner:
                         completed_note_version,
                         tools_executed_count,
                     )
+                    # 返回 note_version 时，再发布一次 task_note.updated（tool_name="note_update_end"）
+                    if self._event_publisher is not None:
+                        try:
+                            comm_ctx = RuntimeCommunicationContext(
+                                stream_id=f"agent.task.{task_id}",
+                                trace_id=None,
+                                metadata={
+                                    "task_id": task_id,
+                                    "scene_id": scene_id,
+                                    "agent_instance_id": target_agent_id,
+                                },
+                            )
+                            await self._event_publisher.publish(
+                                comm_ctx,
+                                "task_note.updated",
+                                {
+                                    "task_id": task_id,
+                                    "agent_instance_id": target_agent_id,
+                                    "scene_id": scene_id,
+                                    "tool_name": "note_update_end",
+                                    "note_version": completed_note_version,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                                source="task_note_observer_runner",
+                            )
+                        except Exception as e:
+                            logger.warning("发布 task_note.updated 事件失败 (静默容错): %s", e)
+
                     return ObserverSessionResult(
                         success=True,
                         covered_until_seq=completed_covered_seq,
                         note_version=completed_note_version,
                         tools_executed_count=tools_executed_count,
                     )
-
-            # 超出最大轮数
-            logger.warning("观察者会话已达到最大轮数 %d，未能提交合法 note_update_end", self._max_turns)
-            return ObserverSessionResult(
-                success=False,
-                error_message=f"超过最大观察轮数 ({self._max_turns})，未能成功提交 note_update_end",
-                tools_executed_count=tools_executed_count,
-            )
 
         finally:
             reset_current_observer_binding(token)

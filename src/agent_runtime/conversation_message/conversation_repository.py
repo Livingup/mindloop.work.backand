@@ -107,3 +107,15 @@ class ConversationRepository(Protocol):
     async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
         """查询指定 Agent 运行时实例下的所有会话 ID 列表。"""
         ...
+
+    # ── Task Note 增量跟踪状态 (CAS 乐观锁) ──────────────────────────
+
+    async def get_task_note_tracking(self, conversation_id: str) -> tuple[dict | None, int]:
+        """读取会话的 Task Note 跟踪状态与版本号。返回 (tracking_dict, version)。"""
+        ...
+
+    async def cas_task_note_tracking(
+        self, conversation_id: str, expected_version: int, tracking: dict
+    ) -> bool:
+        """基于乐观锁版本号原子更新 Task Note 跟踪状态。成功返回 True，版本冲突返回 False。"""
+        ...

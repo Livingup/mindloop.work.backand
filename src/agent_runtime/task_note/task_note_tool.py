@@ -1648,6 +1648,8 @@ def _validate_note_update_end(
                     if isinstance(u, dict):
                         target_end_msg_id = u.get("end_message_id") or u.get("last_message_id")
                     break
+            if not target_end_msg_id:
+                failures.append("断点缺少消息 ID")
 
     # 2. auto_record 未绑定检查 (扫描 covered_until_seq 及之前 units 中的 auto_record)
     unbound_records: list[str] = []
@@ -1659,8 +1661,26 @@ def _validate_note_update_end(
             msgs = getattr(u, "messages", []) if hasattr(u, "messages") else u.get("messages", [])
             for m in msgs:
                 ar_list: list[dict[str, Any]] = []
-                if isinstance(m, dict):
-                    ar = m.get("auto_record")
+                content = getattr(m, "content", None)
+                if isinstance(content, list):
+                    for part in content:
+                        part_type = type(part).__name__
+                        if part_type == "ToolResultPart" or hasattr(part, "tool_use_ref"):
+                            out = getattr(part, "output", None)
+                            if isinstance(out, dict):
+                                ar = out.get("auto_record")
+                                if isinstance(ar, dict):
+                                    ar_list.append(ar)
+                                elif isinstance(ar, list):
+                                    ar_list.extend(ar)
+                elif isinstance(m, dict):
+                    tr = m.get("tool_result")
+                    if isinstance(tr, dict) and isinstance(tr.get("output"), dict):
+                        ar = tr["output"].get("auto_record")
+                    elif isinstance(m.get("output"), dict):
+                        ar = m["output"].get("auto_record")
+                    else:
+                        ar = m.get("auto_record")
                     if isinstance(ar, dict):
                         ar_list.append(ar)
                     elif isinstance(ar, list):
@@ -1674,27 +1694,27 @@ def _validate_note_update_end(
 
                 for ar_item in ar_list:
                     rtype = str(ar_item.get("type") or "").strip().lower()
-                    rid = str(ar_item.get("id") or ar_item.get("resource_id") or "").strip()
+                    rid = str(ar_item.get("artifact_id") or ar_item.get("relationship_id") or ar_item.get("id") or ar_item.get("resource_id") or "").strip()
                     if not rid:
                         continue
                     try:
                         with store._get_connection() as conn:
                             with conn.cursor() as cur:
-                                if rtype == "artifact":
+                                if rtype == "artifact" or "artifact_id" in ar_item:
                                     cur.execute("SELECT mission_id FROM task_artifact_records WHERE artifact_id = %s", (rid,))
-                                elif rtype in ("agent_relationship", "relationship"):
+                                elif rtype in ("agent_relationship", "relationship") or "relationship_id" in ar_item:
                                     cur.execute("SELECT mission_id FROM task_agent_relationships WHERE relationship_id = %s", (rid,))
                                 elif rtype in ("agent_message", "message"):
                                     cur.execute("SELECT mission_id FROM task_agent_messages WHERE message_id = %s", (rid,))
                                 elif rtype in ("remote_agent_message", "remote_message"):
                                     cur.execute("SELECT mission_id FROM task_remote_agent_messages WHERE remote_message_id = %s", (rid,))
                                 else:
-                                    continue
+                                    cur.execute("SELECT mission_id FROM task_artifact_records WHERE artifact_id = %s", (rid,))
                                 row = cur.fetchone()
                                 if row is not None:
                                     mid = row.get("mission_id") if isinstance(row, dict) else row[0]
                                     if not mid or not str(mid).strip():
-                                        unbound_records.append(f"{rtype}:{rid}")
+                                        unbound_records.append(f"{rtype or 'resource'}:{rid}")
                     except Exception as e:
                         logger.warning("检查 auto_record 状态异常: %s", e)
 
@@ -1778,34 +1798,10 @@ def note_update_end(request: NoteUpdateEndRequest, ctx: ToolRuntimeContext) -> B
             loop_control=LoopControl(decision="continue", reason="断点或必填项校验未通过，请补充后重试"),
         )
 
-    try:
-        watermark_info = store.update_watermark(
-            agent_instance_id=agent_instance_id,
-            task_id=task_id,
-            covered_until_seq=request.covered_until_seq,
-            covered_until_message_id=end_msg_id,
-            note_version_inc=True,
-        )
-    except Exception as exc:
-        err_res = _handle_tool_storage_error(exc)
-        if err_res is not None:
-            return err_res
-        logger.error("note_update_end 推进 watermark 异常: %s", exc)
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="DatabaseError",
-            error_message=f"推进 watermark 失败: {exc}",
-            output={"error": str(exc)},
-            loop_control=LoopControl(decision="continue", reason="推进水位异常"),
-        )
-
-    note_ver = watermark_info.get("note_version", 1) if isinstance(watermark_info, dict) else 1
     output = {
         "covered_until_seq": request.covered_until_seq,
-        "note_version": note_ver,
-        "message": f"观察完成，断点已推进至 {request.covered_until_seq}，已安全退出",
-        "watermark": watermark_info,
+        "covered_until_message_id": end_msg_id,
+        "message": "断点校验通过，等待提交",
     }
     return BaseToolResult(
         output=output,

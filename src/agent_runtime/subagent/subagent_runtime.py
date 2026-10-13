@@ -46,6 +46,13 @@ SUBAGENT_SUPPLEMENTARY_PROMPT_TEMPLATE = (
     "子任务内容会在下面的对话消息中给到你。注意一定不要把自己当成父agent去完成父agent的任务！"
     "注意你的任务边界！你现在可用的工具范围是{{available_tools}}"
 )
+class SeededConversationId(str):
+    fork_message_id: str | None = None
+
+    def __new__(cls, conversation_id: str, fork_message_id: str | None = None):
+        instance = super().__new__(cls, conversation_id)
+        instance.fork_message_id = fork_message_id
+        return instance
 
 
 def _extract_definition_tool_names(definition: Any) -> set[str]:
@@ -167,6 +174,7 @@ class SubagentRuntime:
             parent_definition=parent_definition,
             child_definition=child_definition,
         )
+        fork_message_id = getattr(seeded_conversation_id, "fork_message_id", None)
         try:
             _updated_task, child, relation = self._runtime_gateway.create_child_agent_instance(
                 CreateChildAgentInstanceRequest(
@@ -228,6 +236,7 @@ class SubagentRuntime:
             "task_id": child.task_id,
             "thread_id": child.thread_id,
             "relation_id": relation.relation_id,
+            "fork_message_id": fork_message_id,
             "llm_policy_group_id": child.llm_policy_group_id,
             "llm_provider_id": child.llm_provider_id,
             "llm_model_binding_id": child.llm_model_binding_id,
@@ -744,6 +753,15 @@ class SubagentRuntime:
             agent_id=child_agent_definition_id,
             agent_instance_id=child_instance_id,
         )
+        try:
+            from agent_runtime.task_note.task_note_tracking_coordinator import (
+                get_task_note_tracking_coordinator,
+            )
+
+            coordinator = get_task_note_tracking_coordinator()
+            await coordinator.init_child(child_conversation.id, boundary_message.message_id)
+        except RuntimeError:
+            pass
         logger.info(
             "已为子 Agent 创建父会话历史副本并静默追加范围边界消息与配置时间线: "
             "parent_instance_id=%s child_instance_id=%s parent_conversation_id=%s "
@@ -757,7 +775,7 @@ class SubagentRuntime:
             len(child_conversation.messages),
             len(child_timeline),
         )
-        return child_conversation.id
+        return SeededConversationId(child_conversation.id, boundary_message.message_id)
 
     def _resolve_child_llm_selection(
         self,

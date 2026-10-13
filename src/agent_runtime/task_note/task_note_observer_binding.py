@@ -18,6 +18,8 @@ class ObserverBinding:
     scene_id: str = ""
     units: list[Any] = field(default_factory=list)
     observer_min_advance_ratio: float = 0.5
+    run_id: str = ""
+    conversation_id: str = ""
 
 
 _current_observer_binding: contextvars.ContextVar[ObserverBinding | None] = contextvars.ContextVar(

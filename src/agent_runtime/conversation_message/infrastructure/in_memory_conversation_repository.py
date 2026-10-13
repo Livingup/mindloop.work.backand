@@ -26,6 +26,7 @@ class InMemoryConversationRepository:
         self._store: dict[str, Conversation] = {}
         self._hierarchy: dict[str, dict[str, str]] = {}
         self._pending_tool_results: dict[tuple[str, int, str], ToolResultPart] = {}
+        self._tracking_store: dict[str, tuple[dict | None, int]] = {}
 
     async def create(
         self, conv: Conversation, *, task_id: str, thread_id: str,
@@ -36,6 +37,8 @@ class InMemoryConversationRepository:
             "task_id": task_id, "thread_id": thread_id,
             "agent_id": agent_id, "agent_instance_id": agent_instance_id,
         }
+        if conv.state.task_note_tracking is not None:
+            self._tracking_store[conv.id] = (conv.state.task_note_tracking, 0)
 
     async def get(self, conversation_id: str) -> Conversation:
         conv = self._store.get(conversation_id)
@@ -44,11 +47,15 @@ class InMemoryConversationRepository:
         return conv
 
     async def save(self, conv: Conversation) -> None:
+        if conv.id in self._tracking_store:
+            tracking, _ = self._tracking_store[conv.id]
+            conv.state.task_note_tracking = tracking
         self._store[conv.id] = conv
 
     async def delete(self, conversation_id: str) -> None:
         self._store.pop(conversation_id, None)
         self._hierarchy.pop(conversation_id, None)
+        self._tracking_store.pop(conversation_id, None)
 
     async def append_message(self, conversation_id: str, msg: UniMessage) -> None:
         conv = await self.get(conversation_id)
@@ -109,3 +116,22 @@ class InMemoryConversationRepository:
 
     async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
         return [cid for cid, h in self._hierarchy.items() if h["agent_instance_id"] == agent_instance_id]
+
+    async def get_task_note_tracking(self, conversation_id: str) -> tuple[dict | None, int]:
+        if conversation_id not in self._store:
+            return None, 0
+        return self._tracking_store.get(conversation_id, (None, 0))
+
+    async def cas_task_note_tracking(
+        self, conversation_id: str, expected_version: int, tracking: dict
+    ) -> bool:
+        if conversation_id not in self._store:
+            return False
+        current_data, current_version = self._tracking_store.get(conversation_id, (None, 0))
+        if current_version != expected_version:
+            return False
+        new_version = expected_version + 1
+        new_tracking = dict(tracking)
+        new_tracking["version"] = new_version
+        self._tracking_store[conversation_id] = (new_tracking, new_version)
+        return True

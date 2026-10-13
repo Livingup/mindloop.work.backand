@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Task Note 双线程观察者与热组装上下文压缩集成测试 (D02, D05, D06, M6)。
+"""Task Note 协调器与上下文压缩热组装集成测试。
 
 覆盖验收标准：
-1. D02 异步观察触发：业务 Agent 执行产生的增量达到阈值时，后台触发独立观察会话，业务 Agent 不停顿；
-   同一 Agent 同一时刻最多只有一个观察在运行；
-2. D06 工具隔离：业务 Agent 实例在任何状态下都不持有 TASK_NOTE_TOOL_NAMES 工具；
-   业务 Agent 直接调用 Note 工具被抛出 PermissionError 拦截；
-3. D05 + M6 上下文热组装：门禁命中时按水位替换前缀，精准保留 covered_until_message_id 之后的原始尾部；
-   M6-3 尾部首条为 user 消息时与快照合并，协议合法；
-4. D08 降级保护：note_version < 1 时不替换，上下文消息保持原样；
-5. M6-1 观察等待：替换时若检测到观察者运行中，安全等待最多 swap_wait_timeout_seconds。
+1. 工具隔离 (D06)：业务 Agent 实例在任何状态下都不持有 TASK_NOTE_TOOL_NAMES 工具；直接调用 Note 工具被拦截；
+2. 调度器生命周期：start 启动异步观察，cancel 安全取消；
+3. 上下文热组装：门禁命中时按 TaskNoteTracking 替换前缀，精准保留断点后的原始尾部；
+4. 尾部合并 (M6-3)：尾部首条为 user 消息时与快照合并，沿用原消息 ID 且保留原内容；
+5. 降级保护 (D08)：note_version < 1 时不替换，上下文消息保持原样；
+6. 观察等待协调：替换前若检测到观察者运行中，await_running 安全等待至 complete，随后执行替换；
+7. 实例 GC 清理：GC 时正在运行的观察被取消，协调器注销实例内存锁。
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -25,20 +21,19 @@ import pytest
 
 from agent_runtime.agent.agent_execution_engine import (
     AgentExecutionEngine,
-    AgentExecutionRequest,
-    _AgentExecutionInterruptState,
 )
 from agent_runtime.agent.agent_instance import (
     AGENT_INSTANCE_STATUS_RUNNING,
     AgentInstance,
 )
-from agent_runtime.agent.agent_task import AgentTask
 from agent_runtime.agent_definition.agent_definition import AgentDefinition
 from agent_runtime.communication.runtime_event_publisher import (
     NoopRuntimeEventPublisher,
     RuntimeCommunicationContext,
 )
-from agent_runtime.context_compression.gate import CompressionDecision
+from agent_runtime.conversation_message.infrastructure.in_memory_conversation_repository import (
+    InMemoryConversationRepository,
+)
 from agent_runtime.conversation_message.message.models import (
     Conversation,
     ROLE_ASSISTANT,
@@ -52,46 +47,24 @@ from agent_runtime.conversation_message.message.models import (
 )
 from agent_runtime.input_modality import INPUT_MODALITY_TEXT
 from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_RESPONSES
-from agent_runtime.llm_client.llm_request_models import LlmPromptResponse
-from agent_runtime.task_note.task_note_models import TaskNoteWatermark
+from agent_runtime.task_note.task_note_context_assembler import (
+    TaskNoteContextAssembler,
+)
+from agent_runtime.task_note.task_note_models import (
+    TaskNoteTracking,
+)
 from agent_runtime.task_note.task_note_observer_scheduler import (
     ObserverSessionInput,
     ObserverSessionResult,
     TaskNoteObserverScheduler,
 )
-from agent_runtime.task_note.task_note_context_assembler import (
-    TaskNoteContextAssembler,
-)
 from agent_runtime.task_note.task_note_prompt_provider import (
-    TASK_NOTE_TOOL_NAMES,
     TaskNotePromptProvider,
 )
-
-
-class _MockLlmRequestService:
-    def __init__(self, response_messages: list[UniMessage] | None = None) -> None:
-        self.sent_requests = []
-        self._responses = list(response_messages) if response_messages else []
-
-    async def send_prompt(self, request):
-        self.sent_requests.append(request)
-        if self._responses:
-            msg = self._responses.pop(0)
-        else:
-            msg = UniMessage(
-                role=ROLE_ASSISTANT,
-                content=[TextPart("业务执行中...")],
-                source_provider="openai",
-            )
-        request.conversation.append_message(msg)
-        return LlmPromptResponse(
-            raw_response={},
-            assistant_message=msg,
-            provider_id="provider-a",
-            binding_id="model-a",
-            model_id="model-a",
-            model_alias="model-a",
-        )
+from agent_runtime.task_note.task_note_tracking_coordinator import (
+    ObserveTicket,
+    TaskNoteTrackingCoordinator,
+)
 
 
 @pytest.mark.asyncio
@@ -106,7 +79,6 @@ async def test_d06_business_agent_does_not_hold_note_tools() -> None:
     assert "note_update_end" in note_names
 
     # 2. 验证业务 Agent 工具调度器拦截
-    llm_service = _MockLlmRequestService()
     conv = Conversation(id="conv-d06")
     conv.append_message(UniMessage(role=ROLE_USER, content=[TextPart("执行业务")]), [TextPartMeta()])
     instance = AgentInstance(
@@ -164,17 +136,21 @@ async def test_d06_business_agent_does_not_hold_note_tools() -> None:
         prompt_snippet_gateway=SimpleNamespace(get_snippet=lambda n: SimpleNamespace(content="")),
         local_tool_gateway=SimpleNamespace(
             list_tools=lambda **kwargs: [
-                SimpleNamespace(tool_name="run_bash_command", group="system", category="business", always_enabled=True)
+                SimpleNamespace(
+                    tool_name="run_bash_command", group="system", category="business", always_enabled=True
+                )
             ]
         ),
         mcp_client_gateway=None,
         skill_gateway=None,
-        llm_request_service=llm_service,
+        llm_request_service=MagicMock(),
         tool_dispatcher=SimpleNamespace(
-            build_llm_tools=AsyncMock(return_value=[
-                SimpleNamespace(name="run_bash_command", source="local", schema={"name": "run_bash_command"}),
-                SimpleNamespace(name="create_mission", source="local", schema={"name": "create_mission"}),
-            ]),
+            build_llm_tools=AsyncMock(
+                return_value=[
+                    SimpleNamespace(name="run_bash_command", source="local", schema={"name": "run_bash_command"}),
+                    SimpleNamespace(name="create_mission", source="local", schema={"name": "create_mission"}),
+                ]
+            ),
             dispatch_tool_call=AsyncMock(),
         ),
         trace_recorder=SimpleNamespace(
@@ -200,69 +176,74 @@ async def test_d06_business_agent_does_not_hold_note_tools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_d02_observer_scheduler_trigger_and_deduplication() -> None:
-    """测试 D02: 后台观察者单实例并发去重与独立异步执行。"""
-    executed_inputs: list[ObserverSessionInput] = []
+async def test_observer_scheduler_start_and_cancel() -> None:
+    """测试调度器 start 启动后台观察任务与 cancel 安全取消。"""
+    executed = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def fake_runner(session_input: ObserverSessionInput) -> ObserverSessionResult:
-        executed_inputs.append(session_input)
-        await asyncio.sleep(0.05)
-        return ObserverSessionResult(success=True, covered_until_seq=10, note_version=1)
+        executed.set()
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ObserverSessionResult(success=True)
 
     scheduler = TaskNoteObserverScheduler(
         observer_runner=fake_runner,
-        trigger_threshold_tokens=100,  # 低阈值便于触发
+        trigger_threshold_tokens=100,
+    )
+    # mock store 避免真实数据库调用
+    scheduler.store = MagicMock()
+    scheduler.store.get_note_snapshot.return_value = {}
+
+    ticket = ObserveTicket(
+        run_id="run-test",
+        task_id="task-test",
+        agent_instance_id="inst-test",
+        conversation_id="conv-test",
+        messages=[],
+        start_after_message_id=None,
+        end_message_id=None,
+        inherited_until_message_id=None,
+        snapshot_message_id=None,
+        is_subagent=False,
     )
 
-    # 构造历史消息与切片
-    messages = [
-        UniMessage(role=ROLE_USER, content=[TextPart("用户提出需求 A" * 30)], message_id="msg-1"),
-        UniMessage(role=ROLE_ASSISTANT, content=[TextPart("分析需求并开始执行" * 30)], message_id="msg-2"),
-    ]
-
-    # 1. 触发观察
-    triggered = await scheduler.check_and_trigger(
-        task_id="task-d02",
-        agent_instance_id="inst-d02",
-        messages=messages,
+    task = scheduler.start(
+        ticket,
+        target_agent_definition_prompt="prompt",
+        parent_agent_instance_id=None,
+        ancestor_chain=[],
+        scene_id=None,
     )
-    assert triggered is True
-    assert scheduler.is_observer_running("inst-d02") is True
+    await asyncio.wait_for(executed.wait(), timeout=2.0)
+    assert scheduler.is_observer_running("inst-test") is True
 
-    # 2. 再次尝试触发应被单实例并发排重跳过
-    triggered_second = await scheduler.check_and_trigger(
-        task_id="task-d02",
-        agent_instance_id="inst-d02",
-        messages=messages,
-    )
-    assert triggered_second is False
-
-    # 3. 等待完成
-    res = await scheduler.wait_observation_done("inst-d02", timeout=2.0)
-    assert res is not None
-    assert res.success is True
-    assert res.note_version == 1
-    assert scheduler.is_observer_running("inst-d02") is False
-    assert len(executed_inputs) == 1
+    # 执行 cancel
+    await scheduler.cancel("inst-test")
+    assert cancelled.is_set() is True
+    assert scheduler.is_observer_running("inst-test") is False
 
 
 @pytest.mark.asyncio
-async def test_d05_m6_context_assembler_prefix_swap_and_tail_retention() -> None:
-    """测试 D05 + M6: 上下文热组装器按水位替换前缀，完整保留断点后的原始尾部消息。"""
-    # 模拟 5 条消息：msg-1, msg-2 为已被 Note 覆盖的前缀；msg-3, msg-4, msg-5 为残差尾部
+async def test_context_assembler_with_tracking_and_user_tail_merge() -> None:
+    """测试 TaskNoteContextAssembler 结合 TaskNoteTracking 进行热组装与首条 user 合并。"""
     m1 = UniMessage(role=ROLE_USER, content=[TextPart("早期任务需求")], message_id="msg-1")
     m2 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("早期方案输出")], message_id="msg-2")
-    m3 = UniMessage(role=ROLE_TOOL, content=[ToolResultPart(tool_use_ref="tu-1", is_error=False, output="命令输出结果")], message_id="msg-3")
-    m4 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("分析测试结果")], message_id="msg-4")
-    m5 = UniMessage(role=ROLE_USER, content=[TextPart("用户最新反馈指令")], message_id="msg-5")
-    all_messages = [m1, m2, m3, m4, m5]
+    m3 = UniMessage(
+        role=ROLE_TOOL,
+        content=[ToolResultPart(tool_use_ref="tu-1", is_error=False, output="命令输出结果")],
+        message_id="msg-3",
+    )
+    m4 = UniMessage(role=ROLE_USER, content=[TextPart("用户最新反馈指令")], message_id="msg-4")
+    all_messages = [m1, m2, m3, m4]
 
-    watermark = TaskNoteWatermark(
-        agent_instance_id="inst-m6",
-        task_id="task-m6",
-        covered_until_seq=5,
-        covered_until_message_id="msg-2",  # 断点覆盖到 msg-2
+    tracking = TaskNoteTracking(
+        version=1,
         note_version=2,
+        covered_until_message_id="msg-2",
     )
     snapshot = {
         "task_id": "task-m6",
@@ -272,102 +253,114 @@ async def test_d05_m6_context_assembler_prefix_swap_and_tail_retention() -> None
     }
 
     assembler = TaskNoteContextAssembler()
-
     swap_res = await assembler.assemble_context(
         messages=all_messages,
-        watermark=watermark,
+        tracking=tracking,
         note_snapshot=snapshot,
-        force_swap=True,
     )
 
     assert swap_res.swapped is True
     assert swap_res.note_version == 2
-    assert swap_res.covered_until_seq == 5
+    # 尾部是 m3 (tool) 和 m4 (user)，由于首条尾部 m3 不是 user，因此新建快照放在最前
+    assert len(swap_res.messages) == 3
+    assert swap_res.messages[0].message_id == swap_res.snapshot_message_id
+    assert swap_res.messages[1].message_id == "msg-3"
+    assert swap_res.messages[2].message_id == "msg-4"
 
-    # 替换后的序列：首条为快照手记，后续为 msg-3, msg-4, msg-5
-    new_messages = swap_res.messages
-    assert len(new_messages) == 4
-
-    # 验证第 1 条是快照 user 消息
-    first_msg = new_messages[0]
-    assert first_msg.role == ROLE_USER
-    assert "任务现场工作手记" in first_msg.content[0].text
-    assert "步骤2已完成" in first_msg.content[0].text
-
-    # 验证尾部 msg-3, msg-4, msg-5 原样保留！
-    assert new_messages[1].message_id == "msg-3"
-    assert new_messages[2].message_id == "msg-4"
-    assert new_messages[3].message_id == "msg-5"
+    # 若尾部首条是 user 消息，应直接与手记合并
+    messages_user_tail = [m1, m2, m4]
+    swap_res_user = await assembler.assemble_context(
+        messages=messages_user_tail,
+        tracking=tracking,
+        note_snapshot=snapshot,
+    )
+    assert swap_res_user.swapped is True
+    assert len(swap_res_user.messages) == 1
+    assert swap_res_user.messages[0].message_id == "msg-4"
+    assert len(swap_res_user.messages[0].content) == 2
+    assert "步骤2已完成" in swap_res_user.messages[0].content[0].text
+    assert swap_res_user.messages[0].content[1].text == "用户最新反馈指令"
 
 
 @pytest.mark.asyncio
-async def test_m6_3_merge_user_message_when_tail_starts_with_user() -> None:
-    """测试 M6-3: 当残差尾部首条也是 user 消息时，与快照手记合并为单条 user 消息，保证协议合法。"""
-    m1 = UniMessage(role=ROLE_USER, content=[TextPart("任务初始需求")], message_id="msg-1")
-    m2 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("任务初始响应")], message_id="msg-2")
-    # 残差尾部首条是 user 消息
-    m3 = UniMessage(role=ROLE_USER, content=[TextPart("用户最新跟进要求")], message_id="msg-3")
-    m4 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("最新响应中")], message_id="msg-4")
-    all_messages = [m1, m2, m3, m4]
-
-    watermark = TaskNoteWatermark(
-        agent_instance_id="inst-m6-3",
-        task_id="task-m6-3",
-        covered_until_seq=2,
-        covered_until_message_id="msg-2",
-        note_version=1,
-    )
-    snapshot = {
-        "task_id": "task-m6-3",
-        "missions": [{"mission_id": "m1", "title": "任务A"}],
-    }
-
-    assembler = TaskNoteContextAssembler()
-    swap_res = await assembler.assemble_context(
-        messages=all_messages,
-        watermark=watermark,
-        note_snapshot=snapshot,
-        force_swap=True,
+async def test_await_running_coordinates_swap_after_observer_complete() -> None:
+    """测试替换发生前若有后台观察正在运行，await_running 阻塞等待直到 complete 推进版本。"""
+    repo = InMemoryConversationRepository()
+    conv = Conversation(id="conv-coord")
+    conv.append_message(UniMessage(role=ROLE_USER, content=[TextPart("需求文本" * 50)], message_id="m1"))
+    conv.append_message(UniMessage(role=ROLE_ASSISTANT, content=[TextPart("响应文本" * 50)], message_id="m2"))
+    await repo.create(
+        conv,
+        task_id="t1",
+        thread_id="th1",
+        agent_id="a1",
+        agent_instance_id="inst-coord",
     )
 
-    assert swap_res.swapped is True
-    new_messages = swap_res.messages
-    # 原 4 条中前 2 条被快照替换，m3 与快照合并，因此结果只有 2 条 (合并后的 user 消息 + m4)
-    assert len(new_messages) == 2
-    merged_user = new_messages[0]
-    assert merged_user.role == ROLE_USER
-    merged_text = merged_user.content[0].text
-    assert "任务现场工作手记" in merged_text
-    assert "用户最新跟进要求" in merged_text
-    assert "---" in merged_text  # 有分隔线连接
+    coordinator = TaskNoteTrackingCoordinator(
+        conversation_repository=repo,
+        trigger_threshold_tokens=10,
+    )
 
-    # 第二条是原助手的响应
-    assert new_messages[1].message_id == "msg-4"
+    # 1. 触发一次观察并取得 ticket
+    ticket = await coordinator.on_round(
+        task_id="t1",
+        instance_id="inst-coord",
+        conversation=conv,
+        is_subagent=False,
+    )
+    assert ticket is not None
+
+    tracking_before = await coordinator.get(conv.id, is_subagent=False)
+    assert tracking_before.observing is not None
+    assert tracking_before.note_version == 0
+
+    # 2. 模拟替换前调用 await_running，并在后台稍后 complete
+    complete_started = asyncio.Event()
+
+    async def _delayed_complete():
+        await complete_started.wait()
+        await asyncio.sleep(0.05)
+        new_ver = await coordinator.complete(
+            instance_id="inst-coord",
+            conversation_id=conv.id,
+            run_id=ticket.run_id,
+            success=True,
+            covered_until_message_id="m2",
+        )
+        assert new_ver == 1
+
+    complete_task = asyncio.create_task(_delayed_complete())
+    complete_started.set()
+
+    # 此时 await_running 应当阻塞并等待 complete 结束
+    await coordinator.await_running(instance_id="inst-coord", conversation_id=conv.id)
+    await complete_task
+
+    # 3. 验证此时 tracking 已推进到 note_version=1
+    tracking_after = await coordinator.get(conv.id, is_subagent=False)
+    assert tracking_after.observing is None
+    assert tracking_after.note_version == 1
+    assert tracking_after.covered_until_message_id == "m2"
 
 
 @pytest.mark.asyncio
 async def test_d08_skip_swap_when_note_version_is_zero() -> None:
-    """测试 D08: 当 note_version < 1 (无成功快照或存储不可用) 时，拒绝替换，原上下文不丢。"""
+    """测试 D08: 当 tracking.note_version < 1 时，拒绝替换，原上下文不丢。"""
     messages = [
         UniMessage(role=ROLE_USER, content=[TextPart("需求1")], message_id="m1"),
         UniMessage(role=ROLE_ASSISTANT, content=[TextPart("回答1")], message_id="m2"),
     ]
-
-    watermark = TaskNoteWatermark(
-        agent_instance_id="inst-d08",
-        task_id="task-d08",
-        covered_until_seq=0,
-        note_version=0,  # 版本为 0
+    tracking = TaskNoteTracking(
+        version=1,
+        note_version=0,
     )
-
     assembler = TaskNoteContextAssembler()
     swap_res = await assembler.assemble_context(
         messages=messages,
-        watermark=watermark,
-        note_snapshot={},  # 空快照
-        force_swap=True,
+        tracking=tracking,
+        note_snapshot={},
     )
-
     assert swap_res.swapped is False
     assert len(swap_res.messages) == len(messages)
     assert [m.message_id for m in swap_res.messages] == ["m1", "m2"]

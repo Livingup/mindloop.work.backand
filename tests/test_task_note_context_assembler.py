@@ -4,176 +4,172 @@ from __future__ import annotations
 
 import pytest
 
+from agent_runtime.conversation_message.message.models import (
+    ROLE_ASSISTANT,
+    ROLE_USER,
+    TextPart,
+    UniMessage,
+)
 from agent_runtime.task_note.task_note_context_assembler import (
     TaskNoteContextAssembler,
 )
-from agent_runtime.task_note.task_note_models import TaskNoteWatermark
+from agent_runtime.task_note.task_note_models import TaskNoteTracking
 from agent_runtime.task_note.task_note_unit_slicer import TaskNoteUnitSlicer
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_no_swap_when_watermark_zero():
+async def test_assemble_context_no_swap_when_note_version_zero():
+    """当 tracking.note_version < 1 时，不执行替换。"""
     assembler = TaskNoteContextAssembler()
     messages = [
-        {"id": "m1", "role": "user", "content": "你好"},
-        {"id": "m2", "role": "assistant", "content": "你好，有什么可以帮您？"},
+        UniMessage(role=ROLE_USER, content=[TextPart("你好")], message_id="m1"),
+        UniMessage(role=ROLE_ASSISTANT, content=[TextPart("你好，有什么可以帮您？")], message_id="m2"),
     ]
-    wm = TaskNoteWatermark(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        covered_until_seq=0,
+    tracking = TaskNoteTracking(
+        version=1,
+        note_version=0,
+        covered_until_message_id="m2",
     )
 
-    res = await assembler.assemble_context(messages=messages, watermark=wm, force_swap=True)
+    res = await assembler.assemble_context(messages=messages, tracking=tracking)
     assert res.swapped is False
     assert len(res.messages) == 2
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_swaps_prefix_and_preserves_tail():
+async def test_assemble_context_swaps_and_merges_user_tail():
+    """尾部首条是 user 时，合并到该 user 消息，保留原内容且沿用原 message_id。"""
     assembler = TaskNoteContextAssembler()
     messages = [
-        {"id": "m1", "role": "user", "content": "问题一：重构登录"},
-        {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
-        {"id": "m3", "role": "assistant", "content": "继续输出模块设计方案"},
-        {"id": "m4", "role": "user", "content": "确认该方案，继续增加手机号验证码"},
+        UniMessage(role=ROLE_USER, content=[TextPart("问题一：重构登录")], message_id="m1"),
+        UniMessage(role=ROLE_ASSISTANT, content=[TextPart("正在处理登录模块重构")], message_id="m2"),
+        UniMessage(role=ROLE_USER, content=[TextPart("确认该方案，继续增加手机号验证码")], message_id="m3"),
     ]
-    # 水位覆盖到 seq=2 (即 m1 与 m2)
-    wm = TaskNoteWatermark(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        covered_until_seq=2,
-        covered_until_message_id="m2",
+    tracking = TaskNoteTracking(
+        version=1,
         note_version=1,
+        covered_until_message_id="m2",
     )
     fake_snapshot = {
-        "missions": [{"title": "重构登录模块", "status": "completed", "outcome_summary": "登录已完成重构", "pruned_at": "2026-10-12"}],
+        "missions": [
+            {
+                "title": "重构登录模块",
+                "status": "completed",
+                "outcome_summary": "登录已完成重构",
+                "pruned_at": "2026-10-12",
+            }
+        ],
         "progress": {"completed_summary": "完成登录重构", "next_step": "处理手机验证码"},
     }
 
     res = await assembler.assemble_context(
         messages=messages,
-        watermark=wm,
+        tracking=tracking,
         note_snapshot=fake_snapshot,
-        force_swap=True,
     )
 
     assert res.swapped is True
-    assert res.covered_until_seq == 2
-    assert res.tail_message_count == 2    # m3, m4
+    assert res.note_version == 1
+    assert res.tail_message_count == 1  # 尾部是 m3
+    assert res.snapshot_message_id == "m3"  # 沿用原 user 消息 ID
 
-    # 结果包含：1条快照消息 + 2条残差消息 (m3, m4)
-    assert len(res.messages) == 3
-    assert res.messages[0]["is_snapshot"] is True
-    assert "登录已完成重构" in res.messages[0]["content"]
-    assert res.messages[1]["id"] == "m3"
-    assert res.messages[2]["id"] == "m4"
-
-    # 关键验证：将替换后的消息重新送入切片器，验证增量 Token 连续性（快照被完全排除）
-    slicer = TaskNoteUnitSlicer()
-    slice_res = slicer.slice_messages(res.messages, watermark_covered_until_seq=2)
-    # Unit 1 是快照，Unit 2 是 m3，Unit 3 是 m4
-    assert slice_res.all_units[0].is_snapshot is True
-    # 增量只统计未被 watermark 覆盖且非 snapshot 的 Unit
-    assert slice_res.incremental_tokens > 0
-    # 增量 token 仅由 m3 和 m4 贡献，绝对不包含快照字符！
-    assert slice_res.incremental_tokens < 100
+    # 合并后只有 1 条消息（合并了手记的 m3）
+    assert len(res.messages) == 1
+    merged_msg = res.messages[0]
+    assert merged_msg.message_id == "m3"
+    assert len(merged_msg.content) == 2  # [TextPart(手记), TextPart(原内容)]
+    assert "# 任务手记快照 (v1)" in merged_msg.content[0].text
+    assert "登录已完成重构" in merged_msg.content[0].text
+    assert merged_msg.content[1].text == "确认该方案，继续增加手机号验证码"
 
 
 @pytest.mark.asyncio
-async def test_assemble_context_does_not_repeat_swap():
+async def test_assemble_context_swaps_and_creates_snapshot_message_when_tail_is_assistant():
+    """尾部首条不是 user 时，新建独立快照消息放在头部。"""
     assembler = TaskNoteContextAssembler()
     messages = [
-        {"id": "m1", "role": "user", "content": "问题一"},
-        {"id": "m2", "role": "assistant", "content": "回答一"},
+        UniMessage(role=ROLE_USER, content=[TextPart("问题一：重构登录")], message_id="m1"),
+        UniMessage(role=ROLE_ASSISTANT, content=[TextPart("正在处理登录模块重构")], message_id="m2"),
+        UniMessage(role=ROLE_ASSISTANT, content=[TextPart("继续输出模块设计方案")], message_id="m3"),
     ]
-    wm = TaskNoteWatermark(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        covered_until_seq=2,
+    tracking = TaskNoteTracking(
+        version=1,
         note_version=1,
-    )
-
-    # 上次已替换到了 seq=2
-    res = await assembler.assemble_context(
-        messages=messages,
-        watermark=wm,
-        last_swapped_seq=2,
-        force_swap=True,
-    )
-    assert res.swapped is False
-    assert len(res.messages) == 2
-
-
-@pytest.mark.asyncio
-async def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
-    """验证：当业务 Agent 自身总上下文未达系统阈值时，即使后台 Note 已更新，也绝不替换历史。"""
-    assembler = TaskNoteContextAssembler()
-    messages = [
-        {"id": "m1", "role": "user", "content": "问题一：重构登录"},
-        {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
-    ]
-    # 后台 Note 已经更新推进到了 seq=2
-    wm = TaskNoteWatermark(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        covered_until_seq=2,
-        note_version=1,
-    )
-    fake_snapshot = {
-        "missions": [{"title": "重构登录模块", "status": "completed", "outcome_summary": "登录已完成重构"}],
-        "progress": {"completed_summary": "完成登录重构", "next_step": "下一步"},
-    }
-
-    # 设定系统压缩门禁为 50,000 Tokens，而当前对话仅几十 Token
-    res = await assembler.assemble_context(
-        messages=messages,
-        watermark=wm,
-        note_snapshot=fake_snapshot,
-        context_window_threshold=50000,
-    )
-
-    # 核心断言：未达阈值，严禁破坏性替换，保持完整原始会话！
-    assert res.swapped is False
-    assert len(res.messages) == 2
-    assert res.messages[0]["id"] == "m1"
-    assert res.messages[1]["id"] == "m2"
-    assert res.context_window_threshold == 50000
-    assert res.total_tokens < 50000
-
-
-@pytest.mark.asyncio
-async def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
-    """验证：当业务 Agent 自身总上下文达到系统阈值时，消费后台就绪快照进行热替换。"""
-    assembler = TaskNoteContextAssembler()
-    messages = [
-        {"id": "m1", "role": "user", "content": "问题一：重构登录"},
-        {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
-        {"id": "m3", "role": "assistant", "content": "继续输出残差尾部内容"},
-    ]
-    wm = TaskNoteWatermark(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        covered_until_seq=2,
         covered_until_message_id="m2",
-        note_version=1,
     )
     fake_snapshot = {
         "missions": [{"title": "重构登录模块", "status": "completed", "outcome_summary": "登录已完成重构"}],
-        "progress": {"completed_summary": "完成登录重构", "next_step": "下一步"},
+        "progress": {"completed_summary": "完成登录重构", "next_step": "继续输出模块设计方案"},
     }
 
-    # 设定阈值为 10 Tokens（当前消息远超 10 Tokens）
     res = await assembler.assemble_context(
         messages=messages,
-        watermark=wm,
+        tracking=tracking,
         note_snapshot=fake_snapshot,
-        context_window_threshold=10,
     )
 
-    # 核心断言：超过阈值，成功触发热置换！
     assert res.swapped is True
-    assert res.covered_until_seq == 2
-    assert len(res.messages) == 2  # 1条快照 + 1条尾部残差 (m3)
-    assert res.messages[0]["is_snapshot"] is True
-    assert res.messages[1]["id"] == "m3"
+    assert res.note_version == 1
+    assert res.tail_message_count == 1  # m3
+    assert res.snapshot_message_id is not None
+    assert res.snapshot_message_id.startswith("msg_snapshot_v1_")
+
+    assert len(res.messages) == 2  # 快照消息 + m3
+    assert res.messages[0].message_id == res.snapshot_message_id
+    assert "# 任务手记快照 (v1)" in res.messages[0].content[0].text
+    assert res.messages[1].message_id == "m3"
+
+
+@pytest.mark.asyncio
+async def test_assemble_context_consecutive_swaps():
+    """连续两次替换，第二次的尾部恰好是第一次替换之后新增、且未被覆盖的消息。"""
+    assembler = TaskNoteContextAssembler()
+    # 第一次对话：m1 (user), m2 (assistant), m3 (assistant)
+    m1 = UniMessage(role=ROLE_USER, content=[TextPart("任务一")], message_id="m1")
+    m2 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("结果一")], message_id="m2")
+    m3 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("结果一继续")], message_id="m3")
+    messages1 = [m1, m2, m3]
+
+    # 第一次替换：覆盖到 m2
+    tracking1 = TaskNoteTracking(
+        version=1,
+        note_version=1,
+        covered_until_message_id="m2",
+    )
+    fake_snapshot1 = {"missions": [{"title": "任务一", "status": "completed"}]}
+    res1 = await assembler.assemble_context(
+        messages=messages1,
+        tracking=tracking1,
+        note_snapshot=fake_snapshot1,
+    )
+    assert res1.swapped is True
+    snap1_id = res1.snapshot_message_id
+    assert len(res1.messages) == 2  # [snap1, m3]
+
+    # 业务继续推进，产生了 m4 (user), m5 (assistant), m6 (assistant)
+    snap1_msg = res1.messages[0]
+    m4 = UniMessage(role=ROLE_USER, content=[TextPart("任务二")], message_id="m4")
+    m5 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("结果二")], message_id="m5")
+    m6 = UniMessage(role=ROLE_ASSISTANT, content=[TextPart("结果二残差")], message_id="m6")
+    messages2 = [snap1_msg, m3, m4, m5, m6]
+
+    # 第二次观察推进覆盖到了 m5
+    tracking2 = TaskNoteTracking(
+        version=2,
+        note_version=2,
+        covered_until_message_id="m5",
+        snapshot_message_id=snap1_id,
+        prefix_end_message_id=snap1_id,
+    )
+    fake_snapshot2 = {"missions": [{"title": "任务一与二", "status": "completed"}]}
+    res2 = await assembler.assemble_context(
+        messages=messages2,
+        tracking=tracking2,
+        note_snapshot=fake_snapshot2,
+    )
+    assert res2.swapped is True
+    assert res2.note_version == 2
+    # 第二次的尾部恰好是 m5 之后的 m6
+    assert res2.tail_message_count == 1
+    assert len(res2.messages) == 2  # [snap2, m6]
+    assert res2.messages[1].message_id == "m6"

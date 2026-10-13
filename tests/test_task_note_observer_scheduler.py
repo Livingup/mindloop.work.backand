@@ -3,200 +3,212 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
+
 import pytest
 
-from agent_runtime.task_note.task_note_models import TaskNoteWatermark
+from agent_runtime.conversation_message.message.models import (
+    ROLE_ASSISTANT,
+    ROLE_TOOL,
+    ROLE_USER,
+    TextPart,
+    ToolResultPart,
+    ToolUsePart,
+    UniMessage,
+)
+from agent_runtime.task_note.task_note_models import (
+    TaskNoteUnit,
+)
 from agent_runtime.task_note.task_note_observer_scheduler import (
     ObserverSessionInput,
     ObserverSessionResult,
     TaskNoteObserverScheduler,
-    format_units_for_observer,
+    build_observer_user_payload,
+    serialize_units_to_list,
 )
-from agent_runtime.task_note.task_note_store import TaskNoteStore
-from agent_runtime.task_note.task_note_unit_slicer import TaskNoteUnitSlicer
-
-
-class MockTaskNoteStore:
-    def __init__(self):
-        self.watermarks: dict[str, TaskNoteWatermark] = {}
-        self.snapshots: dict[str, dict] = {}
-
-    def get_watermark(self, agent_instance_id: str, task_id: str) -> TaskNoteWatermark:
-        key = f"{agent_instance_id}:{task_id}"
-        if key not in self.watermarks:
-            self.watermarks[key] = TaskNoteWatermark(
-                agent_instance_id=agent_instance_id,
-                task_id=task_id,
-                covered_until_seq=0,
-                note_version=0,
-                inherited_processed=False,
-            )
-        return self.watermarks[key]
-
-    def update_watermark(
-        self,
-        agent_instance_id: str,
-        task_id: str,
-        covered_until_seq: int,
-        covered_until_message_id: str | None = None,
-        note_version_inc: bool = True,
-    ) -> dict:
-        key = f"{agent_instance_id}:{task_id}"
-        wm = self.get_watermark(agent_instance_id, task_id)
-        wm.covered_until_seq = covered_until_seq
-        wm.covered_until_message_id = covered_until_message_id
-        if note_version_inc:
-            wm.note_version += 1
-        return {"covered_until_seq": wm.covered_until_seq, "note_version": wm.note_version}
-
-    def set_inherited_processed(self, agent_instance_id: str, task_id: str) -> bool:
-        wm = self.get_watermark(agent_instance_id, task_id)
-        wm.inherited_processed = True
-        return True
-
-    def get_note_snapshot(self, task_id: str, agent_instance_id: str) -> dict:
-        return {"missions": [], "todos": []}
+from agent_runtime.task_note.task_note_tracking_coordinator import ObserveTicket
 
 
 @pytest.mark.asyncio
-async def test_scheduler_trigger_and_concurrency_lock():
-    store = MockTaskNoteStore()
-    slicer = TaskNoteUnitSlicer(trigger_threshold_tokens=20)
+async def test_scheduler_start_and_cancel_lifecycle():
+    """测试调度器 start 启动后台观察与 cancel 安全取消。"""
+    executed = asyncio.Event()
+    cancelled = asyncio.Event()
 
-    # 模拟耗时 0.2 秒的观察者
     async def slow_runner(session_input: ObserverSessionInput) -> ObserverSessionResult:
-        await asyncio.sleep(0.2)
-        return ObserverSessionResult(
-            success=True,
-            covered_until_seq=session_input.target_seq,
-            note_version=1,
-        )
+        executed.set()
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return ObserverSessionResult(success=True)
 
     scheduler = TaskNoteObserverScheduler(
-        slicer=slicer,
-        store=store,
         observer_runner=slow_runner,
         trigger_threshold_tokens=20,
     )
+    scheduler.store = MagicMock()
+    scheduler.store.get_note_snapshot.return_value = {}
 
-    messages = [
-        {"id": "m1", "role": "user", "content": "问题一" * 20},
-        {"id": "m2", "role": "assistant", "content": "回答一" * 20},
-    ]
-
-    # 1. 首次触发：成功拉起后台观察
-    triggered = await scheduler.check_and_trigger(
-        agent_instance_id="agent-01",
+    ticket = ObserveTicket(
+        run_id="run-01",
         task_id="task-01",
-        messages=messages,
+        agent_instance_id="agent-01",
+        conversation_id="conv-01",
+        messages=[],
+        start_after_message_id=None,
+        end_message_id=None,
+        inherited_until_message_id=None,
+        snapshot_message_id=None,
+        is_subagent=False,
     )
-    assert triggered is True
+
+    task = scheduler.start(ticket)
+    await asyncio.wait_for(executed.wait(), timeout=2.0)
     assert scheduler.is_observer_running("agent-01") is True
 
-    # 2. 并发保护：在运行期间再次尝试触发，应被跳过
-    triggered_again = await scheduler.check_and_trigger(
-        agent_instance_id="agent-01",
-        task_id="task-01",
-        messages=messages,
-    )
-    assert triggered_again is False
-
-    # 3. 等待观察任务完成
-    res = await scheduler.wait_for_observer("agent-01", timeout=1.0)
-    assert res is not None
-    assert res.success is True
-    assert res.covered_until_seq == 2
+    await scheduler.cancel("agent-01")
+    assert cancelled.is_set() is True
     assert scheduler.is_observer_running("agent-01") is False
-
-    # 4. 验证 watermark 已推进
-    wm = store.get_watermark("agent-01", "task-01")
-    assert wm.covered_until_seq == 2
-    assert wm.note_version == 1
 
 
 @pytest.mark.asyncio
-async def test_scheduler_subagent_inherited_marking():
-    store = MockTaskNoteStore()
-    slicer = TaskNoteUnitSlicer(trigger_threshold_tokens=10)
-
+async def test_scheduler_run_sync():
+    """测试调度器 run_sync 同步执行并返回结果。"""
     async def quick_runner(session_input: ObserverSessionInput) -> ObserverSessionResult:
         return ObserverSessionResult(
             success=True,
-            covered_until_seq=session_input.target_seq,
+            covered_until_seq=1,
             note_version=1,
         )
 
     scheduler = TaskNoteObserverScheduler(
-        slicer=slicer,
-        store=store,
         observer_runner=quick_runner,
-        trigger_threshold_tokens=10,
+        trigger_threshold_tokens=20,
     )
+    scheduler.store = MagicMock()
+    scheduler.store.get_note_snapshot.return_value = {}
 
-    messages = [
-        {"id": "m1", "role": "user", "content": "父会话初始化"},
-        {"id": "m_fork", "role": "user", "content": "委派边界"},
-        {"id": "m3", "role": "assistant", "content": "子 Agent 工作中执行详细业务逻辑" * 5},
-    ]
-
-    triggered = await scheduler.check_and_trigger(
-        agent_instance_id="subagent-01",
+    ticket = ObserveTicket(
+        run_id="run-sync-01",
         task_id="task-01",
-        messages=messages,
-        is_subagent=True,
-        fork_message_id="m_fork",
-        delegation_content="请完成子任务",
+        agent_instance_id="agent-sync",
+        conversation_id="conv-01",
+        messages=[],
+        start_after_message_id=None,
+        end_message_id=None,
+        inherited_until_message_id=None,
+        snapshot_message_id=None,
+        is_subagent=False,
     )
-    assert triggered is True
 
-    await scheduler.wait_for_observer("subagent-01", timeout=1.0)
-    wm = store.get_watermark("subagent-01", "task-01")
-    assert wm.inherited_processed is True
+    res = await scheduler.run_sync(ticket)
+    assert res.success is True
+    assert res.note_version == 1
+    assert scheduler.is_observer_running("agent-sync") is False
 
 
 @pytest.mark.asyncio
-async def test_scheduler_invalid_covered_seq_rejected():
-    store = MockTaskNoteStore()
-    slicer = TaskNoteUnitSlicer(trigger_threshold_tokens=10)
+async def test_scheduler_concurrent_multi_instances():
+    """测试两个实例的观察可以并行运行。"""
+    started_1 = asyncio.Event()
+    started_2 = asyncio.Event()
 
-    # 模拟观察者返回非法的已覆盖 seq=0（未能推进）
-    async def bad_runner(session_input: ObserverSessionInput) -> ObserverSessionResult:
-        return ObserverSessionResult(
-            success=True,
-            covered_until_seq=0,
-        )
+    async def concurrent_runner(session_input: ObserverSessionInput) -> ObserverSessionResult:
+        if session_input.agent_instance_id == "inst-1":
+            started_1.set()
+        else:
+            started_2.set()
+        await asyncio.sleep(0.2)
+        return ObserverSessionResult(success=True)
 
     scheduler = TaskNoteObserverScheduler(
-        slicer=slicer,
-        store=store,
-        observer_runner=bad_runner,
+        observer_runner=concurrent_runner,
         trigger_threshold_tokens=10,
     )
+    scheduler.store = MagicMock()
+    scheduler.store.get_note_snapshot.return_value = {}
 
-    messages = [
-        {"id": "m1", "role": "user", "content": "测试指令"},
-        {"id": "m2", "role": "assistant", "content": "测试回复"},
-    ]
-
-    await scheduler.check_and_trigger(
-        agent_instance_id="agent-bad",
-        task_id="task-01",
-        messages=messages,
+    ticket1 = ObserveTicket(
+        run_id="r1", task_id="t1", agent_instance_id="inst-1",
+        conversation_id="c1", messages=[], start_after_message_id=None,
+        end_message_id=None, inherited_until_message_id=None,
+        snapshot_message_id=None, is_subagent=False,
+    )
+    ticket2 = ObserveTicket(
+        run_id="r2", task_id="t1", agent_instance_id="inst-2",
+        conversation_id="c2", messages=[], start_after_message_id=None,
+        end_message_id=None, inherited_until_message_id=None,
+        snapshot_message_id=None, is_subagent=False,
     )
 
-    res = await scheduler.wait_for_observer("agent-bad", timeout=1.0)
-    assert res.success is False
-    # 水位保持为 0，不推进
-    wm = store.get_watermark("agent-bad", "task-01")
-    assert wm.covered_until_seq == 0
+    scheduler.start(ticket1)
+    scheduler.start(ticket2)
+
+    await asyncio.wait_for(started_1.wait(), timeout=1.0)
+    await asyncio.wait_for(started_2.wait(), timeout=1.0)
+
+    assert scheduler.is_observer_running("inst-1") is True
+    assert scheduler.is_observer_running("inst-2") is True
+    assert scheduler.get_running_observer_count() == 2
+
+    await scheduler.cancel("inst-1")
+    await scheduler.cancel("inst-2")
+
+
+def test_serialize_units_to_list_with_tool_use_and_auto_record():
+    """测试 serialize_units_to_list 正确展开 ToolUsePart、ToolResultPart 及提升 auto_record。"""
+    msg_asst = UniMessage(
+        role=ROLE_ASSISTANT,
+        content=[
+            ToolUsePart(name="file_modify", input={"file": "a.py"}, tool_use_id="tu-1"),
+        ],
+        message_id="m-asst",
+    )
+    msg_tool = UniMessage(
+        role=ROLE_TOOL,
+        content=[
+            ToolResultPart(
+                tool_use_ref="tu-1",
+                is_error=False,
+                output={"status": "ok", "auto_record": {"artifact_id": "art-01", "type": "artifact"}},
+            ),
+        ],
+        message_id="m-tool",
+    )
+
+    unit = TaskNoteUnit(
+        seq=1,
+        unit_type="tool_interaction",
+        messages=[msg_asst, msg_tool],
+        token_count=100,
+        end_message_id="m-tool",
+    )
+
+    result_list = serialize_units_to_list([unit])
+    assert len(result_list) == 1
+    u_dict = result_list[0]
+    assert u_dict["seq"] == 1
+    msgs = u_dict["messages"]
+    assert len(msgs) == 2
+
+    # 1. 验证 tool_use
+    asst_part = msgs[0]["tool_use"]
+    assert asst_part["name"] == "file_modify"
+    assert asst_part["id"] == "tu-1"
+    assert asst_part["input"] == {"file": "a.py"}
+
+    # 2. 验证 tool_result
+    tool_part = msgs[1]["tool_result"]
+    assert tool_part["ref"] == "tu-1"
+    assert tool_part["is_error"] is False
+
+    # 3. 验证 auto_record 提升至消息级
+    assert msgs[1]["auto_record"] == {"artifact_id": "art-01", "type": "artifact"}
 
 
 def test_build_observer_user_payload():
-    from agent_runtime.task_note.task_note_models import TaskNoteUnit
-    from agent_runtime.task_note.task_note_observer_scheduler import (
-        build_observer_user_payload,
-    )
-
     unit1 = TaskNoteUnit(
         seq=1,
         unit_type="tool_interaction",
@@ -211,6 +223,8 @@ def test_build_observer_user_payload():
     session_input = ObserverSessionInput(
         task_id="task-test-01",
         agent_instance_id="agent-worker-01",
+        run_id="run-1",
+        conversation_id="conv-1",
         target_seq=1,
         note_snapshot={"missions": [{"title": "实现支付模块", "status": "in_progress"}]},
         incremental_units=[unit1],
@@ -228,4 +242,3 @@ def test_build_observer_user_payload():
     assert "请独立负责支付对接" in payload
     assert "art-999" in payload
     assert "程序底层已自动插入 auto_record" in payload
-    assert "target_seq" not in payload or "seq=1" in payload

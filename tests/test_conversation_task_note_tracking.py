@@ -64,7 +64,7 @@ async def test_conversation_state_task_note_tracking_persistence_and_restart(tmp
 
 @pytest.mark.asyncio
 async def test_conversation_reset_sync(tmp_path: Path):
-    """测试会话重置时跟踪指标置空与 Watermark 重置。"""
+    """测试会话重置时跟踪指标通过 CAS 置空与 Watermark 重置。"""
     repo = SqliteConversationRepository(data_dir=tmp_path)
     conv = create_conversation()
     conv.state.task_note_tracking = {
@@ -79,22 +79,31 @@ async def test_conversation_reset_sync(tmp_path: Path):
         agent_instance_id="inst-reset",
     )
 
-    # 重置会话
+    # 验证 save(conv) 不会覆盖 task_note_tracking
     conv.state.task_note_tracking = None
     await repo.save(conv)
-
-    # 重新加载验证
     reloaded = await repo.get(conv.id)
-    assert reloaded.state.task_note_tracking is None
+    assert reloaded.state.task_note_tracking is not None
+
+    # 通过 CAS 重置 tracking 状态
+    data, version = await repo.get_task_note_tracking(conv.id)
+    ok = await repo.cas_task_note_tracking(conv.id, version, {})
+    assert ok is True
+
+    # 重新加载验证 CAS 更新成功
+    reloaded = await repo.get(conv.id)
+    assert reloaded.state.task_note_tracking == {"version": version + 1}
     repo.close()
 
-    # 验证 TaskNoteStore.reset_watermark 逻辑可用（内存无数据库连接时不抛出异常）
-    store = TaskNoteStore(connection_factory=None)
+    # 验证 TaskNoteStore.reset_watermark 逻辑可用
+    from unittest.mock import MagicMock
+    mock_conn = MagicMock()
+    store = TaskNoteStore(connection_factory=lambda: mock_conn)
     assert store.reset_watermark(agent_instance_id="inst-reset", task_id="task-reset") is True
 
 
 def test_slicer_with_covered_message_id_resilience():
-    """测试即使消息序列发生裁剪或 seq 重新编号，物理 message_id 仍能精确锚定断点。"""
+    """测试即使消息序列发生裁剪，物理 message_id 仍能精确锚定起点。"""
     slicer = TaskNoteUnitSlicer(trigger_threshold_tokens=50)
 
     # 模拟历史消息中包含 msg-cut
@@ -107,12 +116,9 @@ def test_slicer_with_covered_message_id_resilience():
 
     slice_res = slicer.slice_messages(
         messages=messages,
-        watermark_covered_until_seq=999,  # 故意传入已错乱的 seq
-        covered_until_message_id="msg-cut",  # 依靠物理消息 ID 自适应校准
+        start_after_message_id="msg-cut",
     )
 
-    # msg-cut 所在的 Unit seq 应该成为真实基准线
-    assert slice_res.watermark_covered_until_seq == 2
     # 增量只应该包含 msg-new-1 和 msg-new-2
     assert len(slice_res.incremental_units) == 2
     assert slice_res.incremental_units[0].messages[0]["id"] == "msg-new-1"
