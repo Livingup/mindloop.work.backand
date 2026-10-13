@@ -193,22 +193,25 @@ def test_note_tools_execution_zero_redundancy():
     assert res1.output["title"] == "重构登录模块"
     assert "success" not in res1.output
 
+    m_id = res1.output["mission_id"]
+
     # 2. append_mission_prompt
-    res2 = append_mission_prompt(AppendMissionPromptRequest(prompt="用户说增加手机号验证码登录"), ctx)
+    res2 = append_mission_prompt(AppendMissionPromptRequest(mission_id=m_id, prompt="用户说增加手机号验证码登录"), ctx)
     assert "mission_id" in res2.output
     assert res2.output["raw_prompts_count"] >= 1
 
     # 3. update_mission_requirement
-    res3 = update_mission_requirement(UpdateMissionRequirementRequest(refined_requirement="## 需求规格书\n1. 支持手机号验证码"), ctx)
+    res3 = update_mission_requirement(UpdateMissionRequirementRequest(mission_id=m_id, refined_requirement="## 需求规格书\n1. 支持手机号验证码"), ctx)
     assert "mission_id" in res3.output
 
     # 4. update_mission_status
-    res4 = update_mission_status(UpdateMissionStatusRequest(status="in_progress"), ctx)
+    res4 = update_mission_status(UpdateMissionStatusRequest(mission_id=m_id, status="in_progress"), ctx)
     assert "in_progress" in res4.output["message"]
 
     # 5. create_task_workspace_context
     res5 = create_task_workspace_context(
         CreateTaskWorkspaceContextRequest(
+            mission_id=m_id,
             source_type="file",
             path="src/auth.py",
             line_ranges=[LineRange(start_line=10, end_line=30)],
@@ -229,15 +232,15 @@ def test_note_tools_execution_zero_redundancy():
     assert res7.output["deleted_context_id"] == res5.output["context_id"]
 
     # 8. update_task_solution
-    res8 = update_task_solution(UpdateTaskSolutionRequest(solution_content="整体技术架构方案"), ctx)
+    res8 = update_task_solution(UpdateTaskSolutionRequest(mission_id=m_id, solution_content="整体技术架构方案"), ctx)
     assert "solution_id" in res8.output
 
     # 9. supersede_task_solution
-    res9 = supersede_task_solution(SupersedeTaskSolutionRequest(), ctx)
+    res9 = supersede_task_solution(SupersedeTaskSolutionRequest(mission_id=m_id), ctx)
     assert "solution_id" in res9.output
 
     # 10. create_task_decision
-    res10 = create_task_decision(CreateTaskDecisionRequest(decision_content="采用 Redis 缓存 Session", rationale="高并发读需求"), ctx)
+    res10 = create_task_decision(CreateTaskDecisionRequest(mission_id=m_id, decision_content="采用 Redis 缓存 Session", rationale="高并发读需求"), ctx)
     assert "decision_id" in res10.output
 
     # 11. supersede_task_decision
@@ -250,15 +253,18 @@ def test_note_tools_execution_zero_redundancy():
     assert res12.output["decision_id"] == res10.output["decision_id"]
 
     # 13. create_task_todo
-    res13 = create_task_todo(CreateTaskTodoRequest(todo_content="编写单元测试"), ctx)
+    res13 = create_task_todo(CreateTaskTodoRequest(mission_id=m_id, todo_content="编写单元测试"), ctx)
     assert "todo_id" in res13.output
 
     # 14. batch_create_task_todos
     res14 = batch_create_task_todos(
-        BatchCreateTaskTodosRequest(todos=[
-            TodoItemInput(todo_content="任务1", priority=1),
-            TodoItemInput(todo_content="任务2", priority=2),
-        ]),
+        BatchCreateTaskTodosRequest(
+            mission_id=m_id,
+            todos=[
+                TodoItemInput(todo_content="任务1", priority=1),
+                TodoItemInput(todo_content="任务2", priority=2),
+            ],
+        ),
         ctx,
     )
     assert len(res14.output["created_todos"]) == 2
@@ -276,7 +282,7 @@ def test_note_tools_execution_zero_redundancy():
     assert res17.output["deleted_todo_id"] == res13.output["todo_id"]
 
     # 18. create_task_discovery
-    res18 = create_task_discovery(CreateTaskDiscoveryRequest(discovery_content="发现Windows符号链接限制", impact="使用复制代替软链"), ctx)
+    res18 = create_task_discovery(CreateTaskDiscoveryRequest(mission_id=m_id, discovery_content="发现Windows符号链接限制", impact="使用复制代替软链"), ctx)
     assert "discovery_id" in res18.output
 
     # 19. update_task_discovery
@@ -288,7 +294,7 @@ def test_note_tools_execution_zero_redundancy():
     assert res20.output["deleted_discovery_id"] == res18.output["discovery_id"]
 
     # 21. create_task_issue
-    res21 = create_task_issue(CreateTaskIssueRequest(issue_content="连接超时", impact="阻塞调试"), ctx)
+    res21 = create_task_issue(CreateTaskIssueRequest(mission_id=m_id, issue_content="连接超时", impact="阻塞调试"), ctx)
     assert "issue_id" in res21.output
 
     # 22. update_task_issue
@@ -300,7 +306,7 @@ def test_note_tools_execution_zero_redundancy():
     assert res23.output["issue_id"] == res21.output["issue_id"]
 
     # 24. create_task_artifact_other
-    res24 = create_task_artifact_other(CreateTaskArtifactOtherRequest(content="性能评测报告摘要"), ctx)
+    res24 = create_task_artifact_other(CreateTaskArtifactOtherRequest(mission_id=m_id, content="性能评测报告摘要"), ctx)
     assert "artifact_id" in res24.output
 
     # 25. delete_task_artifact_other
@@ -310,6 +316,7 @@ def test_note_tools_execution_zero_redundancy():
     # 26. create_task_validation
     res26 = create_task_validation(
         CreateTaskValidationRequest(
+            mission_id=m_id,
             target_type="requirement",
             validation_method="automated_test",
             validation_scope="登录接口回归测试",
@@ -327,6 +334,7 @@ def test_note_tools_execution_zero_redundancy():
     # 28. create_task_external_state
     res28 = create_task_external_state(
         CreateTaskExternalStateRequest(
+            mission_id=m_id,
             target_type="database",
             target_identifier="pg_dev_db",
             change_content="执行了迁移脚本 002",
@@ -343,6 +351,7 @@ def test_note_tools_execution_zero_redundancy():
     # 30. update_task_progress
     res30 = update_task_progress(
         UpdateTaskProgressRequest(
+            mission_id=m_id,
             completed_summary="完成认证重构",
             current_work="准备集成测试",
             next_step="运行 pytest tests/test_auth.py",
@@ -356,7 +365,7 @@ def test_note_tools_execution_zero_redundancy():
         BindResourcesToMissionRequest(
             resource_type="artifact",
             resource_ids=["art-01", "art-02"],
-            mission_id="mission-01",
+            mission_id=m_id,
         ),
         ctx,
     )
@@ -367,7 +376,7 @@ def test_note_tools_execution_zero_redundancy():
         BindResourcesToMissionRequest(
             resource_type="command",
             resource_ids=["cmd-01", "cmd-02"],
-            mission_id="mission-01",
+            mission_id=m_id,
         ),
         ctx,
     )
@@ -402,3 +411,105 @@ def test_note_tools_execution_zero_redundancy():
     assert res38.loop_control.decision == "complete"
     assert "安全退出" in res38.output["message"]
     assert res38.output["covered_until_seq"] == 15
+
+
+def test_pruned_mission_tool_rejections():
+    """验证当目标任务为已裁剪只读卡片时，所有关联写工具显式拒绝 (D13)。"""
+    from unittest.mock import MagicMock
+    from agent_runtime.task_note.task_note_store import TaskNoteStore, set_task_note_store
+
+    mock_store = MagicMock(spec=TaskNoteStore)
+    err = ValueError("任务已裁剪为卡片，只读")
+    mock_store.append_mission_prompt.side_effect = err
+    mock_store.update_mission_requirement.side_effect = err
+    mock_store.update_mission_status.side_effect = err
+    mock_store.update_mission_prompts.side_effect = err
+    mock_store.update_mission_title.side_effect = err
+    mock_store.create_workspace_context.side_effect = err
+    mock_store.upsert_solution.side_effect = err
+    mock_store.create_decision.side_effect = err
+    mock_store.create_todo.side_effect = err
+    mock_store.batch_create_todos.side_effect = err
+    mock_store.create_discovery.side_effect = err
+    mock_store.create_issue.side_effect = err
+    mock_store.create_artifact_other.side_effect = err
+    mock_store.create_validation.side_effect = err
+    mock_store.create_external_state.side_effect = err
+    mock_store.upsert_progress.side_effect = err
+    mock_store.bind_resources_to_mission.side_effect = err
+
+    set_task_note_store(mock_store)
+    try:
+        ctx = ToolRuntimeContext(task_id="t1", agent_instance_id="a1")
+        pruned_id = "pruned_m"
+
+        res = append_mission_prompt(AppendMissionPromptRequest(mission_id=pruned_id, prompt="新发言"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_mission_requirement(UpdateMissionRequirementRequest(mission_id=pruned_id, refined_requirement="新规格"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_mission_status(UpdateMissionStatusRequest(mission_id=pruned_id, status="completed"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_mission_prompts(UpdateMissionPromptsRequest(mission_id=pruned_id, raw_prompts=["新输入"]), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_mission_title(UpdateMissionTitleRequest(mission_id=pruned_id, title="新标题"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_workspace_context(CreateTaskWorkspaceContextRequest(mission_id=pruned_id, source_type="file"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_task_solution(UpdateTaskSolutionRequest(mission_id=pruned_id, solution_content="新方案"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_decision(CreateTaskDecisionRequest(mission_id=pruned_id, decision_content="新决策", rationale="理由"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_todo(CreateTaskTodoRequest(mission_id=pruned_id, todo_content="新待办"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = batch_create_task_todos(BatchCreateTaskTodosRequest(mission_id=pruned_id, todos=[TodoItemInput(todo_content="新待办")]), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_discovery(CreateTaskDiscoveryRequest(mission_id=pruned_id, discovery_content="发现", impact="影响"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_issue(CreateTaskIssueRequest(mission_id=pruned_id, issue_content="问题", impact="影响"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_artifact_other(CreateTaskArtifactOtherRequest(mission_id=pruned_id, content="产物"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_validation(CreateTaskValidationRequest(mission_id=pruned_id, target_type="requirement", validation_method="automated_test", validation_scope="范围", conclusion="passed", validation_content="通过"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = create_task_external_state(CreateTaskExternalStateRequest(mission_id=pruned_id, target_type="database", target_identifier="db", change_content="变动", current_state="完成"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = update_task_progress(UpdateTaskProgressRequest(mission_id=pruned_id, completed_summary="完成", current_work="进行中", next_step="下一步"), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+
+        res = bind_resources_to_mission(BindResourcesToMissionRequest(mission_id=pruned_id, resource_type="artifact", resource_ids=["art-1"]), ctx)
+        assert res.success is False
+        assert "只读" in (res.error_message or "")
+    finally:
+        set_task_note_store(None)
+

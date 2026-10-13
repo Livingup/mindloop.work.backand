@@ -75,6 +75,45 @@ def _dump_json(val: Any) -> Any:
         return json.dumps(normalized, ensure_ascii=False)
 
 
+def _assert_mission_writable(cur: Any, mission_id: str, agent_instance_id: str) -> None:
+    """断言任务存在、归属于目标 Agent 且未被裁剪，否则抛出异常拒绝写入。"""
+    if not mission_id or not str(mission_id).strip():
+        raise ValueError("缺失必填任务 ID (mission_id)")
+    cur.execute(
+        "SELECT pruned_at, agent_instance_id FROM agent_user_mission WHERE mission_id = %s AND agent_instance_id = %s",
+        (str(mission_id).strip(), agent_instance_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError(f"目标任务不存在: mission_id={mission_id}")
+    pruned_at = row.get("pruned_at") if isinstance(row, dict) else row[0]
+    owner_agent_id = row.get("agent_instance_id") if isinstance(row, dict) else (row[1] if len(row) > 1 else agent_instance_id)
+    if owner_agent_id != agent_instance_id:
+        raise ValueError(f"任务不属于目标 Agent: mission_id={mission_id}")
+    if pruned_at is not None:
+        raise ValueError("任务已裁剪为卡片，只读")
+
+
+def _assert_record_mission_writable(
+    cur: Any,
+    table_name: str,
+    id_col: str,
+    record_id: str,
+    task_id: str,
+    agent_instance_id: str,
+) -> None:
+    """断言待修改/删除的记录所挂载的任务未被裁剪为卡片。"""
+    cur.execute(
+        f"SELECT mission_id FROM {table_name} WHERE task_id = %s AND {id_col} = %s AND agent_instance_id = %s",
+        (task_id, record_id, agent_instance_id),
+    )
+    row = cur.fetchone()
+    if row:
+        mid = row.get("mission_id") if isinstance(row, dict) else row[0]
+        if mid:
+            _assert_mission_writable(cur, mid, agent_instance_id)
+
+
 class TaskNoteStore:
     """Task Note 数据库持久化存储服务。"""
 
@@ -179,6 +218,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE agent_user_mission
@@ -208,6 +248,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE agent_user_mission
@@ -237,6 +278,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE agent_user_mission
@@ -275,6 +317,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE agent_user_mission
@@ -304,6 +347,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE agent_user_mission
@@ -326,38 +370,68 @@ class TaskNoteStore:
         mission_id: str,
         outcome_summary: str,
         keep_record_ids: list[str] | None = None,
-    ) -> bool:
+    ) -> dict[str, Any]:
         """闭环任务卡片化裁剪：清空庞大需求与过程描述，写入结果摘要与裁剪时间，级联清理过程记录。"""
         if self._connection_factory is None:
-            return True
+            return {
+                "mission_id": mission_id,
+                "deleted_count": 0,
+                "kept_count": 0,
+                "message": "存储未启用，跳过裁剪",
+            }
 
         keep_set = set(keep_record_ids or [])
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT status FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
-                        (task_id, agent_instance_id, mission_id),
+                        """
+                        SELECT status, agent_instance_id, pruned_at
+                        FROM agent_user_mission
+                        WHERE task_id = %s AND mission_id = %s
+                        """,
+                        (task_id, mission_id),
                     )
                     row = cur.fetchone()
                     if not row:
-                        logger.warning("prune_mission 目标任务不存在: mission_id=%s", mission_id)
-                        return False
+                        raise ValueError(f"目标任务不存在: mission_id={mission_id}")
 
-                    current_status = row.get("status") if isinstance(row, dict) else row[0]
-                    new_status = current_status if current_status in ("completed", "abandoned") else "completed"
+                    status = row.get("status") if isinstance(row, dict) else row[0]
+                    owner_agent_id = row.get("agent_instance_id") if isinstance(row, dict) else (row[1] if len(row) > 1 else agent_instance_id)
+                    pruned_at = row.get("pruned_at") if isinstance(row, dict) else (row[2] if len(row) > 2 else None)
 
+                    if owner_agent_id != agent_instance_id:
+                        raise ValueError(f"任务不属于目标 Agent: mission_id={mission_id}")
+
+                    if pruned_at is not None:
+                        raise ValueError("任务已裁剪为卡片，只读")
+
+                    if status not in ("completed", "abandoned"):
+                        raise ValueError(f"任务状态为 {status}，仅允许裁剪已闭环任务(completed, abandoned)")
+
+                    # 校验 task_agent_relationships 中该 mission 下不存在 status='unreleased' 的行
+                    cur.execute(
+                        """
+                        SELECT 1 FROM task_agent_relationships
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s AND status = 'unreleased'
+                        LIMIT 1
+                        """,
+                        (task_id, agent_instance_id, mission_id),
+                    )
+                    if cur.fetchone():
+                        raise ValueError("任务存在未释放的子 Agent (status='unreleased')，禁止裁剪")
+
+                    # 同一事务内：写 outcome_summary、pruned_at；清空 raw_prompts、refined_requirement
                     cur.execute(
                         """
                         UPDATE agent_user_mission
                         SET outcome_summary = %s,
                             pruned_at = CURRENT_TIMESTAMP,
-                            status = %s,
                             refined_requirement = NULL,
                             raw_prompts = '[]'::jsonb
                         WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
                         """,
-                        (outcome_summary, new_status, task_id, agent_instance_id, mission_id),
+                        (outcome_summary, task_id, agent_instance_id, mission_id),
                     )
 
                     table_pk_map = [
@@ -373,8 +447,23 @@ class TaskNoteStore:
                         ("task_external_state_records", "external_state_id"),
                     ]
 
+                    deleted_count = 0
+                    kept_count = 0
+
                     for table_name, pk_col in table_pk_map:
                         if keep_set:
+                            cur.execute(
+                                f"""
+                                SELECT COUNT(*) FROM {table_name}
+                                WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                                  AND {pk_col} = ANY(%s)
+                                """,
+                                (task_id, agent_instance_id, mission_id, list(keep_set)),
+                            )
+                            cnt_row = cur.fetchone()
+                            if cnt_row:
+                                kept_count += cnt_row.get("count") if isinstance(cnt_row, dict) else cnt_row[0]
+
                             cur.execute(
                                 f"""
                                 DELETE FROM {table_name}
@@ -391,8 +480,82 @@ class TaskNoteStore:
                                 """,
                                 (task_id, agent_instance_id, mission_id),
                             )
+                        deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                    # 已释放的 task_agent_relationships
+                    if keep_set:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*) FROM task_agent_relationships
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                              AND relationship_id = ANY(%s)
+                            """,
+                            (task_id, agent_instance_id, mission_id, list(keep_set)),
+                        )
+                        cnt_row = cur.fetchone()
+                        if cnt_row:
+                            kept_count += cnt_row.get("count") if isinstance(cnt_row, dict) else cnt_row[0]
+
+                        cur.execute(
+                            """
+                            DELETE FROM task_agent_relationships
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                              AND status = 'released'
+                              AND NOT (relationship_id = ANY(%s))
+                            """,
+                            (task_id, agent_instance_id, mission_id, list(keep_set)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM task_agent_relationships
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                              AND status = 'released'
+                            """,
+                            (task_id, agent_instance_id, mission_id),
+                        )
+                    deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                    # 对应 task_agent_messages
+                    if keep_set:
+                        cur.execute(
+                            """
+                            SELECT COUNT(*) FROM task_agent_messages
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                              AND message_id = ANY(%s)
+                            """,
+                            (task_id, agent_instance_id, mission_id, list(keep_set)),
+                        )
+                        cnt_row = cur.fetchone()
+                        if cnt_row:
+                            kept_count += cnt_row.get("count") if isinstance(cnt_row, dict) else cnt_row[0]
+
+                        cur.execute(
+                            """
+                            DELETE FROM task_agent_messages
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                              AND NOT (message_id = ANY(%s))
+                            """,
+                            (task_id, agent_instance_id, mission_id, list(keep_set)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            DELETE FROM task_agent_messages
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                            """,
+                            (task_id, agent_instance_id, mission_id),
+                        )
+                    deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
                 conn.commit()
-            return True
+
+            return {
+                "mission_id": mission_id,
+                "deleted_count": deleted_count,
+                "kept_count": kept_count,
+                "message": "已完成任务卡片化裁剪，过程细节已安全压缩清理",
+            }
         except Exception as exc:
             logger.error("prune_mission 执行失败: %s", exc)
             raise
@@ -405,72 +568,184 @@ class TaskNoteStore:
         mission_id: str,
         reason: str,
         reassign_to_mission_id: str | None = None,
-    ) -> bool:
+    ) -> dict[str, Any]:
         """物理删除业务任务：支持将挂载的记录转移到目标任务，或直接级联物理删除。"""
         if self._connection_factory is None:
-            return True
+            return {
+                "mission_id": mission_id,
+                "reassigned_count": 0,
+                "deleted_count": 0,
+                "message": f"任务已安全删除 (理由: {reason})",
+            }
 
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT 1 FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
-                        (task_id, agent_instance_id, mission_id),
+                        "SELECT status, agent_instance_id, raw_prompts FROM agent_user_mission WHERE task_id = %s AND mission_id = %s",
+                        (task_id, mission_id),
                     )
-                    if not cur.fetchone():
-                        logger.warning("delete_mission 目标任务不存在: mission_id=%s", mission_id)
-                        return False
+                    row = cur.fetchone()
+                    if not row:
+                        raise ValueError(f"目标任务不存在: mission_id={mission_id}")
+                    status = row.get("status") if isinstance(row, dict) else row[0]
+                    owner_agent_id = row.get("agent_instance_id") if isinstance(row, dict) else (row[1] if len(row) > 1 else agent_instance_id)
+                    src_raw_prompts = row.get("raw_prompts") if isinstance(row, dict) else (row[2] if len(row) > 2 else [])
 
-                    related_tables = [
-                        "task_workspace_context",
-                        "task_solution_content",
-                        "task_decision_records",
-                        "task_todo_items",
-                        "task_progress_content",
-                        "task_discovery_records",
-                        "task_issue_records",
-                        "task_artifact_records",
-                        "task_validation_records",
-                        "task_external_state_records",
-                    ]
+                    if owner_agent_id != agent_instance_id:
+                        raise ValueError(f"任务不属于目标 Agent: mission_id={mission_id}")
 
-                    if reassign_to_mission_id:
+                    reassigned_count = 0
+                    deleted_count = 0
+
+                    if not reassign_to_mission_id:
+                        if status not in ("completed", "abandoned"):
+                            raise ValueError(f"未指定转移目标任务时，仅允许删除已闭环任务 (当前状态: {status})")
+
                         cur.execute(
-                            "SELECT 1 FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
-                            (task_id, agent_instance_id, reassign_to_mission_id),
+                            """
+                            SELECT 1 FROM task_agent_relationships
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s AND status = 'unreleased'
+                            LIMIT 1
+                            """,
+                            (task_id, agent_instance_id, mission_id),
                         )
-                        if not cur.fetchone():
-                            raise ValueError(f"转移目标任务不存在: reassign_to_mission_id={reassign_to_mission_id}")
+                        if cur.fetchone():
+                            raise ValueError("任务存在未释放的子 Agent，禁止删除")
 
-                        for table_name in related_tables:
-                            if table_name in ("task_solution_content", "task_progress_content"):
-                                cur.execute(
-                                    f"DELETE FROM {table_name} WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
-                                    (task_id, agent_instance_id, mission_id),
-                                )
-                            else:
-                                cur.execute(
-                                    f"""
-                                    UPDATE {table_name}
-                                    SET mission_id = %s
-                                    WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
-                                    """,
-                                    (reassign_to_mission_id, task_id, agent_instance_id, mission_id),
-                                )
-                    else:
-                        for table_name in related_tables:
+                        cascade_tables = [
+                            "task_workspace_context",
+                            "task_solution_content",
+                            "task_decision_records",
+                            "task_todo_items",
+                            "task_progress_content",
+                            "task_discovery_records",
+                            "task_issue_records",
+                            "task_artifact_records",
+                            "task_validation_records",
+                            "task_external_state_records",
+                            "task_agent_relationships",
+                            "task_agent_messages",
+                        ]
+                        for table_name in cascade_tables:
                             cur.execute(
                                 f"DELETE FROM {table_name} WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
                                 (task_id, agent_instance_id, mission_id),
                             )
+                            deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
-                    cur.execute(
-                        "DELETE FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
-                        (task_id, agent_instance_id, mission_id),
-                    )
-                conn.commit()
-            logger.info("已成功删除任务: mission_id=%s, reason=%s", mission_id, reason)
-            return True
+                        cur.execute(
+                            "DELETE FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, mission_id),
+                        )
+                        deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                        conn.commit()
+                        logger.info("已成功删除任务: mission_id=%s, reason=%s", mission_id, reason)
+                        return {
+                            "mission_id": mission_id,
+                            "reassigned_count": 0,
+                            "deleted_count": deleted_count,
+                            "message": f"任务已安全删除 (理由: {reason})",
+                        }
+                    else:
+                        if reassign_to_mission_id == mission_id:
+                            raise ValueError("不能转移给任务自身")
+
+                        _assert_mission_writable(cur, reassign_to_mission_id, agent_instance_id)
+
+                        # raw_prompts 按时间顺序并入目标任务
+                        cur.execute(
+                            "SELECT raw_prompts FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, reassign_to_mission_id),
+                        )
+                        dst_row = cur.fetchone()
+                        dst_prompts = dst_row.get("raw_prompts") if isinstance(dst_row, dict) else (dst_row[0] if dst_row else [])
+                        if not isinstance(dst_prompts, list):
+                            dst_prompts = []
+                        if not isinstance(src_raw_prompts, list):
+                            src_raw_prompts = []
+                        merged_prompts = dst_prompts + src_raw_prompts
+                        cur.execute(
+                            """
+                            UPDATE agent_user_mission
+                            SET raw_prompts = %s
+                            WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                            """,
+                            (_dump_json(merged_prompts), task_id, agent_instance_id, reassign_to_mission_id),
+                        )
+
+                        reassign_tables = [
+                            "task_workspace_context",
+                            "task_decision_records",
+                            "task_todo_items",
+                            "task_discovery_records",
+                            "task_issue_records",
+                            "task_artifact_records",
+                            "task_validation_records",
+                            "task_external_state_records",
+                            "task_agent_relationships",
+                            "task_agent_messages",
+                        ]
+                        for table_name in reassign_tables:
+                            cur.execute(
+                                f"""
+                                UPDATE {table_name}
+                                SET mission_id = %s
+                                WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s
+                                """,
+                                (reassign_to_mission_id, task_id, agent_instance_id, mission_id),
+                            )
+                            reassigned_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                        # solution/progress
+                        cur.execute(
+                            "SELECT 1 FROM task_solution_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, reassign_to_mission_id),
+                        )
+                        if cur.fetchone():
+                            cur.execute(
+                                "DELETE FROM task_solution_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                (task_id, agent_instance_id, mission_id),
+                            )
+                            deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                        else:
+                            cur.execute(
+                                "UPDATE task_solution_content SET mission_id = %s WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                (reassign_to_mission_id, task_id, agent_instance_id, mission_id),
+                            )
+                            reassigned_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                        cur.execute(
+                            "SELECT 1 FROM task_progress_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, reassign_to_mission_id),
+                        )
+                        if cur.fetchone():
+                            cur.execute(
+                                "DELETE FROM task_progress_content WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                (task_id, agent_instance_id, mission_id),
+                            )
+                            deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                        else:
+                            cur.execute(
+                                "UPDATE task_progress_content SET mission_id = %s WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                                (reassign_to_mission_id, task_id, agent_instance_id, mission_id),
+                            )
+                            reassigned_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                        cur.execute(
+                            "DELETE FROM agent_user_mission WHERE task_id = %s AND agent_instance_id = %s AND mission_id = %s",
+                            (task_id, agent_instance_id, mission_id),
+                        )
+                        deleted_count += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+                        conn.commit()
+                        logger.info("已成功删除任务: mission_id=%s, reason=%s", mission_id, reason)
+                        return {
+                            "mission_id": mission_id,
+                            "reassigned_count": reassigned_count,
+                            "deleted_count": deleted_count,
+                            "message": f"任务已安全删除并转移记录至 {reassign_to_mission_id} (理由: {reason})",
+                        }
         except Exception as exc:
             logger.error("delete_mission 执行失败: %s", exc)
             raise
@@ -505,6 +780,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_workspace_context (
@@ -573,6 +849,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_workspace_context", "context_id", context_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_workspace_context SET
@@ -628,6 +905,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_workspace_context", "context_id", context_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_workspace_context
@@ -659,6 +937,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_solution_content (
@@ -702,6 +981,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_solution_content
@@ -740,6 +1020,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_decision_records (
@@ -783,6 +1064,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_decision_records", "decision_id", decision_id, task_id, agent_instance_id)
                     if superseded_reason is not None:
                         cur.execute(
                             """
@@ -826,6 +1108,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_decision_records", "decision_id", decision_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_decision_records SET
@@ -863,6 +1146,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_todo_items (
@@ -913,6 +1197,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     for item in todos:
                         tid = _generate_id("todo")
                         content = item.get("todo_content", "")
@@ -952,6 +1237,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_todo_items
@@ -982,6 +1268,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_todo_items SET
@@ -1011,6 +1298,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_todo_items
@@ -1047,6 +1335,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_progress_content (
@@ -1112,6 +1401,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_discovery_records (
@@ -1165,6 +1455,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_discovery_records", "discovery_id", discovery_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_discovery_records SET
@@ -1210,6 +1501,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_discovery_records", "discovery_id", discovery_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_discovery_records
@@ -1248,6 +1540,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_issue_records (
@@ -1303,6 +1596,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_issue_records", "issue_id", issue_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_issue_records SET
@@ -1351,6 +1645,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_issue_records", "issue_id", issue_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_issue_records
@@ -1384,6 +1679,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_artifact_records (
@@ -1423,6 +1719,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_artifact_records", "artifact_id", artifact_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_artifact_records
@@ -1452,6 +1749,18 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT mission_id
+                        FROM task_artifact_records
+                        WHERE task_id = %s AND agent_instance_id = %s AND artifact_id = ANY(%s) AND mission_id IS NOT NULL
+                        """,
+                        (task_id, agent_instance_id, list(artifact_ids)),
+                    )
+                    for r in cur.fetchall():
+                        mid = r.get("mission_id") if isinstance(r, dict) else r[0]
+                        if mid:
+                            _assert_mission_writable(cur, mid, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_artifact_records
@@ -1494,6 +1803,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_validation_records (
@@ -1553,6 +1863,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_validation_records", "validation_id", validation_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_validation_records SET
@@ -1608,6 +1919,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
                         """
                         INSERT INTO task_external_state_records (
@@ -1659,6 +1971,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_record_mission_writable(cur, "task_external_state_records", "external_state_id", external_state_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         UPDATE task_external_state_records SET
@@ -1707,6 +2020,7 @@ class TaskNoteStore:
         try:
             with self._connection_factory() as conn:
                 with conn.cursor() as cur:
+                    _assert_mission_writable(cur, mission_id, agent_instance_id)
                     if resource_type in ("artifact", "artifacts"):
                         cur.execute(
                             """

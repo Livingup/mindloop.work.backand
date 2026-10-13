@@ -473,3 +473,42 @@ def test_format_task_note_skips_empty_sections():
     assert "*(当前暂无持久化任务手记记录)*" in empty_md
 
 
+def test_format_task_note_pruned_mission_card():
+    """测试已裁剪为卡片的任务在 Markdown 中精简渲染为结果卡片 (D14)。"""
+    snapshot = {
+        "task_id": "task_pruned_01",
+        "agent_instance_id": "agent_worker_01",
+        "missions": [
+            {
+                "mission_id": "m_active",
+                "title": "正在进行的业务任务",
+                "status": "in_progress",
+                "refined_requirement": "规格说明书",
+                "raw_prompts": ["请实现登录功能"],
+            },
+            {
+                "mission_id": "m_pruned",
+                "title": "已完成的前置调研任务",
+                "status": "completed",
+                "outcome_summary": "技术选型完毕，确定采用方案B并完成PoC验证",
+                "pruned_at": "2026-10-13T01:00:00Z",
+                "refined_requirement": "被裁剪掉的冗长规格书（不应出现在输出中）",
+            },
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 验证活跃任务正常渲染详细规格
+    assert "### Mission: 正在进行的业务任务" in md
+    assert "- **精炼业务需求**:\n  规格说明书" in md
+
+    # 验证裁剪任务渲染为交付结果卡片，并包含 outcome_summary
+    assert "### 📦 [交付结果卡片] 已完成的前置调研任务 (ID: `m_pruned`, 状态: `completed`)" in md
+    assert "- **交付结论与总结**: 技术选型完毕，确定采用方案B并完成PoC验证" in md
+
+    # 验证裁剪任务的旧详细规格不会泄漏输出
+    assert "被裁剪掉的冗长规格书" not in md
+
+
+

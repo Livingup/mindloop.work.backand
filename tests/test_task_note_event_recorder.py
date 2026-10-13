@@ -118,13 +118,14 @@ def test_record_subagent_relationship(mock_db: Any) -> None:
     cur, conn, factory = mock_db
     recorder = TaskNoteEventRecorder(connection_factory=factory)
 
-    ok = recorder.record_subagent_relationship(
+    rel_id = recorder.record_subagent_relationship(
         task_id="task-1",
         parent_instance_id="inst-parent",
         child_instance_id="inst-child",
     )
 
-    assert ok is True
+    assert rel_id is not None
+    assert str(rel_id).startswith("rel_")
     assert conn.committed is True
     # 2 rows: parent view and child view
     assert len(cur.executed) == 2
@@ -134,7 +135,9 @@ def test_record_subagent_relationship(mock_db: Any) -> None:
     assert p1[3] == "inst-parent"
     assert p1[4] == "child"
     assert p1[5] == "inst-child"
-    assert p1[6] == "unreleased"
+    assert p1[6] is None  # delegation_content
+    assert p1[7] is None  # fork_message_id
+    assert p1[8] == "unreleased"
 
     q2, p2 = cur.executed[1]
     assert p2[1] == "task-1"
@@ -142,7 +145,9 @@ def test_record_subagent_relationship(mock_db: Any) -> None:
     assert p2[3] == "inst-child"
     assert p2[4] == "parent"
     assert p2[5] == "inst-parent"
-    assert p2[6] == "unreleased"
+    assert p2[6] is None  # delegation_content
+    assert p2[7] is None  # fork_message_id
+    assert p2[8] == "unreleased"
 
 
 def test_record_agent_message(mock_db: Any) -> None:
@@ -211,7 +216,7 @@ def test_safe_tolerance_on_exception() -> None:
     # None of these should raise exceptions
     assert recorder.record_file_artifact(task_id="t", agent_instance_id="i", op_type="create") is None
     assert recorder.record_terminal_command(task_id="t", agent_instance_id="i", command_id="c", command_line="ls") is False
-    assert recorder.record_subagent_relationship(task_id="t", parent_instance_id="p", child_instance_id="c") is False
+    assert recorder.record_subagent_relationship(task_id="t", parent_instance_id="p", child_instance_id="c") is None
     assert recorder.record_agent_message(task_id="t", from_instance_id="p", to_instance_id="c", target_agent_type="child", message="m") is False
     assert recorder.record_remote_agent_message(task_id="t", agent_instance_id="i", remote_agent_instance_id="r", message_type="send", message="m") is False
 
@@ -548,6 +553,8 @@ async def test_subagent_tool_hooks() -> None:
             task_id="task-1",
             parent_instance_id="inst-parent",
             child_instance_id="inst-child-001",
+            delegation_content="Start working on module A",
+            fork_message_id=None,
         )
         mock_recorder.async_record_agent_message.assert_awaited_once_with(
             task_id="task-1",

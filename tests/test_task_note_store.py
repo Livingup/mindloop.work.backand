@@ -103,6 +103,30 @@ class MockCursor:
         self.executed_statements.append((sql.strip(), params or ()))
 
     def fetchone(self):
+        if not self.executed_statements:
+            return ("sol_test_123",)
+        last_sql, last_params = self.executed_statements[-1]
+        norm_sql = " ".join(last_sql.split())
+        if "pruned_at, agent_instance_id" in norm_sql:
+            mid = last_params[0] if last_params else ""
+            aid = last_params[1] if len(last_params) > 1 else "a1"
+            if "pruned" in str(mid):
+                return ("2026-10-13T00:00:00Z", aid)
+            return (None, aid)
+        if "status, agent_instance_id, pruned_at" in norm_sql:
+            return ("completed", "a1", None)
+        if "status, raw_prompts, agent_instance_id" in norm_sql or "status, raw_prompts" in norm_sql:
+            return ("completed", [], "a1")
+        if "status = 'unreleased'" in norm_sql:
+            return None
+        if "SELECT mission_id FROM" in norm_sql:
+            return ("m1",)
+        if "raw_prompts FROM" in norm_sql:
+            return ([],)
+        if "SELECT COUNT(*)" in norm_sql:
+            return (0,)
+        if "SELECT 1 FROM" in norm_sql:
+            return None
         return ("sol_test_123",)
 
     def fetchall(self):
@@ -471,7 +495,7 @@ def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -
     # 1. 验证 delete_artifact_other 严格限定 type = 'other'，杜绝误删 file_*
     executed.clear()
     store.delete_artifact_other(task_id="t_iso", agent_instance_id="a_iso", artifact_id="art_other_01")
-    assert len(executed) == 1
+    assert len(executed) >= 1
     del_sql, del_params = executed[-1]
     assert "DELETE FROM task_artifact_records" in del_sql
     assert "WHERE task_id = %s AND artifact_id = %s AND agent_instance_id = %s AND type = 'other'" in del_sql
@@ -480,7 +504,7 @@ def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -
     # 2. 验证 upsert_solution 的 UPSERT 包含 task_id = EXCLUDED.task_id
     executed.clear()
     store.upsert_solution(task_id="t_iso", agent_instance_id="a_iso", mission_id="m_iso", solution_content="方案内容")
-    assert len(executed) == 1
+    assert len(executed) >= 1
     sol_sql, _ = executed[-1]
     assert "ON CONFLICT (mission_id, agent_instance_id)" in sol_sql
     assert "task_id = EXCLUDED.task_id" in sol_sql
@@ -495,7 +519,7 @@ def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -
         current_work="进行",
         next_step="下一步",
     )
-    assert len(executed) == 1
+    assert len(executed) >= 1
     prog_sql, _ = executed[-1]
     assert "ON CONFLICT (mission_id, agent_instance_id)" in prog_sql
     assert "task_id = EXCLUDED.task_id" in prog_sql
@@ -528,8 +552,8 @@ def test_phase1_store_extensions(mock_db: Any):
         mission_id="m1",
         raw_prompts=["用户诉求1", "用户诉求2"],
     )
-    assert len(executed) == 1
-    sql, params = executed[0]
+    assert len(executed) >= 1
+    sql, params = executed[-1]
     assert "UPDATE agent_user_mission" in sql
     assert "SET raw_prompts = %s" in sql
     assert params[1:] == ("t1", "m1", "a1")
@@ -542,8 +566,8 @@ def test_phase1_store_extensions(mock_db: Any):
         mission_id="m1",
         title="全新标题",
     )
-    assert len(executed) == 1
-    sql, params = executed[0]
+    assert len(executed) >= 1
+    sql, params = executed[-1]
     assert "SET title = %s" in sql
     assert params == ("全新标题", "t1", "m1", "a1")
 
@@ -581,8 +605,8 @@ def test_phase1_store_extensions(mock_db: Any):
         agent_instance_id="a1",
         artifact_ids=["art-1", "art-2"],
     )
-    assert len(executed) == 1
-    sql, params = executed[0]
+    assert len(executed) >= 1
+    sql, params = executed[-1]
     assert "DELETE FROM task_artifact_records" in sql
     assert "artifact_id = ANY(%s)" in sql
     assert params == ("t1", "a1", ["art-1", "art-2"])
@@ -606,5 +630,57 @@ def test_phase1_store_extensions(mock_db: Any):
     assert len(executed) == 1
     sql, _ = executed[0]
     assert "inherited_processed = TRUE" in sql
+
+
+def test_store_pruned_mission_readonly_rejection(mock_db: Any):
+    """测试已裁剪为卡片的任务，其关联写操作被全部拒绝 (D13)。"""
+    store, _ = mock_db
+    pruned_id = "pruned_mission_001"
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, prompt="新要求")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.update_mission_requirement(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, refined_requirement="新规格")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.update_mission_status(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, status="completed")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_workspace_context(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", source_type="file")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.upsert_solution(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", solution_content="方案")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_decision(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", decision_content="决策", rationale="理由")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_todo(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", todo_content="待办")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.batch_create_todos(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", todos=[{"todo_content": "待办1"}])
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.upsert_progress(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", completed_summary="已完成", current_work="进行中", next_step="下一步")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_discovery(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", discovery_content="发现", impact="影响")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_issue(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", issue_content="问题", impact="影响")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_artifact_other(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", artifact_type="report", content="产物")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_validation(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", target_type="requirement", validation_method="automated_test", validation_scope="范围", conclusion="passed", validation_content="通过", source_type="test")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_external_state(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", target_type="database", target_identifier="db1", change_content="改动", current_state="状态")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, resource_type="artifact", resource_ids=["art-1"])
+
 
 

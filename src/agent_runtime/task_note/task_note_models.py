@@ -62,21 +62,21 @@ class CreateMissionRequest(BaseToolRequest):
 class AppendMissionPromptRequest(BaseToolRequest):
     """向任务增量追加用户发言或委派指令请求。"""
 
-    mission_id: str | None = Field(default=None, description="目标任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
     prompt: str = Field(min_length=1, description="新增的用户发言或委派指令（支持在保持核心含义与需求不变的前提下优化措辞，使需求描述更清晰明确）。")
 
 
 class UpdateMissionRequirementRequest(BaseToolRequest):
     """全量覆盖更新任务正式需求规格书请求。"""
 
-    mission_id: str | None = Field(default=None, description="目标任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
     refined_requirement: str = Field(min_length=1, description="经提炼后的最新正式需求规格、架构硬约束与验收标准全量文本。")
 
 
 class UpdateMissionStatusRequest(BaseToolRequest):
     """推进任务生命周期状态请求。"""
 
-    mission_id: str | None = Field(default=None, description="目标任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="目标任务 ID。")
     status: MissionStatus = Field(description="目标任务状态；可选值仅限 pending、in_progress、completed、abandoned。")
 
 
@@ -115,7 +115,7 @@ class DeleteMissionRequest(BaseToolRequest):
 class CreateTaskWorkspaceContextRequest(BaseToolRequest):
     """增量创建任务背景素材记录请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     source_type: ContextSourceType = Field(description="素材来源类型；可选值仅限 file、directory、web_search、url_context、terminal、other。")
     description: str | None = Field(default=None, description="说明该素材为何与当前任务强相关。")
     path: str | None = Field(default=None, description="文件或目录的绝对路径（source_type 为 file/directory 时使用）。")
@@ -159,14 +159,14 @@ class DeleteTaskWorkspaceContextRequest(BaseToolRequest):
 class UpdateTaskSolutionRequest(BaseToolRequest):
     """全量覆盖当前工人宏观方案快照请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     solution_content: str = Field(min_length=1, description="实施思路、技术架构与主要步骤全量文本。")
 
 
 class SupersedeTaskSolutionRequest(BaseToolRequest):
     """标记软废弃当前工人宏观方案快照请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
 
 
 # ── 4. 关键决策记录维护工具模型 (task_decision_records) ────────────
@@ -174,7 +174,7 @@ class SupersedeTaskSolutionRequest(BaseToolRequest):
 class CreateTaskDecisionRequest(BaseToolRequest):
     """增量记录技术决策与架构取舍请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     decision_content: str = Field(min_length=1, description="采纳的技术选型、架构取舍或锁定决定。")
     rationale: str = Field(min_length=1, description="采纳该选择的核心技术理由与收益。")
     alternatives: str | None = Field(default=None, description="权衡并被放弃的备选方案说明。")
@@ -203,7 +203,7 @@ class UpdateTaskDecisionRequest(BaseToolRequest):
 class CreateTaskTodoRequest(BaseToolRequest):
     """增量创建单条待办工作项请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     todo_content: str = Field(min_length=1, description="计划执行的工作内容。")
     priority: int = Field(default=1, ge=1, le=100, description="优先级序号；越小越优先，默认为 1。")
 
@@ -211,7 +211,7 @@ class CreateTaskTodoRequest(BaseToolRequest):
 class BatchCreateTaskTodosRequest(BaseToolRequest):
     """批量创建多条待办工作项请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     todos: list[TodoItemInput] = Field(min_length=1, description="待创建的工作项列表，每项包含 todo_content 和 priority。")
 
 
@@ -241,7 +241,7 @@ class DeleteTaskTodoRequest(BaseToolRequest):
 class CreateTaskDiscoveryRequest(BaseToolRequest):
     """增量沉淀客观认知真相与避坑经验请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     discovery_content: str = Field(min_length=1, description="探索中证实的新认知事实、系统限制、失败原因或反模式。")
     impact: str = Field(min_length=1, description="该发现对后续方案设计与代码实现的影响。")
     source_type: str | None = Field(default=None, description="证据来源类型（如 file, terminal, web_search 等）。")
@@ -275,7 +275,7 @@ class DeleteTaskDiscoveryRequest(BaseToolRequest):
 class CreateTaskIssueRequest(BaseToolRequest):
     """增量登记故障报错、未闭环阻塞事项请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     issue_content: str = Field(min_length=1, description="未闭环的具体故障报错、依赖缺失或阻碍事项。")
     impact: str = Field(min_length=1, description="该问题造成的影响。")
     status: Literal["open", "in_progress", "blocked"] = Field(default="open", description="初始问题状态，默认为 open。")
@@ -307,7 +307,7 @@ class ResolveTaskIssueRequest(BaseToolRequest):
 class CreateTaskArtifactOtherRequest(BaseToolRequest):
     """登记非文件类通用交付成果与计算结论请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     content: str = Field(min_length=1, description="通用交付成果内容、计算报告摘要或数据引用。")
 
 
@@ -328,7 +328,7 @@ class DeleteTaskArtifactOtherRequest(BaseToolRequest):
 class CreateTaskValidationRequest(BaseToolRequest):
     """增量记录测试、构建、静态扫描或人工验收结论请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     target_type: ValidationTargetType = Field(description="验证目标类型；可选值仅限 requirement、todo、artifact、external_state、other。")
     target_record_id: str | None = Field(default=None, description="关联的具体目标记录 ID（如 todo_id、artifact_id）。")
     validation_method: ValidationMethod = Field(description="验证方式；可选值仅限 automated_test、build、static_check、manual_check、user_acceptance。")
@@ -356,7 +356,7 @@ class UpdateTaskValidationRequest(BaseToolRequest):
 class CreateTaskExternalStateRequest(BaseToolRequest):
     """登记对外部持久化环境真实改变请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     target_type: ExternalStateTargetType = Field(description="外部目标类型；可选值仅限 environment、service、database、external_api、process、other。")
     target_identifier: str = Field(min_length=1, description="目标标识（如数据库名、容器名、服务名）。")
     change_content: str = Field(min_length=1, description="发生的具体持久改变内容。")
@@ -380,7 +380,7 @@ class UpdateTaskExternalStateRequest(BaseToolRequest):
 class UpdateTaskProgressRequest(BaseToolRequest):
     """覆盖生成唯一恢复快照与即刻下一步（PC 指针）请求。"""
 
-    mission_id: str | None = Field(default=None, description="归属任务 ID；缺省不传时默认绑定当前活跃任务。")
+    mission_id: str = Field(min_length=1, description="归属任务 ID。")
     completed_summary: str = Field(min_length=1, description="有证据支持的已完成工作高密度总结。")
     current_work: str = Field(min_length=1, description="当前正在微观处理的具体动作/断点指针。")
     next_step: str = Field(min_length=1, description="唤醒后执行的第一个具体动作，必须明确拟调用的工具与关键入参。")

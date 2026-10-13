@@ -249,10 +249,11 @@ def format_task_note_to_markdown(
             mid = m.get("mission_id", f"m_{idx}")
             title = m.get("title", "(无标题任务)")
             st = m.get("status", "active")
-            outcome_summary = m.get("outcome_summary")
             pruned_at = m.get("pruned_at")
-            if outcome_summary and pruned_at:
-                m_lines.append(f"### 📦 [交付结果卡片] {title} (ID: `{mid}`, 状态: `{st}`)\n- **交付结论与总结**: {outcome_summary}")
+            outcome_summary = m.get("outcome_summary")
+            if pruned_at:
+                summary_text = outcome_summary or "已闭环"
+                m_lines.append(f"### 📦 [交付结果卡片] {title} (ID: `{mid}`, 状态: `{st}`)\n- **交付结论与总结**: {summary_text}")
                 continue
 
             refined = m.get("refined_requirement", "")

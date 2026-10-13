@@ -65,10 +65,10 @@ logger = logging.getLogger("agent_runtime.task_note.tool")
 
 
 def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
-    """解析目标 mission_id；未显式传递时使用当前上下文默认任务。"""
+    """解析目标 mission_id；缺失或空白时直接抛出 ValueError 拒绝。"""
     if mission_id and mission_id.strip():
         return mission_id.strip()
-    return f"mission-default-{ctx.task_id or 'main'}"
+    raise ValueError("缺失必填任务 ID (mission_id)，请指定所属业务任务")
 
 
 def _normalize_line_ranges(line_ranges: Any) -> list[dict[str, Any]] | None:

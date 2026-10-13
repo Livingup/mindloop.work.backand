@@ -183,7 +183,8 @@ class TaskNoteSnapshotService:
                         "agent_user_mission",
                         """
                         SELECT mission_id, task_id, scene_id, agent_instance_id, title,
-                               raw_prompts, refined_requirement, status, sort_order, created_at
+                               raw_prompts, refined_requirement, status, sort_order,
+                               outcome_summary, pruned_at, created_at
                         FROM agent_user_mission
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY sort_order ASC, created_at ASC
