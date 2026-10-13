@@ -2044,6 +2044,7 @@ class TaskNoteStore:
         self,
         *,
         agent_instance_id: str,
+        task_id: str | None = None,
     ) -> dict[str, Any] | None:
         """获取指定业务 Agent 实例的最新观察断点记录。"""
         try:

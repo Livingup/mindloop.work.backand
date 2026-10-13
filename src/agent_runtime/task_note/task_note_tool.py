@@ -14,6 +14,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from agent_runtime.task_note.task_note_observer_binding import (
+    get_current_observer_binding,
+    resolve_note_tool_target,
+)
+
 from agent_runtime.task_note.task_note_models import (
     AppendMissionPromptRequest,
     BatchCreateTaskTodosRequest,
@@ -105,9 +110,7 @@ def _normalize_line_ranges(line_ranges: Any) -> list[dict[str, Any]] | None:
 )
 def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
-    scene_id = getattr(ctx, "scene_id", None) or f"scene-{task_id}"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         mission_id = store.create_mission(
             task_id=task_id,
@@ -152,8 +155,7 @@ def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> Ba
 def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.append_mission_prompt(
             task_id=task_id,
@@ -193,8 +195,7 @@ def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeC
 def update_mission_requirement(request: UpdateMissionRequirementRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_mission_requirement(
             task_id=task_id,
@@ -233,8 +234,7 @@ def update_mission_requirement(request: UpdateMissionRequirementRequest, ctx: To
 def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_mission_status(
             task_id=task_id,
@@ -274,8 +274,7 @@ def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeC
 def update_mission_prompts(request: UpdateMissionPromptsRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_mission_prompts(
             task_id=task_id,
@@ -315,8 +314,7 @@ def update_mission_prompts(request: UpdateMissionPromptsRequest, ctx: ToolRuntim
 def update_mission_title(request: UpdateMissionTitleRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_mission_title(
             task_id=task_id,
@@ -356,8 +354,7 @@ def update_mission_title(request: UpdateMissionTitleRequest, ctx: ToolRuntimeCon
 def prune_mission(request: PruneMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         ok = store.prune_mission(
             task_id=task_id,
@@ -407,8 +404,7 @@ def prune_mission(request: PruneMissionRequest, ctx: ToolRuntimeContext) -> Base
 def delete_mission(request: DeleteMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         ok = store.delete_mission(
             task_id=task_id,
@@ -459,8 +455,7 @@ def delete_mission(request: DeleteMissionRequest, ctx: ToolRuntimeContext) -> Ba
 def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         context_id = store.create_workspace_context(
             task_id=task_id,
@@ -511,8 +506,7 @@ def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ct
 )
 def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_workspace_context(
             task_id=task_id,
@@ -560,8 +554,7 @@ def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ct
 )
 def delete_task_workspace_context(request: DeleteTaskWorkspaceContextRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.delete_workspace_context(
             task_id=task_id,
@@ -601,8 +594,7 @@ def delete_task_workspace_context(request: DeleteTaskWorkspaceContextRequest, ct
 def update_task_solution(request: UpdateTaskSolutionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         solution_id = store.upsert_solution(
             task_id=task_id,
@@ -642,8 +634,7 @@ def update_task_solution(request: UpdateTaskSolutionRequest, ctx: ToolRuntimeCon
 def supersede_task_solution(request: SupersedeTaskSolutionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         solution_id = store.supersede_solution(
             task_id=task_id,
@@ -684,8 +675,7 @@ def supersede_task_solution(request: SupersedeTaskSolutionRequest, ctx: ToolRunt
 def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         decision_id = store.create_decision(
             task_id=task_id,
@@ -728,8 +718,7 @@ def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeCon
 )
 def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.supersede_decision(
             task_id=task_id,
@@ -769,8 +758,7 @@ def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRunt
 )
 def update_task_decision(request: UpdateTaskDecisionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_decision(
             task_id=task_id,
@@ -814,8 +802,7 @@ def update_task_decision(request: UpdateTaskDecisionRequest, ctx: ToolRuntimeCon
 def create_task_todo(request: CreateTaskTodoRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         todo_id = store.create_todo(
             task_id=task_id,
@@ -858,8 +845,7 @@ def create_task_todo(request: CreateTaskTodoRequest, ctx: ToolRuntimeContext) ->
 def batch_create_task_todos(request: BatchCreateTaskTodosRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         todos_payload = [
             {
@@ -905,8 +891,7 @@ def batch_create_task_todos(request: BatchCreateTaskTodosRequest, ctx: ToolRunti
 )
 def update_task_todo_status(request: UpdateTaskTodoStatusRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_todo_status(
             task_id=task_id,
@@ -945,8 +930,7 @@ def update_task_todo_status(request: UpdateTaskTodoStatusRequest, ctx: ToolRunti
 )
 def update_task_todo_content(request: UpdateTaskTodoContentRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_todo_content(
             task_id=task_id,
@@ -985,8 +969,7 @@ def update_task_todo_content(request: UpdateTaskTodoContentRequest, ctx: ToolRun
 )
 def delete_task_todo(request: DeleteTaskTodoRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.delete_todo(
             task_id=task_id,
@@ -1026,8 +1009,7 @@ def delete_task_todo(request: DeleteTaskTodoRequest, ctx: ToolRuntimeContext) ->
 def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         discovery_id = store.create_discovery(
             task_id=task_id,
@@ -1072,8 +1054,7 @@ def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeC
 )
 def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_discovery(
             task_id=task_id,
@@ -1117,8 +1098,7 @@ def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeC
 )
 def delete_task_discovery(request: DeleteTaskDiscoveryRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.delete_discovery(
             task_id=task_id,
@@ -1158,8 +1138,7 @@ def delete_task_discovery(request: DeleteTaskDiscoveryRequest, ctx: ToolRuntimeC
 def create_task_issue(request: CreateTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         issue_id = store.create_issue(
             task_id=task_id,
@@ -1206,8 +1185,7 @@ def create_task_issue(request: CreateTaskIssueRequest, ctx: ToolRuntimeContext) 
 )
 def update_task_issue(request: UpdateTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_issue(
             task_id=task_id,
@@ -1248,8 +1226,7 @@ def update_task_issue(request: UpdateTaskIssueRequest, ctx: ToolRuntimeContext) 
 )
 def resolve_task_issue(request: ResolveTaskIssueRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.resolve_issue(
             task_id=task_id,
@@ -1291,8 +1268,7 @@ def resolve_task_issue(request: ResolveTaskIssueRequest, ctx: ToolRuntimeContext
 def create_task_artifact_other(request: CreateTaskArtifactOtherRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         artifact_id = store.create_artifact_other(
             task_id=task_id,
@@ -1332,8 +1308,7 @@ def create_task_artifact_other(request: CreateTaskArtifactOtherRequest, ctx: Too
 )
 def delete_task_artifact(request: DeleteTaskArtifactRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         deleted_count = store.delete_task_artifacts(
             task_id=task_id,
@@ -1374,8 +1349,7 @@ def delete_task_artifact(request: DeleteTaskArtifactRequest, ctx: ToolRuntimeCon
 def create_task_validation(request: CreateTaskValidationRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         validation_id = store.create_validation(
             task_id=task_id,
@@ -1424,8 +1398,7 @@ def create_task_validation(request: CreateTaskValidationRequest, ctx: ToolRuntim
 )
 def update_task_validation(request: UpdateTaskValidationRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_validation(
             task_id=task_id,
@@ -1468,8 +1441,7 @@ def update_task_validation(request: UpdateTaskValidationRequest, ctx: ToolRuntim
 def create_task_external_state(request: CreateTaskExternalStateRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         external_state_id = store.create_external_state(
             task_id=task_id,
@@ -1513,8 +1485,7 @@ def create_task_external_state(request: CreateTaskExternalStateRequest, ctx: Too
 )
 def update_task_external_state(request: UpdateTaskExternalStateRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         store.update_external_state(
             task_id=task_id,
@@ -1557,8 +1528,7 @@ def update_task_external_state(request: UpdateTaskExternalStateRequest, ctx: Too
 def update_task_progress(request: UpdateTaskProgressRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     target_mission_id = _resolve_mission_id(request.mission_id, ctx)
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         progress_id = store.upsert_progress(
             task_id=task_id,
@@ -1605,8 +1575,7 @@ def update_task_progress(request: UpdateTaskProgressRequest, ctx: ToolRuntimeCon
 )
 def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
     try:
         bound_count = store.bind_resources_to_mission(
             task_id=task_id,
@@ -1636,6 +1605,134 @@ def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolR
         )
 
 
+
+def _validate_note_update_end(
+    covered_until_seq: int,
+    task_id: str,
+    agent_instance_id: str,
+    store: Any,
+) -> tuple[bool, list[str], str | None]:
+    """校验 note_update_end 的三项准入条件 (D04):
+    1. covered_until_seq 是本次 units 中的合法 seq，且覆盖比例 >= observer_min_advance_ratio (默认 0.5)；
+    2. 该 seq 及之前 units 的 auto_record 行均已绑定 mission_id 或已删除；
+    3. 目标 Agent 每个 in_progress 状态的任务都有 progress 恢复快照。
+
+    返回: (passed, failure_messages, target_end_message_id)
+    """
+    failures: list[str] = []
+    binding = get_current_observer_binding()
+    units = binding.units if binding else []
+    ratio_threshold = binding.observer_min_advance_ratio if binding else 0.5
+
+    target_end_msg_id = None
+
+    # 1. 断点与推进比例校验
+    if not units:
+        failures.append("当前上下文缺少 units 切片数据，无法验证断点")
+    else:
+        unit_seqs = [u.seq if hasattr(u, "seq") else u["seq"] for u in units]
+        if covered_until_seq not in unit_seqs:
+            failures.append(f"断点 seq={covered_until_seq} 不在本次增量 units 列表中 ({unit_seqs})")
+        else:
+            covered_units = [u for u in units if (u.seq if hasattr(u, "seq") else u["seq"]) <= covered_until_seq]
+            advance_ratio = len(covered_units) / len(units)
+            if advance_ratio < ratio_threshold:
+                failures.append(
+                    f"断点 seq={covered_until_seq} 推进比例不足 "
+                    f"({len(covered_units)}/{len(units)} = {advance_ratio:.1%} < {ratio_threshold:.0%})"
+                )
+            for u in units:
+                useq = u.seq if hasattr(u, "seq") else u.get("seq")
+                if useq == covered_until_seq:
+                    target_end_msg_id = getattr(u, "end_message_id", None) or getattr(u, "last_message_id", None)
+                    if isinstance(u, dict):
+                        target_end_msg_id = u.get("end_message_id") or u.get("last_message_id")
+                    break
+
+    # 2. auto_record 未绑定检查 (扫描 covered_until_seq 及之前 units 中的 auto_record)
+    unbound_records: list[str] = []
+    if units:
+        for u in units:
+            useq = u.seq if hasattr(u, "seq") else u.get("seq", 0)
+            if useq > covered_until_seq:
+                continue
+            msgs = getattr(u, "messages", []) if hasattr(u, "messages") else u.get("messages", [])
+            for m in msgs:
+                ar_list: list[dict[str, Any]] = []
+                if isinstance(m, dict):
+                    ar = m.get("auto_record")
+                    if isinstance(ar, dict):
+                        ar_list.append(ar)
+                    elif isinstance(ar, list):
+                        ar_list.extend(ar)
+                else:
+                    ar = getattr(m, "auto_record", None)
+                    if isinstance(ar, dict):
+                        ar_list.append(ar)
+                    elif isinstance(ar, list):
+                        ar_list.extend(ar)
+
+                for ar_item in ar_list:
+                    rtype = str(ar_item.get("type") or "").strip().lower()
+                    rid = str(ar_item.get("id") or ar_item.get("resource_id") or "").strip()
+                    if not rid:
+                        continue
+                    try:
+                        with store._get_connection() as conn:
+                            with conn.cursor() as cur:
+                                if rtype == "artifact":
+                                    cur.execute("SELECT mission_id FROM task_artifact_records WHERE artifact_id = %s", (rid,))
+                                elif rtype in ("agent_relationship", "relationship"):
+                                    cur.execute("SELECT mission_id FROM task_agent_relationships WHERE relationship_id = %s", (rid,))
+                                elif rtype in ("agent_message", "message"):
+                                    cur.execute("SELECT mission_id FROM task_agent_messages WHERE message_id = %s", (rid,))
+                                elif rtype in ("remote_agent_message", "remote_message"):
+                                    cur.execute("SELECT mission_id FROM task_remote_agent_messages WHERE remote_message_id = %s", (rid,))
+                                else:
+                                    continue
+                                row = cur.fetchone()
+                                if row is not None:
+                                    mid = row.get("mission_id") if isinstance(row, dict) else row[0]
+                                    if not mid or not str(mid).strip():
+                                        unbound_records.append(f"{rtype}:{rid}")
+                    except Exception as e:
+                        logger.warning("检查 auto_record 状态异常: %s", e)
+
+    if unbound_records:
+        failures.append(f"存在未绑定 mission_id 且未删除的 auto_record: {', '.join(unbound_records)}")
+
+    # 3. 目标 Agent 每个 in_progress 状态的任务是否有 progress 记录
+    try:
+        with store._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT mission_id, title FROM agent_user_mission
+                    WHERE task_id = %s AND agent_instance_id = %s AND status = 'in_progress'
+                    """,
+                    (task_id, agent_instance_id),
+                )
+                in_prog_rows = cur.fetchall()
+                if in_prog_rows:
+                    m_ids = [r.get("mission_id") if isinstance(r, dict) else r[0] for r in in_prog_rows]
+                    cur.execute(
+                        """
+                        SELECT DISTINCT mission_id FROM task_progress_content
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id = ANY(%s)
+                        """,
+                        (task_id, agent_instance_id, m_ids),
+                    )
+                    prog_rows = cur.fetchall()
+                    found_mids = {r.get("mission_id") if isinstance(r, dict) else r[0] for r in prog_rows}
+                    missing_prog = [mid for mid in m_ids if mid not in found_mids]
+                    if missing_prog:
+                        failures.append(f"处于 in_progress 状态的任务缺少 progress 记录: {', '.join(missing_prog)}")
+    except Exception as e:
+        logger.warning("检查 in_progress mission progress 记录异常: %s", e)
+
+    return len(failures) == 0, failures, target_end_msg_id
+
+
 @tool(
     name="note_update_end",
     description="Note 观察更新流程全部完成后调用，通知系统当前观察批次已完成，提交覆盖到的合法断点 seq，并安全退出观察者会话。",
@@ -1648,28 +1745,67 @@ def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolR
 )
 def note_update_end(request: NoteUpdateEndRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
     store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
+    task_id, agent_instance_id, scene_id = resolve_note_tool_target(ctx)
 
-    watermark_info = None
-    if request.covered_until_seq > 0:
-        try:
-            watermark_info = store.update_watermark(
-                agent_instance_id=agent_instance_id,
-                task_id=task_id,
-                covered_until_seq=request.covered_until_seq,
-                note_version_inc=True,
-            )
-        except Exception as exc:
-            err_res = _handle_tool_storage_error(exc)
-            if err_res is not None:
-                return err_res
-            logger.warning("note_update_end 推进 watermark 异常: %s", exc)
+    if request.covered_until_seq <= 0:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="ValidationError",
+            error_message="note_update_end 要求 covered_until_seq 必须大于 0",
+            output={"success": False, "covered_until_seq": request.covered_until_seq, "message": "covered_until_seq 必须大于 0"},
+            loop_control=LoopControl(decision="continue", reason="断点 seq 必须大于 0"),
+        )
 
+    passed, failures, end_msg_id = _validate_note_update_end(
+        covered_until_seq=request.covered_until_seq,
+        task_id=task_id,
+        agent_instance_id=agent_instance_id,
+        store=store,
+    )
+    if not passed:
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="ValidationError",
+            error_message=f"note_update_end 校验未通过: {'; '.join(failures)}",
+            output={
+                "success": False,
+                "covered_until_seq": request.covered_until_seq,
+                "missing_items": failures,
+                "message": "; ".join(failures),
+            },
+            loop_control=LoopControl(decision="continue", reason="断点或必填项校验未通过，请补充后重试"),
+        )
+
+    try:
+        watermark_info = store.update_watermark(
+            agent_instance_id=agent_instance_id,
+            task_id=task_id,
+            covered_until_seq=request.covered_until_seq,
+            covered_until_message_id=end_msg_id,
+            note_version_inc=True,
+        )
+    except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
+        logger.error("note_update_end 推进 watermark 异常: %s", exc)
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="DatabaseError",
+            error_message=f"推进 watermark 失败: {exc}",
+            output={"error": str(exc)},
+            loop_control=LoopControl(decision="continue", reason="推进水位异常"),
+        )
+
+    note_ver = watermark_info.get("note_version", 1) if isinstance(watermark_info, dict) else 1
     output = {
         "covered_until_seq": request.covered_until_seq,
+        "note_version": note_ver,
+        "message": f"观察完成，断点已推进至 {request.covered_until_seq}，已安全退出",
         "watermark": watermark_info,
-        "message": f"Note 观察流程已结束，成功提交断点 seq={request.covered_until_seq}，系统安全退出 Note 状态并切回业务运行态",
     }
     return BaseToolResult(
         output=output,

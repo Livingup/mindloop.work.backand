@@ -39,19 +39,14 @@ class ObserverPromptResponse(BaseModel):
 
 
 def _load_system_note_update_prompt() -> str:
-    """读取官方内置的 system_note_update.md 文件全文。"""
-    prompt_path = (
-        Path(__file__).resolve().parent.parent.parent
-        / "task_note"
-        / "prompts"
-        / "system_note_update.md"
-    )
-    if not prompt_path.exists():
-        return "# 上下文观察者系统提示词\n（未找到 prompts/system_note_update.md 文件）"
+    """从 TaskNotePromptProvider 严格读取正本系统提示词模板 (D07/D19)。"""
     try:
-        return prompt_path.read_text(encoding="utf-8")
+        from agent_runtime.task_note.task_note_prompt_provider import TaskNotePromptProvider
+
+        provider = TaskNotePromptProvider()
+        return provider.load_raw_template()
     except Exception as exc:
-        logger.error("读取 system_note_update.md 失败: %s", exc)
+        logger.error("读取 system_note_update 模板正本失败: %s", exc)
         return f"# 读取提示词失败: {exc}"
 
 

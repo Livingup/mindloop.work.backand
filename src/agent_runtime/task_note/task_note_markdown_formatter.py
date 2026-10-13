@@ -286,7 +286,8 @@ def format_task_note_to_markdown(
     # ── 1. 当前行动指针与最新进展 (Progress & Next Action) ─────────────
     progresses = note_snapshot.get("progresses") or []
     if not progresses and note_snapshot.get("progress"):
-        progresses = [note_snapshot["progress"]]
+        p_val = note_snapshot["progress"]
+        progresses = p_val if isinstance(p_val, list) else [p_val]
     if progresses:
         p_lines = [f"## {sec_idx}. 现场进度与下一步行动指针 (Progress & Next Action)"]
         sec_idx += 1

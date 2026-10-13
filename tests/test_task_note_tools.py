@@ -475,10 +475,27 @@ def test_note_tools_execution_zero_redundancy():
     assert res37.output["mission_id"] == temp_m_id
 
     # 38. note_update_end
-    res38 = note_update_end(NoteUpdateEndRequest(covered_until_seq=15), ctx)
-    assert res38.loop_control.decision == "complete"
-    assert "安全退出" in res38.output["message"]
-    assert res38.output["covered_until_seq"] == 15
+    from agent_runtime.task_note.task_note_observer_binding import (
+        ObserverBinding,
+        reset_current_observer_binding,
+        set_current_observer_binding,
+    )
+
+    mock_units = [{"seq": i, "end_message_id": f"msg-{i}"} for i in range(1, 16)]
+    token = set_current_observer_binding(
+        ObserverBinding(
+            task_id="task-test-01",
+            target_agent_instance_id="agent-worker-01",
+            units=mock_units,
+        )
+    )
+    try:
+        res38 = note_update_end(NoteUpdateEndRequest(covered_until_seq=15), ctx)
+        assert res38.loop_control.decision == "complete"
+        assert "安全退出" in res38.output["message"]
+        assert res38.output["covered_until_seq"] == 15
+    finally:
+        reset_current_observer_binding(token)
 
 
 def test_pruned_mission_tool_rejections():

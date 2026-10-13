@@ -302,7 +302,7 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 9. task_artifact_records (D16: 出参统一映射为 file_*)
+                    # 9. task_artifact_records (D10: 快照只取已绑定行 mission_id IS NOT NULL)
                     raw_artifacts = _query_rows(
                         "task_artifact_records",
                         """
@@ -310,7 +310,7 @@ class TaskNoteSnapshotService:
                                type, file_path, edits, content_lines, source_path,
                                target_path, content, created_at
                         FROM task_artifact_records
-                        WHERE task_id = %s AND agent_instance_id = %s
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NOT NULL
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),
@@ -369,20 +369,20 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 13. task_agent_relationships
+                    # 13. task_agent_relationships (D10: 快照只取已绑定行 mission_id IS NOT NULL)
                     snapshot["agent_relationships"] = _query_rows(
                         "task_agent_relationships",
                         """
                         SELECT relationship_id, task_id, mission_id, agent_instance_id,
                                target_agent_type, target_agent_instance_id, status, created_at
                         FROM task_agent_relationships
-                        WHERE task_id = %s AND agent_instance_id = %s
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NOT NULL
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),
                     )
 
-                    # 14. task_agent_messages
+                    # 14. task_agent_messages (D10: 快照只取已绑定行 mission_id IS NOT NULL)
                     snapshot["agent_messages"] = _query_rows(
                         "task_agent_messages",
                         """
@@ -390,20 +390,20 @@ class TaskNoteSnapshotService:
                                target_agent_instance_id, target_agent_type, message_type,
                                message, created_at
                         FROM task_agent_messages
-                        WHERE task_id = %s AND agent_instance_id = %s
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NOT NULL
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),
                     )
 
-                    # 15. task_remote_agent_messages
+                    # 15. task_remote_agent_messages (D10: 快照只取已绑定行 mission_id IS NOT NULL)
                     snapshot["remote_agent_messages"] = _query_rows(
                         "task_remote_agent_messages",
                         """
                         SELECT remote_message_id, task_id, mission_id, agent_instance_id,
                                remote_agent_instance_id, message_type, message, created_at
                         FROM task_remote_agent_messages
-                        WHERE task_id = %s AND agent_instance_id = %s
+                        WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NOT NULL
                         ORDER BY created_at ASC
                         """,
                         (task_id, agent_instance_id),

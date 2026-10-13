@@ -89,10 +89,10 @@ def estimate_message_tokens(msg: Any) -> int:
 
 
 def _get_msg_id(msg: Any, fallback_index: int) -> str:
-    """获取消息唯一标识 ID。"""
+    """获取消息唯一标识 ID (优先 UniMessage.message_id)。"""
     if isinstance(msg, dict):
-        return str(msg.get("id") or f"msg-{fallback_index}")
-    mid = getattr(msg, "id", None)
+        return str(msg.get("message_id") or msg.get("id") or f"msg-{fallback_index}")
+    mid = getattr(msg, "message_id", None) or getattr(msg, "id", None)
     if mid:
         return str(mid)
     return f"msg-{fallback_index}"
@@ -192,7 +192,23 @@ class TaskNoteUnitSlicer:
 
         all_units: list[TaskNoteUnit] = []
         current_batch: list[Any] = []
-        seq_counter = 1
+
+        # 1. 如果指定了 covered_until_message_id，定位断点消息索引，只切其之后的新增消息
+        start_idx = 0
+        if covered_until_message_id:
+            for idx, msg in enumerate(messages):
+                if _get_msg_id(msg, idx) == covered_until_message_id:
+                    start_idx = idx + 1
+                    break
+
+        if covered_until_message_id and start_idx > 0:
+            target_messages = messages[start_idx:]
+            seq_counter = watermark_covered_until_seq + 1
+            has_filtered_by_watermark = True
+        else:
+            target_messages = messages
+            seq_counter = 1
+            has_filtered_by_watermark = False
 
         def commit_unit(unit_type: str, is_snapshot: bool = False) -> None:
             nonlocal seq_counter, current_batch
@@ -213,9 +229,9 @@ class TaskNoteUnitSlicer:
             current_batch = []
 
         i = 0
-        n = len(messages)
+        n = len(target_messages)
         while i < n:
-            msg = messages[i]
+            msg = target_messages[i]
             role = _get_msg_role(msg)
             is_snap = _is_snapshot_msg(msg)
 
@@ -260,8 +276,8 @@ class TaskNoteUnitSlicer:
                     current_batch.append(msg)
                     i += 1
                     # 贪婪吸收紧随其后的所有 tool 结果
-                    while i < n and _is_tool_result(messages[i]):
-                        current_batch.append(messages[i])
+                    while i < n and _is_tool_result(target_messages[i]):
+                        current_batch.append(target_messages[i])
                         i += 1
                     # 一批 tool 结果全部返回齐备后，形成一个合法断点
                     commit_unit(unit_type="tool_interaction")
@@ -270,7 +286,7 @@ class TaskNoteUnitSlicer:
             # 5. 如果是孤立的 tool 结果或其他未知消息
             current_batch.append(msg)
             # 检查下一条消息是否还是 tool 结果，若不是则闭合该断点
-            if i + 1 >= n or not _is_tool_result(messages[i + 1]):
+            if i + 1 >= n or not _is_tool_result(target_messages[i + 1]):
                 commit_unit(unit_type="tool_interaction")
             i += 1
 
@@ -278,42 +294,47 @@ class TaskNoteUnitSlicer:
         if current_batch:
             commit_unit(unit_type="trailing_execution")
 
-        # ── 确定基线水位 effective_covered_seq ────────────────────────
-        effective_covered_seq = watermark_covered_until_seq
+        # ── 确定基线水位与增量单元 ─────────────────────────────────
+        if has_filtered_by_watermark:
+            inherited_units = []
+            incremental_units = all_units
+            effective_covered_seq = watermark_covered_until_seq
+        else:
+            effective_covered_seq = watermark_covered_until_seq
 
-        # 1. 优先根据物理 message_id 定位断点，避免相对 seq 位移错乱
-        if covered_until_message_id:
-            for u in all_units:
-                if u.end_message_id == covered_until_message_id or any(
-                    _get_msg_id(m, 0) == covered_until_message_id for m in u.messages
-                ):
-                    effective_covered_seq = u.seq
-                    break
-
-        # 2. 若首个 Unit 是快照单元，且历史断点已被裁剪（当前 max_seq < watermark），以快照作为基线
-        if all_units and all_units[0].is_snapshot:
-            if effective_covered_seq > all_units[-1].seq or effective_covered_seq <= 0:
-                effective_covered_seq = all_units[0].seq
-
-        # 3. 划分 inherited_units（子 Agent 首次观察）
-        inherited_units: list[TaskNoteUnit] = []
-        if is_subagent and not inherited_processed:
-            fork_unit_idx = -1
-            if fork_message_id:
-                for idx, u in enumerate(all_units):
-                    if any(_get_msg_id(m, 0) == fork_message_id for m in u.messages):
-                        fork_unit_idx = idx
+            # 1. 优先根据物理 message_id 定位断点，避免相对 seq 位移错乱
+            if covered_until_message_id:
+                for u in all_units:
+                    if u.end_message_id == covered_until_message_id or any(
+                        _get_msg_id(m, 0) == covered_until_message_id for m in u.messages
+                    ):
+                        effective_covered_seq = u.seq
                         break
-            if fork_unit_idx != -1:
-                inherited_units = all_units[: fork_unit_idx + 1]
-                # 关键修复：子 Agent 增量严格从 fork_unit 之后起算
-                if effective_covered_seq < all_units[fork_unit_idx].seq:
-                    effective_covered_seq = all_units[fork_unit_idx].seq
-            else:
-                inherited_units = [u for u in all_units if u.seq <= effective_covered_seq]
 
-        # 4. 划分 incremental_units (seq > effective_covered_seq)
-        incremental_units = [u for u in all_units if u.seq > effective_covered_seq]
+            # 2. 若首个 Unit 是快照单元，且历史断点已被裁剪（当前 max_seq < watermark），以快照作为基线
+            if all_units and all_units[0].is_snapshot:
+                if effective_covered_seq > all_units[-1].seq or effective_covered_seq <= 0:
+                    effective_covered_seq = all_units[0].seq
+
+            # 3. 划分 inherited_units（子 Agent 首次观察）
+            inherited_units: list[TaskNoteUnit] = []
+            if is_subagent and not inherited_processed:
+                fork_unit_idx = -1
+                if fork_message_id:
+                    for idx, u in enumerate(all_units):
+                        if any(_get_msg_id(m, 0) == fork_message_id for m in u.messages):
+                            fork_unit_idx = idx
+                            break
+                if fork_unit_idx != -1:
+                    inherited_units = all_units[: fork_unit_idx + 1]
+                    # 关键修复：子 Agent 增量严格从 fork_unit 之后起算
+                    if effective_covered_seq < all_units[fork_unit_idx].seq:
+                        effective_covered_seq = all_units[fork_unit_idx].seq
+                else:
+                    inherited_units = [u for u in all_units if u.seq <= effective_covered_seq]
+
+            # 4. 划分 incremental_units (seq > effective_covered_seq)
+            incremental_units = [u for u in all_units if u.seq > effective_covered_seq]
 
         # 5. 统计增量 Token（严格排除快照手记 is_snapshot）
         incremental_tokens = sum(

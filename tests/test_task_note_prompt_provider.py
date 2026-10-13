@@ -66,13 +66,37 @@ def test_get_note_tools_with_gateway():
         assert "name" in t.schema or "function" in t.schema or "type" in t.schema
 
 
-def test_boundary_and_resumed_prompts():
+def test_observer_user_payload_and_resumed_prompts():
+    from agent_runtime.task_note.task_note_observer_scheduler import (
+        ObserverSessionInput,
+        build_observer_user_payload,
+    )
+    from agent_runtime.task_note.task_note_unit_slicer import TaskNoteUnit
+
+    unit = TaskNoteUnit(
+        seq=1,
+        unit_type="user_turn",
+        messages=[],
+        end_message_id="msg-001",
+    )
+    session_input = ObserverSessionInput(
+        task_id="task-1",
+        scene_id="scene-1",
+        agent_instance_id="inst-1",
+        target_seq=1,
+        incremental_units=[unit],
+        note_snapshot={"task_id": "task-1", "missions": []},
+        target_agent_definition_prompt="你是一个开发Agent",
+    )
+    payload = build_observer_user_payload(session_input)
+    assert "目标 Agent 身份与职责" in payload
+    assert "inst-1" in payload
+    assert "你是一个开发Agent" in payload
+    assert "当前 Task Note 基准线快照" in payload
+    assert "待观察的增量对话切片" in payload
+
     provider = TaskNotePromptProvider()
     snapshot = {"task_id": "task-1", "missions": []}
-    boundary = provider.build_compression_boundary_prompt(snapshot)
-    assert "上面的历史消息是之前的业务agent的对话记录" in boundary
-    assert "task-1" in boundary
-
     resumed = provider.build_resumed_conversation_prompt(snapshot)
     assert "系统已完成上下文压缩与Note更新" in resumed
     assert "task-1" in resumed

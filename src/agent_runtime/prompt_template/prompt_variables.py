@@ -189,6 +189,13 @@ BUILTIN_PROMPT_VARIABLES: tuple[PromptVariableDefinition, ...] = (
         value_logic="从 render_options 中提取 preferred_text_format（缺省为 html）",
         category="lifecycle",
     ),
+    PromptVariableDefinition(
+        placeholder="{{NOTE_SNAPSHOT_JSON}}",
+        name="NOTE_SNAPSHOT_JSON",
+        description="Task Note 快照说明占位符",
+        value_logic="渲染为固定文本：本次 user 消息中的 Task Note 快照",
+        category="capability",
+    ),
 )
 
 _VARIABLE_MAP: dict[str, PromptVariableDefinition] = {
@@ -284,6 +291,8 @@ def build_prompt_variable_values(context: PromptVariableContext) -> dict[str, st
         "frontend_channel": context.frontend_channel,
         "supported_text_formats": context.supported_text_formats,
         "preferred_text_format": context.preferred_text_format,
+        "NOTE_SNAPSHOT_JSON": "本次 user 消息中的 Task Note 快照",
+        "note_snapshot_json": "本次 user 消息中的 Task Note 快照",
     }
 
 

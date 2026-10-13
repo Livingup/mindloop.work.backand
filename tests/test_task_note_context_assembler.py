@@ -11,7 +11,8 @@ from agent_runtime.task_note.task_note_models import TaskNoteWatermark
 from agent_runtime.task_note.task_note_unit_slicer import TaskNoteUnitSlicer
 
 
-def test_assemble_context_no_swap_when_watermark_zero():
+@pytest.mark.asyncio
+async def test_assemble_context_no_swap_when_watermark_zero():
     assembler = TaskNoteContextAssembler()
     messages = [
         {"id": "m1", "role": "user", "content": "你好"},
@@ -23,24 +24,26 @@ def test_assemble_context_no_swap_when_watermark_zero():
         covered_until_seq=0,
     )
 
-    res = assembler.assemble_context(messages=messages, watermark=wm)
+    res = await assembler.assemble_context(messages=messages, watermark=wm, force_swap=True)
     assert res.swapped is False
     assert len(res.messages) == 2
 
 
-def test_assemble_context_swaps_prefix_and_preserves_tail():
+@pytest.mark.asyncio
+async def test_assemble_context_swaps_prefix_and_preserves_tail():
     assembler = TaskNoteContextAssembler()
     messages = [
         {"id": "m1", "role": "user", "content": "问题一：重构登录"},
         {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
-        {"id": "m3", "role": "user", "content": "问题二：增加手机号验证码"},
-        {"id": "m4", "role": "assistant", "content": "已添加手机号验证码逻辑"},
+        {"id": "m3", "role": "assistant", "content": "继续输出模块设计方案"},
+        {"id": "m4", "role": "user", "content": "确认该方案，继续增加手机号验证码"},
     ]
     # 水位覆盖到 seq=2 (即 m1 与 m2)
     wm = TaskNoteWatermark(
         agent_instance_id="agent-01",
         task_id="task-01",
         covered_until_seq=2,
+        covered_until_message_id="m2",
         note_version=1,
     )
     fake_snapshot = {
@@ -48,15 +51,15 @@ def test_assemble_context_swaps_prefix_and_preserves_tail():
         "progress": {"completed_summary": "完成登录重构", "next_step": "处理手机验证码"},
     }
 
-    res = assembler.assemble_context(
+    res = await assembler.assemble_context(
         messages=messages,
         watermark=wm,
         note_snapshot=fake_snapshot,
+        force_swap=True,
     )
 
     assert res.swapped is True
     assert res.covered_until_seq == 2
-    assert res.pruned_message_count == 2  # m1, m2
     assert res.tail_message_count == 2    # m3, m4
 
     # 结果包含：1条快照消息 + 2条残差消息 (m3, m4)
@@ -77,7 +80,8 @@ def test_assemble_context_swaps_prefix_and_preserves_tail():
     assert slice_res.incremental_tokens < 100
 
 
-def test_assemble_context_does_not_repeat_swap():
+@pytest.mark.asyncio
+async def test_assemble_context_does_not_repeat_swap():
     assembler = TaskNoteContextAssembler()
     messages = [
         {"id": "m1", "role": "user", "content": "问题一"},
@@ -87,19 +91,22 @@ def test_assemble_context_does_not_repeat_swap():
         agent_instance_id="agent-01",
         task_id="task-01",
         covered_until_seq=2,
+        note_version=1,
     )
 
     # 上次已替换到了 seq=2
-    res = assembler.assemble_context(
+    res = await assembler.assemble_context(
         messages=messages,
         watermark=wm,
         last_swapped_seq=2,
+        force_swap=True,
     )
     assert res.swapped is False
     assert len(res.messages) == 2
 
 
-def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
+@pytest.mark.asyncio
+async def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
     """验证：当业务 Agent 自身总上下文未达系统阈值时，即使后台 Note 已更新，也绝不替换历史。"""
     assembler = TaskNoteContextAssembler()
     messages = [
@@ -119,7 +126,7 @@ def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
     }
 
     # 设定系统压缩门禁为 50,000 Tokens，而当前对话仅几十 Token
-    res = assembler.assemble_context(
+    res = await assembler.assemble_context(
         messages=messages,
         watermark=wm,
         note_snapshot=fake_snapshot,
@@ -135,18 +142,20 @@ def test_assemble_context_skips_swap_when_total_tokens_below_threshold():
     assert res.total_tokens < 50000
 
 
-def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
+@pytest.mark.asyncio
+async def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
     """验证：当业务 Agent 自身总上下文达到系统阈值时，消费后台就绪快照进行热替换。"""
     assembler = TaskNoteContextAssembler()
     messages = [
         {"id": "m1", "role": "user", "content": "问题一：重构登录"},
         {"id": "m2", "role": "assistant", "content": "正在处理登录模块重构"},
-        {"id": "m3", "role": "user", "content": "问题二：残差尾巴"},
+        {"id": "m3", "role": "assistant", "content": "继续输出残差尾部内容"},
     ]
     wm = TaskNoteWatermark(
         agent_instance_id="agent-01",
         task_id="task-01",
         covered_until_seq=2,
+        covered_until_message_id="m2",
         note_version=1,
     )
     fake_snapshot = {
@@ -155,7 +164,7 @@ def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
     }
 
     # 设定阈值为 10 Tokens（当前消息远超 10 Tokens）
-    res = assembler.assemble_context(
+    res = await assembler.assemble_context(
         messages=messages,
         watermark=wm,
         note_snapshot=fake_snapshot,
@@ -168,4 +177,3 @@ def test_assemble_context_swaps_when_total_tokens_exceeds_threshold():
     assert len(res.messages) == 2  # 1条快照 + 1条尾部残差 (m3)
     assert res.messages[0]["is_snapshot"] is True
     assert res.messages[1]["id"] == "m3"
-

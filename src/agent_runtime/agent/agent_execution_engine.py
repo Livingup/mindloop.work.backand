@@ -93,6 +93,8 @@ from agent_runtime.task_note.task_note_snapshot_service import (
     TaskNoteSnapshotService,
     get_task_note_snapshot_service,
 )
+from agent_runtime.task_note.task_note_context_assembler import TaskNoteContextAssembler
+from agent_runtime.task_note.task_note_observer_scheduler import TaskNoteObserverScheduler
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -340,21 +342,7 @@ class AgentMessageSubmissionResult:
     message_metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _is_note_state_allowed_user_message(message: PendingAgentUserMessage) -> bool:
-    """Note 状态下只允许消费真实人类用户消息，保留外部远程 Agent 和本地父子 Agent 的业务消息。"""
-    meta = message.metadata or {}
-    source_type = str(meta.get("source_type") or "").strip().lower()
-    transport = str(meta.get("transport") or "").strip().lower()
-    channel = str(meta.get("channel") or "").strip().lower()
-    if source_type in {"local_agent", "remote_agent"}:
-        return False
-    if transport in {"subagent", "lacp"}:
-        return False
-    if channel in {"subagent", "lacp"}:
-        return False
-    if "subagent" in meta or "remote_agent" in meta or "lacp" in meta:
-        return False
-    return True
+# (M7: 已删除 Note 状态消息过滤分流逻辑)
 
 
 class AgentExecutionEngine:
@@ -385,6 +373,9 @@ class AgentExecutionEngine:
         file_resource_service_getter: Callable[[], Any] | None = None,
         task_note_prompt_provider: TaskNotePromptProvider | None = None,
         task_note_snapshot_service: TaskNoteSnapshotService | None = None,
+        task_note_observer_scheduler: TaskNoteObserverScheduler | None = None,
+        task_note_context_assembler: TaskNoteContextAssembler | None = None,
+        swap_wait_timeout_seconds: float = 10.0,
     ) -> None:
         # Agent 运行态网关，负责 task/instance 创建和状态流转。
         self._runtime_gateway = runtime_gateway
@@ -417,6 +408,12 @@ class AgentExecutionEngine:
             local_tool_gateway=local_tool_gateway,
         )
         self._task_note_snapshot_service = task_note_snapshot_service or get_task_note_snapshot_service()
+        self._task_note_observer_scheduler = task_note_observer_scheduler
+        self._swap_wait_timeout_seconds = swap_wait_timeout_seconds
+        self._task_note_context_assembler = task_note_context_assembler or TaskNoteContextAssembler(
+            scheduler=task_note_observer_scheduler,
+            swap_wait_timeout_seconds=swap_wait_timeout_seconds,
+        )
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
@@ -437,8 +434,50 @@ class AgentExecutionEngine:
                 instance_id,
                 reason=reason,
             ),
-            cleanup_task_notes=self._task_note_snapshot_service.async_cleanup_task_note,
+            cleanup_task_notes=self._cleanup_task_notes_with_wait,
         )
+
+    async def _cleanup_task_notes_with_wait(self, task_id: str) -> None:
+        if self._task_note_observer_scheduler is not None:
+            try:
+                task_obj = self._runtime_gateway.get_task(task_id)
+                if task_obj and hasattr(task_obj, "agent_instances"):
+                    for inst_item in task_obj.agent_instances:
+                        if self._task_note_observer_scheduler.is_observer_running(inst_item.instance_id):
+                            await self._task_note_observer_scheduler.wait_for_observer(
+                                inst_item.instance_id,
+                                timeout=self._swap_wait_timeout_seconds,
+                            )
+            except Exception as exc:
+                logger.debug("等待 Task Observer 完成异常: %s", exc)
+        await self._task_note_snapshot_service.async_cleanup_task_note(task_id)
+
+    def _trigger_background_observer_if_needed(
+        self,
+        *,
+        task_id: str,
+        instance: AgentInstance,
+        conversation: Conversation,
+        scene_id: str | None = None,
+    ) -> None:
+        """在业务 Agent 每轮 LLM 或工具批次完成后，非阻塞检查并触发后台观察者 (D02)。"""
+        if self._task_note_observer_scheduler is None:
+            return
+        try:
+            asyncio.create_task(
+                self._task_note_observer_scheduler.check_and_trigger(
+                    agent_instance_id=instance.instance_id,
+                    task_id=task_id,
+                    messages=conversation.messages,
+                    is_subagent=(instance.parent_instance_id is not None),
+                    fork_message_id=getattr(instance, "fork_message_id", None),
+                    delegation_content=getattr(instance, "delegation_content", None),
+                    parent_agent_instance_id=instance.parent_instance_id,
+                    scene_id=scene_id,
+                )
+            )
+        except Exception as exc:
+            logger.debug("触发后台观察者异常 (静默容错): %s", exc)
 
     def _set_execution_phase(
         self,
@@ -1641,6 +1680,9 @@ class AgentExecutionEngine:
         )
         try:
             self._runtime_gateway.start_task(task.task_id)
+            if instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
+                self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
+                instance = instance.exit_note_update()
             self._runtime_gateway.start_agent_instance(instance.instance_id)
             await self._publish_task_status(
                 communication_context,
@@ -1719,8 +1761,6 @@ class AgentExecutionEngine:
                     phase="drain_user_messages",
                     loop_index=loop_index,
                 )
-                is_note_update = instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE
-                drain_predicate = _is_note_state_allowed_user_message if is_note_update else None
                 pending_user_message_count = len(instance.pending_user_messages)
                 if pending_user_message_count:
                     communication_context = communication_context.with_metadata(
@@ -1731,7 +1771,7 @@ class AgentExecutionEngine:
                     conversation=conversation,
                     communication_context=communication_context,
                     trace_path=trace_path,
-                    predicate=drain_predicate,
+                    predicate=None,
                 )
                 self._touch_execution_progress(instance.instance_id, metadata={"drained_user_message_count": drained_count})
                 current_instance_after_drain = self._runtime_gateway.get_agent_instance(instance.instance_id)
@@ -1739,11 +1779,7 @@ class AgentExecutionEngine:
                     instance_id=instance.instance_id,
                     stage="pending_user_messages.drain",
                     status="drained" if drained_count else "empty",
-                    summary=(
-                        "Note 状态下已过滤消费人类用户消息，保留外部业务消息在队列等待切回业务状态。"
-                        if is_note_update and len(current_instance_after_drain.pending_user_messages) > 0
-                        else "执行循环在下一次 LLM 请求前完成待处理用户消息队列消费。"
-                    ),
+                    summary="执行循环在下一次 LLM 请求前完成待处理用户消息队列消费。",
                     details={
                         "task_id": task.task_id,
                         "conversation_id": conversation.id,
@@ -2051,6 +2087,12 @@ class AgentExecutionEngine:
                         task, instance, request, conversation, communication_context, trace_path = next_execution
                         plain_text_fallback_count = 0
                         continue
+                    self._trigger_background_observer_if_needed(
+                        task_id=task.task_id,
+                        instance=instance,
+                        conversation=conversation,
+                        scene_id=getattr(task, "scene_id", None),
+                    )
                     self._end_execution_loop_frame(
                         instance_id=instance.instance_id,
                         frame_id=current_frame_id,
@@ -2198,150 +2240,13 @@ class AgentExecutionEngine:
                 )
                 self._trace_recorder.record_tool_result(trace_path, tool_result_message)
                 loop_decision = _select_loop_decision(tool_results)
-                has_note_update_end = any(tu.name == "note_update_end" for tu in tool_uses)
-                if has_note_update_end and instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
-                    self._record_execution_loop_step(
-                        instance_id=instance.instance_id,
-                        frame_id=current_frame_id,
-                        stage="task_note.update_end.detected",
-                        status="started",
-                        summary="检测到 note_update_end 工具调用，开始构建全新会话并替换 Conversation。",
-                        details={
-                            "task_id": task.task_id,
-                            "old_conversation_id": conversation.id,
-                            "instance_id": instance.instance_id,
-                        },
-                        expected_next="task_note.conversation.swap",
-                    )
-                    # 1. 从 PostgreSQL 读取当前 agent 实例 + task_id 的最新完整 Note 全量快照 JSON
-                    latest_note_snapshot = None
-                    try:
-                        latest_note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
-                            task_id=task.task_id,
-                            agent_instance_id=instance.instance_id,
-                        )
-                    except Exception as exc:
-                        logger.error("构建退出 Note 快照失败，跳过会话替换: %s", exc)
-                        self._record_execution_loop_step(
-                            instance_id=instance.instance_id,
-                            frame_id=current_frame_id,
-                            stage="task_note.swap_skipped",
-                            status="skipped",
-                            summary=f"快照读取失败，不替换上下文，保持原会话: {exc}",
-                            details={"error": str(exc)},
-                        )
-
-                    if latest_note_snapshot is not None:
-                        # 2. 调用会话仓储创建全新的 Conversation
-                        new_conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
-                        new_conversation = Conversation(id=new_conversation_id)
-
-                        # 3. 在新会话的 timeline 中初始化业务 Agent 定义的 Prompt 与 Tools
-                        business_tools = await self._tool_dispatcher.build_llm_tools(
-                            agent_definition=agent_definition,
-                            api_format=resolved_candidates[0].api_format,
-                        )
-                        business_system_prompt = self._render_system_prompt(
-                            agent_definition,
-                            instance.instance_id,
-                            instance.current_working_directory,
-                            request.render_options,
-                            business_tools,
-                            conversation=new_conversation,
-                        )
-                        new_conversation.system_prompt = business_system_prompt
-                        new_conversation.tools = tuple(
-                            deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
-                            for t in business_tools
-                        )
-                        new_conversation.record_configuration_event(
-                            ConfigurationComponentEvent(
-                                event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
-                                definition_id=agent_definition.agent_id,
-                                anchor="start",
-                                sequence=1,
-                                status="active",
-                                component="prompt",
-                            )
-                        )
-                        new_conversation.record_configuration_event(
-                            ConfigurationComponentEvent(
-                                event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
-                                definition_id=agent_definition.agent_id,
-                                anchor="start",
-                                sequence=0,
-                                status="active",
-                                component="tool",
-                            )
-                        )
-
-                        # 4. 注入包含 Note 快照与业务唤醒指示的初始消息（反查源码行号与命令行指令，组织为 Markdown 工作手记）
-                        resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(
-                            note_snapshot=latest_note_snapshot,
-                            current_working_directory=instance.current_working_directory,
-                            task_id=task.task_id,
-                            agent_instance_id=instance.instance_id,
-                        )
-                        resumed_msg = UniMessage(
-                            role=ROLE_USER,
-                            content=[TextPart(text=resumed_prompt)],
-                            message_id=f"msg_{uuid.uuid4().hex[:12]}",
-                        )
-                        new_conversation.append_message(resumed_msg, [TextPartMeta()])
-                        await self._conversation_repository.create(
-                            new_conversation,
-                            task_id=task.task_id,
-                            thread_id=instance.thread_id,
-                            agent_id=agent_definition.agent_id,
-                            agent_instance_id=instance.instance_id,
-                        )
-
-                        # 5. 调用 switch_agent_instance_conversation
-                        self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, new_conversation.id)
-
-                        # 6. 更新实例状态：instance = instance.exit_note_update()，写回 SQLite
-                        instance = instance.exit_note_update()
-                        self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
-
-                        # 7. 切换会话引用与上下文
-                        old_conversation_id = conversation.id
-                        conversation = new_conversation
-                        communication_context = communication_context.with_metadata(conversation_id=conversation.id)
-
-                        # 8. 记录事件与日志
-                        self._record_execution_conversation_rebind(
-                            instance_id=instance.instance_id,
-                            frame_id=current_frame_id,
-                            reason="task_note_update_completed",
-                            job_id=None,
-                            source_conversation_id=old_conversation_id,
-                            target_conversation_id=new_conversation.id,
-                        )
-                        self._trace_recorder.record_event(
-                            trace_path,
-                            "task_note_update_conversation_swapped",
-                            {
-                                "old_conversation_id": old_conversation_id,
-                                "new_conversation_id": new_conversation.id,
-                                "task_id": task.task_id,
-                                "agent_instance_id": instance.instance_id,
-                            },
-                        )
-                        await self._event_publisher.publish(
-                            communication_context,
-                            "agent.conversation.swapped",
-                            {
-                                "task_id": task.task_id,
-                                "agent_instance_id": instance.instance_id,
-                                "old_conversation_id": old_conversation_id,
-                                "new_conversation_id": new_conversation.id,
-                                "reason": "task_note_update_completed",
-                            },
-                            source="agent_execution_engine",
-                        )
-
-                        # 9. 强制收敛决策为 continue，让循环继续进入新会话
-                        loop_decision = "continue"
+                # 每轮工具执行完成后，非阻塞检查并触发后台观察者 (D02)
+                self._trigger_background_observer_if_needed(
+                    task_id=task.task_id,
+                    instance=instance,
+                    conversation=conversation,
+                    scene_id=getattr(task, "scene_id", None),
+                )
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     frame_id=current_frame_id,
@@ -3010,110 +2915,95 @@ class AgentExecutionEngine:
                 )
 
             if instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
-                tools = self._task_note_prompt_provider.get_note_tools(resolved_model.api_format)
-                note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
-                system_prompt = self._task_note_prompt_provider.render_note_system_prompt(
-                    agent_instance_id=instance.instance_id,
-                    agent_name=agent_definition.name,
-                    current_working_directory=instance.current_working_directory,
-                    available_tools=note_tool_names,
-                )
-                _record_prompt_preparation_step(
-                    "llm.prompt.note_update.prepared",
-                    "completed",
-                    "Note 更新状态：已构建 32 个 Note 专属工具并渲染 Note 更新系统提示词。",
-                    {
-                        "system_prompt_length": len(system_prompt),
-                        "tool_count": len(tools),
-                        "tool_names": [tool.name for tool in tools],
-                    },
-                    "llm.candidate.request.start",
-                )
-            else:
-                _record_prompt_preparation_step(
-                    "llm.prompt.tools.build.start",
-                    "started",
-                    "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
-                    {
-                        "agent_definition_id": agent_definition.agent_id,
-                        "local_tool_id_count": len(agent_definition.tool_ids),
-                        "bound_mcp_service_count": len(agent_definition.mcp_tools),
-                        "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
-                    },
-                    "llm.prompt.tools.build.complete",
-                )
-                tools = await self._tool_dispatcher.build_llm_tools(
-                    agent_definition=agent_definition,
-                    api_format=resolved_model.api_format,
-                )
-                tool_source_counts: dict[str, int] = {}
-                for tool in tools:
-                    tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
-                _record_prompt_preparation_step(
-                    "llm.prompt.tools.build.complete",
-                    "completed",
-                    "LLM 可见工具 schema 构建完成。",
-                    {
-                        "tool_schema_count": len(tools),
-                        "tool_names": [tool.name for tool in tools],
-                        "tool_source_counts": tool_source_counts,
-                        "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
-                    },
-                    "llm.prompt.mcp_services.load.start",
-                )
-                _record_prompt_preparation_step(
-                    "llm.prompt.mcp_services.load.start",
-                    "started",
-                    "开始加载 MCP 服务与工具摘要提示词。",
-                    {
-                        "bound_mcp_service_count": len(agent_definition.mcp_tools),
-                        "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
-                    },
-                    "llm.prompt.mcp_services.load.complete",
-                )
-                mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
-                _record_prompt_preparation_step(
-                    "llm.prompt.mcp_services.load.complete",
-                    "completed",
-                    "MCP 服务与工具摘要提示词加载完成。",
-                    {
-                        "mcp_services_prompt_present": bool(mcp_services_prompt),
-                        "mcp_services_prompt_length": len(mcp_services_prompt),
-                    },
-                    "llm.prompt.render.start",
-                )
-                _record_prompt_preparation_step(
-                    "llm.prompt.render.start",
-                    "started",
-                    "开始渲染系统提示词。",
-                    {
-                        "system_prompt_segment_count": len(agent_definition.system_prompt),
-                        "skill_id_count": len(agent_definition.skill_ids),
-                        "available_sub_agent_id_count": len(agent_definition.available_sub_agent_ids),
-                        "render_option_keys": sorted(render_options.keys()),
-                    },
-                    "llm.prompt.agent_segments.start",
-                )
-                system_prompt = self._render_system_prompt(
-                    agent_definition,
-                    instance.instance_id,
-                    instance.current_working_directory,
-                    render_options,
-                    tools,
-                    conversation=conversation,
-                    mcp_services_prompt=mcp_services_prompt,
-                    prompt_step_recorder=_record_prompt_preparation_step,
-                )
-                _record_prompt_preparation_step(
-                    "llm.prompt.render.complete",
-                    "completed",
-                    "系统提示词渲染完成。",
-                    {
-                        "system_prompt_present": system_prompt is not None,
-                        "system_prompt_length": len(system_prompt or ""),
-                    },
-                    "llm.prompt.prepared",
-                )
+                self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
+                instance = instance.exit_note_update()
+
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.start",
+                "started",
+                "开始按 AgentDefinition 本地工具能力边界构建 LLM 可见工具 schema。",
+                {
+                    "agent_definition_id": agent_definition.agent_id,
+                    "local_tool_id_count": len(agent_definition.tool_ids),
+                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                },
+                "llm.prompt.tools.build.complete",
+            )
+            raw_tools = await self._tool_dispatcher.build_llm_tools(
+                agent_definition=agent_definition,
+                api_format=resolved_model.api_format,
+            )
+            note_tool_names = set(self._task_note_prompt_provider.get_note_tool_names())
+            tools = [t for t in raw_tools if t.name not in note_tool_names]
+            tool_source_counts: dict[str, int] = {}
+            for tool in tools:
+                tool_source_counts[tool.source] = tool_source_counts.get(tool.source, 0) + 1
+            _record_prompt_preparation_step(
+                "llm.prompt.tools.build.complete",
+                "completed",
+                "LLM 可见工具 schema 构建完成。",
+                {
+                    "tool_schema_count": len(tools),
+                    "tool_names": [tool.name for tool in tools],
+                    "tool_source_counts": tool_source_counts,
+                    "mcp_direct_tool_names": [tool.name for tool in tools if tool.source == "mcp"],
+                },
+                "llm.prompt.mcp_services.load.start",
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.mcp_services.load.start",
+                "started",
+                "开始加载 MCP 服务与工具摘要提示词。",
+                {
+                    "bound_mcp_service_count": len(agent_definition.mcp_tools),
+                    "bound_mcp_tool_count": sum(len(binding.tool_ids) for binding in agent_definition.mcp_tools),
+                },
+                "llm.prompt.mcp_services.load.complete",
+            )
+            mcp_services_prompt = await self._load_mcp_services_prompt(agent_definition)
+            _record_prompt_preparation_step(
+                "llm.prompt.mcp_services.load.complete",
+                "completed",
+                "MCP 服务与工具摘要提示词加载完成。",
+                {
+                    "mcp_services_prompt_present": bool(mcp_services_prompt),
+                    "mcp_services_prompt_length": len(mcp_services_prompt),
+                },
+                "llm.prompt.render.start",
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.start",
+                "started",
+                "开始渲染系统提示词。",
+                {
+                    "system_prompt_segment_count": len(agent_definition.system_prompt),
+                    "skill_id_count": len(agent_definition.skill_ids),
+                    "available_sub_agent_id_count": len(agent_definition.available_sub_agent_ids),
+                    "render_option_keys": sorted(render_options.keys()),
+                },
+                "llm.prompt.agent_segments.start",
+            )
+            system_prompt = self._render_system_prompt(
+                agent_definition,
+                instance.instance_id,
+                instance.current_working_directory,
+                render_options,
+                tools,
+                conversation=conversation,
+                mcp_services_prompt=mcp_services_prompt,
+                prompt_step_recorder=_record_prompt_preparation_step,
+            )
+            _record_prompt_preparation_step(
+                "llm.prompt.render.complete",
+                "completed",
+                "系统提示词渲染完成。",
+                {
+                    "system_prompt_present": system_prompt is not None,
+                    "system_prompt_length": len(system_prompt or ""),
+                },
+                "llm.prompt.prepared",
+            )
             self._record_execution_loop_step(
                 instance_id=instance.instance_id,
                 stage="llm.prompt.prepared",
@@ -3136,119 +3026,45 @@ class AgentExecutionEngine:
                 expected_next="context_compression_or_llm_request",
             )
             try:
-                if instance.execution_substate != EXECUTION_SUBSTATE_NOTE_UPDATE:
-                    compression_decision = self._check_compression_gate(conversation, resolved_model)
-                    if compression_decision.should_compress:
-                        # 检查底层存储可用性 (D08 降级保护)
-                        from agent_runtime.task_note.task_note_store import is_task_note_available, TaskNoteStorageUnavailableError
-
-                        note_snapshot = None
-                        if not is_task_note_available():
-                            self._record_execution_loop_step(
-                                instance_id=instance.instance_id,
-                                stage="task_note.swap_skipped",
-                                status="skipped",
-                                summary="Task Note 存储不可用，跳过压缩切换，业务会话保持原样。",
-                                details={
-                                    "task_id": task.task_id,
-                                    "conversation_id": conversation.id,
-                                    "reason": "storage_unavailable",
-                                },
-                            )
-                        else:
-                            try:
-                                note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
-                                    task_id=task.task_id,
-                                    agent_instance_id=instance.instance_id,
-                                )
-                            except (TaskNoteStorageUnavailableError, Exception) as snap_exc:
-                                logger.warning("构建快照失败，跳过压缩切换: %s", snap_exc)
-                                self._record_execution_loop_step(
-                                    instance_id=instance.instance_id,
-                                    stage="task_note.swap_skipped",
-                                    status="skipped",
-                                    summary=f"构建快照失败，跳过压缩切换: {snap_exc}",
-                                    details={
-                                        "task_id": task.task_id,
-                                        "conversation_id": conversation.id,
-                                        "error": str(snap_exc),
-                                    },
-                                )
-
-                        if note_snapshot is not None:
-                            self._record_execution_loop_step(
-                                instance_id=instance.instance_id,
-                                stage="context_compression.note_update.triggered",
-                                status="triggered",
-                                summary="上下文使用量达到阈值，触发 Note 更新状态切换与基线快照注入。",
-                                details={
-                                    "task_id": task.task_id,
-                                    "conversation_id": conversation.id,
-                                    "decision_reason": compression_decision.reason,
-                                    "used_tokens": compression_decision.used_tokens,
-                                    "threshold": compression_decision.threshold,
-                                },
-                                expected_next="task_note_snapshot_build",
-                            )
-
-                            # 步骤 2：追加边界 User 提示消息（包含基线 Note 快照）
-                            boundary_prompt = self._task_note_prompt_provider.build_compression_boundary_prompt(note_snapshot)
-                        boundary_msg = UniMessage(
-                            role=ROLE_USER,
-                            content=[TextPart(text=boundary_prompt)],
-                            message_id=f"msg_{uuid.uuid4().hex[:12]}",
-                        )
-                        conversation.append_message(boundary_msg, [TextPartMeta()])
-
-                        # 步骤 3：更新 conversation.timeline（冻结当前业务 prompt/tools 为 historical，追加 Note prompt/tools 的活跃配置事件，并保存会话）
-                        self._freeze_and_append_note_timeline(
-                            conversation=conversation,
-                            agent_definition=agent_definition,
-                            business_system_prompt=system_prompt,
-                            business_tools=tools,
-                            boundary_message_id=boundary_msg.message_id,
-                        )
-                        await self._conversation_repository.save(conversation)
-
-                        # 步骤 4：更新实例状态为 note_update 并持久化到 SQLite
-                        instance = instance.enter_note_update()
-                        self._runtime_gateway.update_agent_instance_execution_substate(
-                            instance.instance_id,
-                            EXECUTION_SUBSTATE_NOTE_UPDATE,
-                        )
-
-                        # 步骤 5：当前轮次立即切换为 Note Prompt + Note Tools 发送给 LLM
-                        tools = self._task_note_prompt_provider.get_note_tools(resolved_model.api_format)
-                        note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
-                        system_prompt = self._task_note_prompt_provider.render_note_system_prompt(
+                compression_decision = self._check_compression_gate(conversation, resolved_model)
+                if compression_decision.should_compress:
+                    if self._task_note_context_assembler is not None:
+                        swap_result = await self._task_note_context_assembler.assemble_context(
+                            messages=conversation.messages,
+                            task_id=task.task_id,
                             agent_instance_id=instance.instance_id,
-                            agent_name=agent_definition.name,
                             current_working_directory=instance.current_working_directory,
-                            available_tools=note_tool_names,
+                            context_window_threshold=compression_decision.threshold,
+                            current_tokens=compression_decision.used_tokens,
                         )
-                        self._trace_recorder.record_event(
-                            trace_path,
-                            "context_compression_note_update_entered",
-                            {
-                                "task_id": task.task_id,
-                                "agent_instance_id": instance.instance_id,
-                                "boundary_message_id": boundary_msg.message_id,
-                                "decision_reason": compression_decision.reason,
-                            },
-                        )
-                        await self._event_publisher.publish(
-                            communication_context,
-                            "agent.context_compression.note_update_entered",
-                            {
-                                "task_id": task.task_id,
-                                "agent_instance_id": instance.instance_id,
-                                "conversation_id": conversation.id,
-                                "reason": compression_decision.reason,
-                            },
-                            source="agent_execution_engine",
-                        )
-                    if interrupt_state.requested:
-                        raise LlmRequestCancelled("LLM request cancelled.")
+                        if swap_result.swapped:
+                            conversation.messages = list(swap_result.messages)
+                            await self._conversation_repository.save(conversation)
+                            self._trace_recorder.record_event(
+                                trace_path,
+                                "task_note_context_swapped",
+                                {
+                                    "task_id": task.task_id,
+                                    "agent_instance_id": instance.instance_id,
+                                    "covered_until_seq": swap_result.covered_until_seq,
+                                    "note_version": swap_result.note_version,
+                                    "tail_message_count": swap_result.tail_message_count,
+                                },
+                            )
+                            await self._event_publisher.publish(
+                                communication_context,
+                                "agent.task_note.context_swapped",
+                                {
+                                    "task_id": task.task_id,
+                                    "agent_instance_id": instance.instance_id,
+                                    "conversation_id": conversation.id,
+                                    "covered_until_seq": swap_result.covered_until_seq,
+                                    "note_version": swap_result.note_version,
+                                },
+                                source="agent_execution_engine",
+                            )
+                if interrupt_state.requested:
+                    raise LlmRequestCancelled("LLM request cancelled.")
                 self._set_execution_phase(
                     task_id=task.task_id,
                     instance_id=instance.instance_id,
@@ -3291,10 +3107,7 @@ class AgentExecutionEngine:
                     deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
                     for t in tools
                 )
-                if (
-                    instance.execution_substate != EXECUTION_SUBSTATE_NOTE_UPDATE
-                    and not getattr(conversation, "timeline", None)
-                ):
+                if not getattr(conversation, "timeline", None):
                     if system_prompt is not None:
                         conversation.record_configuration_event(
                             ConfigurationComponentEvent(
@@ -3509,88 +3322,6 @@ class AgentExecutionEngine:
             except Exception as exc:
                 logger.warning("检查上下文压缩门禁异常: %s", exc)
         return CompressionDecision(False, "no_compression_service")
-
-    def _freeze_and_append_note_timeline(
-        self,
-        *,
-        conversation: Conversation,
-        agent_definition: AgentDefinition,
-        business_system_prompt: str | None,
-        business_tools: tuple[LlmToolDefinition, ...] | list[LlmToolDefinition],
-        boundary_message_id: str,
-    ) -> None:
-        business_tool_schemas = tuple(
-            deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
-            for t in business_tools
-        )
-        if not conversation.timeline:
-            if business_system_prompt is not None:
-                conversation.record_configuration_event(
-                    ConfigurationComponentEvent(
-                        event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
-                        definition_id=agent_definition.agent_id,
-                        anchor="start",
-                        sequence=1,
-                        status="active",
-                        component="prompt",
-                    )
-                )
-            if business_tools:
-                conversation.record_configuration_event(
-                    ConfigurationComponentEvent(
-                        event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
-                        definition_id=agent_definition.agent_id,
-                        anchor="start",
-                        sequence=0,
-                        status="active",
-                        component="tool",
-                    )
-                )
-
-        frozen_timeline: list[ConfigurationComponentEvent] = []
-        for evt in conversation.timeline:
-            if evt.status == "active":
-                snapshot = (
-                    business_system_prompt or ""
-                    if evt.component == "prompt"
-                    else tuple(
-                        t.name if hasattr(t, "name") else (t.get("name") if isinstance(t, dict) else str(t))
-                        for t in business_tools
-                    )
-                )
-                frozen_timeline.append(
-                    replace(
-                        evt,
-                        status="historical",
-                        snapshot=snapshot,
-                    )
-                )
-            else:
-                frozen_timeline.append(evt)
-        conversation.timeline = frozen_timeline
-
-        conversation.record_configuration_event(
-            ConfigurationComponentEvent(
-                event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
-                definition_id=NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
-                anchor="after_message_id",
-                anchor_message_id=boundary_message_id,
-                sequence=1,
-                status="active",
-                component="prompt",
-            )
-        )
-        conversation.record_configuration_event(
-            ConfigurationComponentEvent(
-                event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
-                definition_id="task_note",
-                anchor="after_message_id",
-                anchor_message_id=boundary_message_id,
-                sequence=0,
-                status="active",
-                component="tool",
-            )
-        )
 
     def _render_system_prompt(
         self,
@@ -4030,17 +3761,9 @@ class AgentExecutionEngine:
     ) -> ToolDispatchResult:
         """执行单个工具调用，调度层异常也转换为 LLM 可见的工具错误结果。"""
         try:
-            if instance is not None and instance.execution_substate == EXECUTION_SUBSTATE_NOTE_UPDATE:
-                note_tool_names = self._task_note_prompt_provider.get_note_tool_names()
-                if tool_use.name not in note_tool_names:
-                    raise PermissionError(f"Note 更新状态下仅允许调用 Task Note 工具，禁止调用工具: {tool_use.name}")
-                effective_definition = replace(
-                    definition,
-                    tool_ids=note_tool_names,
-                    mcp_tools=(),
-                )
-            else:
-                effective_definition = definition
+            if tool_use.name in self._task_note_prompt_provider.get_note_tool_names():
+                raise PermissionError(f"业务 Agent 严禁直接调用 Task Note 工具: {tool_use.name} (D06)")
+            effective_definition = definition
 
             return await self._tool_dispatcher.dispatch_tool_call(
                 agent_definition=effective_definition,
@@ -4499,6 +4222,13 @@ class AgentExecutionEngine:
                 if self._task_note_snapshot_service is not None:
                     targets = set(released_agent_instance_ids) | {instance_id}
                     for tid in targets:
+                        if self._task_note_observer_scheduler is not None:
+                            try:
+                                await self._task_note_observer_scheduler.wait_for_observer(
+                                    tid, timeout=self._swap_wait_timeout_seconds
+                                )
+                            except Exception:
+                                pass
                         try:
                             await self._task_note_snapshot_service.async_cleanup_agent_instance_note(
                                 task_id=task_id, agent_instance_id=tid

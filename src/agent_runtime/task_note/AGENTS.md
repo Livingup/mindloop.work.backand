@@ -1,55 +1,53 @@
 # 任务 Note 工具模块（task_note）
 
-负责面向 Note 更新 Agent 的任务意图、宏观方案、决策、待办、认知真相、问题排查、交付产物、验证结论与恢复快照的专属维护工具集（共 32 个工具）。
+负责面向后台观察者（Task Note Observer）的任务意图、宏观方案、决策、待办、认知真相、问题排查、交付产物、验证结论与恢复快照的专属维护工具集（共 36 个工具、16 张表）。
 
 ## 模块边界
 
 本模块是具体业务工具模块，负责 Task Note 数据结构与专属维护工具的实现。
 
 - `tool` 模块负责统一工具协议、注册表、Schema 生成与执行调度。
-- `task_note` 工具必须保持 `group="task_note"` 供展示筛选，并配置 `category="business"`；在系统进入 Note 更新状态时由 Runtime 原地挂载。
-- 工具入参必须基于 `BaseToolRequest`，严禁在 Schema 中包含 `task_id`、`agent_instance_id` 等环境元数据参数，这些参数统一通过 `ctx: ToolRuntimeContext` 隐式注入。
+- `task_note` 工具必须保持 `group="task_note"` 供展示筛选，并配置 `category="business"`。
+- **业务 Agent 严格隔离**：业务 Agent 在任何状态下工具列表中都不持有任何 Task Note 工具；Note 工具只挂载在后台独立的观察者会话上（D06）。
+- 工具入参必须基于 `BaseToolRequest`，严禁在 Schema 中包含 `task_id`、`agent_instance_id` 等环境元数据参数，这些参数统一通过 `ctx: ToolRuntimeContext` 与 `ObserverBinding` 隐式注入（杜绝默认静态兜底 ID）。
 - 出参遵循零冗余原则：
   - 严禁在 `output` 字典中包含 `"success": true`；
   - 严禁机械回显入参中的非主键字段；
   - 仅返回系统生成的记录主键 ID、简明对账标识文本以及极简的 message 结论。
-- `note_update_end` 必须声明 `allowed_loop_decisions=("continue", "complete")`，返回 `decision="complete"` 作为退出 Note 更新状态的控制信号。
+- `note_update_end` 必须声明 `allowed_loop_decisions=("continue", "complete")`，三项准入校验通过后方可返回 `decision="complete"` 并推进断点水位。
 
-## Note 上下文压缩与状态流转规则
+## 双线程解耦架构与上下文替换规则
 
-1. **零 Agent Fork（Zero Agent Fork）**：
-   - 上下文压缩进入 Note 更新时不创建新 Agent 实例，`agent_instance_id` 全程保持不变。
-   - 通过将业务 Agent 原地切换为 Note 更新状态（`execution_substate="note_update"`）实现。
-2. **状态持久化与抗中断**：
-   - `AgentInstance.execution_substate` 在进入 Note 更新时持久化到 SQLite `agent_instances.execution_substate`，退出 Note 更新时清空为 `None`。
-   - 任务中断、暂停或进程重启后，恢复执行时若处于 `note_update` 状态，必须直接恢复 Note System Prompt 和 Note Tools，绝不发生状态丢失或提示词/工具撕裂。
-3. **提示词模板化与工具权限隔离**：
-   - Note 系统提示词必须从模板网关读取 `name="system_note_update"`（支持 `{{agent_instance_id}}` 和 `{{available_tools}}` 占位符），不得硬编码。
-   - 在 `note_update` 状态下执行循环强制隔离工具，仅允许调用 32 个 Task Note 工具，非 Note 工具严格拦截并返回工具错误。
-4. **触发时序**：
-   - 触发时序：查询 PG 基线快照 -> 追加边界 User 提示消息 -> 更新 `conversation.timeline`（冻结业务 prompt/tools 为 historical，追加 Note active 配置事件）并保存会话 -> `enter_note_update()` 持久化状态 -> 下发 Note Prompt/Tools。
-5. **退出时序与上下文反查重建**：
-   - 调用 `note_update_end` 工具 -> 查询 PG 最新完整快照 -> 反查本地磁盘源码（`path + line_ranges` 带 1-based 行号）、反查命令行执行记录（`command_id` 映射到真实 `command_line`，标注为“命令行执行 ID”）、提取父子协作专线与远程 Agent 对等通信流 -> 组织为高密度结构化 Markdown 现场工作手记（突出 Next Step 与 Todo 复选框，严禁直接倾倒数据库表原始 JSON） -> 创建全新干净 `Conversation` 并以 Markdown 手记为初始消息注入 -> timeline 初始化为业务 prompt/tools -> `switch_agent_instance_conversation` -> `exit_note_update()` 持久化状态 -> 覆盖 `loop_decision="continue"` 让业务 Agent 在新会话中无缝继续执行。
-6. **辅助表与索引增效约束**：
-   - `task_command_records` 记录终端命令索引（`mission_id` 初始为 NULL，支持通过 `bind_resources_to_mission` 延迟归属绑定）。该表作为底层技术反查辅助表，不在 Note Agent 状态快照中直接倾倒给模型，以极大节约上下文 Token。Note Agent 在业务表（workspace_context, validations, discoveries 等）中记录 `command_id` 作为命令行执行 ID 进行关联索引，切回业务状态时由系统自动反查真实命令行指令。
+1. **双线程观察模型（前后台完全解耦，D02）**：
+   - 前台业务 Agent 专注任务执行，不持有 Note 工具，不感知观察者存在；
+   - 后台观察者是独立的 LLM 会话，自上一断点以来的消息增量达到阈值时（从配置读取 `observer_trigger_tokens`，默认 80k），由程序后台异步启动观察，业务 Agent 不阻塞；
+   - 每次观察均为全新独立 Conversation，同一目标 Agent 同一时刻最多只有一个观察运行；
+   - 观察会话通过 `ObserverBinding` 注入目标 Agent 身份与切片 units（D03, M5）。
+2. **断点校验与水位推进（D04）**：
+   - `note_update_end` 必须依次校验：
+     1. covered_until_seq 属于本次增量 units 且覆盖比例达到配置要求（默认 >= 50%）；
+     2. 该 seq 及之前的 auto_record 项均已绑定 mission_id 或已删除；
+     3. 目标 Agent 每个 in_progress 状态的任务均有 progress 记录。
+   - 全部通过后原子推进 `task_note_watermark`；任一不通过返回拒绝并详细说明缺失项，水位不推进。
+3. **上下文热替换与尾部保留（D05, M6）**：
+   - 仅在业务 Agent 两次 LLM 调用之间检查门禁；
+   - 命中门禁时，新上下文 = 业务系统提示词 + 快照手记（user，只取已绑定行与卡片）+ `covered_until_message_id` 之后的原始残差消息；
+   - 只有快照读取成功且 `note_version >= 1` 时才允许替换；
+   - M6-1：替换时若后台观察运行中，等待最多 `swap_wait_timeout_seconds`（超时使用上一版快照）；
+   - M6-2：组装后残差尾部若仍超门禁阈值，先同步执行一次观察再重新组装；
+   - M6-3：残差尾部首条若是 user 消息，与快照 user 消息安全合并，确保 LLM 协议合法。
+4. **存量升级兼容（M7）**：
+   - 升级或重启时若检测到实例处于 `execution_substate="note_update"`，直接重置为业务态，保留 `pending_user_messages` 队列，水位不推进，按正常业务态执行；
+   - 删除消息分流逻辑，所有待处理用户消息正常 drain 消费。
+5. **降级与容错策略（D08）**：
+   - PostgreSQL 存储不可用或连接失败时，Note 工具显式返回失败，不静默假成功；
+   - 快照读取失败或为空时不替换上下文，业务会话保持原样，watermark 不推进。
+6. **双 ID 租户环境隔离约束**：
+   - Task Note 16 张表全量以 `task_id` 和 `agent_instance_id` 作为底层隔离归属字段；
+   - 无论单表增删改查还是读取快照，所有 SQL 必须 100% 携带 `task_id` 与 `agent_instance_id` 双条件；
+   - 方案与进度 UPSERT 冲突分支同步更新 `task_id = EXCLUDED.task_id`。
 7. **生命周期垃圾回收与物理清理约束 (GC)**：
-   - Note 体系本质是服务于超长会话上下文压缩的“运行态工作记忆”，不是业务持久化或历史审计归档库。
-   - 当非 Root Agent（子 Agent）调用 `end_task` 退出时，Runtime 必须物理清除该子 Agent 实例在全部 15 张 Note 表中的记录（`WHERE task_id = %s AND agent_instance_id = %s`）。
-   - 当 Root Agent（主 Agent）调用 `end_task` 完成全任务时，Runtime 必须物理清除该 `task_id` 下全部 15 张 Note 表的记录（`WHERE task_id = %s`）。
-   - 高频技术辅助表 `task_command_records` 必须随同上述 15 张表一起物理删除，杜绝命令累积导致数据库膨胀。
-   - 清理动作由 Runtime 引擎静默执行，不得触发 LLM 对话或进入 Note 更新循环。
-8. **产物格式化真实契约约束**：
-   - `task_artifact_records.edits` 的底层存储仅包含 `feature_desc` 和 `replace_lines`（无原始删除行记录）。在反查与 Markdown 格式化手记时，严禁虚构带 `-` 删减行的伪 Git Diff，必须真实渲染 `feature_desc` 与 `replace_lines` 代码块。
-9. **意图指令（raw_prompts）语义维护契约**：
-   - `agent_user_mission.raw_prompts` 记录用户或父 Agent 的委派消息，按时间序追加；
-   - 不强求一字不变的机械原文，允许 Agent 在保证原始核心含义和真实需求绝对不变的前提下，优化措辞或描述，使需求表达更清晰明确。
-10. **Note 状态下的消息精准路由与隔离消费规则**：
-    - Note 状态（`execution_substate="note_update"`）下，执行循环仅允许过滤消费真实人类用户提交的消息（供 Note Agent 了解最新指引并辅助整理手记）；
-    - 外部远程 Agent（LACP/remote_agent）或本地父/子 Agent（subagent/local_agent）发来的消息属于业务 Agent 的协作消息，严禁进入 Note 会话；
-    - 该类外部业务协作消息必须保留在 `AgentInstance.pending_user_messages` 队列中，待调用 `note_update_end` 切换为全新业务会话并恢复正常业务状态后，在业务执行循环的第一轮开头全量消费并追加到新业务会话尾部。
-11. **双 ID 租户环境隔离与产物安全约束**：
-    - Task Note 15 张表全量以 `task_id`（班次/任务会期）和 `agent_instance_id`（执行实例）作为底层隔离归属字段。
-    - 无论是单表增删改查还是 Agent 实例读取自身手记快照（`build_snapshot`），所有 SQL 必须 100% 携带 `task_id` 与 `agent_instance_id` 双条件（包括 `agent_user_mission`），严禁遗漏任何一张表，杜绝跨班次与跨 Agent 实例数据混淆与泄露。
-    - 通用产物删除 `delete_task_artifact_other` 严格限定 `AND type = 'other'`，与 `create_task_artifact_other` 对称对齐；严禁删除底层文件工具自动捕获的 `file_*`（`file_create`, `file_modify`, `file_delete`, `file_move`）物理文件产物记录。
-    - 协作资源级联绑定（`bind_resources_to_mission`）的子查询必须限定当前 `task_id` 与 `agent_instance_id`，杜绝跨实例解析拓扑关系。
-    - 方案与进度 UPSERT 冲突分支必须同步更新 `task_id = EXCLUDED.task_id`，确保根实例跨班次复用时方案/进度归属于当前最新活跃班次。
+   - 当子 Agent 或 Root Agent 结束时，清理前先调用调度器等待或取消运行中的观察（最多 `swap_wait_timeout_seconds`）；
+   - 随后物理清除全部 16 张 Note 表中该实例或 task 的记录，杜绝数据库残留膨胀。
+8. **意图指令语义维护契约**：
+   - `agent_user_mission.raw_prompts` 记录委派指令，允许 Agent 在保证原始核心含义和真实需求绝对不变的前提下优化措辞。

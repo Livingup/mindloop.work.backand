@@ -242,26 +242,6 @@ def test_format_task_note_to_markdown_comprehensive(tmp_path: Path):
     assert "📥 **[接收自远程 Agent]**: 已分配节点计算资源" in md
 
 
-def test_prompt_provider_excludes_commands_from_boundary_prompt():
-    """测试触发压缩时，Note Agent 看到的基线快照不包含 commands 辅助表。"""
-    provider = TaskNotePromptProvider()
-    snapshot = {
-        "task_id": "t1",
-        "agent_instance_id": "a1",
-        "missions": [{"mission_id": "m1", "title": "任务1"}],
-        "commands": [
-            {"command_id": "cmd_01", "command_line": "echo hello"},
-            {"command_id": "cmd_02", "command_line": "ls -l"},
-        ],
-    }
-
-    boundary = provider.build_compression_boundary_prompt(snapshot)
-    assert "任务1" in boundary
-    # commands 辅助表应该被剔除，不出现在给 Note Agent 的快照中
-    assert "cmd_01" not in boundary
-    assert "echo hello" not in boundary
-
-
 def test_prompt_provider_build_resumed_conversation_prompt_markdown():
     """测试 Note 更新完成后切回业务 Agent，返回规范的 Markdown 工作手记。"""
     provider = TaskNotePromptProvider()

@@ -39,6 +39,9 @@ from agent_runtime.task_note.task_note_snapshot_service import (
     TaskNoteSnapshotService,
     get_task_note_snapshot_service,
 )
+from agent_runtime.task_note.task_note_observer_runner import TaskNoteObserverRunner
+from agent_runtime.task_note.task_note_observer_scheduler import TaskNoteObserverScheduler
+from agent_runtime.task_note.task_note_context_assembler import TaskNoteContextAssembler
 from agent_runtime.tool.local_tool_factory import LocalToolFactory
 
 
@@ -188,6 +191,24 @@ class AgentExecutionFactory:
             local_tool_gateway=local_tool_gateway,
         )
         task_note_snapshot_service = get_task_note_snapshot_service()
+        task_note_observer_runner = TaskNoteObserverRunner(
+            llm_request_service=llm_request_service,
+            prompt_provider=task_note_prompt_provider,
+            local_tool_gateway=local_tool_gateway,
+            llm_registry_gateway=llm_registry_gateway,
+            runtime_gateway=runtime_gateway,
+            event_publisher=event_publisher,
+            observer_min_advance_ratio=config.context_compression.observer_min_advance_ratio,
+        )
+        task_note_observer_scheduler = TaskNoteObserverScheduler(
+            observer_runner=task_note_observer_runner,
+            prompt_provider=task_note_prompt_provider,
+            trigger_threshold_tokens=config.context_compression.observer_trigger_tokens,
+        )
+        task_note_context_assembler = TaskNoteContextAssembler(
+            scheduler=task_note_observer_scheduler,
+            swap_wait_timeout_seconds=config.context_compression.swap_wait_timeout_seconds,
+        )
         engine = AgentExecutionEngine(
             runtime_gateway=runtime_gateway,
             agent_definition_gateway=agent_definition_gateway,
@@ -207,6 +228,9 @@ class AgentExecutionFactory:
             file_resource_service_getter=get_file_resource_service,
             task_note_prompt_provider=task_note_prompt_provider,
             task_note_snapshot_service=task_note_snapshot_service,
+            task_note_observer_scheduler=task_note_observer_scheduler,
+            task_note_context_assembler=task_note_context_assembler,
+            swap_wait_timeout_seconds=config.context_compression.swap_wait_timeout_seconds,
         )
         LacpFactory.create_bridge(
             runtime_gateway=runtime_gateway,
