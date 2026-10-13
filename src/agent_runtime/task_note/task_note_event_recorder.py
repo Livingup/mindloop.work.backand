@@ -35,6 +35,11 @@ class TaskNoteEventRecorder:
         connection_factory: Callable[[], ContextManager[Any]] | None = None,
     ) -> None:
         self._connection_factory = connection_factory
+        self._failure_count: int = 0
+
+    @property
+    def failure_count(self) -> int:
+        return self._failure_count
 
     @classmethod
     def from_config_registry(cls) -> "TaskNoteEventRecorder":
@@ -67,7 +72,10 @@ class TaskNoteEventRecorder:
         mission_id: str | None = None,
     ) -> str | None:
         """记录文件操作物理产物到 task_artifact_records。"""
-        if not task_id or not agent_instance_id or self._connection_factory is None:
+        if not task_id or not agent_instance_id:
+            return None
+        if self._connection_factory is None:
+            self._failure_count += 1
             return None
 
         artifact_id = _generate_id("art")
@@ -108,6 +116,7 @@ class TaskNoteEventRecorder:
                 conn.commit()
             return artifact_id
         except Exception as exc:
+            self._failure_count += 1
             logger.warning("记录 task_artifact_records 异常 (已忽略): %s", exc)
             return None
 
@@ -120,7 +129,10 @@ class TaskNoteEventRecorder:
         command_line: str,
     ) -> bool:
         """记录终端命令索引到 task_command_records。"""
-        if not task_id or not agent_instance_id or not command_id or self._connection_factory is None:
+        if not task_id or not agent_instance_id or not command_id:
+            return False
+        if self._connection_factory is None:
+            self._failure_count += 1
             return False
 
         try:
@@ -145,6 +157,7 @@ class TaskNoteEventRecorder:
                 conn.commit()
             return True
         except Exception as exc:
+            self._failure_count += 1
             logger.warning("记录 task_command_records 异常 (已忽略): %s", exc)
             return False
 
@@ -176,7 +189,10 @@ class TaskNoteEventRecorder:
         mission_id: str | None = None,
     ) -> str | None:
         """记录子 Agent 协作拓扑关系到 task_agent_relationships（面向父子双方双向记录），返回父视角关系 ID。"""
-        if not task_id or not parent_instance_id or not child_instance_id or self._connection_factory is None:
+        if not task_id or not parent_instance_id or not child_instance_id:
+            return None
+        if self._connection_factory is None:
+            self._failure_count += 1
             return None
 
         try:
@@ -240,6 +256,7 @@ class TaskNoteEventRecorder:
                 conn.commit()
             return rel_id_parent
         except Exception as exc:
+            self._failure_count += 1
             logger.warning("记录 task_agent_relationships 异常 (已忽略): %s", exc)
             return None
 
@@ -323,7 +340,10 @@ class TaskNoteEventRecorder:
         mission_id: str | None = None,
     ) -> bool:
         """记录父子 Agent 专线消息到 task_agent_messages（双向单条记录）。"""
-        if not task_id or not from_instance_id or not to_instance_id or self._connection_factory is None:
+        if not task_id or not from_instance_id or not to_instance_id:
+            return False
+        if self._connection_factory is None:
+            self._failure_count += 1
             return False
 
         try:
@@ -380,6 +400,7 @@ class TaskNoteEventRecorder:
                 conn.commit()
             return True
         except Exception as exc:
+            self._failure_count += 1
             logger.warning("记录 task_agent_messages 异常 (已忽略): %s", exc)
             return False
 
@@ -415,7 +436,10 @@ class TaskNoteEventRecorder:
         mission_id: str | None = None,
     ) -> bool:
         """记录远程对等 Agent 通信消息到 task_remote_agent_messages（单条记录）。"""
-        if not task_id or not agent_instance_id or not remote_agent_instance_id or self._connection_factory is None:
+        if not task_id or not agent_instance_id or not remote_agent_instance_id:
+            return False
+        if self._connection_factory is None:
+            self._failure_count += 1
             return False
 
         try:
@@ -445,6 +469,7 @@ class TaskNoteEventRecorder:
                 conn.commit()
             return True
         except Exception as exc:
+            self._failure_count += 1
             logger.warning("记录 task_remote_agent_messages 异常 (已忽略): %s", exc)
             return False
 

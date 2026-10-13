@@ -385,7 +385,7 @@ def test_file_modify_hook(tmp_path: Any) -> None:
     kwargs = mock_recorder.record_file_artifact.call_args.kwargs
     assert kwargs["task_id"] == "task-1"
     assert kwargs["agent_instance_id"] == "inst-1"
-    assert kwargs["op_type"] == "modify"
+    assert kwargs["op_type"] == "file_modify"
     assert kwargs["file_path"] == str(target_file.resolve())
     assert len(kwargs["edits"]) == 1
     assert kwargs["edits"][0]["feature_desc"] == "change return value"
@@ -465,7 +465,7 @@ def test_file_create_and_delete_hooks(tmp_path: Any) -> None:
     assert res_create.success is True
     mock_recorder.record_file_artifact.assert_called_once()
     kwargs = mock_recorder.record_file_artifact.call_args.kwargs
-    assert kwargs["op_type"] == "create"
+    assert kwargs["op_type"] == "file_create"
     assert kwargs["content_lines"] == ["line 1", "line 2"]
 
     mock_recorder.reset_mock()
@@ -480,7 +480,7 @@ def test_file_create_and_delete_hooks(tmp_path: Any) -> None:
     assert res_del.success is True
     mock_recorder.record_file_artifact.assert_called_once()
     kwargs_del = mock_recorder.record_file_artifact.call_args.kwargs
-    assert kwargs_del["op_type"] == "delete"
+    assert kwargs_del["op_type"] == "file_delete"
     assert kwargs_del["content"] == "clean up temp file"
 
 
@@ -506,7 +506,7 @@ def test_file_move_hook(tmp_path: Any) -> None:
     assert res_move.success is True
     mock_recorder.record_file_artifact.assert_called_once()
     kwargs = mock_recorder.record_file_artifact.call_args.kwargs
-    assert kwargs["op_type"] == "move"
+    assert kwargs["op_type"] == "file_move"
     assert kwargs["source_path"] == str(src_file.resolve())
     assert kwargs["target_path"] == str((project_root / "dst.txt").resolve())
     assert kwargs["content"] == "rename to dst"
@@ -639,4 +639,33 @@ async def test_lacp_bridge_inbound_hook() -> None:
         message_type="receive",
         message="Please verify the integration test.",
     )
+
+
+def test_recorder_failure_count_when_pg_disconnected_file_create_succeeds(tmp_path: Any) -> None:
+    """验收 4: 断开 PG 时 file_create 仍成功，recorder 失败计数 +1。"""
+    from agent_runtime.task_note.task_note_event_recorder import TaskNoteEventRecorder
+    from agent_runtime.file_tools.file_edit_tools import FileCreateRequest, file_create
+
+    # 真实的 recorder，但是没有 connection_factory（模拟断开 PG）
+    real_recorder = TaskNoteEventRecorder(connection_factory=None)
+    assert real_recorder.failure_count == 0
+    set_task_note_event_recorder(real_recorder)
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    ctx = ToolRuntimeContext(task_id="task-1", agent_instance_id="inst-1")
+
+    req_create = FileCreateRequest(
+        project_root=str(project_root),
+        file_path="hello.txt",
+        content_lines=["hello world"],
+    )
+    # file_create 应该依然成功
+    res = file_create(req_create, ctx)
+    assert res.success is True
+    assert (project_root / "hello.txt").exists()
+
+    # recorder 失败计数 +1
+    assert real_recorder.failure_count == 1
+
 

@@ -14,7 +14,7 @@ from agent_runtime.llm_api_protocol import API_FORMAT_OPENAI_CHAT_COMPLETIONS
 def test_get_note_tool_names():
     provider = TaskNotePromptProvider()
     names = provider.get_note_tool_names()
-    assert len(names) == 37
+    assert len(names) == 36
     assert "create_mission" in names
     assert "note_update_end" in names
     assert "update_task_progress" in names
@@ -56,7 +56,7 @@ def test_get_note_tools_with_gateway():
     gateway = LocalToolFactory.create()
     provider = TaskNotePromptProvider(local_tool_gateway=gateway)
     tools = provider.get_note_tools(API_FORMAT_OPENAI_CHAT_COMPLETIONS)
-    assert len(tools) == 37
+    assert len(tools) == 36
     names = {t.name for t in tools}
     assert "create_mission" in names
     assert "note_update_end" in names

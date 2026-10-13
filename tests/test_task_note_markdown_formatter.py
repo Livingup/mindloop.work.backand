@@ -511,4 +511,88 @@ def test_format_task_note_pruned_mission_card():
     assert "被裁剪掉的冗长规格书" not in md
 
 
+def test_artifacts_folding_net_changes():
+    """验收 3.5 (D18): 单测覆盖'多次 modify 只输出一条'、'create+delete 不输出'、'move 后 modify 归到新路径'。"""
+    from agent_runtime.task_note.task_note_markdown_formatter import fold_artifacts_net_changes, format_task_note_to_markdown
+
+    artifacts = [
+        # 场景 1: 多次 modify 同一文件
+        {"artifact_id": "art_mod_1", "type": "file_modify", "file_path": "src/core.py", "description": "第1次修改", "created_at": "2026-10-13T01:00:00"},
+        {"artifact_id": "art_mod_2", "type": "modify", "file_path": "src/core.py", "description": "第2次修改", "created_at": "2026-10-13T02:00:00"},
+
+        # 场景 2: 本会期内 create 后 delete
+        {"artifact_id": "art_temp_c", "type": "file_create", "file_path": "temp.py", "description": "新建临时文件", "created_at": "2026-10-13T01:10:00"},
+        {"artifact_id": "art_temp_d", "type": "file_delete", "file_path": "temp.py", "description": "删除临时文件", "created_at": "2026-10-13T02:10:00"},
+
+        # 场景 3: move 后 modify
+        {"artifact_id": "art_move", "type": "file_move", "source_path": "old_util.py", "target_path": "new_util.py", "description": "重命名", "created_at": "2026-10-13T01:20:00"},
+        {"artifact_id": "art_mod_new", "type": "file_modify", "file_path": "new_util.py", "description": "移动后的修改", "created_at": "2026-10-13T02:20:00"},
+
+        # 场景 4: 成果交付 (other) 原样保留
+        {"artifact_id": "art_other", "type": "other", "content": "交付物报告PDF", "created_at": "2026-10-13T03:00:00"},
+    ]
+
+    folded = fold_artifacts_net_changes(artifacts)
+
+    # 1. other 产物存在
+    other_items = [x for x in folded if x.get("type") == "other"]
+    assert len(other_items) == 1
+    assert other_items[0]["artifact_id"] == "art_other"
+
+    # 2. temp.py create+delete 彻底消失
+    temp_items = [x for x in folded if "temp.py" in str(x.get("file_path"))]
+    assert len(temp_items) == 0
+
+    # 3. src/core.py 多次 modify 仅剩 1 条
+    core_items = [x for x in folded if x.get("file_path") == "src/core.py"]
+    assert len(core_items) == 1
+    assert core_items[0]["artifact_id"] == "art_mod_2"
+
+    # 4. move 后 modify 归到新路径并注明原路径
+    util_items = [x for x in folded if x.get("file_path") == "new_util.py"]
+    assert len(util_items) == 1
+    assert util_items[0]["type"] == "file_move"
+    assert "old_util.py" in util_items[0]["description"]
+
+    # 5. 渲染 Markdown 验证
+    snapshot = {"task_id": "t1", "artifacts": artifacts}
+    md = format_task_note_to_markdown(snapshot)
+    assert "temp.py" not in md
+    assert "src/core.py" in md
+    assert "new_util.py" in md
+
+
+def test_multiple_missions_progress_and_solutions_rendering():
+    """验收 3.2 (D09): 同一 Agent 2 个 mission 各写一条 progress 和 solution，手记中两条都出现。"""
+    from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+
+    snapshot = {
+        "task_id": "task-test",
+        "agent_instance_id": "agent-test",
+        "missions": [
+            {"mission_id": "mission-01", "title": "任务一", "status": "in_progress"},
+            {"mission_id": "mission-02", "title": "任务二", "status": "in_progress"},
+        ],
+        "solutions": [
+            {"mission_id": "mission-01", "solution_content": "方案一：采用架构A"},
+            {"mission_id": "mission-02", "solution_content": "方案二：采用架构B"},
+        ],
+        "progresses": [
+            {"mission_id": "mission-01", "next_step": "执行任务一步骤1", "current_work": "编写代码1"},
+            {"mission_id": "mission-02", "next_step": "执行任务二步骤2", "current_work": "编写代码2"},
+        ],
+    }
+    md = format_task_note_to_markdown(snapshot)
+    # 验证两条方案均渲染并标注任务 ID
+    assert "方案一：采用架构A" in md
+    assert "方案二：采用架构B" in md
+    assert "`mission-01`" in md
+    assert "`mission-02`" in md
+
+    # 验证两条 progress 均渲染
+    assert "执行任务一步骤1" in md
+    assert "执行任务二步骤2" in md
+
+
+
 

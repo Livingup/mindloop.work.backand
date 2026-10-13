@@ -210,14 +210,12 @@ CREATE INDEX IF NOT EXISTS idx_external_state_mission ON task_external_state_rec
 CREATE TABLE IF NOT EXISTS task_command_records (
     command_id              VARCHAR(64) PRIMARY KEY,
     task_id                 VARCHAR(64) NOT NULL,
-    mission_id              VARCHAR(64),
     agent_instance_id       VARCHAR(64) NOT NULL,
     command_line            TEXT NOT NULL,
     created_at              TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_command_tenant ON task_command_records(task_id, agent_instance_id);
-CREATE INDEX IF NOT EXISTS idx_command_mission ON task_command_records(task_id, mission_id);
 
 -- 13. 子 Agent 协作关系表 (task_agent_relationships)
 -- 面向 agent_instance_id 双向记录，无 updated_at
@@ -289,6 +287,8 @@ ALTER TABLE agent_user_mission ADD COLUMN IF NOT EXISTS outcome_summary TEXT;
 ALTER TABLE agent_user_mission ADD COLUMN IF NOT EXISTS pruned_at TIMESTAMP WITH TIME ZONE;
 ALTER TABLE task_agent_relationships ADD COLUMN IF NOT EXISTS delegation_content TEXT;
 ALTER TABLE task_agent_relationships ADD COLUMN IF NOT EXISTS fork_message_id VARCHAR(64);
+DROP INDEX IF EXISTS idx_command_mission;
+ALTER TABLE task_command_records DROP COLUMN IF EXISTS mission_id;
 """
 
 

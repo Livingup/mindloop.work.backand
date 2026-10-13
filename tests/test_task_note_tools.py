@@ -60,7 +60,6 @@ from agent_runtime.task_note.task_note_tool import (
     create_task_workspace_context,
     delete_mission,
     delete_task_artifact,
-    delete_task_artifact_other,
     delete_task_discovery,
     delete_task_todo,
     delete_task_workspace_context,
@@ -123,7 +122,6 @@ ALL_NOTE_TOOL_NAMES = [
     "update_task_issue",
     "resolve_task_issue",
     "create_task_artifact_other",
-    "delete_task_artifact_other",
     "delete_task_artifact",
     "create_task_validation",
     "update_task_validation",
@@ -142,9 +140,9 @@ def init_factory():
 
 
 def test_all_note_tools_registered():
-    """验证所有 37 个 Note 工具成功注册至全局工具仓储中。"""
+    """验证所有 36 个 Note 工具成功注册至全局工具仓储中。"""
     repo = get_global_repository()
-    assert len(ALL_NOTE_TOOL_NAMES) == 37
+    assert len(ALL_NOTE_TOOL_NAMES) == 36
 
     for name in ALL_NOTE_TOOL_NAMES:
         assert repo.contains(name), f"工具 {name} 未在仓储中注册"
@@ -182,8 +180,69 @@ def test_note_tools_schema_generation_without_ctx_leak():
         assert "agent_instance_id" not in properties
 
 
+def test_note_tools_storage_unavailable_returns_error_code():
+    """验收 3.1 #1: 断开 PG 后调用任一 Note 工具，返回 TASK_NOTE_STORAGE_UNAVAILABLE。"""
+    from agent_runtime.task_note.task_note_store import TaskNoteStore, set_task_note_store
+
+    set_task_note_store(TaskNoteStore(connection_factory=None))
+    ctx = ToolRuntimeContext(task_id="task-test-01", agent_instance_id="agent-worker-01")
+
+    # 1. create_mission 返回 TASK_NOTE_STORAGE_UNAVAILABLE
+    res_mission = create_mission(CreateMissionRequest(title="测试任务"), ctx)
+    assert res_mission.success is False
+    assert res_mission.error_code == "TASK_NOTE_STORAGE_UNAVAILABLE"
+
+    # 2. update_task_progress 返回 TASK_NOTE_STORAGE_UNAVAILABLE
+    res_prog = update_task_progress(UpdateTaskProgressRequest(mission_id="m-1", completed_summary="已完成", current_work="进行中", next_step="下一步行动"), ctx)
+    assert res_prog.success is False
+    assert res_prog.error_code == "TASK_NOTE_STORAGE_UNAVAILABLE"
+
+    # 3. bind_resources_to_mission 返回 TASK_NOTE_STORAGE_UNAVAILABLE
+    res_bind = bind_resources_to_mission(BindResourcesToMissionRequest(mission_id="m-1", resource_type="artifact", resource_ids=["art-1"]), ctx)
+    assert res_bind.success is False
+    assert res_bind.error_code == "TASK_NOTE_STORAGE_UNAVAILABLE"
+
+
 def test_note_tools_execution_zero_redundancy():
     """验证工具执行并返回零冗余输出结构（无 output.success 冗余，且入参不机械复述）。"""
+    from unittest.mock import MagicMock
+    from contextlib import contextmanager
+    from agent_runtime.task_note.task_note_store import TaskNoteStore, set_task_note_store
+
+    mock_cur = MagicMock()
+    last_query = [""]
+
+    def mock_execute(query, params=None):
+        last_query[0] = str(query)
+
+    mock_cur.execute.side_effect = mock_execute
+
+    def mock_fetchone():
+        q = last_query[0]
+        if "task_agent_relationships" in q and "unreleased" in q:
+            return None
+        if "COUNT(*)" in q:
+            return {"count": 0}
+        return {
+            "status": "completed",
+            "pruned_at": None,
+            "agent_instance_id": "agent-worker-01",
+            "solution_id": "sol-mocked-1",
+            "raw_prompts": [],
+        }
+
+    mock_cur.fetchone.side_effect = mock_fetchone
+    mock_cur.rowcount = 1
+    mock_cur.fetchall.return_value = []
+
+    @contextmanager
+    def mock_conn():
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = mock_cur
+        conn.cursor.return_value.__exit__.return_value = False
+        yield conn
+
+    set_task_note_store(TaskNoteStore(connection_factory=mock_conn))
     ctx = ToolRuntimeContext(task_id="task-test-01", agent_instance_id="agent-worker-01")
 
     # 1. create_mission
@@ -309,9 +368,9 @@ def test_note_tools_execution_zero_redundancy():
     res24 = create_task_artifact_other(CreateTaskArtifactOtherRequest(mission_id=m_id, content="性能评测报告摘要"), ctx)
     assert "artifact_id" in res24.output
 
-    # 25. delete_task_artifact_other
-    res25 = delete_task_artifact_other(DeleteTaskArtifactOtherRequest(artifact_id=res24.output["artifact_id"]), ctx)
-    assert res25.output["deleted_artifact_id"] == res24.output["artifact_id"]
+    # 25. delete_task_artifact (验收 3.7: 覆盖删除 type='other' 的交付物)
+    res25 = delete_task_artifact(DeleteTaskArtifactRequest(artifact_ids=[res24.output["artifact_id"]]), ctx)
+    assert res25.output["deleted_count"] == 1
 
     # 26. create_task_validation
     res26 = create_task_validation(
@@ -360,7 +419,8 @@ def test_note_tools_execution_zero_redundancy():
     )
     assert "progress_id" in res30.output
 
-    # 31. bind_resources_to_mission
+    # 31. bind_resources_to_mission (artifact & agent_relationship)
+    mock_cur.rowcount = 2
     res31 = bind_resources_to_mission(
         BindResourcesToMissionRequest(
             resource_type="artifact",
@@ -372,16 +432,24 @@ def test_note_tools_execution_zero_redundancy():
     assert res31.output["bound_count"] == 2
     assert res31.output["resource_type"] == "artifact"
 
-    res31_cmd = bind_resources_to_mission(
+    res31_rel = bind_resources_to_mission(
         BindResourcesToMissionRequest(
-            resource_type="command",
-            resource_ids=["cmd-01", "cmd-02"],
+            resource_type="agent_relationship",
+            resource_ids=["rel-01", "rel-02"],
             mission_id=m_id,
         ),
         ctx,
     )
-    assert res31_cmd.output["bound_count"] == 2
-    assert res31_cmd.output["resource_type"] == "command"
+    assert res31_rel.output["bound_count"] == 2
+    assert res31_rel.output["resource_type"] == "agent_relationship"
+
+    # D17: command binding 已废弃且严格禁止
+    with pytest.raises(Exception):
+        BindResourcesToMissionRequest(
+            resource_type="command",  # type: ignore
+            resource_ids=["cmd-01", "cmd-02"],
+            mission_id=m_id,
+        )
 
     # 33. update_mission_title
     m_id = res1.output["mission_id"]
@@ -396,7 +464,7 @@ def test_note_tools_execution_zero_redundancy():
     res35 = delete_task_artifact(DeleteTaskArtifactRequest(artifact_ids=["art-01"]), ctx)
     assert res35.output["deleted_count"] >= 1
 
-    # 36. prune_mission
+    # 36. prune_mission (仅闭环任务可裁剪)
     res36 = prune_mission(PruneMissionRequest(mission_id=m_id, outcome_summary="已完成手机号验证码登录并全量回归"), ctx)
     assert "outcome_summary" in res36.output
 

@@ -151,6 +151,114 @@ def _format_command_execution(command_id: str | None, command_lookup: dict[str, 
     return f"> 💻 **命令行执行 ID**: `{command_id}`"
 
 
+
+def fold_artifacts_net_changes(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 path 分组并按时间排序折叠物理产物净变化。
+
+    折叠规则：
+    1. 同一路径多次 modify 只输出一条净变化；
+    2. 本会期内 create 后 delete 的路径不输出；
+    3. move 以最终路径为键并注明原路径，后续对新路径的 modify 归入该路径；
+    4. 非文件产物（type='other'）保持原样输出。
+    """
+    file_ops = ("file_create", "create", "file_modify", "modify", "file_delete", "delete", "file_move", "move")
+    others: list[dict[str, Any]] = []
+    file_records: list[dict[str, Any]] = []
+    for a in artifacts:
+        t = a.get("type")
+        if t in file_ops:
+            file_records.append(dict(a))
+        else:
+            others.append(dict(a))
+
+    file_records.sort(key=lambda x: str(x.get("created_at", "")))
+
+    class Lifecycle:
+        def __init__(self, path: str, first_rec: dict[str, Any]) -> None:
+            self.original_path = path
+            self.current_path = path
+            self.was_created = first_rec.get("type") in ("file_create", "create")
+            self.is_deleted = first_rec.get("type") in ("file_delete", "delete")
+            self.moves: list[tuple[str, str]] = []
+            self.records: list[dict[str, Any]] = [first_rec]
+
+    lifecycles: dict[str, Lifecycle] = {}
+
+    for rec in file_records:
+        t = rec.get("type")
+        if t in ("file_create", "create"):
+            p = rec.get("file_path") or rec.get("path") or ""
+            lc = Lifecycle(p, rec)
+            lifecycles[p] = lc
+        elif t in ("file_modify", "modify"):
+            p = rec.get("file_path") or rec.get("path") or ""
+            if p in lifecycles:
+                lc = lifecycles[p]
+                lc.records.append(rec)
+            else:
+                lc = Lifecycle(p, rec)
+                lifecycles[p] = lc
+        elif t in ("file_move", "move"):
+            src = rec.get("source_path") or rec.get("file_path") or rec.get("path") or ""
+            dst = rec.get("target_path") or rec.get("path") or ""
+            if src in lifecycles:
+                lc = lifecycles.pop(src)
+                lc.current_path = dst
+                lc.moves.append((src, dst))
+                lc.records.append(rec)
+                lifecycles[dst] = lc
+            else:
+                lc = Lifecycle(src, rec)
+                lc.current_path = dst
+                lc.moves.append((src, dst))
+                lc.records.append(rec)
+                lifecycles[dst] = lc
+        elif t in ("file_delete", "delete"):
+            p = rec.get("file_path") or rec.get("path") or ""
+            if p in lifecycles:
+                lc = lifecycles[p]
+                lc.is_deleted = True
+                lc.records.append(rec)
+            else:
+                lc = Lifecycle(p, rec)
+                lc.is_deleted = True
+                lifecycles[p] = lc
+
+    results: list[dict[str, Any]] = []
+    for lc in lifecycles.values():
+        if lc.is_deleted:
+            if lc.was_created:
+                # create + delete: 不输出
+                continue
+            del_rec = dict(lc.records[-1])
+            del_rec["type"] = "file_delete"
+            del_rec["file_path"] = lc.current_path
+            results.append(del_rec)
+        else:
+            if lc.moves:
+                last_rec = dict(lc.records[-1])
+                last_rec["type"] = "file_move"
+                last_rec["file_path"] = lc.current_path
+                last_rec["source_path"] = lc.original_path
+                last_rec["target_path"] = lc.current_path
+                desc = last_rec.get("description") or ""
+                note = f"原路径: {lc.original_path}"
+                last_rec["description"] = f"{desc} ({note})" if desc else note
+                results.append(last_rec)
+            elif lc.was_created:
+                last_rec = dict(lc.records[-1])
+                last_rec["type"] = "file_create"
+                last_rec["file_path"] = lc.current_path
+                results.append(last_rec)
+            else:
+                last_rec = dict(lc.records[-1])
+                last_rec["type"] = "file_modify"
+                last_rec["file_path"] = lc.current_path
+                results.append(last_rec)
+
+    return others + results
+
+
 def format_task_note_to_markdown(
     note_snapshot: dict[str, Any],
     *,
@@ -176,40 +284,52 @@ def format_task_note_to_markdown(
     sec_idx = 1
 
     # ── 1. 当前行动指针与最新进展 (Progress & Next Action) ─────────────
-    progress = note_snapshot.get("progress")
-    if progress and isinstance(progress, dict):
-        has_progress = any(
-            progress.get(k)
-            for k in (
-                "next_step",
-                "completed_summary",
-                "current_work",
-                "current_blockers",
-                "recent_validation",
-                "handoff_notes",
+    progresses = note_snapshot.get("progresses") or []
+    if not progresses and note_snapshot.get("progress"):
+        progresses = [note_snapshot["progress"]]
+    if progresses:
+        p_lines = [f"## {sec_idx}. 现场进度与下一步行动指针 (Progress & Next Action)"]
+        sec_idx += 1
+        has_any = False
+        for p in progresses:
+            if not isinstance(p, dict):
+                continue
+            has_fields = any(
+                p.get(k)
+                for k in (
+                    "next_step",
+                    "completed_summary",
+                    "current_work",
+                    "current_blockers",
+                    "recent_validation",
+                    "handoff_notes",
+                )
             )
-        )
-        if has_progress:
-            p_lines = [f"## {sec_idx}. 现场进度与下一步行动指针 (Progress & Next Action)"]
-            sec_idx += 1
-            next_step = progress.get("next_step") or "(未设定明确下一步)"
+            if not has_fields:
+                continue
+            has_any = True
+            mid = p.get("mission_id")
+            if mid and len(progresses) > 1:
+                p_lines.append(f"### 任务 `{mid}` 进度")
+            next_step = p.get("next_step") or "(未设定明确下一步)"
             p_lines.append(f"> 🎯 **下一步明确行动 (Next Step)**:\n> **{next_step}**\n")
 
-            comp = progress.get("completed_summary")
+            comp = p.get("completed_summary")
             if comp:
                 p_lines.append(f"- **已完成工作摘要**: {comp}")
-            cur_w = progress.get("current_work")
+            cur_w = p.get("current_work")
             if cur_w:
                 p_lines.append(f"- **当前正在进行**: {cur_w}")
-            blockers = progress.get("current_blockers")
+            blockers = p.get("current_blockers")
             if blockers:
                 p_lines.append(f"- **当前阻塞与风险**: {blockers}")
-            rec_v = progress.get("recent_validation")
+            rec_v = p.get("recent_validation")
             if rec_v:
                 p_lines.append(f"- **最近验证结论**: {rec_v}")
-            handoff = progress.get("handoff_notes")
+            handoff = p.get("handoff_notes")
             if handoff:
                 p_lines.append(f"- **交接备忘**: {handoff}")
+        if has_any:
             sections.append("\n".join(p_lines))
 
     # ── 2. 待办任务清单 (Todos) ───────────────────────────────────────
@@ -278,10 +398,23 @@ def format_task_note_to_markdown(
         sections.append("\n".join(m_lines))
 
     # ── 4. 当前方案设计与架构方案 (Active Solution) ─────────────────────
-    solution = note_snapshot.get("solution")
-    if solution and isinstance(solution, dict) and solution.get("solution_content"):
-        sections.append(f"## {sec_idx}. 当前执行方案与架构设计 (Active Solution)\n" + solution["solution_content"])
+    solutions = note_snapshot.get("solutions") or []
+    if not solutions and note_snapshot.get("solution"):
+        solutions = [note_snapshot["solution"]]
+    if solutions:
+        s_lines = [f"## {sec_idx}. 当前执行方案与架构设计 (Active Solution)"]
         sec_idx += 1
+        has_any_sol = False
+        for s in solutions:
+            if not isinstance(s, dict) or not s.get("solution_content"):
+                continue
+            has_any_sol = True
+            mid = s.get("mission_id")
+            if mid and len(solutions) > 1:
+                s_lines.append(f"### [方案] 任务: `{mid}`")
+            s_lines.append(s["solution_content"])
+        if has_any_sol:
+            sections.append("\n\n".join(s_lines))
 
     # ── 5. 关键技术决策与约定 (Technical Decisions) ───────────────────
     decisions = note_snapshot.get("decisions") or []
@@ -455,7 +588,8 @@ def format_task_note_to_markdown(
         sections.append("\n".join(v_lines))
 
     # ── 10. 关键物理产物 (Artifacts) ──────────────────────────────────
-    artifacts = note_snapshot.get("artifacts") or []
+    raw_artifacts = note_snapshot.get("artifacts") or []
+    artifacts = fold_artifacts_net_changes(raw_artifacts)
     if artifacts:
         art_lines = [f"## {sec_idx}. 关键产物与文件 (Artifacts)"]
         sec_idx += 1

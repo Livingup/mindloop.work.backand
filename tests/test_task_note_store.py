@@ -2,6 +2,7 @@
 """TaskNoteStore 数据库持久化层与 31 个 Note 维护工具的单元与集成测试。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -45,6 +46,7 @@ from agent_runtime.task_note.task_note_models import (
 )
 from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
 from agent_runtime.task_note.task_note_store import (
+    TaskNoteStorageUnavailableError,
     TaskNoteStore,
     get_task_note_store,
     set_task_note_store,
@@ -62,7 +64,6 @@ from agent_runtime.task_note.task_note_tool import (
     create_task_todo,
     create_task_validation,
     create_task_workspace_context,
-    delete_task_artifact_other,
     delete_task_discovery,
     delete_task_todo,
     delete_task_workspace_context,
@@ -164,89 +165,29 @@ def mock_db():
 
 
 def test_task_note_store_no_db_fallback():
-    """测试在无数据库配置时的降级与安全缺省行为。"""
+    """测试在无数据库配置时的保护机制：显式抛出 TaskNoteStorageUnavailableError (D08)。"""
     store = TaskNoteStore(connection_factory=None)
 
-    mid = store.create_mission(task_id="t1", scene_id="s1", agent_instance_id="a1", title="任务标题")
-    assert mid.startswith("mission-")
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.create_mission(task_id="t1", scene_id="s1", agent_instance_id="a1", title="任务标题")
 
-    assert store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id=mid, prompt="原话") is True
-    assert store.update_mission_requirement(task_id="t1", agent_instance_id="a1", mission_id=mid, refined_requirement="规格") is True
-    assert store.update_mission_status(task_id="t1", agent_instance_id="a1", mission_id=mid, status="completed") is True
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id="m1", prompt="原话")
 
-    cid = store.create_workspace_context(task_id="t1", mission_id=mid, agent_instance_id="a1", source_type="file", path="test.py")
-    assert cid.startswith("ctx_")
-    assert store.update_workspace_context(task_id="t1", agent_instance_id="a1", context_id=cid, description="说明") is True
-    assert store.delete_workspace_context(task_id="t1", agent_instance_id="a1", context_id=cid) is True
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.update_mission_requirement(task_id="t1", agent_instance_id="a1", mission_id="m1", refined_requirement="规格")
 
-    sid = store.upsert_solution(task_id="t1", mission_id=mid, agent_instance_id="a1", solution_content="方案内容")
-    assert sid.startswith("sol_")
-    assert store.supersede_solution(task_id="t1", mission_id=mid, agent_instance_id="a1") == "sol-superseded-t1"
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.create_workspace_context(task_id="t1", mission_id="m1", agent_instance_id="a1", source_type="file", path="test.py")
 
-    did = store.create_decision(task_id="t1", mission_id=mid, agent_instance_id="a1", decision_content="决策", rationale="理由")
-    assert did.startswith("dec_")
-    assert store.supersede_decision(task_id="t1", agent_instance_id="a1", decision_id=did, superseded_reason="新方案替换") is True
-    assert store.update_decision(task_id="t1", agent_instance_id="a1", decision_id=did, rationale="新理由") is True
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.upsert_solution(task_id="t1", mission_id="m1", agent_instance_id="a1", solution_content="方案内容")
 
-    tid = store.create_todo(task_id="t1", mission_id=mid, agent_instance_id="a1", todo_content="工作内容")
-    assert tid.startswith("todo_")
-    batch = store.batch_create_todos(task_id="t1", mission_id=mid, agent_instance_id="a1", todos=[{"todo_content": "item1"}])
-    assert len(batch) == 1
-    assert store.update_todo_status(task_id="t1", agent_instance_id="a1", todo_id=tid, status="已完成") is True
-    assert store.update_todo_content(task_id="t1", agent_instance_id="a1", todo_id=tid, todo_content="新内容") is True
-    assert store.delete_todo(task_id="t1", agent_instance_id="a1", todo_id=tid) is True
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.upsert_progress(task_id="t1", mission_id="m1", agent_instance_id="a1", completed_summary="总结", current_work="动作", next_step="下一步")
 
-    disc_id = store.create_discovery(task_id="t1", mission_id=mid, agent_instance_id="a1", discovery_content="发现", impact="影响")
-    assert disc_id.startswith("disc_")
-    assert store.update_discovery(task_id="t1", agent_instance_id="a1", discovery_id=disc_id, impact="新影响") is True
-    assert store.delete_discovery(task_id="t1", agent_instance_id="a1", discovery_id=disc_id) is True
-
-    iid = store.create_issue(task_id="t1", mission_id=mid, agent_instance_id="a1", issue_content="故障", impact="影响")
-    assert iid.startswith("issue_")
-    assert store.update_issue(task_id="t1", agent_instance_id="a1", issue_id=iid, status="in_progress") is True
-    assert store.resolve_issue(task_id="t1", agent_instance_id="a1", issue_id=iid, resolution="解决方案") is True
-
-    art_id = store.create_artifact_other(task_id="t1", mission_id=mid, agent_instance_id="a1", artifact_type="other", content="产物内容")
-    assert art_id.startswith("art_")
-    assert store.delete_artifact_other(task_id="t1", agent_instance_id="a1", artifact_id=art_id) is True
-
-    vid = store.create_validation(
-        task_id="t1",
-        mission_id=mid,
-        agent_instance_id="a1",
-        target_type="requirement",
-        validation_method="automated_test",
-        validation_scope="范围",
-        conclusion="passed",
-        validation_content="用例通过",
-        source_type="manual",
-    )
-    assert vid.startswith("val_")
-    assert store.update_validation(task_id="t1", agent_instance_id="a1", validation_id=vid, conclusion="failed") is True
-
-    ext_id = store.create_external_state(
-        task_id="t1",
-        mission_id=mid,
-        agent_instance_id="a1",
-        target_type="database",
-        target_identifier="pg_db",
-        change_content="迁移脚本",
-        current_state="已迁移",
-    )
-    assert ext_id.startswith("ext_")
-    assert store.update_external_state(task_id="t1", agent_instance_id="a1", external_state_id=ext_id, current_state="运行中") is True
-
-    pid = store.upsert_progress(
-        task_id="t1",
-        mission_id=mid,
-        agent_instance_id="a1",
-        completed_summary="完成总结",
-        current_work="当前动作",
-        next_step="下一步工具",
-    )
-    assert pid.startswith("prog_")
-
-    assert store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="artifact", resource_ids=["r1", "r2"]) == 2
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id="m1", resource_type="artifact", resource_ids=["r1"])
 
 
 def test_task_note_store_crud_with_mock_db(mock_db):
@@ -283,10 +224,9 @@ def test_task_note_store_crud_with_mock_db(mock_db):
     assert "UPDATE task_artifact_records" in sql
     assert "mission_id = %s" in sql
 
-    store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="command", resource_ids=["cmd-1", "cmd-2"])
-    sql, params = executed[-1]
-    assert "UPDATE task_command_records" in sql
-    assert "mission_id = %s" in sql
+    # D17: command binding 已废弃，必须抛出 ValueError
+    with pytest.raises(ValueError):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="command", resource_ids=["cmd-1", "cmd-2"])
 
     store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="agent_relationship", resource_ids=["rel-1"])
     assert len(executed) >= 2
@@ -342,13 +282,31 @@ def test_task_note_tool_scene_id_passthrough():
 
 def test_snapshot_service_read_after_store_contract_alignment():
     """测试 TaskNoteSnapshotService 读取结构与 TaskNoteStore 写入契约对齐。"""
-    service = TaskNoteSnapshotService(connection_factory=None)
+    # 1. 验证 connection_factory=None 时显式抛出 TaskNoteStorageUnavailableError (D08)
+    service_none = TaskNoteSnapshotService(connection_factory=None)
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        service_none.build_snapshot(task_id="task-align-01", agent_instance_id="inst-align-01")
+
+    # 2. 验证在有连接时返回对齐的快照结构 (D09 多 mission 结构 solutions / progresses)
+    mock_cur = MagicMock()
+    mock_cur.fetchall.return_value = []
+    mock_cur.fetchone.return_value = None
+
+    @contextmanager
+    def mock_conn():
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = mock_cur
+        conn.cursor.return_value.__exit__.return_value = False
+        yield conn
+
+    service = TaskNoteSnapshotService(connection_factory=mock_conn)
     snapshot = service.build_snapshot(task_id="task-align-01", agent_instance_id="inst-align-01")
 
     # 11 个业务主题对应字段必须齐全且结构合规
     assert "missions" in snapshot
     assert "workspace_context" in snapshot
     assert "solution" in snapshot
+    assert "solutions" in snapshot
     assert "decisions" in snapshot
     assert "todos" in snapshot
     assert "discoveries" in snapshot
@@ -357,6 +315,7 @@ def test_snapshot_service_read_after_store_contract_alignment():
     assert "validations" in snapshot
     assert "external_states" in snapshot
     assert "progress" in snapshot
+    assert "progresses" in snapshot
     assert "commands" in snapshot
     assert "agent_relationships" in snapshot
     assert "agent_messages" in snapshot
@@ -537,7 +496,7 @@ def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -
     msg_sql, msg_params = msg_update
     assert "WHERE task_id = %s AND agent_instance_id = %s" in msg_sql
     assert "WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)" in msg_sql
-    assert msg_params == ("m_iso", "t_iso", "a_iso", "t_iso", "a_iso", ["rel_01"])
+    assert msg_params == ("m_iso", "t_iso", "a_iso", "t_iso", "a_iso", ["rel_01"], "a_iso", "t_iso", "a_iso", ["rel_01"])
 
 
 def test_phase1_store_extensions(mock_db: Any):

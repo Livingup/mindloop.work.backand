@@ -27,7 +27,7 @@ ValidationMethod = Literal["automated_test", "build", "static_check", "manual_ch
 ValidationConclusion = Literal["passed", "failed", "partial", "not_completed"]
 ExternalStateTargetType = Literal["environment", "service", "database", "external_api", "process", "other"]
 ExternalStateReversibility = Literal["reversible", "irreversible", "unknown"]
-BindResourceType = Literal["artifact", "command", "agent_relationship"]
+BindResourceType = Literal["artifact", "agent_relationship"]
 
 
 class LineRange(BaseModel):
@@ -212,7 +212,7 @@ class BatchCreateTaskTodosRequest(BaseToolRequest):
     """批量创建多条待办工作项请求。"""
 
     mission_id: str = Field(min_length=1, description="归属任务 ID。")
-    todos: list[TodoItemInput] = Field(min_length=1, description="待创建的工作项列表，每项包含 todo_content 和 priority。")
+    todos: list[TodoItemInput] = Field(min_length=1, max_length=50, description="待创建的工作项列表，每项包含 todo_content 和 priority。")
 
 
 class UpdateTaskTodoStatusRequest(BaseToolRequest):

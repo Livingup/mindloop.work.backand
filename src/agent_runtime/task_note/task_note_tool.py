@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Agent Task Note 32 个专属维护工具定义。
+"""Agent Task Note 36 个专属维护工具定义。
 
 实现 Note 更新 Agent 对 11 张表的增删改查、生命周期推进、延迟绑定与退出控制。
 严格遵循项目 LocalTool 规范：
@@ -27,7 +27,6 @@ from agent_runtime.task_note.task_note_models import (
     CreateTaskTodoRequest,
     CreateTaskValidationRequest,
     CreateTaskWorkspaceContextRequest,
-    DeleteTaskArtifactOtherRequest,
     DeleteTaskArtifactRequest,
     DeleteTaskDiscoveryRequest,
     DeleteTaskTodoRequest,
@@ -53,7 +52,7 @@ from agent_runtime.task_note.task_note_models import (
     UpdateTaskValidationRequest,
     UpdateTaskWorkspaceContextRequest,
 )
-from agent_runtime.task_note.task_note_store import get_task_note_store
+from agent_runtime.task_note.task_note_store import TaskNoteStorageUnavailableError, get_task_note_store
 from agent_runtime.tool.tool_decorator import tool
 from agent_runtime.tool.tool_execution_models import (
     BaseToolResult,
@@ -63,6 +62,18 @@ from agent_runtime.tool.tool_execution_models import (
 
 logger = logging.getLogger("agent_runtime.task_note.tool")
 
+
+
+def _handle_tool_storage_error(exc: Exception) -> BaseToolResult | None:
+    if isinstance(exc, TaskNoteStorageUnavailableError):
+        return BaseToolResult(
+            success=False,
+            execution_status="failed",
+            error_code="TASK_NOTE_STORAGE_UNAVAILABLE",
+            error_message=f"Task Note 存储不可用: {exc}",
+            output={"error": "TASK_NOTE_STORAGE_UNAVAILABLE", "message": str(exc)},
+        )
+    return None
 
 def _resolve_mission_id(mission_id: str | None, ctx: ToolRuntimeContext) -> str:
     """解析目标 mission_id；缺失或空白时直接抛出 ValueError 拒绝。"""
@@ -116,6 +127,9 @@ def create_mission(request: CreateMissionRequest, ctx: ToolRuntimeContext) -> Ba
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_mission 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -154,6 +168,9 @@ def append_mission_prompt(request: AppendMissionPromptRequest, ctx: ToolRuntimeC
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("append_mission_prompt 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -191,6 +208,9 @@ def update_mission_requirement(request: UpdateMissionRequirementRequest, ctx: To
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_mission_requirement 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -229,6 +249,9 @@ def update_mission_status(request: UpdateMissionStatusRequest, ctx: ToolRuntimeC
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_mission_status 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -267,6 +290,9 @@ def update_mission_prompts(request: UpdateMissionPromptsRequest, ctx: ToolRuntim
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_mission_prompts 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -305,6 +331,9 @@ def update_mission_title(request: UpdateMissionTitleRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_mission_title 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -353,6 +382,9 @@ def prune_mission(request: PruneMissionRequest, ctx: ToolRuntimeContext) -> Base
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("prune_mission 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -400,6 +432,9 @@ def delete_mission(request: DeleteMissionRequest, ctx: ToolRuntimeContext) -> Ba
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("delete_mission 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -452,6 +487,9 @@ def create_task_workspace_context(request: CreateTaskWorkspaceContextRequest, ct
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_workspace_context 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -498,6 +536,9 @@ def update_task_workspace_context(request: UpdateTaskWorkspaceContextRequest, ct
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_workspace_context 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -533,6 +574,9 @@ def delete_task_workspace_context(request: DeleteTaskWorkspaceContextRequest, ct
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("delete_task_workspace_context 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -573,6 +617,9 @@ def update_task_solution(request: UpdateTaskSolutionRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_solution 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -610,6 +657,9 @@ def supersede_task_solution(request: SupersedeTaskSolutionRequest, ctx: ToolRunt
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("supersede_task_solution 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -654,6 +704,9 @@ def create_task_decision(request: CreateTaskDecisionRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_decision 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -692,6 +745,9 @@ def supersede_task_decision(request: SupersedeTaskDecisionRequest, ctx: ToolRunt
             output["superseded_reason"] = request.superseded_reason
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("supersede_task_decision 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -731,6 +787,9 @@ def update_task_decision(request: UpdateTaskDecisionRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_decision 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -774,6 +833,9 @@ def create_task_todo(request: CreateTaskTodoRequest, ctx: ToolRuntimeContext) ->
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_todo 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -819,6 +881,9 @@ def batch_create_task_todos(request: BatchCreateTaskTodosRequest, ctx: ToolRunti
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("batch_create_task_todos 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -856,6 +921,9 @@ def update_task_todo_status(request: UpdateTaskTodoStatusRequest, ctx: ToolRunti
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_todo_status 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -893,6 +961,9 @@ def update_task_todo_content(request: UpdateTaskTodoContentRequest, ctx: ToolRun
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_todo_content 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -928,6 +999,9 @@ def delete_task_todo(request: DeleteTaskTodoRequest, ctx: ToolRuntimeContext) ->
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("delete_task_todo 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -974,6 +1048,9 @@ def create_task_discovery(request: CreateTaskDiscoveryRequest, ctx: ToolRuntimeC
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_discovery 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1016,6 +1093,9 @@ def update_task_discovery(request: UpdateTaskDiscoveryRequest, ctx: ToolRuntimeC
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_discovery 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1051,6 +1131,9 @@ def delete_task_discovery(request: DeleteTaskDiscoveryRequest, ctx: ToolRuntimeC
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("delete_task_discovery 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1099,6 +1182,9 @@ def create_task_issue(request: CreateTaskIssueRequest, ctx: ToolRuntimeContext) 
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_issue 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1138,6 +1224,9 @@ def update_task_issue(request: UpdateTaskIssueRequest, ctx: ToolRuntimeContext) 
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_issue 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1175,6 +1264,9 @@ def resolve_task_issue(request: ResolveTaskIssueRequest, ctx: ToolRuntimeContext
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("resolve_task_issue 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1216,47 +1308,15 @@ def create_task_artifact_other(request: CreateTaskArtifactOtherRequest, ctx: Too
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_artifact_other 失败: %s", exc)
         return BaseToolResult(
             success=False,
             execution_status="failed",
             error_code="DatabaseError",
             error_message=f"登记通用产物失败: {exc}",
-            output={"error": str(exc)},
-        )
-
-
-@tool(
-    name="delete_task_artifact_other",
-    description="物理删除非代码文件的通用交付产物（严格仅限 type='other'，底层绝对防止删除文件物理产物）。",
-    group="task_note",
-    category="business",
-    public=True,
-    execution_mode="direct",
-    wiki="### delete_task_artifact_other\n物理删除无效通用成果，仅限 type='other'，底层绝对保护 file_* 文件物理产物。",
-)
-def delete_task_artifact_other(request: DeleteTaskArtifactOtherRequest, ctx: ToolRuntimeContext) -> BaseToolResult:
-    store = get_task_note_store()
-    task_id = ctx.task_id or "task-default"
-    agent_instance_id = ctx.agent_instance_id or "inst-default"
-    try:
-        store.delete_artifact_other(
-            task_id=task_id,
-            agent_instance_id=agent_instance_id,
-            artifact_id=request.artifact_id,
-        )
-        output = {
-            "deleted_artifact_id": request.artifact_id,
-            "message": "通用交付物删除成功",
-        }
-        return BaseToolResult(output=output)
-    except Exception as exc:
-        logger.error("delete_task_artifact_other 失败: %s", exc)
-        return BaseToolResult(
-            success=False,
-            execution_status="failed",
-            error_code="DatabaseError",
-            error_message=f"删除通用产物失败: {exc}",
             output={"error": str(exc)},
         )
 
@@ -1287,6 +1347,9 @@ def delete_task_artifact(request: DeleteTaskArtifactRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("delete_task_artifact 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1337,6 +1400,9 @@ def create_task_validation(request: CreateTaskValidationRequest, ctx: ToolRuntim
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_validation 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1375,6 +1441,9 @@ def update_task_validation(request: UpdateTaskValidationRequest, ctx: ToolRuntim
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_validation 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1420,6 +1489,9 @@ def create_task_external_state(request: CreateTaskExternalStateRequest, ctx: Too
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("create_task_external_state 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1458,6 +1530,9 @@ def update_task_external_state(request: UpdateTaskExternalStateRequest, ctx: Too
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_external_state 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1504,6 +1579,9 @@ def update_task_progress(request: UpdateTaskProgressRequest, ctx: ToolRuntimeCon
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("update_task_progress 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1545,6 +1623,9 @@ def bind_resources_to_mission(request: BindResourcesToMissionRequest, ctx: ToolR
         }
         return BaseToolResult(output=output)
     except Exception as exc:
+        err_res = _handle_tool_storage_error(exc)
+        if err_res is not None:
+            return err_res
         logger.error("bind_resources_to_mission 失败: %s", exc)
         return BaseToolResult(
             success=False,
@@ -1580,6 +1661,9 @@ def note_update_end(request: NoteUpdateEndRequest, ctx: ToolRuntimeContext) -> B
                 note_version_inc=True,
             )
         except Exception as exc:
+            err_res = _handle_tool_storage_error(exc)
+            if err_res is not None:
+                return err_res
             logger.warning("note_update_end 推进 watermark 异常: %s", exc)
 
     output = {

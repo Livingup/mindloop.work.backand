@@ -418,27 +418,75 @@ def create_agent_runtime_router(
         mission_id: str | None = None,
     ) -> dict[str, Any]:
         """获取指定 task_id 和 agent_instance_id 的 Task Note 结构化快照与 Markdown 视图。"""
-        from agent_runtime.task_note.task_note_snapshot_service import get_task_note_snapshot_service
-        from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
-
-        snapshot_service = get_task_note_snapshot_service()
-        snapshot = snapshot_service.build_snapshot(
-            task_id=task_id,
-            agent_instance_id=agent_instance_id,
-        )
+        # 1. 校验 Agent 实例是否存在 (404 AGENT_INSTANCE_NOT_FOUND)
         cwd = ""
         try:
             instance = gateway.get_agent_instance(agent_instance_id)
-            cwd = instance.current_working_directory or ""
-        except Exception:
-            pass
+            cwd = getattr(instance, "current_working_directory", "") or ""
+        except (KeyError, Exception) as exc:
+            logger.warning("获取 Task Note 时未找到 Agent 实例: %s", exc)
+            raise HTTPException(
+                status_code=404,
+                detail=f"Agent 实例不存在: {agent_instance_id} (AGENT_INSTANCE_NOT_FOUND)",
+            )
+
+        # 2. 从底层服务构建快照与读取水位 (503 TASK_NOTE_STORAGE_UNAVAILABLE)
+        from agent_runtime.task_note.task_note_store import TaskNoteStorageUnavailableError, get_task_note_store
+        from agent_runtime.task_note.task_note_snapshot_service import get_task_note_snapshot_service
+        from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+
+        store = get_task_note_store()
+        snapshot_service = get_task_note_snapshot_service()
+
+        try:
+            snapshot = snapshot_service.build_snapshot(
+                task_id=task_id,
+                agent_instance_id=agent_instance_id,
+            )
+            raw_wm = store.get_watermark(agent_instance_id)
+        except TaskNoteStorageUnavailableError as exc:
+            logger.warning("获取 Task Note 存储不可用: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Task Note 存储不可用: {exc} (TASK_NOTE_STORAGE_UNAVAILABLE)",
+            )
+        except Exception as exc:
+            logger.error("获取 Task Note 异常: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Task Note 存储不可用: {exc} (TASK_NOTE_STORAGE_UNAVAILABLE)",
+            )
+
+        # 3. 组织水位字段
+        if raw_wm and isinstance(raw_wm, dict):
+            watermark = {
+                "covered_until_seq": raw_wm.get("covered_until_seq", 0),
+                "note_version": raw_wm.get("note_version", 0),
+                "updated_at": raw_wm.get("updated_at"),
+            }
+        else:
+            watermark = {
+                "covered_until_seq": 0,
+                "note_version": 0,
+                "updated_at": None,
+            }
 
         markdown = format_task_note_to_markdown(snapshot, current_working_directory=cwd)
+
+        # 4. Phase 3 契约返回
         return {
             "task_id": task_id,
             "agent_instance_id": agent_instance_id,
             "mission_id": mission_id,
+            "watermark": watermark,
+            "observing": False,
             "snapshot": snapshot,
+            "unbound": {
+                "artifacts": [],
+                "agent_relationships": [],
+                "agent_messages": [],
+                "remote_agent_messages": [],
+            },
             "markdown": markdown,
         }
 

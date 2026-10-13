@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Agent Task Note 领域数据访问与持久化存储服务 (TaskNoteStore)。
 
-负责 Note 更新 Agent 调用的 31 个维护工具对 PostgreSQL 11 张主题表的持久化 CRUD 操作：
-1. agent_user_mission: create_mission, append_mission_prompt, update_mission_requirement, update_mission_status
+负责 Note 更新 Agent 调用的 36 个维护工具对 PostgreSQL 16 张表的持久化 CRUD 操作：
+1. agent_user_mission: create_mission, append_mission_prompt, update_mission_prompts, update_mission_title, update_mission_requirement, update_mission_status, prune_mission, delete_mission
 2. task_workspace_context: create, update, delete
 3. task_solution_content: upsert, supersede
 4. task_decision_records: create, supersede, update
@@ -10,10 +10,14 @@
 6. task_progress_content: upsert
 7. task_discovery_records: create, update, delete
 8. task_issue_records: create, update, resolve
-9. task_artifact_records (通用产物): create_other, delete_other
+9. task_artifact_records: create_other, delete_task_artifacts
 10. task_validation_records: create, update
 11. task_external_state_records: create, update
-12. 物理事实延迟归属绑定: bind_resources_to_mission
+12. task_command_records: 终端命令索引记录
+13. task_agent_relationships: 子 Agent 拓扑关系
+14. task_agent_messages: 父子 Agent 专线消息
+15. task_remote_agent_messages: 远程对等 Agent 通信消息
+16. task_note_watermark: 观察断点水位记录
 """
 from __future__ import annotations
 
@@ -27,6 +31,11 @@ from typing import Any, Callable, ContextManager
 logger = logging.getLogger("agent_runtime.task_note.store")
 
 _task_note_available: bool = False
+
+
+class TaskNoteStorageUnavailableError(RuntimeError):
+    """Task Note 存储不可用（PG 未启用、未配置连接工厂或底层连接失败）。"""
+    pass
 
 
 def set_task_note_available(available: bool) -> None:
@@ -87,7 +96,7 @@ def _assert_mission_writable(cur: Any, mission_id: str, agent_instance_id: str) 
     if not row:
         raise ValueError(f"目标任务不存在: mission_id={mission_id}")
     pruned_at = row.get("pruned_at") if isinstance(row, dict) else row[0]
-    owner_agent_id = row.get("agent_instance_id") if isinstance(row, dict) else (row[1] if len(row) > 1 else agent_instance_id)
+    owner_agent_id = (row.get("agent_instance_id") or agent_instance_id) if isinstance(row, dict) else (row[1] if len(row) > 1 else agent_instance_id)
     if owner_agent_id != agent_instance_id:
         raise ValueError(f"任务不属于目标 Agent: mission_id={mission_id}")
     if pruned_at is not None:
@@ -123,6 +132,25 @@ class TaskNoteStore:
     ) -> None:
         self._connection_factory = connection_factory
 
+    def is_available(self) -> bool:
+        """检查底层数据库是否可用。"""
+        if self._connection_factory is None:
+            return False
+        try:
+            with self._connection_factory() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def _get_connection(self) -> ContextManager[Any]:
+        """获取数据库连接，若未配置或不可用则显式抛出 TaskNoteStorageUnavailableError。"""
+        try:
+            return self._connection_factory()
+        except Exception as exc:
+            raise TaskNoteStorageUnavailableError(f"Task Note 存储不可用 (连接失败): {exc}") from exc
+
     @classmethod
     def from_config_registry(cls) -> "TaskNoteStore":
         """从全局配置中心创建 Task Note 存储服务实例。"""
@@ -156,10 +184,6 @@ class TaskNoteStore:
     ) -> str | None:
         """创建新业务任务单元（保存标题、用户/委派输入与提炼需求，支持优化措辞使需求更清晰明确）。"""
         resolved_mission_id = mission_id or f"mission-{time.strftime('%Y%m%d')}-{uuid.uuid4().hex[:6]}"
-        if self._connection_factory is None:
-            logger.debug("TaskNoteStore 未配置数据库连接，跳过 create_mission")
-            return resolved_mission_id
-
         initial_prompts = []
         if raw_prompt and raw_prompt.strip():
             initial_prompts.append({
@@ -168,7 +192,7 @@ class TaskNoteStore:
             })
 
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -207,16 +231,13 @@ class TaskNoteStore:
         prompt: str,
     ) -> bool:
         """向业务任务追加用户发言或委派指令（支持在保持原意前提下优化措辞使需求更明确）。"""
-        if self._connection_factory is None:
-            return True
-
         new_item = [{
             "prompt": prompt,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }]
 
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -242,11 +263,8 @@ class TaskNoteStore:
         refined_requirement: str,
     ) -> bool:
         """覆盖更新正式需求规格书。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -272,11 +290,8 @@ class TaskNoteStore:
         status: str,
     ) -> bool:
         """推进业务任务状态。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -302,9 +317,6 @@ class TaskNoteStore:
         raw_prompts: list[str],
     ) -> bool:
         """整组全量覆盖替换任务原始诉求列表（支持在保持核心含义与需求不变的前提下优化措辞）。"""
-        if self._connection_factory is None:
-            return True
-
         items = [
             {
                 "prompt": p.strip(),
@@ -315,7 +327,7 @@ class TaskNoteStore:
         ]
 
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -341,11 +353,8 @@ class TaskNoteStore:
         title: str,
     ) -> bool:
         """更新业务任务简明标题。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -372,17 +381,9 @@ class TaskNoteStore:
         keep_record_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """闭环任务卡片化裁剪：清空庞大需求与过程描述，写入结果摘要与裁剪时间，级联清理过程记录。"""
-        if self._connection_factory is None:
-            return {
-                "mission_id": mission_id,
-                "deleted_count": 0,
-                "kept_count": 0,
-                "message": "存储未启用，跳过裁剪",
-            }
-
         keep_set = set(keep_record_ids or [])
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -570,16 +571,8 @@ class TaskNoteStore:
         reassign_to_mission_id: str | None = None,
     ) -> dict[str, Any]:
         """物理删除业务任务：支持将挂载的记录转移到目标任务，或直接级联物理删除。"""
-        if self._connection_factory is None:
-            return {
-                "mission_id": mission_id,
-                "reassigned_count": 0,
-                "deleted_count": 0,
-                "message": f"任务已安全删除 (理由: {reason})",
-            }
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT status, agent_instance_id, raw_prompts FROM agent_user_mission WHERE task_id = %s AND mission_id = %s",
@@ -774,11 +767,8 @@ class TaskNoteStore:
     ) -> str:
         """新增背景素材记录。"""
         context_id = _generate_id("ctx")
-        if self._connection_factory is None:
-            return context_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -843,11 +833,8 @@ class TaskNoteStore:
         content: str | None = None,
     ) -> bool:
         """更新背景素材记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_workspace_context", "context_id", context_id, task_id, agent_instance_id)
                     cur.execute(
@@ -899,11 +886,8 @@ class TaskNoteStore:
         context_id: str,
     ) -> bool:
         """删除背景素材记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_workspace_context", "context_id", context_id, task_id, agent_instance_id)
                     cur.execute(
@@ -931,11 +915,8 @@ class TaskNoteStore:
     ) -> str:
         """全量覆盖更新宏观技术方案快照 (基于 mission_id, agent_instance_id 唯一约束)。"""
         solution_id = _generate_id("sol")
-        if self._connection_factory is None:
-            return solution_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -975,11 +956,8 @@ class TaskNoteStore:
         agent_instance_id: str,
     ) -> str | None:
         """软废弃当前宏观技术方案。"""
-        if self._connection_factory is None:
-            return f"sol-superseded-{task_id}"
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -993,7 +971,9 @@ class TaskNoteStore:
                     )
                     row = cur.fetchone()
                 conn.commit()
-            return row[0] if row else f"sol-superseded-{task_id}"
+            if row:
+                return row.get("solution_id") if isinstance(row, dict) else row[0]
+            return f"sol-superseded-{task_id}"
         except Exception as exc:
             logger.error("supersede_solution 更新失败: %s", exc)
             raise
@@ -1014,11 +994,8 @@ class TaskNoteStore:
     ) -> str:
         """新增关键决策记录。"""
         decision_id = _generate_id("dec")
-        if self._connection_factory is None:
-            return decision_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1058,11 +1035,8 @@ class TaskNoteStore:
         superseded_reason: str | None = None,
     ) -> bool:
         """软废弃决策记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_decision_records", "decision_id", decision_id, task_id, agent_instance_id)
                     if superseded_reason is not None:
@@ -1102,11 +1076,8 @@ class TaskNoteStore:
         impact: str | None = None,
     ) -> bool:
         """更新决策记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_decision_records", "decision_id", decision_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1140,11 +1111,8 @@ class TaskNoteStore:
     ) -> str:
         """新增待办工作项。"""
         todo_id = _generate_id("todo")
-        if self._connection_factory is None:
-            return todo_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1186,16 +1154,8 @@ class TaskNoteStore:
         if not todos:
             return results
 
-        if self._connection_factory is None:
-            for item in todos:
-                results.append({
-                    "todo_id": _generate_id("todo"),
-                    "todo_content": item.get("todo_content", ""),
-                })
-            return results
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     for item in todos:
@@ -1231,11 +1191,8 @@ class TaskNoteStore:
         status: str,
     ) -> bool:
         """极简推进待办状态。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1262,11 +1219,8 @@ class TaskNoteStore:
         priority: int | None = None,
     ) -> bool:
         """修改待办内容或优先级。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1292,11 +1246,8 @@ class TaskNoteStore:
         todo_id: str,
     ) -> bool:
         """物理删除失效待办。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_todo_items", "todo_id", todo_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1329,11 +1280,8 @@ class TaskNoteStore:
     ) -> str:
         """全量覆盖写入当前唯一的恢复快照 PC 指针。"""
         progress_id = _generate_id("prog")
-        if self._connection_factory is None:
-            return progress_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1395,11 +1343,8 @@ class TaskNoteStore:
     ) -> str:
         """新增客观认知发现记录。"""
         discovery_id = _generate_id("disc")
-        if self._connection_factory is None:
-            return discovery_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1449,11 +1394,8 @@ class TaskNoteStore:
         reference_url: str | None = None,
     ) -> bool:
         """更新客观认知记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_discovery_records", "discovery_id", discovery_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1495,11 +1437,8 @@ class TaskNoteStore:
         discovery_id: str,
     ) -> bool:
         """物理删除证伪认知噪音。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_discovery_records", "discovery_id", discovery_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1534,11 +1473,8 @@ class TaskNoteStore:
     ) -> str:
         """新增问题与阻塞记录。"""
         issue_id = _generate_id("issue")
-        if self._connection_factory is None:
-            return issue_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1590,11 +1526,8 @@ class TaskNoteStore:
         command_id: str | None = None,
     ) -> bool:
         """更新问题记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_issue_records", "issue_id", issue_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1639,11 +1572,8 @@ class TaskNoteStore:
         resolution: str,
     ) -> bool:
         """闭环解决问题。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_issue_records", "issue_id", issue_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1673,11 +1603,8 @@ class TaskNoteStore:
     ) -> str:
         """登记通用成果交付产物 (非 file 类型)。"""
         artifact_id = _generate_id("art")
-        if self._connection_factory is None:
-            return artifact_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1712,14 +1639,10 @@ class TaskNoteStore:
         agent_instance_id: str,
         artifact_id: str,
     ) -> bool:
-        """删除非代码文件的通用交付物 (严格仅限 type='other'，底层杜绝误删文件操作物理产物)。"""
-        if self._connection_factory is None:
-            return True
-
+        """删除非代码文件的通用交付物 (严格限定 type='other')。"""
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
-                    _assert_record_mission_writable(cur, "task_artifact_records", "artifact_id", artifact_id, task_id, agent_instance_id)
                     cur.execute(
                         """
                         DELETE FROM task_artifact_records
@@ -1728,9 +1651,9 @@ class TaskNoteStore:
                         (task_id, artifact_id, agent_instance_id),
                     )
                 conn.commit()
-            return True
+                return cur.rowcount > 0
         except Exception as exc:
-            logger.error("delete_artifact_other 删除失败: %s", exc)
+            logger.error("delete_artifact_other 执行失败: %s", exc)
             raise
 
     def delete_task_artifacts(
@@ -1743,11 +1666,8 @@ class TaskNoteStore:
         """根据主键批量物理删除产物记录。"""
         if not artifact_ids:
             return 0
-        if self._connection_factory is None:
-            return len(artifact_ids)
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -1797,11 +1717,8 @@ class TaskNoteStore:
     ) -> str:
         """登记测试与验证结论。"""
         validation_id = _generate_id("val")
-        if self._connection_factory is None:
-            return validation_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1857,11 +1774,8 @@ class TaskNoteStore:
         line_ranges: list[Any] | None = None,
     ) -> bool:
         """修正验证结论。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_validation_records", "validation_id", validation_id, task_id, agent_instance_id)
                     cur.execute(
@@ -1913,11 +1827,8 @@ class TaskNoteStore:
     ) -> str:
         """记录外部环境状态变更与回滚指引。"""
         external_state_id = _generate_id("ext")
-        if self._connection_factory is None:
-            return external_state_id
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
                     cur.execute(
@@ -1965,11 +1876,8 @@ class TaskNoteStore:
         command_id: str | None = None,
     ) -> bool:
         """更新外部状态记录。"""
-        if self._connection_factory is None:
-            return True
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_record_mission_writable(cur, "task_external_state_records", "external_state_id", external_state_id, task_id, agent_instance_id)
                     cur.execute(
@@ -2013,15 +1921,15 @@ class TaskNoteStore:
         """将底层物理事实记录批量延迟绑定到指定业务任务。"""
         if not resource_ids:
             return 0
-        if self._connection_factory is None:
-            return len(resource_ids)
+        if resource_type not in ("artifact", "agent_relationship"):
+            raise ValueError(f"无效的 resource_type: {resource_type}，仅支持 'artifact' 或 'agent_relationship'")
 
         bound_count = 0
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     _assert_mission_writable(cur, mission_id, agent_instance_id)
-                    if resource_type in ("artifact", "artifacts"):
+                    if resource_type == "artifact":
                         cur.execute(
                             """
                             UPDATE task_artifact_records
@@ -2031,17 +1939,7 @@ class TaskNoteStore:
                             (mission_id, task_id, agent_instance_id, resource_ids),
                         )
                         bound_count = cur.rowcount
-                    elif resource_type in ("command", "commands"):
-                        cur.execute(
-                            """
-                            UPDATE task_command_records
-                            SET mission_id = %s
-                            WHERE task_id = %s AND agent_instance_id = %s AND command_id = ANY(%s)
-                            """,
-                            (mission_id, task_id, agent_instance_id, resource_ids),
-                        )
-                        bound_count = cur.rowcount
-                    elif resource_type in ("agent_relationship", "agent_relationships"):
+                    elif resource_type == "agent_relationship":
                         cur.execute(
                             """
                             UPDATE task_agent_relationships
@@ -2051,27 +1949,46 @@ class TaskNoteStore:
                             (mission_id, task_id, agent_instance_id, resource_ids),
                         )
                         bound_count = cur.rowcount
-                        # 级联更新关联的目标子 Agent 专线消息
+                        # 级联更新关联的目标子 Agent 专线消息（双向）
                         cur.execute(
                             """
                             UPDATE task_agent_messages
                             SET mission_id = %s
-                            WHERE task_id = %s AND agent_instance_id = %s
-                              AND target_agent_instance_id IN (
-                                  SELECT target_agent_instance_id
-                                  FROM task_agent_relationships
-                                  WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)
+                            WHERE task_id = %s
+                              AND (
+                                  (agent_instance_id = %s AND target_agent_instance_id IN (
+                                      SELECT target_agent_instance_id
+                                      FROM task_agent_relationships
+                                      WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)
+                                  ))
+                                  OR
+                                  (target_agent_instance_id = %s AND agent_instance_id IN (
+                                      SELECT target_agent_instance_id
+                                      FROM task_agent_relationships
+                                      WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)
+                                  ))
                               )
                             """,
-                            (mission_id, task_id, agent_instance_id, task_id, agent_instance_id, resource_ids),
+                            (
+                                mission_id,
+                                task_id,
+                                agent_instance_id,
+                                task_id,
+                                agent_instance_id,
+                                resource_ids,
+                                agent_instance_id,
+                                task_id,
+                                agent_instance_id,
+                                resource_ids,
+                            ),
                         )
-                    else:
-                        logger.warning("未知的 resource_type: %s", resource_type)
                 conn.commit()
             return bound_count
+        except (ValueError, PermissionError, TaskNoteStorageUnavailableError):
+            raise
         except Exception as exc:
             logger.error("bind_resources_to_mission 绑定失败: %s", exc)
-            raise
+            raise TaskNoteStorageUnavailableError(f"bind_resources_to_mission 失败: {exc}") from exc
 
     def get_command_lines_by_ids(
         self,
@@ -2080,10 +1997,10 @@ class TaskNoteStore:
         command_ids: list[str],
     ) -> dict[str, str]:
         """按 command_id 列表批量反查对应的 命令行指令 (command_line)。"""
-        if not command_ids or self._connection_factory is None:
+        if not command_ids:
             return {}
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2105,10 +2022,8 @@ class TaskNoteStore:
         agent_instance_id: str,
     ) -> dict[str, str]:
         """反查当前租户 (task_id, agent_instance_id) 下的所有 命令行执行 ID 与 命令行指令映射。"""
-        if self._connection_factory is None:
-            return {}
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2131,10 +2046,8 @@ class TaskNoteStore:
         agent_instance_id: str,
     ) -> dict[str, Any] | None:
         """获取指定业务 Agent 实例的最新观察断点记录。"""
-        if self._connection_factory is None:
-            return None
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2177,18 +2090,8 @@ class TaskNoteStore:
         inherited_processed: bool | None = None,
     ) -> dict[str, Any]:
         """原子插入或推进观察断点水位。"""
-        if self._connection_factory is None:
-            return {
-                "agent_instance_id": agent_instance_id,
-                "task_id": task_id,
-                "covered_until_seq": covered_until_seq,
-                "covered_until_message_id": covered_until_message_id,
-                "note_version": 1,
-                "inherited_processed": bool(inherited_processed),
-            }
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2253,10 +2156,8 @@ class TaskNoteStore:
         task_id: str,
     ) -> bool:
         """标记子 Agent 继承段已在首次观察中处理完成。"""
-        if self._connection_factory is None:
-            return True
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2284,10 +2185,8 @@ class TaskNoteStore:
         task_id: str | None = None,
     ) -> bool:
         """重置指定 Agent 实例的观察断点水位为初始状态（用于会话重置/清空时同步）。"""
-        if self._connection_factory is None:
-            return True
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     if task_id:
                         cur.execute(
@@ -2335,11 +2234,8 @@ class TaskNoteStore:
             "relationships": [],
             "agent_messages": [],
         }
-        if self._connection_factory is None:
-            return snapshot
-
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -2507,12 +2403,12 @@ class TaskNoteStore:
 
         用于非 Root Agent 调用 end_task 完成会话时的垃圾回收。
         """
-        if not task_id or not agent_instance_id or self._connection_factory is None:
+        if not task_id or not agent_instance_id:
             return 0
 
         total_deleted = 0
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     for table in ALL_NOTE_TABLES:
                         if table == "task_note_watermark":
@@ -2551,12 +2447,12 @@ class TaskNoteStore:
 
         用于 Root Agent 调用 end_task 结束全任务时的垃圾回收。
         """
-        if not task_id or self._connection_factory is None:
+        if not task_id:
             return 0
 
         total_deleted = 0
         try:
-            with self._connection_factory() as conn:
+            with self._get_connection() as conn:
                 with conn.cursor() as cur:
                     for table in ALL_NOTE_TABLES:
                         cur.execute(

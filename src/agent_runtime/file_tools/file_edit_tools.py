@@ -496,7 +496,7 @@ def file_modify(request: FileModifyRequest, ctx: ToolRuntimeContext) -> BaseTool
                 art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
-                    op_type="modify",
+                    op_type="file_modify",
                     file_path=str(target.path),
                     edits=detailed_edits,
                 )
@@ -566,7 +566,7 @@ def file_create(request: FileCreateRequest, ctx: ToolRuntimeContext) -> BaseTool
                 art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
-                    op_type="create",
+                    op_type="file_create",
                     file_path=str(target.path),
                     content_lines=request.content_lines,
                 )
@@ -620,7 +620,7 @@ def file_delete(request: FileDeleteRequest, ctx: ToolRuntimeContext) -> BaseTool
                 art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
-                    op_type="delete",
+                    op_type="file_delete",
                     file_path=str(target.path),
                     content=request.reason,
                 )
@@ -720,7 +720,7 @@ def file_move(request: FileMoveRequest, ctx: ToolRuntimeContext) -> BaseToolResu
                 art_id = get_task_note_event_recorder().record_file_artifact(
                     task_id=ctx.task_id,
                     agent_instance_id=ctx.agent_instance_id,
-                    op_type="move",
+                    op_type="file_move",
                     file_path=str(target.path),
                     source_path=str(source.path),
                     target_path=str(target.path),

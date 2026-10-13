@@ -47,7 +47,6 @@ TASK_NOTE_TOOL_NAMES: tuple[str, ...] = (
     "create_task_workspace_context",
     "delete_mission",
     "delete_task_artifact",
-    "delete_task_artifact_other",
     "delete_task_discovery",
     "delete_task_todo",
     "delete_task_workspace_context",

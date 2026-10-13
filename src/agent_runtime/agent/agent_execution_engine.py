@@ -2214,121 +2214,134 @@ class AgentExecutionEngine:
                         expected_next="task_note.conversation.swap",
                     )
                     # 1. 从 PostgreSQL 读取当前 agent 实例 + task_id 的最新完整 Note 全量快照 JSON
-                    latest_note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
-                        task_id=task.task_id,
-                        agent_instance_id=instance.instance_id,
-                    )
-
-                    # 2. 调用会话仓储创建全新的 Conversation
-                    new_conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
-                    new_conversation = Conversation(id=new_conversation_id)
-
-                    # 3. 在新会话的 timeline 中初始化业务 Agent 定义的 Prompt 与 Tools
-                    business_tools = await self._tool_dispatcher.build_llm_tools(
-                        agent_definition=agent_definition,
-                        api_format=resolved_candidates[0].api_format,
-                    )
-                    business_system_prompt = self._render_system_prompt(
-                        agent_definition,
-                        instance.instance_id,
-                        instance.current_working_directory,
-                        request.render_options,
-                        business_tools,
-                        conversation=new_conversation,
-                    )
-                    new_conversation.system_prompt = business_system_prompt
-                    new_conversation.tools = tuple(
-                        deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
-                        for t in business_tools
-                    )
-                    new_conversation.record_configuration_event(
-                        ConfigurationComponentEvent(
-                            event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
-                            definition_id=agent_definition.agent_id,
-                            anchor="start",
-                            sequence=1,
-                            status="active",
-                            component="prompt",
+                    latest_note_snapshot = None
+                    try:
+                        latest_note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
+                            task_id=task.task_id,
+                            agent_instance_id=instance.instance_id,
                         )
-                    )
-                    new_conversation.record_configuration_event(
-                        ConfigurationComponentEvent(
-                            event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
-                            definition_id=agent_definition.agent_id,
-                            anchor="start",
-                            sequence=0,
-                            status="active",
-                            component="tool",
+                    except Exception as exc:
+                        logger.error("构建退出 Note 快照失败，跳过会话替换: %s", exc)
+                        self._record_execution_loop_step(
+                            instance_id=instance.instance_id,
+                            frame_id=current_frame_id,
+                            stage="task_note.swap_skipped",
+                            status="skipped",
+                            summary=f"快照读取失败，不替换上下文，保持原会话: {exc}",
+                            details={"error": str(exc)},
                         )
-                    )
 
-                    # 4. 注入包含 Note 快照与业务唤醒指示的初始消息（反查源码行号与命令行指令，组织为 Markdown 工作手记）
-                    resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(
-                        note_snapshot=latest_note_snapshot,
-                        current_working_directory=instance.current_working_directory,
-                        task_id=task.task_id,
-                        agent_instance_id=instance.instance_id,
-                    )
-                    resumed_msg = UniMessage(
-                        role=ROLE_USER,
-                        content=[TextPart(text=resumed_prompt)],
-                        message_id=f"msg_{uuid.uuid4().hex[:12]}",
-                    )
-                    new_conversation.append_message(resumed_msg, [TextPartMeta()])
-                    await self._conversation_repository.create(
-                        new_conversation,
-                        task_id=task.task_id,
-                        thread_id=instance.thread_id,
-                        agent_id=agent_definition.agent_id,
-                        agent_instance_id=instance.instance_id,
-                    )
+                    if latest_note_snapshot is not None:
+                        # 2. 调用会话仓储创建全新的 Conversation
+                        new_conversation_id = f"conv_{uuid.uuid4().hex[:12]}"
+                        new_conversation = Conversation(id=new_conversation_id)
 
-                    # 5. 调用 switch_agent_instance_conversation
-                    self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, new_conversation.id)
+                        # 3. 在新会话的 timeline 中初始化业务 Agent 定义的 Prompt 与 Tools
+                        business_tools = await self._tool_dispatcher.build_llm_tools(
+                            agent_definition=agent_definition,
+                            api_format=resolved_candidates[0].api_format,
+                        )
+                        business_system_prompt = self._render_system_prompt(
+                            agent_definition,
+                            instance.instance_id,
+                            instance.current_working_directory,
+                            request.render_options,
+                            business_tools,
+                            conversation=new_conversation,
+                        )
+                        new_conversation.system_prompt = business_system_prompt
+                        new_conversation.tools = tuple(
+                            deepcopy(t.schema) if hasattr(t, "schema") else deepcopy(t)
+                            for t in business_tools
+                        )
+                        new_conversation.record_configuration_event(
+                            ConfigurationComponentEvent(
+                                event_id=f"evt_prompt_{uuid.uuid4().hex[:8]}",
+                                definition_id=agent_definition.agent_id,
+                                anchor="start",
+                                sequence=1,
+                                status="active",
+                                component="prompt",
+                            )
+                        )
+                        new_conversation.record_configuration_event(
+                            ConfigurationComponentEvent(
+                                event_id=f"evt_tool_{uuid.uuid4().hex[:8]}",
+                                definition_id=agent_definition.agent_id,
+                                anchor="start",
+                                sequence=0,
+                                status="active",
+                                component="tool",
+                            )
+                        )
 
-                    # 6. 更新实例状态：instance = instance.exit_note_update()，写回 SQLite
-                    instance = instance.exit_note_update()
-                    self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
+                        # 4. 注入包含 Note 快照与业务唤醒指示的初始消息（反查源码行号与命令行指令，组织为 Markdown 工作手记）
+                        resumed_prompt = self._task_note_prompt_provider.build_resumed_conversation_prompt(
+                            note_snapshot=latest_note_snapshot,
+                            current_working_directory=instance.current_working_directory,
+                            task_id=task.task_id,
+                            agent_instance_id=instance.instance_id,
+                        )
+                        resumed_msg = UniMessage(
+                            role=ROLE_USER,
+                            content=[TextPart(text=resumed_prompt)],
+                            message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                        )
+                        new_conversation.append_message(resumed_msg, [TextPartMeta()])
+                        await self._conversation_repository.create(
+                            new_conversation,
+                            task_id=task.task_id,
+                            thread_id=instance.thread_id,
+                            agent_id=agent_definition.agent_id,
+                            agent_instance_id=instance.instance_id,
+                        )
 
-                    # 7. 切换会话引用与上下文
-                    old_conversation_id = conversation.id
-                    conversation = new_conversation
-                    communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+                        # 5. 调用 switch_agent_instance_conversation
+                        self._runtime_gateway.switch_agent_instance_conversation(instance.instance_id, new_conversation.id)
 
-                    # 8. 记录事件与日志
-                    self._record_execution_conversation_rebind(
-                        instance_id=instance.instance_id,
-                        frame_id=current_frame_id,
-                        reason="task_note_update_completed",
-                        job_id=None,
-                        source_conversation_id=old_conversation_id,
-                        target_conversation_id=new_conversation.id,
-                    )
-                    self._trace_recorder.record_event(
-                        trace_path,
-                        "task_note_update_conversation_swapped",
-                        {
-                            "old_conversation_id": old_conversation_id,
-                            "new_conversation_id": new_conversation.id,
-                            "task_id": task.task_id,
-                            "agent_instance_id": instance.instance_id,
-                        },
-                    )
-                    await self._event_publisher.publish(
-                        communication_context,
-                        "agent.conversation.swapped",
-                        {
-                            "task_id": task.task_id,
-                            "agent_instance_id": instance.instance_id,
-                            "old_conversation_id": old_conversation_id,
-                            "new_conversation_id": new_conversation.id,
-                            "reason": "task_note_update_completed",
-                        },
-                        source="agent_execution_engine",
-                    )
+                        # 6. 更新实例状态：instance = instance.exit_note_update()，写回 SQLite
+                        instance = instance.exit_note_update()
+                        self._runtime_gateway.update_agent_instance_execution_substate(instance.instance_id, None)
 
-                    # 9. 强制收敛决策为 continue，让循环继续进入新会话
-                    loop_decision = "continue"
+                        # 7. 切换会话引用与上下文
+                        old_conversation_id = conversation.id
+                        conversation = new_conversation
+                        communication_context = communication_context.with_metadata(conversation_id=conversation.id)
+
+                        # 8. 记录事件与日志
+                        self._record_execution_conversation_rebind(
+                            instance_id=instance.instance_id,
+                            frame_id=current_frame_id,
+                            reason="task_note_update_completed",
+                            job_id=None,
+                            source_conversation_id=old_conversation_id,
+                            target_conversation_id=new_conversation.id,
+                        )
+                        self._trace_recorder.record_event(
+                            trace_path,
+                            "task_note_update_conversation_swapped",
+                            {
+                                "old_conversation_id": old_conversation_id,
+                                "new_conversation_id": new_conversation.id,
+                                "task_id": task.task_id,
+                                "agent_instance_id": instance.instance_id,
+                            },
+                        )
+                        await self._event_publisher.publish(
+                            communication_context,
+                            "agent.conversation.swapped",
+                            {
+                                "task_id": task.task_id,
+                                "agent_instance_id": instance.instance_id,
+                                "old_conversation_id": old_conversation_id,
+                                "new_conversation_id": new_conversation.id,
+                                "reason": "task_note_update_completed",
+                            },
+                            source="agent_execution_engine",
+                        )
+
+                        # 9. 强制收敛决策为 continue，让循环继续进入新会话
+                        loop_decision = "continue"
                 self._record_execution_loop_step(
                     instance_id=instance.instance_id,
                     frame_id=current_frame_id,
@@ -3126,28 +3139,60 @@ class AgentExecutionEngine:
                 if instance.execution_substate != EXECUTION_SUBSTATE_NOTE_UPDATE:
                     compression_decision = self._check_compression_gate(conversation, resolved_model)
                     if compression_decision.should_compress:
-                        self._record_execution_loop_step(
-                            instance_id=instance.instance_id,
-                            stage="context_compression.note_update.triggered",
-                            status="triggered",
-                            summary="上下文使用量达到阈值，触发 Note 更新状态切换与基线快照注入。",
-                            details={
-                                "task_id": task.task_id,
-                                "conversation_id": conversation.id,
-                                "decision_reason": compression_decision.reason,
-                                "used_tokens": compression_decision.used_tokens,
-                                "threshold": compression_decision.threshold,
-                            },
-                            expected_next="task_note_snapshot_build",
-                        )
-                        # 步骤 1：从 PG 读取 Note 基线快照
-                        note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
-                            task_id=task.task_id,
-                            agent_instance_id=instance.instance_id,
-                        )
+                        # 检查底层存储可用性 (D08 降级保护)
+                        from agent_runtime.task_note.task_note_store import is_task_note_available, TaskNoteStorageUnavailableError
 
-                        # 步骤 2：追加边界 User 提示消息（包含基线 Note 快照）
-                        boundary_prompt = self._task_note_prompt_provider.build_compression_boundary_prompt(note_snapshot)
+                        note_snapshot = None
+                        if not is_task_note_available():
+                            self._record_execution_loop_step(
+                                instance_id=instance.instance_id,
+                                stage="task_note.swap_skipped",
+                                status="skipped",
+                                summary="Task Note 存储不可用，跳过压缩切换，业务会话保持原样。",
+                                details={
+                                    "task_id": task.task_id,
+                                    "conversation_id": conversation.id,
+                                    "reason": "storage_unavailable",
+                                },
+                            )
+                        else:
+                            try:
+                                note_snapshot = await self._task_note_snapshot_service.build_task_note_snapshot_json(
+                                    task_id=task.task_id,
+                                    agent_instance_id=instance.instance_id,
+                                )
+                            except (TaskNoteStorageUnavailableError, Exception) as snap_exc:
+                                logger.warning("构建快照失败，跳过压缩切换: %s", snap_exc)
+                                self._record_execution_loop_step(
+                                    instance_id=instance.instance_id,
+                                    stage="task_note.swap_skipped",
+                                    status="skipped",
+                                    summary=f"构建快照失败，跳过压缩切换: {snap_exc}",
+                                    details={
+                                        "task_id": task.task_id,
+                                        "conversation_id": conversation.id,
+                                        "error": str(snap_exc),
+                                    },
+                                )
+
+                        if note_snapshot is not None:
+                            self._record_execution_loop_step(
+                                instance_id=instance.instance_id,
+                                stage="context_compression.note_update.triggered",
+                                status="triggered",
+                                summary="上下文使用量达到阈值，触发 Note 更新状态切换与基线快照注入。",
+                                details={
+                                    "task_id": task.task_id,
+                                    "conversation_id": conversation.id,
+                                    "decision_reason": compression_decision.reason,
+                                    "used_tokens": compression_decision.used_tokens,
+                                    "threshold": compression_decision.threshold,
+                                },
+                                expected_next="task_note_snapshot_build",
+                            )
+
+                            # 步骤 2：追加边界 User 提示消息（包含基线 Note 快照）
+                            boundary_prompt = self._task_note_prompt_provider.build_compression_boundary_prompt(note_snapshot)
                         boundary_msg = UniMessage(
                             role=ROLE_USER,
                             content=[TextPart(text=boundary_prompt)],

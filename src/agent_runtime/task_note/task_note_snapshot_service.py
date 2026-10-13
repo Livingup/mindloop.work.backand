@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Callable, ContextManager, Iterator
 
+from agent_runtime.task_note.task_note_store import TaskNoteStorageUnavailableError
+
 logger = logging.getLogger("agent_runtime.task_note.snapshot_service")
 
 
@@ -37,9 +39,11 @@ def get_empty_task_note_snapshot(task_id: str, agent_instance_id: str) -> dict[s
         "agent_instance_id": agent_instance_id,
         "missions": [],
         "workspace_context": [],
+        "solutions": [],
         "solution": None,
         "decisions": [],
         "todos": [],
+        "progresses": [],
         "progress": None,
         "discoveries": [],
         "issues": [],
@@ -135,10 +139,11 @@ class TaskNoteSnapshotService:
         agent_instance_id: str,
     ) -> dict[str, Any]:
         """构建指定 task_id 和 agent_instance_id 的完整 Note 快照 JSON。"""
-        snapshot = get_empty_task_note_snapshot(task_id, agent_instance_id)
         conn_factory = self._get_connection_factory()
         if conn_factory is None:
-            return snapshot
+            raise TaskNoteStorageUnavailableError("Task Note 存储不可用: 未配置数据库连接工厂或 PostgreSQL 未启用")
+
+        snapshot = get_empty_task_note_snapshot(task_id, agent_instance_id)
 
         try:
             with conn_factory() as conn:
@@ -148,17 +153,14 @@ class TaskNoteSnapshotService:
                             cur.execute(sql, params)
                             return [_serialize_row(r) for r in cur.fetchall()]
                         except Exception as exc:
-                            logger.warning(
-                                "构建 Task Note 快照时查询 %s 失败 (已降级为空): %s",
+                            logger.error(
+                                "构建 Task Note 快照时查询 %s 失败: %s",
                                 table_name,
                                 exc,
                             )
-                            if hasattr(conn, "rollback"):
-                                try:
-                                    conn.rollback()
-                                except Exception:
-                                    pass
-                            return []
+                            raise TaskNoteStorageUnavailableError(
+                                f"构建 Task Note 快照时查询 {table_name} 失败: {exc}"
+                            ) from exc
 
                     def _query_one(table_name: str, sql: str, params: tuple) -> dict[str, Any] | None:
                         try:
@@ -166,17 +168,14 @@ class TaskNoteSnapshotService:
                             row = cur.fetchone()
                             return _serialize_row(row) if row else None
                         except Exception as exc:
-                            logger.warning(
-                                "构建 Task Note 快照时查询 %s 失败 (已降级为空): %s",
+                            logger.error(
+                                "构建 Task Note 快照时查询 %s 失败: %s",
                                 table_name,
                                 exc,
                             )
-                            if hasattr(conn, "rollback"):
-                                try:
-                                    conn.rollback()
-                                except Exception:
-                                    pass
-                            return None
+                            raise TaskNoteStorageUnavailableError(
+                                f"构建 Task Note 快照时查询 {table_name} 失败: {exc}"
+                            ) from exc
 
                     # 1. agent_user_mission (当前 agent 实例在该 task 下创建和维护的 mission)
                     snapshot["missions"] = _query_rows(
@@ -207,8 +206,8 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 3. task_solution_content (当前 agent 的活跃方案)
-                    snapshot["solution"] = _query_one(
+                    # 3. task_solution_content (多 mission 方案支持 + 兼容字段)
+                    all_solutions = _query_rows(
                         "task_solution_content",
                         """
                         SELECT solution_id, task_id, mission_id, agent_instance_id,
@@ -216,10 +215,16 @@ class TaskNoteSnapshotService:
                         FROM task_solution_content
                         WHERE task_id = %s AND agent_instance_id = %s AND solution_status = 'active'
                         ORDER BY created_at DESC
-                        LIMIT 1
                         """,
                         (task_id, agent_instance_id),
                     )
+                    solutions_by_mission: dict[str, dict[str, Any]] = {}
+                    for sol in all_solutions:
+                        m_id = sol.get("mission_id") or ""
+                        if m_id not in solutions_by_mission:
+                            solutions_by_mission[m_id] = sol
+                    snapshot["solutions"] = list(solutions_by_mission.values())
+                    snapshot["solution"] = all_solutions[0] if all_solutions else None
 
                     # 4. task_decision_records
                     snapshot["decisions"] = _query_rows(
@@ -248,8 +253,8 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 6. task_progress_content (当前 agent 唯一恢复快照)
-                    snapshot["progress"] = _query_one(
+                    # 6. task_progress_content (多 mission 进度支持 + 兼容字段)
+                    all_progresses = _query_rows(
                         "task_progress_content",
                         """
                         SELECT progress_id, task_id, mission_id, agent_instance_id,
@@ -258,10 +263,16 @@ class TaskNoteSnapshotService:
                         FROM task_progress_content
                         WHERE task_id = %s AND agent_instance_id = %s
                         ORDER BY created_at DESC
-                        LIMIT 1
                         """,
                         (task_id, agent_instance_id),
                     )
+                    progresses_by_mission: dict[str, dict[str, Any]] = {}
+                    for prog in all_progresses:
+                        m_id = prog.get("mission_id") or ""
+                        if m_id not in progresses_by_mission:
+                            progresses_by_mission[m_id] = prog
+                    snapshot["progresses"] = list(progresses_by_mission.values())
+                    snapshot["progress"] = all_progresses[0] if all_progresses else None
 
                     # 7. task_discovery_records
                     snapshot["discoveries"] = _query_rows(
@@ -291,8 +302,8 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 9. task_artifact_records
-                    snapshot["artifacts"] = _query_rows(
+                    # 9. task_artifact_records (D16: 出参统一映射为 file_*)
+                    raw_artifacts = _query_rows(
                         "task_artifact_records",
                         """
                         SELECT artifact_id, task_id, mission_id, agent_instance_id,
@@ -304,6 +315,17 @@ class TaskNoteSnapshotService:
                         """,
                         (task_id, agent_instance_id),
                     )
+                    type_mapping = {
+                        "create": "file_create",
+                        "modify": "file_modify",
+                        "delete": "file_delete",
+                        "move": "file_move",
+                    }
+                    for art in raw_artifacts:
+                        t = art.get("type")
+                        if t in type_mapping:
+                            art["type"] = type_mapping[t]
+                    snapshot["artifacts"] = raw_artifacts
 
                     # 10. task_validation_records
                     snapshot["validations"] = _query_rows(
@@ -334,11 +356,11 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
-                    # 12. task_command_records
+                    # 12. task_command_records (D17: 移除 mission_id 列)
                     snapshot["commands"] = _query_rows(
                         "task_command_records",
                         """
-                        SELECT command_id, task_id, mission_id, agent_instance_id,
+                        SELECT command_id, task_id, agent_instance_id,
                                command_line, created_at
                         FROM task_command_records
                         WHERE task_id = %s AND agent_instance_id = %s
@@ -387,9 +409,11 @@ class TaskNoteSnapshotService:
                         (task_id, agent_instance_id),
                     )
 
+        except (TaskNoteStorageUnavailableError, ValueError, PermissionError):
+            raise
         except Exception as exc:
             logger.exception("构建 Task Note 快照失败: task_id=%s, agent_instance_id=%s, error=%s", task_id, agent_instance_id, exc)
-            return get_empty_task_note_snapshot(task_id, agent_instance_id)
+            raise TaskNoteStorageUnavailableError(f"构建 Task Note 快照失败: {exc}") from exc
 
         return snapshot
 
