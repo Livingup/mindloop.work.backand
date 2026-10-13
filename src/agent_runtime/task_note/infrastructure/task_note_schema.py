@@ -300,3 +300,64 @@ def init_task_note_schema(conn: Any) -> None:
         cur.execute(TASK_NOTE_MIGRATIONS_SQL)
     conn.commit()
     logger.info("Task Note 16 张表与索引初始化/升级完成。")
+
+
+REQUIRED_MIGRATION_COLUMNS = frozenset({
+    ("agent_user_mission", "outcome_summary"),
+    ("agent_user_mission", "pruned_at"),
+    ("task_agent_relationships", "delegation_content"),
+    ("task_agent_relationships", "fork_message_id"),
+})
+
+
+def ensure_task_note_schema(config_registry: Any = None) -> bool:
+    """检查并执行 Task Note 16 张表与迁移。
+
+    1. PG 未启用返回 False；
+    2. 获取连接调用 init_task_note_schema(conn)；
+    3. 查询 information_schema.columns 断言 outcome_summary、pruned_at、delegation_content、fork_message_id 四列存在；
+    4. 成功返回 True；任何异常记 error 日志（含异常类型）并返回 False，不抛出。
+    """
+    try:
+        from agent_runtime.config import ConfigRegistry
+
+        cfg = config_registry
+        if cfg is None:
+            if getattr(ConfigRegistry, "_instance", None) is not None:
+                cfg = ConfigRegistry.instance()
+            else:
+                logger.info("ConfigRegistry 尚未初始化，跳过 Task Note schema 初始化。")
+                return False
+
+        cloud_db = getattr(cfg, "cloud_user_config_database", None)
+        if cloud_db is None or not cloud_db.is_postgresql_enabled:
+            logger.info("PostgreSQL 未启用，跳过 Task Note schema 初始化。")
+            return False
+
+        from agent_runtime.cloud_user_config.postgres_store import PostgresUserConfigStore
+
+        store = PostgresUserConfigStore(lambda: cfg.cloud_user_config_database)
+        with store._connect() as conn:
+            init_task_note_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_name, column_name 
+                    FROM information_schema.columns 
+                    WHERE table_schema = 'public' 
+                      AND (
+                        (table_name = 'agent_user_mission' AND column_name IN ('outcome_summary', 'pruned_at')) OR
+                        (table_name = 'task_agent_relationships' AND column_name IN ('delegation_content', 'fork_message_id'))
+                      );
+                """)
+                existing_cols = frozenset((row[0], row[1]) for row in cur.fetchall())
+                missing = REQUIRED_MIGRATION_COLUMNS - existing_cols
+                if missing:
+                    logger.error("Task Note 迁移断言失败，缺失必需列: %s", missing)
+                    return False
+
+        logger.info("Task Note 16 张表与索引初始化/升级完成。")
+        return True
+    except Exception as exc:
+        logger.error("Task Note schema 初始化执行失败 (%s): %s", type(exc).__name__, exc, exc_info=True)
+        return False
+

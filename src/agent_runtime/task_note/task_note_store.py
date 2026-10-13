@@ -26,6 +26,21 @@ from typing import Any, Callable, ContextManager
 
 logger = logging.getLogger("agent_runtime.task_note.store")
 
+_task_note_available: bool = False
+
+
+def set_task_note_available(available: bool) -> None:
+    """设置 Task Note 底层存储可用状态。"""
+    global _task_note_available
+    _task_note_available = bool(available)
+
+
+def is_task_note_available() -> bool:
+    """查询 Task Note 底层存储当前是否可用。"""
+    global _task_note_available
+    return _task_note_available
+
+
 
 def _generate_id(prefix: str) -> str:
     """生成带业务前缀的紧凑唯一标识。"""

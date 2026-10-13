@@ -673,6 +673,17 @@ def create_app(
                 _start_full_mode_background_services_on_loop()
             else:
                 logger.info("Runtime 处于 bootstrap 限制模式，跳过 MCP 自动连接与 LACP 启动。")
+
+            # Task Note 16 张表结构与迁移升级初始化
+            try:
+                from agent_runtime.task_note.infrastructure.task_note_schema import ensure_task_note_schema
+                from agent_runtime.task_note.task_note_store import set_task_note_available
+
+                task_note_ready = ensure_task_note_schema()
+                set_task_note_available(task_note_ready)
+            except Exception as exc:
+                logger.error("Task Note schema 初始化未捕获异常: %s", exc)
+
             logger.info(
                 "Runtime lifespan diagnostic: trace_id=%s stream_id=%s event_type=%s service_id=%s "
                 "operation=%s phase=%s task_name=%s duration_ms=%s timeout_seconds=%s event_loop_status=%s",
