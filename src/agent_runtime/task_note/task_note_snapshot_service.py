@@ -374,7 +374,8 @@ class TaskNoteSnapshotService:
                         "task_agent_relationships",
                         """
                         SELECT relationship_id, task_id, mission_id, agent_instance_id,
-                               target_agent_type, target_agent_instance_id, status, created_at
+                               target_agent_type, target_agent_instance_id, delegation_content, fork_message_id,
+                               status, created_at
                         FROM task_agent_relationships
                         WHERE task_id = %s AND agent_instance_id = %s AND mission_id IS NOT NULL
                         ORDER BY created_at ASC

@@ -736,6 +736,9 @@ def format_task_note_to_markdown(
             role = rel_info.get("target_agent_type", "child")
             st = rel_info.get("status", "unreleased")
             dlg_lines.append(f"### 协作子 Agent: `{cid}` (角色: `{role}`, 状态: `{st}`)")
+            delegation = rel_info.get("delegation_content")
+            if delegation:
+                dlg_lines.append(f"- **委派任务**: {delegation}")
 
             child_msgs = [m for m in agent_msgs if m.get("target_agent_instance_id") == cid]
             if child_msgs:
