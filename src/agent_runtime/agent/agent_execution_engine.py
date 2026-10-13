@@ -464,19 +464,37 @@ class AgentExecutionEngine:
             logger.debug("GC 清理 Task Observer 异常: %s", exc)
         await self._task_note_snapshot_service.async_cleanup_task_note(task_id)
 
+    def _resolve_parent_instance_id(self, instance: AgentInstance) -> str | None:
+        """查询指定实例的父实例 ID；根实例返回 None。"""
+        try:
+            task = self._runtime_gateway.get_task(instance.task_id)
+            if task is None or not hasattr(task, "parent_of"):
+                return None
+            return task.parent_of(instance.instance_id)
+        except KeyError:
+            logger.warning(
+                "解析父实例失败，按根实例处理: task=%s instance=%s",
+                instance.task_id,
+                instance.instance_id,
+            )
+            return None
+
     def _ancestor_chain(self, instance: AgentInstance) -> list[str]:
-        """沿 parent_instance_id 向上追溯祖先链，最多 32 层防止成环。"""
+        """沿任务关系向上追溯祖先链，最多 32 层防止成环，近亲在前。"""
+        try:
+            task = self._runtime_gateway.get_task(instance.task_id)
+            if task is None or not hasattr(task, "parent_of"):
+                return []
+        except KeyError:
+            return []
         chain: list[str] = []
-        curr = instance.parent_instance_id
+        curr = task.parent_of(instance.instance_id)
         depth = 0
         seen = {instance.instance_id}
         while curr and depth < 32 and curr not in seen:
             seen.add(curr)
             chain.append(curr)
-            parent_inst = self._runtime_gateway.get_agent_instance(curr)
-            if not parent_inst:
-                break
-            curr = getattr(parent_inst, "parent_instance_id", None)
+            curr = task.parent_of(curr)
             depth += 1
         return chain
 
@@ -492,7 +510,8 @@ class AgentExecutionEngine:
         if self._task_note_observer_scheduler is None or self._task_note_tracking_coordinator is None:
             return
         try:
-            is_sub = instance.parent_instance_id is not None
+            parent_id = self._resolve_parent_instance_id(instance)
+            is_sub = parent_id is not None
             ticket = await self._task_note_tracking_coordinator.on_round(
                 task_id=task_id,
                 instance_id=instance.instance_id,
@@ -503,12 +522,17 @@ class AgentExecutionEngine:
                 self._task_note_observer_scheduler.start(
                     ticket,
                     target_agent_definition_prompt=conversation.system_prompt,
-                    parent_agent_instance_id=instance.parent_instance_id,
+                    parent_agent_instance_id=parent_id,
                     ancestor_chain=self._ancestor_chain(instance),
                     scene_id=scene_id,
                 )
         except Exception as exc:
-            logger.debug("触发后台观察者异常 (静默容错): %s", exc)
+            logger.warning(
+                "触发后台观察者失败: task=%s instance=%s",
+                task_id,
+                instance.instance_id,
+                exc_info=True,
+            )
 
     def _set_execution_phase(
         self,
@@ -3062,7 +3086,8 @@ class AgentExecutionEngine:
                     if self._task_note_context_assembler is not None and self._task_note_tracking_coordinator is not None:
                         coordinator = self._task_note_tracking_coordinator
                         scheduler = self._task_note_observer_scheduler
-                        is_sub = instance.parent_instance_id is not None
+                        parent_id = self._resolve_parent_instance_id(instance)
+                        is_sub = parent_id is not None
 
                         # 1. 等待当前运行中的观察者结束
                         await coordinator.await_running(
@@ -3101,7 +3126,7 @@ class AgentExecutionEngine:
                                 await scheduler.run_sync(
                                     ticket,
                                     target_agent_definition_prompt=conversation.system_prompt,
-                                    parent_agent_instance_id=instance.parent_instance_id,
+                                    parent_agent_instance_id=parent_id,
                                     ancestor_chain=self._ancestor_chain(instance),
                                     scene_id=getattr(task, "scene_id", None),
                                 )

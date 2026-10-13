@@ -132,6 +132,7 @@ Desktop.ini
 !/tests/test_conversation_task_note_tracking.py
 !/tests/test_task_note_tracking_coordinator.py
 !/tests/test_task_note_schema_init.py
+!/tests/test_task_note_observer_trigger.py
 !/tests/test_logging_setup.py
 !/tests/test_agent_instance_note_substate.py
 !/tests/test_note_context_compression_flow.py

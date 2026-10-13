@@ -62,6 +62,13 @@ def _tool_use_ref(tool_use: ToolUsePart) -> str:
     return tool_use.tool_use_id or tool_use.name
 
 
+def _resolve_stream_id(task_id: str, scene_id: str | None) -> str:
+    """计算 Task Note 事件的目标通信流 ID。有 scene_id 时走场景流，否则走任务流。"""
+    if scene_id:
+        return f"stream-scene-{scene_id}"
+    return f"stream-agent-task-{task_id}"
+
+
 class TaskNoteObserverRunner:
     """Task Note 真实观察会话执行器 (D02)。"""
 
@@ -185,6 +192,7 @@ class TaskNoteObserverRunner:
         """执行独立观察会话。"""
         target_agent_id = session_input.agent_instance_id
         task_id = session_input.task_id
+        stream_id = _resolve_stream_id(task_id, session_input.scene_id)
         scene_id = session_input.scene_id or f"scene-{task_id}"
 
         resolved_model = self._resolve_model(target_agent_id)
@@ -306,7 +314,7 @@ class TaskNoteObserverRunner:
                     if tool_res.success and self._event_publisher is not None:
                         try:
                             comm_ctx = RuntimeCommunicationContext(
-                                stream_id=f"agent.task.{task_id}",
+                                stream_id=stream_id,
                                 trace_id=None,
                                 metadata={
                                     "task_id": task_id,
@@ -380,7 +388,7 @@ class TaskNoteObserverRunner:
                     if self._event_publisher is not None:
                         try:
                             comm_ctx = RuntimeCommunicationContext(
-                                stream_id=f"agent.task.{task_id}",
+                                stream_id=stream_id,
                                 trace_id=None,
                                 metadata={
                                     "task_id": task_id,
