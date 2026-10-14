@@ -6,6 +6,8 @@
 - 逻辑承载：业务规则写在领域服务，REST 适配器只做 HTTP 映射与限流
 - 跨模块与横切：server.create_app 为全局组合根，认证、bootstrap、网络监控以 HTTP middleware 写在 server.py
 - 持久化：sqlite3 手写 SQL，每次操作独立连接并提交，表结构在连接时以 CREATE TABLE IF NOT EXISTS 保证，行转 frozen dataclass
+- 持久化（task_note）：Note 数据用 PostgreSQL（psycopg，复用 cloud_user_config_database），会话 tracking 用 SQLite JSON 加版本列 CAS
+- 横切（task_note）：观察会话由后台 asyncio 任务承载，目标身份经 contextvars 注入；task_note 服务为模块级单例（get_/set_），由 agent_execution_factory 装配
 - 错误：领域服务抛 ValueError，由适配器或中间件转为 HTTP 响应
 
 ## 全局技术约定

@@ -1,8 +1,8 @@
 # Task Note 上下文压缩 task_note
 
 ## 边界
-- 负责：压缩门禁、按实例增量触发观察、观察会话、Note 数据（16 张表、36 个 Note 工具、事实写入接口）、task_note_tracking 的结构与更新规则、替换内容组装、手记渲染、Note 清理、压缩配置
-- 不负责：Agent 循环与调用时机（→ agent 执行引擎）、conversation_state 存储（→ conversation_message）、事件通道与 SSE（→ communication）、子会话创建与边界消息生成（→ subagent）、远程传输（→ lacp）、模板存储（→ prompt_template）、LLM 调用（→ llm_client）
+- 负责：压缩门禁、按实例增量触发观察、观察会话、观察者模型选择、Note 数据（16 张表、36 个 Note 工具、事实写入接口）、task_note_tracking 的结构与更新规则、替换内容组装、手记渲染、Note 清理、压缩配置、task_note.updated 的发布口径、/note 只读视图
+- 不负责：Agent 循环与调用时机（→ agent 执行引擎）、通用工具分发（→ tool，分发器在工具成功后按本域口径发布 task_note.updated）、conversation_state 存储（→ conversation_message）、事件通道与 SSE（→ communication）、子会话创建与边界消息生成（→ subagent）、远程传输（→ lacp）、模板存储（→ prompt_template）、LLM 调用（→ llm_client）
 
 ## 关键概念
 - 班次 task_id：从启动 Agent 到 end_task 的会期，一个班次内可先后或并行发生多个 Mission
@@ -16,11 +16,16 @@
 - tracking：conversation_state.task_note_tracking，记录本实例的前缀、快照消息、断点、note_version、继承段是否已处理、运行中的观察
 - 快照消息：替换后作为首条 user 消息的手记；尾部首条为 user 时与之合并
 - 继承段：子 Agent 会话中边界消息及之前复制自父辈的前缀，只作背景
+- 压缩门禁阈值：模型 compression_threshold，缺省为 context_window × default_threshold_ratio；按 last_context_usage 加之后新增消息的估算判断，没有 usage 时不压缩
+- 观察触发阈值：observer_trigger_tokens，与断点之后的消息估算比较
+- 推进比例：observer_min_advance_ratio，断点 seq 及之前的 units 占本次 units 的比例
+- 快照标题：快照消息首个文本块的固定前缀“# 任务手记快照”
 
 ## 状态流转
 观察（每实例）：无观察 →(增量达到触发阈值) 观察中 →(note_update_end 通过) 无观察，断点推进
-观察（每实例）：观察中 →(观察失败) 无观察，断点不变
-上下文：原始会话 →(达到压缩阈值，等本实例观察结束，note_version≥1) 系统提示词 + 快照消息 + 断点之后的原始消息
+观察（每实例）：观察中 →(观察失败 / 重启后 run_id 失效 / Agent 结束时取消) 无观察，断点不变
+上下文：原始会话 →(达到压缩门禁阈值，等本实例观察结束) 命中门禁 →(note_version=0 或断点后增量 ≥ 门禁阈值) 同步观察 → 替换
+上下文：命中门禁 →(note_version≥1) 系统提示词 + 快照消息 + 断点之后的原始消息
 Mission：pending / in_progress →(TASK_NOTE-09 的完成条件) completed
 Mission：pending / in_progress →(用户明确放弃) abandoned
 Mission：completed / abandoned →(裁剪) 已裁剪
@@ -40,8 +45,8 @@ Mission：completed / abandoned →(裁剪) 已裁剪
 - TASK_NOTE-12 task_progress_content 与 task_solution_content 在同一 Mission、同一 Agent 实例下必须只有一份。
 - TASK_NOTE-13 组装快照时仅限取 mission_id 已绑定的行。
 - TASK_NOTE-14 观察者不得执行目标 Agent 的任务：不得编写业务内容、搜索网络、执行命令、调用业务 MCP 工具，不得向用户或其他 Agent 发消息。
-- TASK_NOTE-15 note_update_end 仅限在断点合法、断点之前的 auto_record 行均已绑定或删除、每个 in_progress Mission 都有 progress 时通过。
+- TASK_NOTE-15 note_update_end 仅限在以下条件同时满足时通过：断点 seq 属于本次 units；断点 seq 及之前的 units 占比不低于 observer_min_advance_ratio；断点 unit 带消息 ID；断点之前的 auto_record 行均已绑定或删除；每个 in_progress Mission 都有 progress。
 - TASK_NOTE-16 同一业务 Agent 实例同一时刻最多一个观察在运行；不同实例的观察互不影响，可并行。
 - TASK_NOTE-17 观察失败时断点不得推进，下次从原断点重新观察。
-- TASK_NOTE-18 替换前缀时若本实例观察在运行，必须等其结束；note_version 为 0 时不得替换，子 Agent 首次替换前必须先同步完成一次观察。
+- TASK_NOTE-18 替换前缀时，若本实例有观察在运行，必须等其结束；note_version 为 0 或断点后增量不低于门禁阈值时，必须先同步完成一次观察再替换；同步观察后 note_version 仍为 0 时不得替换。
 - TASK_NOTE-19 Note 存储不可用时 Note 工具必须返回 TASK_NOTE_STORAGE_UNAVAILABLE，快照读取失败时不得替换上下文、不得推进断点。
