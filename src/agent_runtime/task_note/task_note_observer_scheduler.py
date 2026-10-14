@@ -182,12 +182,19 @@ def serialize_units_to_list(units: Sequence[TaskNoteUnit]) -> list[dict[str, Any
     return result
 
 
+def _json_default(val: Any) -> Any:
+    """JSON 序列化兜底处理器，兼容 datetime 等复杂对象。"""
+    if hasattr(val, "isoformat") and callable(val.isoformat):
+        return val.isoformat()
+    return str(val)
+
+
 def format_units_for_observer(units: Sequence[TaskNoteUnit]) -> str:
     """按文档 1 §9.3 序列化 units 结构化文本。"""
     if not units:
         return '{\n  "units": []\n}'
     data = {"units": serialize_units_to_list(units)}
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    return json.dumps(data, ensure_ascii=False, indent=2, default=_json_default)
 
 
 def build_observer_user_payload(
@@ -196,7 +203,7 @@ def build_observer_user_payload(
 ) -> str:
     """构造观察者会话启动时的首条 User 消息完整文本 (包含文档 1 §9.2 规定的 5 类内容)。"""
     clean_snapshot = {k: v for k, v in session_input.note_snapshot.items() if k != "commands"}
-    snapshot_json_str = json.dumps(clean_snapshot, ensure_ascii=False, indent=2)
+    snapshot_json_str = json.dumps(clean_snapshot, ensure_ascii=False, indent=2, default=_json_default)
 
     # 1. 目标 Agent 身份
     parts: list[str] = [
@@ -209,7 +216,7 @@ def build_observer_user_payload(
     if session_input.parent_agent_instance_id:
         parts.append(f"- 父 Agent ID: `{session_input.parent_agent_instance_id}`")
     if session_input.ancestor_chain:
-        parts.append(f"- 祖先链: {json.dumps(session_input.ancestor_chain, ensure_ascii=False)}")
+        parts.append(f"- 祖先链: {json.dumps(session_input.ancestor_chain, ensure_ascii=False, default=_json_default)}")
     if session_input.delegation_content:
         parts.append(f"- 直接父级委派原文: `{session_input.delegation_content}`")
 

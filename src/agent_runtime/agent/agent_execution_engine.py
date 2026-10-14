@@ -3099,18 +3099,49 @@ class AgentExecutionEngine:
                         tracking = await coordinator.get(conversation.id, is_subagent=is_sub)
 
                         # 3. 如果 note_version == 0 或起点之后的 token >= 门禁阈值，强制执行一次同步观察
+                        messages = list(conversation.messages)
+                        msg_ids = [
+                            getattr(m, "message_id", None) or getattr(m, "id", None) or (m.get("message_id") if isinstance(m, dict) else None)
+                            for m in messages
+                        ]
                         start_mid = tracking.covered_until_message_id or tracking.prefix_end_message_id
+                        if start_mid and start_mid not in msg_ids:
+                            # 起点 ID 丢失（前缀替换崩溃等），回退至最后一条快照标记消息
+                            fallback_mid = None
+                            for m in reversed(messages):
+                                content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
+                                first_text = ""
+                                if isinstance(content, list) and content:
+                                    fp = content[0]
+                                    first_text = getattr(fp, "text", "") if not isinstance(fp, dict) else fp.get("text", "")
+                                elif isinstance(content, str):
+                                    first_text = content
+                                if str(first_text or "").startswith("# 任务手记快照"):
+                                    fallback_mid = getattr(m, "message_id", None) or getattr(m, "id", None) or (m.get("message_id") if isinstance(m, dict) else None)
+                                    break
+                            start_mid = fallback_mid
+
+                        start_idx = 0
+                        if start_mid:
+                            for idx, mid in enumerate(msg_ids):
+                                if mid == start_mid:
+                                    start_idx = idx + 1
+                                    break
+
                         tokens_after_start = 0
-                        start_found = (start_mid is None)
-                        for m in conversation.messages:
-                            if not start_found:
-                                if getattr(m, "message_id", None) == start_mid or getattr(m, "id", None) == start_mid:
-                                    start_found = True
-                                continue
-                            if tracking.snapshot_message_id and (getattr(m, "message_id", None) == tracking.snapshot_message_id or getattr(m, "id", None) == tracking.snapshot_message_id):
-                                content = getattr(m, "content", None)
+                        for idx in range(start_idx, len(messages)):
+                            m = messages[idx]
+                            mid = msg_ids[idx]
+                            if tracking.snapshot_message_id and mid == tracking.snapshot_message_id:
+                                content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
                                 if isinstance(content, list) and len(content) > 1:
-                                    tokens_after_start += sum(estimate_message_tokens(p) for p in content[1:])
+                                    from agent_runtime.conversation_message.message.models import UniMessage
+                                    sub_msg = UniMessage(
+                                        role=getattr(m, "role", "user") if not isinstance(m, dict) else m.get("role", "user"),
+                                        content=content[1:],
+                                        message_id=mid,
+                                    )
+                                    tokens_after_start += estimate_message_tokens(sub_msg)
                             else:
                                 tokens_after_start += estimate_message_tokens(m)
 

@@ -352,7 +352,12 @@ def ensure_task_note_schema(config_registry: Any = None) -> bool:
                         (table_name = 'task_decision_records' AND column_name IN ('superseded_reason'))
                       );
                 """)
-                existing_cols = frozenset((row[0], row[1]) for row in cur.fetchall())
+                def _get_col_pair(r: Any) -> tuple[str, str]:
+                    if isinstance(r, dict):
+                        return (str(r.get("table_name") or ""), str(r.get("column_name") or ""))
+                    return (str(r[0]), str(r[1]))
+
+                existing_cols = frozenset(_get_col_pair(row) for row in cur.fetchall())
                 missing = REQUIRED_MIGRATION_COLUMNS - existing_cols
                 if missing:
                     logger.error("Task Note 迁移断言失败，缺失必需列: %s", missing)

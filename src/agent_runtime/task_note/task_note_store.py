@@ -25,7 +25,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, ContextManager
 
 logger = logging.getLogger("agent_runtime.task_note.store")
@@ -57,9 +57,13 @@ def _generate_id(prefix: str) -> str:
 
 
 def _to_json_compatible(val: Any) -> Any:
-    """递归将 Pydantic 模型、dataclass 等对象转换为原生 JSON 可序列化类型。"""
+    """递归将 Pydantic 模型、dataclass、datetime 等对象转换为原生 JSON 可序列化类型。"""
     if val is None:
         return None
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    if isinstance(val, uuid.UUID):
+        return str(val)
     if hasattr(val, "model_dump") and callable(val.model_dump):
         return val.model_dump(mode="json")
     if hasattr(val, "dict") and callable(val.dict):
@@ -2064,7 +2068,7 @@ class TaskNoteStore:
                     if not row:
                         return None
                     if isinstance(row, dict):
-                        return dict(row)
+                        return _to_json_compatible(dict(row))
                     if row and len(row) >= 7:
                         return {
                             "agent_instance_id": row[0],
@@ -2390,10 +2394,10 @@ class TaskNoteStore:
                     )
                     snapshot["agent_messages"] = [dict(r) for r in cur.fetchall()]
 
-            return snapshot
+            return _to_json_compatible(snapshot)
         except Exception as exc:
             logger.error("get_note_snapshot 查询失败: %s", exc)
-            return snapshot
+            return _to_json_compatible(snapshot)
 
     def cleanup_agent_instance_note(
         self,
