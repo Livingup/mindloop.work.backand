@@ -1,0 +1,671 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import copy
+import json
+import logging
+import mimetypes
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+from agent_runtime.file_resource.north_gateway.resource_create_contracts import (
+    Base64CreateRequest,
+    RemoteUrlCreateRequest,
+)
+from agent_runtime.file_resource.service import FileResourceService
+from agent_runtime.image_generation.models import (
+    GeneratedImageResource,
+    ImageGenerationRequest,
+    ImageGenerationResult,
+)
+from agent_runtime.image_generation.openai_images_client import OpenAIImagesGenerationClient
+from agent_runtime.image_generation.settings_repository import ImageGenerationSettingsRepository
+from agent_runtime.llm_api_protocol import (
+    API_FORMAT_CODEX_RESPONSES,
+    API_FORMAT_OPENAI_IMAGES_GENERATIONS,
+    API_FORMAT_OPENAI_RESPONSES,
+)
+from agent_runtime.llm_client.llm_request_service import LlmRequestService
+from agent_runtime.llm_model_registry.north_gateway.llm_model_registry_contracts import LlmModelRegistryGateway
+from agent_runtime.llm_model_registry.llm_model_registry_service import ResolvedLlmProviderModel
+
+
+MODE_GENERATE = "generate"
+MODE_EDIT = "edit"
+_SUPPORTED_MODES = {MODE_GENERATE, MODE_EDIT}
+
+
+_ENV_VAR_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*))?\}$")
+_SIZE_PATTERN = re.compile(r"^([1-9]\d*)x([1-9]\d*)$")
+_MIME_BY_OUTPUT_FORMAT = {
+    "png": "image/png",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+}
+_DEFAULT_OUTPUT_FORMAT = "png"
+_DEFAULT_SIZE = "1024x1024"
+_DEFAULT_QUALITY = "high"
+_STANDARD_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+_MAX_SIZE_EDGE = 3840
+_MAX_SIZE_PIXELS = 3840 * 2160
+_GPT_IMAGE_AGENT_MAX_ROUNDS = 5
+_GPT_IMAGE_AGENT_SYSTEM_PROMPT = (
+    "你是 generate_image 工具内部的临时生图 Agent。"
+    "尽最大可能根据用户的需求描述来直接生成图片，不要询问用户。"
+    "你只能使用当前请求中提供的内置图片生成工具完成任务。"
+    "如果用户需求信息不完整，请自行做合理视觉补全并直接生成图片。"
+)
+
+logger = logging.getLogger(__name__)
+
+
+class ImageGenerationConfigurationError(ValueError):
+    pass
+
+
+class ImageGenerationService:
+    def __init__(
+        self,
+        *,
+        settings_repository: ImageGenerationSettingsRepository,
+        llm_registry_gateway: LlmModelRegistryGateway,
+        file_resource_service: FileResourceService,
+        llm_request_service: LlmRequestService,
+        images_client: OpenAIImagesGenerationClient | None = None,
+    ) -> None:
+        self._settings_repository = settings_repository
+        self._llm_registry_gateway = llm_registry_gateway
+        self._file_resource_service = file_resource_service
+        self._llm_request_service = llm_request_service
+        self._images_client = images_client or OpenAIImagesGenerationClient()
+
+    def get_settings(self):
+        return self._settings_repository.get_settings()
+
+    def save_settings(
+        self,
+        *,
+        llm_policy_group_id: str | None,
+    ):
+        normalized_policy_id = llm_policy_group_id.strip() if isinstance(llm_policy_group_id, str) else None
+        if normalized_policy_id == "":
+            normalized_policy_id = None
+        if normalized_policy_id is not None:
+            self._require_usable_policy(normalized_policy_id)
+        return self._settings_repository.save_settings(
+            llm_policy_group_id=normalized_policy_id,
+        )
+
+    def validate_policy(self, policy_group_id: str) -> None:
+        self._require_usable_policy(policy_group_id)
+
+    async def generate_image(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        if not request.prompt.strip():
+            raise ValueError("prompt must not be empty.")
+        mode = _resolve_mode(request)
+        settings = self._settings_repository.get_settings()
+        if not settings.llm_policy_group_id:
+            raise ImageGenerationConfigurationError("Image generation LLM policy is not configured.")
+        policy = self._llm_registry_gateway.resolve_execution_policy(settings.llm_policy_group_id)
+        request_body = self._build_request_body(request, mode=mode)
+        use_edit_endpoint = (mode == MODE_EDIT)
+        last_error: Exception | None = None
+        attempt_count = 0
+        for candidate_index, candidate in enumerate(policy.candidates):
+            resolved = candidate.resolved_model
+            self._assert_supported_model(resolved)
+
+            api_key_items = list(resolved.api_keys)
+            api_keys: list[str | None] = [item.key for item in api_key_items] or [None]
+            max_retries = max(0, int(resolved.retry.max_retries_per_key))
+            for api_key_index, raw_api_key in enumerate(api_keys):
+                try:
+                    api_key = _resolve_api_key(raw_api_key) if raw_api_key is not None else None
+                except Exception as exc:
+                    last_error = exc
+                    continue
+                for retry_index in range(max_retries + 1):
+                    attempt_count += 1
+                    attempt_started_at = time.perf_counter()
+                    try:
+                        if _is_responses_image_agent_model(resolved):
+                            response = await self._run_gpt_image_agent(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                request=request,
+                                request_body=request_body,
+                                mode=mode,
+                            )
+                        elif use_edit_endpoint:
+                            response = await self._images_client.edit(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                body=request_body,
+                            )
+                        else:
+                            response = await self._images_client.generate(
+                                resolved_model=resolved,
+                                api_key=api_key,
+                                body=request_body,
+                            )
+                        images = self._ingest_images(
+                            response,
+                            output_format=str(
+                                request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT
+                            ),
+                        )
+                        if not images:
+                            raise RuntimeError("OpenAI Images API returned no image data.")
+                        logger.info(
+                            "Image generation attempt succeeded: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s attempt_count=%s elapsed_ms=%s mode=%s",
+                            settings.llm_policy_group_id,
+                            candidate_index,
+                            resolved.provider_id,
+                            resolved.binding_id,
+                            api_key_index,
+                            retry_index,
+                            attempt_count,
+                            int((time.perf_counter() - attempt_started_at) * 1000),
+                            mode,
+                        )
+                        return ImageGenerationResult(
+                            images=tuple(images),
+                            provider_id=resolved.provider_id,
+                            binding_id=resolved.binding_id,
+                            model_id=resolved.model_id,
+                            model_alias=resolved.model_alias,
+                            api_format=resolved.api_format,
+                            candidate_index=candidate_index,
+                            api_key_index=api_key_index,
+                            attempt_count=attempt_count,
+                            request_params=_sanitize_request_params(request_body),
+                            mode=mode,
+                        )
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            "Image generation attempt failed: policy=%s candidate_index=%s provider=%s binding=%s api_key_index=%s retry_index=%s max_retries=%s attempt_count=%s elapsed_ms=%s error=%s: %s",
+                            settings.llm_policy_group_id,
+                            candidate_index,
+                            resolved.provider_id,
+                            resolved.binding_id,
+                            api_key_index,
+                            retry_index,
+                            max_retries,
+                            attempt_count,
+                            int((time.perf_counter() - attempt_started_at) * 1000),
+                            exc.__class__.__name__,
+                            exc,
+                        )
+                        if retry_index < max_retries:
+                            await _sleep_before_retry(
+                                resolved.retry.initial_delay_seconds,
+                                resolved.retry.max_delay_seconds,
+                                retry_index,
+                            )
+                            continue
+                        break
+        if last_error is not None:
+            raise RuntimeError(f"Image generation failed after {attempt_count} attempts: {last_error}") from last_error
+        raise RuntimeError("Image generation failed: no usable policy candidate.")
+
+    def _build_request_body(
+        self,
+        request: ImageGenerationRequest,
+        *,
+        mode: str,
+    ) -> dict[str, Any]:
+        output_format = request.output_format or _DEFAULT_OUTPUT_FORMAT
+        if request.background == "transparent" and output_format not in {"png", "webp"}:
+            raise ValueError("background=transparent requires output_format to be png or webp.")
+        if request.output_compression is not None and output_format not in {"jpeg", "webp"}:
+            raise ValueError("output_compression is only supported for jpeg or webp output.")
+        body: dict[str, Any] = {
+            "prompt": request.prompt,
+            "n": _bounded_count(request.n),
+            "size": _normalize_size(request.size),
+            "quality": _DEFAULT_QUALITY,
+            "output_format": output_format,
+            "response_format": "b64_json",
+        }
+        if mode == MODE_EDIT:
+            images = _image_references_from_request(request.image_urls, request.image_paths)
+            if not images:
+                raise ValueError("mode='edit' requires at least one source image in image_urls or image_paths.")
+            body["images"] = images
+            mask = _mask_reference_from_request(request.mask_url, request.mask_path)
+            if mask is not None:
+                body["mask"] = mask
+            if request.input_fidelity is not None:
+                body["input_fidelity"] = request.input_fidelity
+        for key, value in {
+            "background": request.background,
+            "output_compression": request.output_compression,
+        }.items():
+            if value is not None:
+                body[key] = value
+        return body
+
+    def _ingest_images(self, response: dict[str, Any], *, output_format: str) -> list[GeneratedImageResource]:
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError("OpenAI Images API response data must be a list.")
+        mime_type = _mime_type_for_output_format(output_format)
+        b64_entries: list[tuple[int, Base64CreateRequest, str | None]] = []
+        url_entries: list[tuple[int, RemoteUrlCreateRequest, str | None]] = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                continue
+            revised_prompt = item.get("revised_prompt")
+            revised_prompt_str = str(revised_prompt) if revised_prompt is not None else None
+            b64_json = item.get("b64_json")
+            if isinstance(b64_json, str) and b64_json.strip():
+                b64_entries.append(
+                    (index, Base64CreateRequest(resource_base64_content=b64_json, resource_mime_type=mime_type), revised_prompt_str)
+                )
+                continue
+            url = item.get("url")
+            if isinstance(url, str) and url.strip():
+                url_entries.append(
+                    (index, RemoteUrlCreateRequest(resource_url=url, resource_mime_type=mime_type), revised_prompt_str)
+                )
+                continue
+        if not b64_entries and not url_entries:
+            return []
+        indexed_results: list[tuple[int, GeneratedImageResource]] = []
+        if b64_entries:
+            created_b64 = self._file_resource_service.create_resources_from_base64_contents(
+                [req for _, req, _ in b64_entries]
+            )
+            for (orig_idx, _, prompt_val), res in zip(b64_entries, created_b64):
+                indexed_results.append((
+                    orig_idx,
+                    GeneratedImageResource(
+                        resource_id=res.resource_id,
+                        object_storage_url=res.object_storage_url,
+                        local_storage_path=res.local_storage_path,
+                        mime_type=mime_type,
+                        revised_prompt=prompt_val,
+                    ),
+                ))
+        if url_entries:
+            created_urls = self._file_resource_service.create_resources_from_remote_urls(
+                [req for _, req, _ in url_entries]
+            )
+            for (orig_idx, _, prompt_val), res in zip(url_entries, created_urls):
+                indexed_results.append((
+                    orig_idx,
+                    GeneratedImageResource(
+                        resource_id=res.resource_id,
+                        object_storage_url=res.object_storage_url,
+                        local_storage_path=res.local_storage_path,
+                        mime_type=mime_type,
+                        revised_prompt=prompt_val,
+                    ),
+                ))
+        indexed_results.sort(key=lambda x: x[0])
+        return [res for _, res in indexed_results]
+
+    def _require_usable_policy(self, policy_group_id: str) -> None:
+        policy = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
+        if not policy.candidates:
+            raise ImageGenerationConfigurationError("Image generation LLM policy has no candidates.")
+        for candidate in policy.candidates:
+            self._assert_supported_model(candidate.resolved_model)
+
+    def _assert_supported_model(self, resolved: ResolvedLlmProviderModel) -> None:
+        if resolved.api_format == API_FORMAT_OPENAI_IMAGES_GENERATIONS:
+            return
+        if _is_responses_image_agent_model(resolved):
+            return
+        raise ImageGenerationConfigurationError(
+            "Image generation only supports "
+            f"{API_FORMAT_OPENAI_IMAGES_GENERATIONS}, "
+            f"{API_FORMAT_OPENAI_RESPONSES}, or "
+            f"{API_FORMAT_CODEX_RESPONSES}: "
+            f"{resolved.provider_id}/{resolved.binding_id} ({resolved.api_format})"
+        )
+
+    async def _run_gpt_image_agent(
+        self,
+        *,
+        resolved_model: ResolvedLlmProviderModel,
+        api_key: str | None,
+        request: ImageGenerationRequest,
+        request_body: dict[str, Any],
+        mode: str,
+    ) -> dict[str, Any]:
+        conversation_id = (
+            _normalize_relay_session_id(request.relay_session_id)
+            or _fallback_gpt_image_agent_relay_session_id(resolved_model)
+        )
+        input_items = _build_gpt_image_agent_initial_input(request, request_body, mode=mode)
+        request_params = _merge_gpt_image_agent_request_params(resolved_model)
+        for fixed_field in ("model", "input", "instructions", "tools"):
+            request_params.pop(fixed_field, None)
+        request_params.update({
+            "tool_choice": {"type": "image_generation"},
+            "store": False,
+            "stream": True,
+        })
+        output_format = str(request_body.get("output_format") or _DEFAULT_OUTPUT_FORMAT)
+        for round_index in range(_GPT_IMAGE_AGENT_MAX_ROUNDS):
+            raw_response = await self._llm_request_service.request_standard_responses(
+                resolved_model=resolved_model,
+                conversation_id=conversation_id,
+                input_items=input_items,
+                system_prompt=_GPT_IMAGE_AGENT_SYSTEM_PROMPT,
+                tools=({"type": "image_generation"},),
+                request_params=request_params,
+                api_key=api_key,
+                input_configuration_capability=(
+                    resolved_model.api_format == API_FORMAT_OPENAI_RESPONSES
+                ),
+            )
+            if not isinstance(raw_response, dict):
+                raise RuntimeError("Standard Responses image agent response must be a JSON object.")
+            data = _extract_gpt_image_agent_image_data(raw_response, output_format=output_format)
+            if data:
+                return {"data": data}
+            input_items.extend(_replayable_gpt_image_agent_output_items(raw_response))
+            input_items.append(_build_gpt_image_agent_continue_input(round_index))
+        raise RuntimeError(f"{resolved_model.model_id} image agent did not return image data after {_GPT_IMAGE_AGENT_MAX_ROUNDS} rounds.")
+
+
+
+def _bounded_count(value: int) -> int:
+    count = int(value)
+    if count < 1 or count > 10:
+        raise ValueError("n must be between 1 and 10.")
+    return count
+
+
+def _normalize_size(value: str | None) -> str:
+    if value is None:
+        return _DEFAULT_SIZE
+    normalized = value.strip().lower()
+    if normalized == "auto" or normalized in _STANDARD_SIZES:
+        return normalized
+    match = _SIZE_PATTERN.match(normalized)
+    if match is None:
+        raise ValueError("size must be auto or a WIDTHxHEIGHT string.")
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width % 16 != 0 or height % 16 != 0:
+        raise ValueError("size width and height must both be divisible by 16.")
+    if width > _MAX_SIZE_EDGE or height > _MAX_SIZE_EDGE:
+        raise ValueError("size width and height must not exceed 3840.")
+    if width * height > _MAX_SIZE_PIXELS:
+        raise ValueError("size must not exceed 3840x2160 pixels.")
+    if width * 3 < height or height * 3 < width:
+        raise ValueError("size aspect ratio must be between 1:3 and 3:1.")
+    return normalized
+
+
+def _mime_type_for_output_format(output_format: str) -> str:
+    normalized = output_format.strip().lower()
+    if normalized not in _MIME_BY_OUTPUT_FORMAT:
+        raise ValueError("output_format must be one of: png, jpeg, webp.")
+    return _MIME_BY_OUTPUT_FORMAT[normalized]
+
+
+def _resolve_api_key(key: str) -> str:
+    match = _ENV_VAR_PATTERN.match(key.strip())
+    if match is None:
+        return key
+    env_key = match.group(1)
+    default = match.group(2)
+    env_value = os.environ.get(env_key)
+    if env_value is not None:
+        return env_value
+    if default is not None:
+        return default
+    raise ValueError(f"LLM API Key environment variable is not set: {env_key}")
+
+
+def _image_references_from_request(image_urls: tuple[str, ...], image_paths: tuple[str, ...]) -> list[dict[str, str]]:
+    references = [{"image_url": _normalize_image_url(url)} for url in image_urls if url.strip()]
+    references.extend({"image_url": _image_path_to_data_url(path)} for path in image_paths if path.strip())
+    if len(references) > 16:
+        raise ValueError("image edit supports at most 16 input images.")
+    return references
+
+
+def _mask_reference_from_request(mask_url: str | None, mask_path: str | None) -> dict[str, str] | None:
+    normalized_url = mask_url.strip() if isinstance(mask_url, str) else ""
+    normalized_path = mask_path.strip() if isinstance(mask_path, str) else ""
+    if normalized_url and normalized_path:
+        raise ValueError("mask_url and mask_path cannot both be provided.")
+    if normalized_url:
+        return {"image_url": _normalize_image_url(normalized_url)}
+    if normalized_path:
+        return {"image_url": _image_path_to_data_url(normalized_path)}
+    return None
+
+
+def _normalize_image_url(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("http://") or normalized.startswith("https://") or normalized.startswith("data:image/"):
+        return normalized
+    raise ValueError("image URLs must be http(s) URLs or data:image/... URLs.")
+
+
+def _image_path_to_data_url(path: str) -> str:
+    file_path = Path(path).expanduser()
+    if not file_path.is_file():
+        raise ValueError(f"image path does not exist or is not a file: {path}")
+    mime_type, _encoding = mimetypes.guess_type(str(file_path))
+    if not mime_type or not mime_type.startswith("image/"):
+        raise ValueError(f"image path must point to an image file: {path}")
+    encoded = base64.b64encode(file_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _sanitize_request_params(value: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(value)
+    if isinstance(sanitized.get("images"), list):
+        sanitized["images"] = [_sanitize_image_reference(item) for item in sanitized["images"]]
+    if isinstance(sanitized.get("mask"), dict):
+        sanitized["mask"] = _sanitize_image_reference(sanitized["mask"])
+    return sanitized
+
+
+def _sanitize_image_reference(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    image_url = value.get("image_url")
+    if not isinstance(image_url, str) or not image_url.startswith("data:image/"):
+        return dict(value)
+    return {"image_url": f"{image_url.split(',', 1)[0]},<base64 omitted>"}
+
+
+def _is_responses_image_agent_model(resolved: ResolvedLlmProviderModel) -> bool:
+    return resolved.api_format in {API_FORMAT_OPENAI_RESPONSES, API_FORMAT_CODEX_RESPONSES}
+
+
+_is_gpt_image_agent_model = _is_responses_image_agent_model
+
+
+def _normalize_relay_session_id(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _fallback_gpt_image_agent_relay_session_id(resolved_model: ResolvedLlmProviderModel) -> str:
+    return f"image-generation:{resolved_model.provider_id}:{resolved_model.binding_id}"
+
+
+def _merge_gpt_image_agent_request_params(resolved_model: ResolvedLlmProviderModel) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    _merge_json_field(merged, resolved_model.custom_request_params, "custom_request_params")
+    _merge_json_field(merged, resolved_model.thinking, "thinking")
+    return merged
+
+
+def _merge_json_field(target: dict[str, Any], value: str | None, field_name: str) -> None:
+    if value is None or not value.strip():
+        return
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field_name} must be a JSON object.")
+    target.update(parsed)
+
+
+def _resolve_mode(request: ImageGenerationRequest) -> str:
+    has_images = bool(request.image_urls or request.image_paths)
+    if request.mode is not None:
+        normalized = request.mode.strip().lower()
+        if normalized not in _SUPPORTED_MODES:
+            raise ValueError(f"mode must be one of: {', '.join(sorted(_SUPPORTED_MODES))}, got {request.mode!r}")
+        if normalized == MODE_EDIT and not has_images:
+            raise ValueError("mode='edit' requires at least one source image in image_urls or image_paths.")
+        if normalized == MODE_GENERATE and has_images:
+            raise ValueError("mode='generate' does not accept input images. Use mode='edit' for image-to-image or editing.")
+        return normalized
+    return MODE_EDIT if has_images else MODE_GENERATE
+
+
+def _build_gpt_image_agent_initial_input(
+    request: ImageGenerationRequest,
+    request_body: dict[str, Any],
+    *,
+    mode: str,
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": _build_gpt_image_agent_prompt(request, request_body, mode=mode),
+        }
+    ]
+    if mode == MODE_EDIT:
+        for image in request_body.get("images") or []:
+            if isinstance(image, dict) and isinstance(image.get("image_url"), str):
+                content.append({"type": "input_image", "image_url": image["image_url"]})
+        mask = request_body.get("mask")
+        if isinstance(mask, dict) and isinstance(mask.get("image_url"), str):
+            content.append({"type": "input_image", "image_url": mask["image_url"]})
+    return [{"type": "message", "role": "user", "content": content}]
+
+
+def _build_gpt_image_agent_prompt(
+    request: ImageGenerationRequest,
+    request_body: dict[str, Any],
+    *,
+    mode: str,
+) -> str:
+    mode_desc = (
+        "全新图片生成（文生图）"
+        if mode == MODE_GENERATE
+        else "基于参考图的编辑/风格重绘/局部重绘（图生图）"
+    )
+    lines = [
+        "请根据以下 generate_image 工具参数直接生成图片，不要询问用户。",
+        f"任务模式: {mode_desc}",
+        f"用户生图需求: {request.prompt}",
+        f"输出数量: {request_body.get('n')}",
+        f"输出尺寸: {request_body.get('size')}",
+        f"输出格式: {request_body.get('output_format')}",
+        f"背景模式: {request_body.get('background', 'auto')}",
+        f"质量: {request_body.get('quality')}",
+    ]
+    if request_body.get("output_compression") is not None:
+        lines.append(f"输出压缩: {request_body.get('output_compression')}")
+    if mode == MODE_EDIT:
+        if request_body.get("input_fidelity") is not None:
+            lines.append(f"输入参考/编辑保真度: {request_body.get('input_fidelity')}")
+        if request_body.get("images"):
+            lines.append("已附加输入/参考/编辑图片，请务必结合这些图片完成风格转换或重绘。")
+        if request_body.get("mask"):
+            lines.append("已附加局部编辑 mask 图片，请按 mask 限定区域完成编辑。")
+    return "\n".join(lines)
+
+
+def _build_gpt_image_agent_continue_input(round_index: int) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {
+                "type": "input_text",
+                "text": (
+                    f"第 {round_index + 1} 轮没有返回图片结果。"
+                    "请不要询问用户，不要只返回说明文字，立刻调用内置图片生成工具并返回图片。"
+                ),
+            }
+        ],
+    }
+
+
+def _extract_gpt_image_agent_image_data(raw_response: dict[str, Any], *, output_format: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in _iter_dicts_deep(raw_response.get("output")):
+        item_type = item.get("type")
+        if item_type not in {"image_generation_call", "image_generation"}:
+            continue
+        result = item.get("result") or item.get("image") or item.get("b64_json")
+        if isinstance(result, str) and result.strip():
+            b64_json, mime_type = _normalize_generated_image_result(result, output_format)
+            items.append({"b64_json": b64_json, "revised_prompt": _text_or_none(item.get("revised_prompt")) or _text_or_none(item.get("prompt"))})
+            continue
+        if isinstance(result, dict):
+            b64_json = result.get("b64_json") or result.get("base64") or result.get("data")
+            if isinstance(b64_json, str) and b64_json.strip():
+                normalized, _mime_type = _normalize_generated_image_result(b64_json, output_format)
+                items.append({"b64_json": normalized, "revised_prompt": _text_or_none(result.get("revised_prompt")) or _text_or_none(result.get("prompt"))})
+    return items
+
+
+def _normalize_generated_image_result(value: str, output_format: str) -> tuple[str, str]:
+    stripped = value.strip()
+    if stripped.startswith("data:image/"):
+        header, _separator, data = stripped.partition(",")
+        mime_type = header.removeprefix("data:").split(";", 1)[0] or _mime_type_for_output_format(output_format)
+        return data, mime_type
+    return stripped, _mime_type_for_output_format(output_format)
+
+
+def _replayable_gpt_image_agent_output_items(raw_response: dict[str, Any]) -> list[dict[str, Any]]:
+    output = raw_response.get("output")
+    if not isinstance(output, list):
+        return []
+    replayable: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in {"reasoning", "message", "function_call"}:
+            replayable.append(copy.deepcopy(item))
+    return replayable
+
+
+def _iter_dicts_deep(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_dicts_deep(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_dicts_deep(child)
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+async def _sleep_before_retry(initial_delay: float, max_delay: float, retry_index: int) -> None:
+    delay = max(0.0, float(initial_delay)) * (2 ** max(0, retry_index - 1))
+    if max_delay > 0:
+        delay = min(delay, float(max_delay))
+    if delay > 0:
+        await asyncio.sleep(delay)

@@ -1,0 +1,645 @@
+# -*- coding: utf-8 -*-
+"""TaskNoteStore 数据库持久化层与 31 个 Note 维护工具的单元与集成测试。"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from agent_runtime.task_note.task_note_models import (
+    AppendMissionPromptRequest,
+    BatchCreateTaskTodosRequest,
+    BindResourcesToMissionRequest,
+    CreateMissionRequest,
+    CreateTaskArtifactOtherRequest,
+    CreateTaskDecisionRequest,
+    CreateTaskDiscoveryRequest,
+    CreateTaskExternalStateRequest,
+    CreateTaskIssueRequest,
+    CreateTaskTodoRequest,
+    CreateTaskValidationRequest,
+    CreateTaskWorkspaceContextRequest,
+    DeleteTaskArtifactOtherRequest,
+    DeleteTaskDiscoveryRequest,
+    DeleteTaskTodoRequest,
+    DeleteTaskWorkspaceContextRequest,
+    LineRange,
+    NoteUpdateEndRequest,
+    ResolveTaskIssueRequest,
+    SupersedeTaskDecisionRequest,
+    SupersedeTaskSolutionRequest,
+    TodoItemInput,
+    UpdateMissionRequirementRequest,
+    UpdateMissionStatusRequest,
+    UpdateTaskDecisionRequest,
+    UpdateTaskDiscoveryRequest,
+    UpdateTaskExternalStateRequest,
+    UpdateTaskIssueRequest,
+    UpdateTaskProgressRequest,
+    UpdateTaskSolutionRequest,
+    UpdateTaskTodoContentRequest,
+    UpdateTaskTodoStatusRequest,
+    UpdateTaskValidationRequest,
+    UpdateTaskWorkspaceContextRequest,
+)
+from agent_runtime.task_note.task_note_snapshot_service import TaskNoteSnapshotService
+from agent_runtime.task_note.task_note_store import (
+    TaskNoteStorageUnavailableError,
+    TaskNoteStore,
+    get_task_note_store,
+    set_task_note_store,
+)
+from agent_runtime.task_note.task_note_tool import (
+    append_mission_prompt,
+    batch_create_task_todos,
+    bind_resources_to_mission,
+    create_mission,
+    create_task_artifact_other,
+    create_task_decision,
+    create_task_discovery,
+    create_task_external_state,
+    create_task_issue,
+    create_task_todo,
+    create_task_validation,
+    create_task_workspace_context,
+    delete_task_discovery,
+    delete_task_todo,
+    delete_task_workspace_context,
+    note_update_end,
+    resolve_task_issue,
+    supersede_task_decision,
+    supersede_task_solution,
+    update_mission_requirement,
+    update_mission_status,
+    update_task_decision,
+    update_task_discovery,
+    update_task_external_state,
+    update_task_issue,
+    update_task_progress,
+    update_task_solution,
+    update_task_todo_content,
+    update_task_todo_status,
+    update_task_validation,
+    update_task_workspace_context,
+)
+from agent_runtime.tool.tool_execution_models import ToolRuntimeContext
+
+
+class MockCursor:
+    """模拟数据库游标。"""
+
+    def __init__(self, executed_statements: list[tuple[str, tuple[Any, ...]]]):
+        self.executed_statements = executed_statements
+        self.rowcount = 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        self.executed_statements.append((sql.strip(), params or ()))
+
+    def fetchone(self):
+        if not self.executed_statements:
+            return ("sol_test_123",)
+        last_sql, last_params = self.executed_statements[-1]
+        norm_sql = " ".join(last_sql.split())
+        if "pruned_at, agent_instance_id" in norm_sql:
+            mid = last_params[0] if last_params else ""
+            aid = last_params[1] if len(last_params) > 1 else "a1"
+            if "pruned" in str(mid):
+                return ("2026-10-13T00:00:00Z", aid)
+            return (None, aid)
+        if "status, agent_instance_id, pruned_at" in norm_sql:
+            return ("completed", "a1", None)
+        if "status, raw_prompts, agent_instance_id" in norm_sql or "status, raw_prompts" in norm_sql:
+            return ("completed", [], "a1")
+        if "status = 'unreleased'" in norm_sql:
+            return None
+        if "SELECT mission_id FROM" in norm_sql:
+            return ("m1",)
+        if "raw_prompts FROM" in norm_sql:
+            return ([],)
+        if "SELECT COUNT(*)" in norm_sql:
+            return (0,)
+        if "SELECT 1 FROM" in norm_sql:
+            return None
+        return ("sol_test_123",)
+
+    def fetchall(self):
+        return []
+
+
+class MockConnectionContext:
+    """模拟数据库连接上下文管理器，捕获执行的 SQL 与参数。"""
+
+    def __init__(self, executed_statements: list[tuple[str, tuple[Any, ...]]]):
+        self.executed_statements = executed_statements
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def cursor(self):
+        return MockCursor(self.executed_statements)
+
+    def commit(self):
+        pass
+
+
+@pytest.fixture
+def mock_db():
+    executed: list[tuple[str, tuple[Any, ...]]] = []
+
+    def factory():
+        return MockConnectionContext(executed)
+
+    store = TaskNoteStore(connection_factory=factory)
+    return store, executed
+
+
+def test_task_note_store_no_db_fallback():
+    """测试在无数据库配置时的保护机制：显式抛出 TaskNoteStorageUnavailableError (D08)。"""
+    store = TaskNoteStore(connection_factory=None)
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.create_mission(task_id="t1", scene_id="s1", agent_instance_id="a1", title="任务标题")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id="m1", prompt="原话")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.update_mission_requirement(task_id="t1", agent_instance_id="a1", mission_id="m1", refined_requirement="规格")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.create_workspace_context(task_id="t1", mission_id="m1", agent_instance_id="a1", source_type="file", path="test.py")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.upsert_solution(task_id="t1", mission_id="m1", agent_instance_id="a1", solution_content="方案内容")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.upsert_progress(task_id="t1", mission_id="m1", agent_instance_id="a1", completed_summary="总结", current_work="动作", next_step="下一步")
+
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id="m1", resource_type="artifact", resource_ids=["r1"])
+
+
+def test_task_note_store_crud_with_mock_db(mock_db):
+    """测试 TaskNoteStore 在有 DB 连接时正确生成并执行 SQL。"""
+    store, executed = mock_db
+
+    # 1. create_mission
+    mid = store.create_mission(
+        task_id="t1",
+        scene_id="s1",
+        agent_instance_id="a1",
+        title="测试任务",
+        raw_prompt="用户原话",
+        refined_requirement="提炼需求",
+    )
+    assert mid is not None
+    assert len(executed) == 1
+    sql, params = executed[-1]
+    assert "INSERT INTO agent_user_mission" in sql
+    assert params[0] == mid
+    assert params[1] == "t1"
+    assert params[2] == "s1"
+    assert params[4] == "测试任务"
+
+    # 2. append_mission_prompt
+    store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id=mid, prompt="追加原话")
+    sql, params = executed[-1]
+    assert "UPDATE agent_user_mission" in sql
+    assert "raw_prompts = raw_prompts ||" in sql
+
+    # 3. bind_resources_to_mission (artifact, command, agent_relationship)
+    store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="artifact", resource_ids=["art-1", "art-2"])
+    sql, params = executed[-1]
+    assert "UPDATE task_artifact_records" in sql
+    assert "mission_id = %s" in sql
+
+    # D17: command binding 已废弃，必须抛出 ValueError
+    with pytest.raises(ValueError):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="command", resource_ids=["cmd-1", "cmd-2"])
+
+    store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=mid, resource_type="agent_relationship", resource_ids=["rel-1"])
+    assert len(executed) >= 2
+    # 验证级联更新 task_agent_messages
+    assert any("UPDATE task_agent_relationships" in s for s, _ in executed)
+    assert any("UPDATE task_agent_messages" in s for s, _ in executed)
+
+    # 4. get_command_lines_by_ids & get_all_command_lines_for_tenant
+    store.get_command_lines_by_ids(task_id="t1", command_ids=["cmd-1", "cmd-2"])
+    sql, params = executed[-1]
+    assert "FROM task_command_records" in sql
+    assert "command_id = ANY(%s)" in sql
+
+
+def test_task_note_tool_database_error_handling():
+    """测试当底层数据库抛出异常时，Tool 稳健返回 BaseToolResult(success=False, error_code='DatabaseError')。"""
+    mock_store = MagicMock(spec=TaskNoteStore)
+    mock_store.create_mission.side_effect = RuntimeError("PG connection failed")
+
+    old_store = get_task_note_store()
+    set_task_note_store(mock_store)
+    try:
+        ctx = ToolRuntimeContext(task_id="t-err", agent_instance_id="a-err", scene_id="scene-01")
+        res = create_mission(CreateMissionRequest(title="报错任务"), ctx)
+        assert res.success is False
+        assert res.execution_status == "failed"
+        assert res.error_code == "DatabaseError"
+        assert "PG connection failed" in (res.error_message or "")
+    finally:
+        set_task_note_store(old_store)
+
+
+def test_task_note_tool_scene_id_passthrough():
+    """测试 ToolRuntimeContext 中的 scene_id 穿透至 create_mission。"""
+    mock_store = MagicMock(spec=TaskNoteStore)
+    mock_store.create_mission.return_value = "mission-mock-123"
+
+    old_store = get_task_note_store()
+    set_task_note_store(mock_store)
+    try:
+        ctx = ToolRuntimeContext(task_id="task-custom-01", agent_instance_id="agent-custom-01", scene_id="scene-custom-999")
+        res = create_mission(CreateMissionRequest(title="场景穿透测试"), ctx)
+        assert res.success is True
+        assert res.output["mission_id"] == "mission-mock-123"
+        mock_store.create_mission.assert_called_once()
+        kwargs = mock_store.create_mission.call_args.kwargs
+        assert kwargs["scene_id"] == "scene-custom-999"
+        assert kwargs["task_id"] == "task-custom-01"
+        assert kwargs["agent_instance_id"] == "agent-custom-01"
+    finally:
+        set_task_note_store(old_store)
+
+
+def test_snapshot_service_read_after_store_contract_alignment():
+    """测试 TaskNoteSnapshotService 读取结构与 TaskNoteStore 写入契约对齐。"""
+    # 1. 验证 connection_factory=None 时显式抛出 TaskNoteStorageUnavailableError (D08)
+    service_none = TaskNoteSnapshotService(connection_factory=None)
+    with pytest.raises(TaskNoteStorageUnavailableError):
+        service_none.build_snapshot(task_id="task-align-01", agent_instance_id="inst-align-01")
+
+    # 2. 验证在有连接时返回对齐的快照结构 (D09 多 mission 结构 solutions / progresses)
+    mock_cur = MagicMock()
+    mock_cur.fetchall.return_value = []
+    mock_cur.fetchone.return_value = None
+
+    @contextmanager
+    def mock_conn():
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = mock_cur
+        conn.cursor.return_value.__exit__.return_value = False
+        yield conn
+
+    service = TaskNoteSnapshotService(connection_factory=mock_conn)
+    snapshot = service.build_snapshot(task_id="task-align-01", agent_instance_id="inst-align-01")
+
+    # 11 个业务主题对应字段必须齐全且结构合规
+    assert "missions" in snapshot
+    assert "workspace_context" in snapshot
+    assert "solution" in snapshot
+    assert "solutions" in snapshot
+    assert "decisions" in snapshot
+    assert "todos" in snapshot
+    assert "discoveries" in snapshot
+    assert "issues" in snapshot
+    assert "artifacts" in snapshot
+    assert "validations" in snapshot
+    assert "external_states" in snapshot
+    assert "progress" in snapshot
+    assert "progresses" in snapshot
+    assert "commands" in snapshot
+    assert "agent_relationships" in snapshot
+    assert "agent_messages" in snapshot
+    assert "remote_agent_messages" in snapshot
+
+
+def test_cleanup_agent_instance_note(mock_db: Any):
+    """测试非 Root Agent 调用 end_task 时物理删除该实例的 16 张表 Note 记录（含 task_command_records 与 watermark）。"""
+    store, executed = mock_db
+    deleted = store.cleanup_agent_instance_note(task_id="task-cleanup-01", agent_instance_id="subagent-worker-01")
+
+    # 16 张表每个表执行一条 DELETE 语句，总共 16 条
+    assert len(executed) == 16
+    assert deleted == 16
+
+    executed_tables = []
+    for sql, params in executed:
+        assert sql.startswith("DELETE FROM ")
+        assert "WHERE task_id = %s AND agent_instance_id = %s" in sql
+        assert params == ("task-cleanup-01", "subagent-worker-01")
+        # 提取表名
+        table_name = sql.split()[2]
+        executed_tables.append(table_name)
+
+    # 重点验证：task_command_records 与 task_note_watermark 必须在内
+    assert "task_command_records" in executed_tables
+    assert "task_note_watermark" in executed_tables
+    assert "agent_user_mission" in executed_tables
+    assert "task_solution_content" in executed_tables
+    assert "task_todo_items" in executed_tables
+    assert "task_artifact_records" in executed_tables
+    assert "task_agent_relationships" in executed_tables
+    assert "task_agent_messages" in executed_tables
+
+
+def test_cleanup_task_note(mock_db: Any):
+    """测试 Root Agent 调用 end_task 时物理删除该 Task 下所有实例的 16 张表 Note 记录（含 task_command_records 与 watermark）。"""
+    store, executed = mock_db
+    deleted = store.cleanup_task_note(task_id="task-cleanup-02")
+
+    assert len(executed) == 16
+    assert deleted == 16
+
+    executed_tables = []
+    for sql, params in executed:
+        assert sql.startswith("DELETE FROM ")
+        assert sql.endswith("WHERE task_id = %s")
+        assert params == ("task-cleanup-02",)
+        table_name = sql.split()[2]
+        executed_tables.append(table_name)
+
+    # 重点验证：task_command_records 与 task_note_watermark 必须在内
+    assert "task_command_records" in executed_tables
+    assert "task_note_watermark" in executed_tables
+    assert "agent_user_mission" in executed_tables
+    assert "task_solution_content" in executed_tables
+    assert "task_progress_content" in executed_tables
+
+
+@pytest.mark.asyncio
+async def test_snapshot_service_async_cleanup(mock_db: Any):
+    """测试 TaskNoteSnapshotService 的异步封装清理调用。"""
+    _store, executed = mock_db
+    # 构建连接工厂
+    def factory():
+        return MockConnectionContext(executed)
+
+    service = TaskNoteSnapshotService(connection_factory=factory)
+
+    # 1. 异步清理子 Agent 实例 (支持关键字与位置传参)
+    del_inst = await service.async_cleanup_agent_instance_note(task_id="t1", agent_instance_id="sub1")
+    assert del_inst == 16
+    del_inst_pos = await service.async_cleanup_agent_instance_note("t1", "sub1")
+    assert del_inst_pos == 16
+
+    # 2. 异步清理 Task 全量 (支持关键字与位置传参)
+    del_task = await service.async_cleanup_task_note(task_id="t1")
+    assert del_task == 16
+    del_task_pos = await service.async_cleanup_task_note("t1")
+    assert del_task_pos == 16
+
+
+def test_dump_json_serializes_pydantic_line_ranges():
+    """测试 _dump_json 能够安全将包含 Pydantic LineRange 的对象序列化为原生可序列化格式。"""
+    import json
+    from agent_runtime.task_note.task_note_models import LineRange
+    from agent_runtime.task_note.task_note_store import _dump_json, _to_json_compatible
+
+    ranges = [LineRange(start_line=10, end_line=30), LineRange(start_line=50, end_line=100)]
+    compat = _to_json_compatible(ranges)
+    assert compat == [{"start_line": 10, "end_line": 30}, {"start_line": 50, "end_line": 100}]
+
+    dumped = _dump_json(ranges)
+    # 不论是 Jsonb 还是 fallback json str，都应可被标准 json.dumps 处理
+    inner_val = getattr(dumped, "obj", dumped)
+    serialized = json.dumps(inner_val)
+    assert '{"start_line": 10, "end_line": 30}' in serialized
+    assert '{"start_line": 50, "end_line": 100}' in serialized
+
+
+def test_create_workspace_context_with_pydantic_line_ranges(mock_db: Any):
+    """测试 create_task_workspace_context 传入 Pydantic LineRange 实例时正常执行入库。"""
+    import json
+    from agent_runtime.task_note.task_note_models import CreateTaskWorkspaceContextRequest, LineRange
+    from agent_runtime.task_note.task_note_store import set_task_note_store
+    _store, executed = mock_db
+    set_task_note_store(_store)
+    try:
+        ctx = ToolRuntimeContext(task_id="t_real", agent_instance_id="inst_real")
+
+        req = CreateTaskWorkspaceContextRequest(
+            mission_id="m1",
+            source_type="file",
+            path="src/engine.py",
+            line_ranges=[LineRange(start_line=3300, end_line=3479)],
+            description="引擎门禁",
+        )
+        res = create_task_workspace_context(req, ctx)
+        assert res.success is True
+        assert "context_id" in res.output
+
+        # 验证执行的 SQL 参数中 line_ranges 已正确转换为原生 dict，可被 json.dumps 序列化
+        insert_stmt = [stmt for stmt in executed if "INSERT INTO task_workspace_context" in stmt[0]][0]
+        line_ranges_param = insert_stmt[1][7]
+        inner = getattr(line_ranges_param, "obj", line_ranges_param)
+        dumped = json.dumps(inner)
+        assert '{"start_line": 3300, "end_line": 3479}' in dumped
+    finally:
+        set_task_note_store(None)
+
+
+def test_dual_id_isolation_and_artifact_other_semantic_alignment(mock_db: Any) -> None:
+    """验证 delete_artifact_other 严格限定 type='other'，UPSERT 同步 task_id，以及关系级联更新严格限制双 ID。"""
+    store, executed = mock_db
+
+    # 1. 验证 delete_artifact_other 严格限定 type = 'other'，杜绝误删 file_*
+    executed.clear()
+    store.delete_artifact_other(task_id="t_iso", agent_instance_id="a_iso", artifact_id="art_other_01")
+    assert len(executed) >= 1
+    del_sql, del_params = executed[-1]
+    assert "DELETE FROM task_artifact_records" in del_sql
+    assert "WHERE task_id = %s AND artifact_id = %s AND agent_instance_id = %s AND type = 'other'" in del_sql
+    assert del_params == ("t_iso", "art_other_01", "a_iso")
+
+    # 2. 验证 upsert_solution 的 UPSERT 包含 task_id = EXCLUDED.task_id
+    executed.clear()
+    store.upsert_solution(task_id="t_iso", agent_instance_id="a_iso", mission_id="m_iso", solution_content="方案内容")
+    assert len(executed) >= 1
+    sol_sql, _ = executed[-1]
+    assert "ON CONFLICT (mission_id, agent_instance_id)" in sol_sql
+    assert "task_id = EXCLUDED.task_id" in sol_sql
+
+    # 3. 验证 upsert_progress 的 UPSERT 包含 task_id = EXCLUDED.task_id
+    executed.clear()
+    store.upsert_progress(
+        task_id="t_iso",
+        agent_instance_id="a_iso",
+        mission_id="m_iso",
+        completed_summary="完成",
+        current_work="进行",
+        next_step="下一步",
+    )
+    assert len(executed) >= 1
+    prog_sql, _ = executed[-1]
+    assert "ON CONFLICT (mission_id, agent_instance_id)" in prog_sql
+    assert "task_id = EXCLUDED.task_id" in prog_sql
+
+    # 4. 验证 bind_resources_to_mission 级联更新专线消息时，子查询严格带双 ID 约束
+    executed.clear()
+    store.bind_resources_to_mission(
+        task_id="t_iso",
+        agent_instance_id="a_iso",
+        mission_id="m_iso",
+        resource_type="agent_relationship",
+        resource_ids=["rel_01"],
+    )
+    msg_update = [stmt for stmt in executed if "UPDATE task_agent_messages" in stmt[0]][0]
+    msg_sql, msg_params = msg_update
+    assert "WHERE task_id = %s AND agent_instance_id = %s" in msg_sql
+    assert "WHERE task_id = %s AND agent_instance_id = %s AND relationship_id = ANY(%s)" in msg_sql
+    assert msg_params == ("m_iso", "t_iso", "a_iso", "t_iso", "a_iso", ["rel_01"], "a_iso", "t_iso", "a_iso", ["rel_01"])
+
+
+def test_phase1_store_extensions(mock_db: Any):
+    """测试 Phase 1 新增的 Mission、Artifact 与 Watermark 核心持久化方法。"""
+    store, executed = mock_db
+
+    # 1. update_mission_prompts
+    executed.clear()
+    store.update_mission_prompts(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        raw_prompts=["用户诉求1", "用户诉求2"],
+    )
+    assert len(executed) >= 1
+    sql, params = executed[-1]
+    assert "UPDATE agent_user_mission" in sql
+    assert "SET raw_prompts = %s" in sql
+    assert params[1:] == ("t1", "m1", "a1")
+
+    # 2. update_mission_title
+    executed.clear()
+    store.update_mission_title(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        title="全新标题",
+    )
+    assert len(executed) >= 1
+    sql, params = executed[-1]
+    assert "SET title = %s" in sql
+    assert params == ("全新标题", "t1", "m1", "a1")
+
+    # 3. prune_mission
+    executed.clear()
+    store.prune_mission(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        outcome_summary="已成功交付所有接口",
+        keep_record_ids=["keep-art-01"],
+    )
+    prune_stmts = [s[0] for s in executed]
+    assert any("UPDATE agent_user_mission" in s and "outcome_summary = %s" in s for s in prune_stmts)
+    assert any("DELETE FROM task_workspace_context" in s for s in prune_stmts)
+    assert any("DELETE FROM task_artifact_records" in s and "NOT (artifact_id = ANY(%s))" in s for s in prune_stmts)
+
+    # 4. delete_mission
+    executed.clear()
+    store.delete_mission(
+        task_id="t1",
+        agent_instance_id="a1",
+        mission_id="m1",
+        reason="测试删除",
+        reassign_to_mission_id="m2",
+    )
+    del_stmts = [s[0] for s in executed]
+    assert any("UPDATE task_workspace_context" in s and "SET mission_id = %s" in s for s in del_stmts)
+    assert any("DELETE FROM agent_user_mission" in s for s in del_stmts)
+
+    # 5. delete_task_artifacts
+    executed.clear()
+    store.delete_task_artifacts(
+        task_id="t1",
+        agent_instance_id="a1",
+        artifact_ids=["art-1", "art-2"],
+    )
+    assert len(executed) >= 1
+    sql, params = executed[-1]
+    assert "DELETE FROM task_artifact_records" in sql
+    assert "artifact_id = ANY(%s)" in sql
+    assert params == ("t1", "a1", ["art-1", "art-2"])
+
+    # 6. watermark operations
+    executed.clear()
+    store.update_watermark(
+        agent_instance_id="a1",
+        task_id="t1",
+        covered_until_seq=42,
+        covered_until_message_id="msg-42",
+        note_version_inc=True,
+    )
+    assert len(executed) == 1
+    sql, _ = executed[0]
+    assert "INSERT INTO task_note_watermark" in sql
+    assert "ON CONFLICT (agent_instance_id) DO UPDATE" in sql
+
+    executed.clear()
+    store.set_inherited_processed(agent_instance_id="a1", task_id="t1")
+    assert len(executed) == 1
+    sql, _ = executed[0]
+    assert "inherited_processed = TRUE" in sql
+
+
+def test_store_pruned_mission_readonly_rejection(mock_db: Any):
+    """测试已裁剪为卡片的任务，其关联写操作被全部拒绝 (D13)。"""
+    store, _ = mock_db
+    pruned_id = "pruned_mission_001"
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.append_mission_prompt(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, prompt="新要求")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.update_mission_requirement(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, refined_requirement="新规格")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.update_mission_status(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, status="completed")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_workspace_context(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", source_type="file")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.upsert_solution(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", solution_content="方案")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_decision(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", decision_content="决策", rationale="理由")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_todo(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", todo_content="待办")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.batch_create_todos(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", todos=[{"todo_content": "待办1"}])
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.upsert_progress(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", completed_summary="已完成", current_work="进行中", next_step="下一步")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_discovery(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", discovery_content="发现", impact="影响")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_issue(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", issue_content="问题", impact="影响")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_artifact_other(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", artifact_type="report", content="产物")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_validation(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", target_type="requirement", validation_method="automated_test", validation_scope="范围", conclusion="passed", validation_content="通过", source_type="test")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.create_external_state(task_id="t1", mission_id=pruned_id, agent_instance_id="a1", target_type="database", target_identifier="db1", change_content="改动", current_state="状态")
+
+    with pytest.raises(ValueError, match="任务已裁剪为卡片，只读"):
+        store.bind_resources_to_mission(task_id="t1", agent_instance_id="a1", mission_id=pruned_id, resource_type="artifact", resource_ids=["art-1"])
+
+
+

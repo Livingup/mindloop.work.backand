@@ -1,0 +1,128 @@
+﻿# 通用 Agent 运行时环境服务配置
+#
+# 该配置文件用于承载当前项目的运行时基础配置。
+# 当前先落统一文件资源服务相关配置，同时保留整个运行时服务自己的宿主配置。
+
+agent_runtime_service:
+  # 当前运行时服务实例名称，用于区分不同部署环境或不同节点。
+  service_instance_name: "${SPREAD_AI_SERVICE_INSTANCE_NAME:-agent-runtime-local}"
+
+  # 当前运行时服务环境标识，可选值可继续扩展为 local / dev / test / prod。
+  service_environment: "${SPREAD_AI_SERVICE_ENVIRONMENT:-local}"
+
+  # API 监听地址（bind address），决定后端进程把 API 绑定到这台电脑的哪个网络入口：
+  # - 127.0.0.1：只给本机前端/本机脚本访问。
+  # - 0.0.0.0：允许通过本机所有网卡访问，例如本机、局域网 IP、Docker 容器网络。
+  # 该字段不填写远端机器地址，也不是权限白名单。
+  service_host: "${SPREAD_AI_SERVICE_HOST:-127.0.0.1}"
+
+  # 当前运行时服务监听端口。
+  service_port: "${SPREAD_AI_SERVICE_PORT:-8000}"
+
+file_resource_service:
+  # 统一文件资源服务单次批量处理上限。
+  file_resource_batch_limit: 20
+
+  # 统一文件资源服务本地热存储根目录。
+  local_resource_storage_root_path: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/file-resource"
+
+conversation_repository:
+  # 会话数据存储根目录（SQLite 元数据 + JSONL 消息文件）。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/conversations"
+
+agent_runtime:
+  # Agent 任务、实例和父子关系运行态仓储类型。sqlite 支持本机多 worker / 多进程共享。
+  repository_type: "sqlite"
+
+  # Agent 运行态 SQLite 数据目录。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/agent-runtime"
+
+  # 每个 Agent 实例会将自己的对话执行过程保存为 Markdown trace 文件。
+  trace_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/agent-traces"
+
+communication:
+  # 热路径存储：memory=进程内 ring（默认，推荐）。
+  # sqlite 已废弃，仅临时回滚保留，不推荐生产使用。
+  storage_mode: "${SPREAD_AI_COMMUNICATION_STORAGE_MODE:-memory}"
+  # 通用通信流与消息日志 SQLite 数据目录（sqlite 模式；memory 模式默认不写热路径）。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/communication"
+  # 单 stream ring 条数/字节与 MAIN/TERM 双预算。
+  memory_ring_max_events: 4000
+  memory_ring_max_bytes: 25165824
+  memory_ring_main_min_events: 1000
+  memory_ring_terminal_max_events: 3000
+  global_memory_ring_max_bytes: 2684354560
+  subscriber_queue_size: 1000
+  stream_idle_reclaim_minutes: 30
+  stream_idle_shrink_events: 64
+  idle_scan_interval_seconds: 60
+
+scene:
+  # 全局 Scene SQLite 数据库文件路径。所有 workspace 共享该数据库，每条 scene 通过 project_id 归属到项目。
+  scenes_db_path: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/scene/scene.db"
+  # 全局最近工作区索引文件路径，前端"最近项目"列表展示用，丢失或损坏不影响业务（项目身份与 scene 数据完整保留）。
+  recent_workspaces_path: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/recent-workspaces.json"
+
+prompt_template:
+  # 提示词片段 YAML 文件存储根目录。
+  snippets_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/prompt-snippets"
+
+skill_service:
+  # Skill 仓库根目录默认值；用户可在 UI 中配置实际目录并写入共享用户设置数据库。
+  skills_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/skills"
+  settings_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/skill"
+
+mcp_client:
+  # MCP 服务配置 YAML 文件存放目录，每个 YAML 文件对应一个可连接的 MCP 服务。
+  config_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/mcp-servers"
+
+agent_definition:
+  # Agent 定义 YAML 文件存放目录（每个 Agent 定义一个 YAML 文件，文件名即 agent_id）。
+  definitions_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/agents"
+
+llm_model_registry:
+  # LLM 模型注册 SQLite 数据库所在根目录。运行期权威数据文件为 llm_model_registry.sqlite3。
+  # legacy YAML 只作为一次性迁移输入，不会在应用启动或仓储初始化时自动导入。
+  registry_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-model-registry"
+
+cloud_user_config_database:
+  # 用户全局可复用配置的云端 PostgreSQL 权威库。
+  # PostgreSQL 连接信息必须由用户在初始化引导中提供；YAML 不预置真实 host/database/username。
+  # 缺少本机 bootstrap 凭据时，Runtime 进入初始化引导有限模式，不把本地共享配置当作权威来源。
+  enabled: false
+  backend: "local"
+  host: ""
+  port: 5432
+  database: ""
+  username: ""
+  password: ""
+  sslmode: "require"
+  bootstrap_data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/cloud-user-config"
+  pool:
+    min_size: 1
+    max_size: 5
+    connect_timeout_seconds: 10
+
+codex_oauth:
+  # louyi-codex SDK 的本机权威存储目录；旧 codex_oauth.sqlite3 不再读取或迁移。
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/louyi-codex"
+
+llm_http_trace:
+  enabled: true
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/llm-http-traces"
+
+context_compression:
+  enabled: true
+  default_threshold_ratio: 0.75
+  max_worker_rounds: 128
+  input_mode: "native_multimodal_history"
+  verifier_enabled: false
+  archive_data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/context-compression"
+
+
+lacp:
+  data_dir: "${SPREAD_AI_DATA_ROOT:-~/.spread-ai}/lacp"
+  connect_timeout_seconds: 10
+  request_timeout_seconds: 5
+  reconnect_initial_delay_seconds: 1
+  reconnect_max_delay_seconds: 30

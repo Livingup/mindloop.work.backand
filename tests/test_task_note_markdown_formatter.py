@@ -1,0 +1,578 @@
+# -*- coding: utf-8 -*-
+import json
+import pytest
+from pathlib import Path
+
+from agent_runtime.task_note.task_note_markdown_formatter import (
+    reverse_lookup_source_code,
+    format_task_note_to_markdown,
+)
+from agent_runtime.task_note.task_note_prompt_provider import TaskNotePromptProvider
+
+
+def test_reverse_lookup_source_code_with_real_file(tmp_path: Path):
+    """测试源码行号反查：正常读取文件并带 1-based 行号格式化代码块。"""
+    sample_py = tmp_path / "sample.py"
+    sample_py.write_text(
+        "def add(a, b):\n"
+        "    \"\"\"Add two numbers.\"\"\"\n"
+        "    return a + b\n"
+        "\n"
+        "def sub(a, b):\n"
+        "    return a - b\n",
+        encoding="utf-8",
+    )
+
+    # 1. 单个区间
+    snippet = reverse_lookup_source_code(
+        path=str(sample_py),
+        line_ranges=[{"start_line": 1, "end_line": 3}],
+        current_working_directory=str(tmp_path),
+    )
+    assert snippet is not None
+    assert "```python" in snippet
+    assert "   1 | def add(a, b):" in snippet
+    assert "   2 |     \"\"\"Add two numbers.\"\"\"" in snippet
+    assert "   3 |     return a + b" in snippet
+    assert "sub" not in snippet
+
+    # 2. 相对路径
+    snippet_rel = reverse_lookup_source_code(
+        path="sample.py",
+        line_ranges='[{"start_line": 5, "end_line": 6}]',
+        current_working_directory=str(tmp_path),
+    )
+    assert snippet_rel is not None
+    assert "   5 | def sub(a, b):" in snippet_rel
+    assert "   6 |     return a - b" in snippet_rel
+
+
+def test_reverse_lookup_source_code_missing_file():
+    """测试文件不存在时优雅回退，不抛出异常。"""
+    snippet = reverse_lookup_source_code(
+        path="non_existent_file.py",
+        line_ranges=[{"start_line": 10, "end_line": 20}],
+    )
+    assert snippet is not None
+    assert "non_existent_file.py" in snippet
+    assert "暂未在磁盘找到" in snippet
+
+
+def test_format_task_note_to_markdown_comprehensive(tmp_path: Path):
+    """综合测试 Note 转换为 Markdown 现场手记：命令行反查、父子与远程对话流水、待办、进展等。"""
+    code_file = tmp_path / "server.py"
+    code_file.write_text(
+        "import sys\n"
+        "def main():\n"
+        "    print('hello world')\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+
+    snapshot = {
+        "task_id": "task_audit_999",
+        "agent_instance_id": "inst_lead_01",
+        "missions": [
+            {
+                "mission_id": "m_001",
+                "title": "重构 Note 格式化与反查模块",
+                "status": "in_progress",
+                "refined_requirement": "支持源码行号反查与命令行执行 ID 反查",
+                "raw_prompts": ["请优化切换回业务状态时的 Note 上下文格式", "不要倾倒 json"],
+            }
+        ],
+        "progress": {
+            "next_step": "执行 pytest 验证全量 Note 流程闭环",
+            "completed_summary": "已完成数据库表调整与反查函数编写",
+            "current_work": "正在运行单元测试",
+            "current_blockers": "无",
+            "recent_validation": "SQL 单元测试通过",
+            "handoff_notes": "注意检查 command_id 是否正确标注为命令行执行 ID",
+        },
+        "todos": [
+            {"todo_id": "t_01", "priority": 1, "todo_content": "删除 mission_id 字段", "status": "completed"},
+            {"todo_id": "t_02", "priority": 1, "todo_content": "实现 Markdown 格式化", "status": "in_progress"},
+            {"todo_id": "t_03", "priority": 2, "todo_content": "编写验证测试", "status": "pending"},
+            {"todo_id": "t_04", "priority": 3, "todo_content": "废弃旧脚本", "status": "cancelled"},
+        ],
+        "solution": {
+            "solution_content": "### 整体方案\n采用 Markdown 格式组织现场工作手记，辅以磁盘读取与命令反查字典。",
+        },
+        "decisions": [
+            {
+                "decision_id": "dec_01",
+                "decision_content": "task_command_records 作为纯技术辅助表，不带 mission_id",
+                "rationale": "节约 token 并建立唯一命令执行映射",
+                "decision_status": "active",
+            }
+        ],
+        "workspace_context": [
+            {
+                "context_id": "ctx_01",
+                "source_type": "file",
+                "description": "服务端主入口",
+                "path": str(code_file),
+                "line_ranges": [{"start_line": 2, "end_line": 3}],
+                "command_id": "cmd_exec_001",
+            }
+        ],
+        "discoveries": [
+            {
+                "discovery_id": "disc_01",
+                "discovery_content": "发现终端工具执行失败时也需返回 command_id",
+                "impact": "保证后续无论成功失败都能精确反查命令",
+                "command_id": "cmd_exec_002",
+            }
+        ],
+        "issues": [
+            {
+                "issue_id": "iss_01",
+                "issue_content": "原先输出了原始数据库 JSON",
+                "status": "resolved",
+                "resolution": "使用 TaskNoteMarkdownFormatter 重新格式化",
+            }
+        ],
+        "validations": [
+            {
+                "validation_id": "val_01",
+                "validation_scope": "数据库结构与反查测试",
+                "conclusion": "passed",
+                "validation_content": "5 项测试用例全部通过",
+                "command_id": "cmd_exec_003",
+            }
+        ],
+        "artifacts": [
+            {"artifact_id": "art_01", "type": "file", "path": "src/server.py", "description": "业务服务器入口"}
+        ],
+        "external_states": [
+            {
+                "external_state_id": "ext_01",
+                "target_type": "database",
+                "target_identifier": "agent_runtime",
+                "change_content": "删除 task_command_records.mission_id 列",
+                "current_state": "列已删除，索引已更新",
+            }
+        ],
+        "agent_relationships": [
+            {
+                "relationship_id": "rel_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "subagent_tester_01",
+                "status": "unreleased",
+            }
+        ],
+        "agent_messages": [
+            {
+                "message_id": "msg_01",
+                "target_agent_instance_id": "subagent_tester_01",
+                "message_type": "send",
+                "message": "请协助运行端到端测试",
+                "created_at": "2026-09-11 10:00:00",
+            },
+            {
+                "message_id": "msg_02",
+                "target_agent_instance_id": "subagent_tester_01",
+                "message_type": "receive",
+                "message": "已完成测试，覆盖率 98%",
+                "created_at": "2026-09-11 10:00:10",
+            },
+        ],
+        "remote_agent_messages": [
+            {
+                "remote_message_id": "rmsg_01",
+                "remote_agent_instance_id": "remote_agent_chunjing_99",
+                "message_type": "send",
+                "message": "请求协同调度资源",
+                "created_at": "2026-09-11 10:05:00",
+            },
+            {
+                "remote_message_id": "rmsg_02",
+                "remote_agent_instance_id": "remote_agent_chunjing_99",
+                "message_type": "receive",
+                "message": "已分配节点计算资源",
+                "created_at": "2026-09-11 10:05:15",
+            },
+        ],
+    }
+
+    command_lookup = {
+        "cmd_exec_001": "python server.py --port 8000",
+        "cmd_exec_002": "grep -rn 'task_command_records' .",
+        "cmd_exec_003": "pytest tests/test_task_note_store.py",
+    }
+
+    md = format_task_note_to_markdown(
+        snapshot,
+        command_lookup=command_lookup,
+        current_working_directory=str(tmp_path),
+    )
+
+    # 1. 验证行动指针与进展 (Next Step 置顶且醒目)
+    assert "## 1. 现场进度与下一步行动指针 (Progress & Next Action)" in md
+    assert "下一步明确行动 (Next Step)" in md
+    assert "执行 pytest 验证全量 Note 流程闭环" in md
+    assert "已完成数据库表调整与反查函数编写" in md
+
+    # 2. 验证 Todos 复选框
+    assert "## 2. 任务待办清单 (Todos)" in md
+    assert "- [x] [P1] 删除 mission_id 字段" in md
+    assert "- [/] [P1] 实现 Markdown 格式化 ⏳ *(进行中)*" in md
+    assert "- [ ] [P2] 编写验证测试" in md
+    assert "- [ ] ~~[P3] 废弃旧脚本 (已取消)~~" in md
+
+    # 3. 验证命令行执行反查（必须是命令行执行 ID，且包含实际命令行）
+    assert "**命令行执行 ID**: `cmd_exec_001` ➔ **执行命令**: `python server.py --port 8000`" in md
+    assert "**命令行执行 ID**: `cmd_exec_002` ➔ **执行命令**: `grep -rn 'task_command_records' .`" in md
+    assert "**命令行执行 ID**: `cmd_exec_003` ➔ **执行命令**: `pytest tests/test_task_note_store.py`" in md
+
+    # 4. 验证源码行号反查
+    assert "def main():" in md
+    assert "print('hello world')" in md
+    assert "L2-L3" in md or "2-3" in md
+
+    # 5. 验证子 Agent 协作与专线通信流
+    assert "### 协作子 Agent: `subagent_tester_01`" in md
+    assert "📤 **[发往子 Agent]**: 请协助运行端到端测试" in md
+    assert "📥 **[收到子 Agent 回复]**: 已完成测试，覆盖率 98%" in md
+
+    # 6. 验证远程 Agent 通信记录
+    assert "### 远程对等 Agent 实例 ID: `remote_agent_chunjing_99`" in md
+    assert "📤 **[发往远程 Agent]**: 请求协同调度资源" in md
+    assert "📥 **[接收自远程 Agent]**: 已分配节点计算资源" in md
+
+
+def test_prompt_provider_build_resumed_conversation_prompt_markdown():
+    """测试 Note 更新完成后切回业务 Agent，返回规范的 Markdown 工作手记。"""
+    provider = TaskNotePromptProvider()
+    snapshot = {
+        "task_id": "t_prod_01",
+        "agent_instance_id": "a_prod_01",
+        "progress": {"next_step": "启动服务并验证端口"},
+        "commands": [{"command_id": "c1", "command_line": "uvicorn main:app --port 8000"}],
+        "validations": [{"validation_id": "v1", "validation_scope": "服务端口", "command_id": "c1", "conclusion": "passed", "validation_content": "8000 端口响应 200"}],
+    }
+
+    resumed = provider.build_resumed_conversation_prompt(snapshot)
+    assert "系统已完成上下文压缩与Note更新" in resumed
+    assert "以下是最新任务现场工作手记快照" in resumed
+    assert "# 任务现场工作手记 (Task Work Note)" in resumed
+    assert "启动服务并验证端口" in resumed
+    assert "**命令行执行 ID**: `c1` ➔ **执行命令**: `uvicorn main:app --port 8000`" in resumed
+    # 确认没有未反查的生硬 JSON table 倾倒
+    assert "{\n  \"task_id\"" not in resumed
+
+
+def test_format_task_note_parent_and_two_children_topology_and_file_modify_artifact():
+    """专门测试：1 个父 Agent + 2 个子 Agent 的拓扑对话组织，以及文件修改产物 (modify) 的行号与 Diff 呈现。"""
+    snapshot = {
+        "task_id": "task_multi_agent_101",
+        "agent_instance_id": "agent_backend_mid_01",
+        "artifacts": [
+            {
+                "artifact_id": "art_mod_001",
+                "type": "modify",
+                "file_path": "src/services/auth_service.py",
+                "edits": [
+                    {
+                        "feature_desc": "修复 JWT 过期时间校验及缓存失效逻辑",
+                        "start_line": 45,
+                        "end_line": 58,
+                        "deleted_lines": 5,
+                        "inserted_lines": 8,
+                        "search_lines": [
+                            "if token.expired:",
+                            "    return None",
+                        ],
+                        "replace_lines": [
+                            "if token.is_expired(clock_skew=30):",
+                            "    cache.invalidate(token.id)",
+                            "    return None",
+                        ],
+                    }
+                ],
+            }
+        ],
+        "agent_relationships": [
+            {
+                "relationship_id": "rel_p_01",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "status": "unreleased",
+            },
+            {
+                "relationship_id": "rel_c_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "status": "unreleased",
+            },
+            {
+                "relationship_id": "rel_c_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "status": "released",
+            },
+        ],
+        "agent_messages": [
+            # 与父 Agent 通信
+            {
+                "message_id": "m_p_01",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "message_type": "receive",
+                "message": "请尽快修复鉴权漏洞并协调子 Agent 跑测",
+                "created_at": "2026-09-11 10:10:00",
+            },
+            {
+                "message_id": "m_p_02",
+                "target_agent_type": "parent",
+                "target_agent_instance_id": "agent_lead_orchestrator",
+                "message_type": "send",
+                "message": "已完成 auth_service.py 修改，子 Agent 正在进行测试",
+                "created_at": "2026-09-11 10:12:00",
+            },
+            # 与子 Agent 1 (DB) 通信
+            {
+                "message_id": "m_c1_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "message_type": "send",
+                "message": "请检查 token 索引是否命中",
+                "created_at": "2026-09-11 10:10:30",
+            },
+            {
+                "message_id": "m_c1_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_db",
+                "message_type": "receive",
+                "message": "索引正常，执行耗时 1.2ms",
+                "created_at": "2026-09-11 10:11:00",
+            },
+            # 与子 Agent 2 (QA) 通信
+            {
+                "message_id": "m_c2_01",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "message_type": "send",
+                "message": "请执行鉴权相关单测",
+                "created_at": "2026-09-11 10:11:15",
+            },
+            {
+                "message_id": "m_c2_02",
+                "target_agent_type": "child",
+                "target_agent_instance_id": "agent_worker_qa",
+                "message_type": "receive",
+                "message": "12 项鉴权测试全绿通过",
+                "created_at": "2026-09-11 10:11:50",
+            },
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 1. 验证关键产物 (Artifacts) 中的文件修改输出 (空章节跳过后动态编号为 1)
+    assert "## 1. 关键产物与文件 (Artifacts)" in md
+    assert "- 📝 **[文件修改 (file_modify)]**: `src/services/auth_service.py` (`art_mod_001`)" in md
+    assert "行区间: `L45-L58`" in md
+    assert "功能说明" in md
+    assert "修复 JWT 过期时间校验及缓存失效逻辑" in md
+    assert "替换写入代码 (replace_lines)" in md
+    assert "if token.is_expired(clock_skew=30):" in md
+    assert "cache.invalidate(token.id)" in md
+
+    # 2. 验证多 Agent 协作拓扑：明确区分父 Agent 与 2 个子 Agent (动态编号为 2)
+    assert "## 2. 多 Agent 协作拓扑与通信记录 (Multi-Agent Collaboration & Dialogs)" in md
+    
+    # 2.1 父 Agent 专线
+    assert "### 🔼 上级父 Agent: `agent_lead_orchestrator` (角色: `parent`, 状态: `unreleased`)" in md
+    assert "📥 **[收到父 Agent 指令]**: 请尽快修复鉴权漏洞并协调子 Agent 跑测" in md
+    assert "📤 **[向父 Agent 汇报]**: 已完成 auth_service.py 修改，子 Agent 正在进行测试" in md
+
+    # 2.2 子 Agent 1 专线
+    assert "### 协作子 Agent: `agent_worker_db` (角色: `child`, 状态: `unreleased`)" in md
+    assert "📤 **[发往子 Agent]**: 请检查 token 索引是否命中" in md
+    assert "📥 **[收到子 Agent 回复]**: 索引正常，执行耗时 1.2ms" in md
+
+    # 2.3 子 Agent 2 专线
+    assert "### 协作子 Agent: `agent_worker_qa` (角色: `child`, 状态: `released`)" in md
+    assert "📤 **[发往子 Agent]**: 请执行鉴权相关单测" in md
+    assert "📥 **[收到子 Agent 回复]**: 12 项鉴权测试全绿通过" in md
+
+
+def test_format_task_note_skips_empty_sections():
+    """测试当部分或大部分表为空时，绝不输出空章节标题与占位文本，并保持动态连续序号。"""
+    # 只有 missions 和 workspace_context
+    snapshot = {
+        "task_id": "task_sparse_01",
+        "agent_instance_id": "agent_sparse_01",
+        "missions": [
+            {
+                "mission_id": "m_sparse_1",
+                "title": "排查空章节渲染问题",
+                "status": "active",
+                "refined_requirement": "仅对有内容的表进行章节渲染",
+            }
+        ],
+        "workspace_context": [
+            {
+                "context_id": "ctx_sparse_1",
+                "source_type": "file",
+                "description": "格式化代码",
+                "path": "src/agent_runtime/task_note/task_note_markdown_formatter.py",
+                "important_content": "sec_idx 动态自增计数",
+            }
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 1. 验证仅有内容的两个部分被渲染，且序号分别为 1 和 2
+    assert "## 1. 意图与目标需求 (Missions)" in md
+    assert "## 2. 工作区关键上下文与重点源码 (Workspace Context)" in md
+    assert "排查空章节渲染问题" in md
+    assert "sec_idx 动态自增计数" in md
+
+    # 2. 验证空表章节完全被跳过，不出现其标题或占位符
+    assert "现场进度与下一步行动指针" not in md
+    assert "任务待办清单" not in md
+    assert "当前执行方案与架构设计" not in md
+    assert "关键技术决策与约定" not in md
+    assert "探索与关键分析发现" not in md
+    assert "问题排查与阻碍记录" not in md
+    assert "验证与测试结论" not in md
+    assert "关键产物与文件" not in md
+    assert "外部环境与服务状态" not in md
+    assert "多 Agent 协作拓扑" not in md
+    assert "外部远程 Agent" not in md
+    assert "暂无" not in md
+
+    # 3. 验证如果完全没有任何有效内容，则输出提示行
+    empty_snapshot = {"task_id": "task_empty", "agent_instance_id": "agent_empty"}
+    empty_md = format_task_note_to_markdown(empty_snapshot)
+    assert "## 1." not in empty_md
+    assert "*(当前暂无持久化任务手记记录)*" in empty_md
+
+
+def test_format_task_note_pruned_mission_card():
+    """测试已裁剪为卡片的任务在 Markdown 中精简渲染为结果卡片 (D14)。"""
+    snapshot = {
+        "task_id": "task_pruned_01",
+        "agent_instance_id": "agent_worker_01",
+        "missions": [
+            {
+                "mission_id": "m_active",
+                "title": "正在进行的业务任务",
+                "status": "in_progress",
+                "refined_requirement": "规格说明书",
+                "raw_prompts": ["请实现登录功能"],
+            },
+            {
+                "mission_id": "m_pruned",
+                "title": "已完成的前置调研任务",
+                "status": "completed",
+                "outcome_summary": "技术选型完毕，确定采用方案B并完成PoC验证",
+                "pruned_at": "2026-10-13T01:00:00Z",
+                "refined_requirement": "被裁剪掉的冗长规格书（不应出现在输出中）",
+            },
+        ],
+    }
+
+    md = format_task_note_to_markdown(snapshot)
+
+    # 验证活跃任务正常渲染详细规格
+    assert "### Mission: 正在进行的业务任务" in md
+    assert "- **精炼业务需求**:\n  规格说明书" in md
+
+    # 验证裁剪任务渲染为交付结果卡片，并包含 outcome_summary
+    assert "### 📦 [交付结果卡片] 已完成的前置调研任务 (ID: `m_pruned`, 状态: `completed`)" in md
+    assert "- **交付结论与总结**: 技术选型完毕，确定采用方案B并完成PoC验证" in md
+
+    # 验证裁剪任务的旧详细规格不会泄漏输出
+    assert "被裁剪掉的冗长规格书" not in md
+
+
+def test_artifacts_folding_net_changes():
+    """验收 3.5 (D18): 单测覆盖'多次 modify 只输出一条'、'create+delete 不输出'、'move 后 modify 归到新路径'。"""
+    from agent_runtime.task_note.task_note_markdown_formatter import fold_artifacts_net_changes, format_task_note_to_markdown
+
+    artifacts = [
+        # 场景 1: 多次 modify 同一文件
+        {"artifact_id": "art_mod_1", "type": "file_modify", "file_path": "src/core.py", "description": "第1次修改", "created_at": "2026-10-13T01:00:00"},
+        {"artifact_id": "art_mod_2", "type": "modify", "file_path": "src/core.py", "description": "第2次修改", "created_at": "2026-10-13T02:00:00"},
+
+        # 场景 2: 本会期内 create 后 delete
+        {"artifact_id": "art_temp_c", "type": "file_create", "file_path": "temp.py", "description": "新建临时文件", "created_at": "2026-10-13T01:10:00"},
+        {"artifact_id": "art_temp_d", "type": "file_delete", "file_path": "temp.py", "description": "删除临时文件", "created_at": "2026-10-13T02:10:00"},
+
+        # 场景 3: move 后 modify
+        {"artifact_id": "art_move", "type": "file_move", "source_path": "old_util.py", "target_path": "new_util.py", "description": "重命名", "created_at": "2026-10-13T01:20:00"},
+        {"artifact_id": "art_mod_new", "type": "file_modify", "file_path": "new_util.py", "description": "移动后的修改", "created_at": "2026-10-13T02:20:00"},
+
+        # 场景 4: 成果交付 (other) 原样保留
+        {"artifact_id": "art_other", "type": "other", "content": "交付物报告PDF", "created_at": "2026-10-13T03:00:00"},
+    ]
+
+    folded = fold_artifacts_net_changes(artifacts)
+
+    # 1. other 产物存在
+    other_items = [x for x in folded if x.get("type") == "other"]
+    assert len(other_items) == 1
+    assert other_items[0]["artifact_id"] == "art_other"
+
+    # 2. temp.py create+delete 彻底消失
+    temp_items = [x for x in folded if "temp.py" in str(x.get("file_path"))]
+    assert len(temp_items) == 0
+
+    # 3. src/core.py 多次 modify 仅剩 1 条
+    core_items = [x for x in folded if x.get("file_path") == "src/core.py"]
+    assert len(core_items) == 1
+    assert core_items[0]["artifact_id"] == "art_mod_2"
+
+    # 4. move 后 modify 归到新路径并注明原路径
+    util_items = [x for x in folded if x.get("file_path") == "new_util.py"]
+    assert len(util_items) == 1
+    assert util_items[0]["type"] == "file_move"
+    assert "old_util.py" in util_items[0]["description"]
+
+    # 5. 渲染 Markdown 验证
+    snapshot = {"task_id": "t1", "artifacts": artifacts}
+    md = format_task_note_to_markdown(snapshot)
+    assert "temp.py" not in md
+    assert "src/core.py" in md
+    assert "new_util.py" in md
+
+
+def test_multiple_missions_progress_and_solutions_rendering():
+    """验收 3.2 (D09): 同一 Agent 2 个 mission 各写一条 progress 和 solution，手记中两条都出现。"""
+    from agent_runtime.task_note.task_note_markdown_formatter import format_task_note_to_markdown
+
+    snapshot = {
+        "task_id": "task-test",
+        "agent_instance_id": "agent-test",
+        "missions": [
+            {"mission_id": "mission-01", "title": "任务一", "status": "in_progress"},
+            {"mission_id": "mission-02", "title": "任务二", "status": "in_progress"},
+        ],
+        "solutions": [
+            {"mission_id": "mission-01", "solution_content": "方案一：采用架构A"},
+            {"mission_id": "mission-02", "solution_content": "方案二：采用架构B"},
+        ],
+        "progresses": [
+            {"mission_id": "mission-01", "next_step": "执行任务一步骤1", "current_work": "编写代码1"},
+            {"mission_id": "mission-02", "next_step": "执行任务二步骤2", "current_work": "编写代码2"},
+        ],
+    }
+    md = format_task_note_to_markdown(snapshot)
+    # 验证两条方案均渲染并标注任务 ID
+    assert "方案一：采用架构A" in md
+    assert "方案二：采用架构B" in md
+    assert "`mission-01`" in md
+    assert "`mission-02`" in md
+
+    # 验证两条 progress 均渲染
+    assert "执行任务一步骤1" in md
+    assert "执行任务二步骤2" in md
+
+
+
+

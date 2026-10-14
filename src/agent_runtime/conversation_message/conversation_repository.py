@@ -1,0 +1,121 @@
+"""会话持久化仓储接口。
+
+定义会话聚合根的持久化协议接口，具体实现位于 infrastructure/ 下。
+
+会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id
+"""
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+from agent_runtime.conversation_message.message.models import (
+    Conversation,
+    ConversationState,
+    ToolResultPart,
+    UniMessage,
+)
+
+
+class ConversationRepository(Protocol):
+    """会话聚合根持久化仓储协议接口。
+
+    会话组织层级：task_id → thread_id → agent_id → agent_instance_id → conversation_id
+    - agent_id: Agent 定义标识（模板/类型）
+    - agent_instance_id: Agent 运行时实例标识（每次运行唯一）
+
+    支持两种写入模式：
+    - 全量覆写：save() 替换全部消息、状态和供应商状态
+    - 增量操作：append_message()、save_state()、save_provider_state()
+    """
+
+    async def create(
+        self,
+        conv: Conversation,
+        *,
+        task_id: str,
+        thread_id: str,
+        agent_id: str,
+        agent_instance_id: str,
+    ) -> None:
+        """持久化一个新创建的会话，同时记录其所属层级关系。"""
+        ...
+
+    async def get(self, conversation_id: str) -> Conversation:
+        """根据会话 ID 加载完整会话。未找到时抛出 KeyError。"""
+        ...
+
+    async def save(self, conv: Conversation) -> None:
+        """全量覆写：替换会话的全部消息、派生状态和供应商状态。"""
+        ...
+
+    async def delete(self, conversation_id: str) -> None:
+        """删除会话及其所有数据。会话不存在时静默跳过。"""
+        ...
+
+    # ── 增量操作 ─────────────────────────────────────────────────
+
+    async def append_message(self, conversation_id: str, msg: UniMessage) -> None:
+        """追加一条消息（增量写入，不重写整个文件）。"""
+        ...
+
+    async def save_state(self, conversation_id: str, state: ConversationState) -> None:
+        """覆写会话的派生统计状态（模态、图片数、PDF 页数等）。"""
+        ...
+
+    async def save_provider_state(
+        self, conversation_id: str, provider: str, state: Any,
+    ) -> None:
+        """新增或更新单个 LLM 供应商的会话状态（如缓存路由、缓存断点或思考续接状态）。"""
+        ...
+
+    async def save_pending_tool_result(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+        result_part: ToolResultPart,
+    ) -> None:
+        ...
+
+    async def list_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> list[ToolResultPart]:
+        ...
+
+    async def clear_pending_tool_results(
+        self,
+        conversation_id: str,
+        assistant_message_index: int,
+    ) -> None:
+        ...
+
+    # ── 层级查询 ─────────────────────────────────────────────────
+
+    async def list_by_task(self, task_id: str) -> list[str]:
+        """查询指定任务下的所有会话 ID 列表。"""
+        ...
+
+    async def list_by_thread(self, thread_id: str) -> list[str]:
+        """查询指定线程下的所有会话 ID 列表。"""
+        ...
+
+    async def list_by_agent(self, agent_id: str) -> list[str]:
+        """查询指定 Agent 定义下的所有会话 ID 列表。"""
+        ...
+
+    async def list_by_agent_instance(self, agent_instance_id: str) -> list[str]:
+        """查询指定 Agent 运行时实例下的所有会话 ID 列表。"""
+        ...
+
+    # ── Task Note 增量跟踪状态 (CAS 乐观锁) ──────────────────────────
+
+    async def get_task_note_tracking(self, conversation_id: str) -> tuple[dict | None, int]:
+        """读取会话的 Task Note 跟踪状态与版本号。返回 (tracking_dict, version)。"""
+        ...
+
+    async def cas_task_note_tracking(
+        self, conversation_id: str, expected_version: int, tracking: dict
+    ) -> bool:
+        """基于乐观锁版本号原子更新 Task Note 跟踪状态。成功返回 True，版本冲突返回 False。"""
+        ...

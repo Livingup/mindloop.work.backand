@@ -1,0 +1,1 @@
+"""Logs management northbound adapters."""

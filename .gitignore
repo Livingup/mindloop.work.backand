@@ -1,0 +1,154 @@
+# =============================================
+# 环境变量 / 敏感凭证（禁止提交）
+# =============================================
+.env
+.env.*
+!.env.example
+!config/.env.dev
+
+# =============================================
+# Python 构建与运行产物
+# =============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+*.tar.gz
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# 类型检查 / 代码分析缓存
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.pyre/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# =============================================
+# IDE / 编辑器
+# =============================================
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================
+# 操作系统临时文件
+# =============================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+._*
+
+# =============================================
+# 项目专属排除
+# =============================================
+# 工作流代理运行时目录
+/.workflowagent/
+/.spread-ai/
+
+# 项目文档（外部API参考等大文件，不纳入版本管理）
+/doc/
+
+# 运行时数据（由程序动态生成，不纳入版本管理）
+/runtime-data/
+
+# 测试代码（历史上默认忽略新测试文件；需要长期回归保障的测试需显式放行纳入版本管理）
+/tests/*
+!/tests/test_scene_session_registry.py
+!/tests/test_runtime_auth_token_transport.py
+!/tests/test_runtime_auth_session_lifecycle.py
+!/tests/test_runtime_network_auth_failure_sampling.py
+!/tests/test_system_settings_persistence_inventory.py
+!/tests/test_cloud_user_config_migration.py
+!/tests/test_cloud_user_config_config_center.py
+!/tests/test_cloud_user_config_database_settings_api.py
+!/tests/test_logs_management_service.py
+!/tests/test_tool_schema_sanitizer.py
+!/tests/test_execution_loop_logger.py
+!/tests/test_runtime_task_registry.py
+!/tests/test_communication_sse_contract.py
+!/tests/test_llm_runtime_event_publish_queue.py
+!/tests/test_subagent_conversation_history.py
+!/tests/test_filesystem_skill_repository.py
+!/tests/test_builtin_skill_installer.py
+!/tests/test_sqlite_threaded_repositories.py
+!/tests/test_asyncio_diagnostics.py
+!/tests/test_lacp_inbound_attachments.py
+!/tests/test_file_input_policy.py
+!/tests/test_release_windows_subprocess_visibility.py
+!/tests/test_desktop_server_stderr_rotation.py
+!/tests/test_workspace_tree_lazy_loading.py
+!/tests/test_workspace_memory_rest_adapter.py
+!/tests/test_pause_task_timeout.py
+!/tests/test_scene_task_completion.py
+!/tests/test_context_compression_worker_contents.py
+!/tests/test_context_compression_worker_fanout.py
+!/tests/test_context_compression_worker_activity_publish.py
+!/tests/test_context_compression_rest_adapter.py
+!/tests/test_mcp_metadata_cache.py
+!/tests/test_pty_terminal_process_windows_control.py
+!/tests/test_shell_integration_and_policy.py
+!/tests/test_terminal_capacity_phase1.py
+!/tests/test_terminal_read_output_service.py
+!/tests/test_text_search_file_and_directory.py
+!/tests/test_file_edit_tools_expected_sha256.py
+!/tests/test_openai_responses_configuration_timeline.py
+!/tests/test_prompt_variables.py
+!/tests/test_task_note_store.py
+!/tests/test_task_note_markdown_formatter.py
+!/tests/test_task_note_event_recorder.py
+!/tests/test_task_note_snapshot_service.py
+!/tests/test_task_note_prompt_provider.py
+!/tests/test_task_note_tools.py
+!/tests/test_task_note_update_events.py
+!/tests/test_task_note_unit_slicer.py
+!/tests/test_task_note_observer_scheduler.py
+!/tests/test_task_note_context_assembler.py
+!/tests/test_conversation_task_note_tracking.py
+!/tests/test_task_note_tracking_coordinator.py
+!/tests/test_task_note_schema_init.py
+!/tests/test_task_note_observer_trigger.py
+!/tests/test_logging_setup.py
+!/tests/test_agent_instance_note_substate.py
+!/tests/test_note_context_compression_flow.py
+!/tests/test_note_state_message_isolation.py
+!/tests/test_prompt_snippet_line_edits.py
+!/tests/test_stable_prefix_prompt.py
+!/tests/test_web_tools.py
+!/tests/test_image_generation_*.py
+!/tests/test_llm_registry_api_key_restore.py
+
+/web-frontend/
+
+# =============================================
+# 日志与临时文件
+# =============================================
+*.log
+*.tmp
+*.bak
+*.orig
