@@ -5,7 +5,7 @@
 1. 实现异步调用接口: async __call__(session_input: ObserverSessionInput) -> ObserverSessionResult;
 2. 每次观察新建独立 Conversation，装配系统提示词 (system_note_update) 与首条 user 消息 (D03 payload);
 3. 挂载 36 个 Note 工具，注入 ObserverBinding 上下文；
-4. 通过 llm_request_service 驱动与 LLM 的多轮交互 (单步循环最多 30 轮)，直到 note_update_end 返回 complete 或达到轮数上限；
+4. 通过 llm_request_service 驱动与 LLM 的多轮交互，直到 note_update_end 返回 complete；
 5. Note 工具调用成功与 watermark 推进后，对外发布 task_note.updated 事件 (接收方为目标业务 Agent)；
 6. 异常或失败时安全返回 ObserverSessionResult(success=False, ...)，不抛出阻断异常。
 """
@@ -14,9 +14,10 @@ from __future__ import annotations
 import asyncio
 import copy
 from datetime import datetime, timezone
-import json
+import inspect
 import logging
-from typing import Any, Callable
+import typing
+from typing import Any
 import uuid
 
 from agent_runtime.communication.runtime_event_publisher import (
@@ -24,7 +25,6 @@ from agent_runtime.communication.runtime_event_publisher import (
 )
 from agent_runtime.conversation_message.message.models import (
     Conversation,
-    ROLE_ASSISTANT,
     ROLE_TOOL,
     ROLE_USER,
     TextPart,
@@ -117,7 +117,9 @@ class TaskNoteObserverRunner:
                 # 尝试获取默认/首个可用策略
                 policies = self._llm_registry_gateway.list_execution_policies()
                 if policies:
-                    policy_group_id = getattr(policies[0], 'policy_group_id', None) or getattr(policies[0], 'policy_id', None)
+                    policy_group_id = getattr(policies[0], "policy_group_id", None) or getattr(
+                        policies[0], "policy_id", None
+                    )
                     pol = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
                     if pol and pol.candidates:
                         return pol.candidates[0].resolved_model
@@ -144,6 +146,7 @@ class TaskNoteObserverRunner:
         if self._local_tool_gateway is not None:
             try:
                 from agent_runtime.tool.north_gateway.local_tool_contracts import ToolExecuteRequest
+
                 req = ToolExecuteRequest(
                     tool_name=tool_name,
                     params=tool_args,
@@ -160,6 +163,7 @@ class TaskNoteObserverRunner:
 
         # 直接调用 task_note_tool 中的对应函数
         from agent_runtime.task_note import task_note_tool
+
         func = getattr(task_note_tool, tool_name, None)
         if func is None or not callable(func):
             return BaseToolResult(
@@ -171,20 +175,16 @@ class TaskNoteObserverRunner:
 
         # 尝试通过参数类型实例化 Pydantic Request
         try:
-            import inspect
-            sig = inspect.signature(func)
-            req_cls = None
-            import typing
             req_cls = None
             try:
                 type_hints = typing.get_type_hints(func)
-                req_cls = type_hints.get('request')
+                req_cls = type_hints.get("request")
             except Exception:
                 req_cls = None
             if req_cls is None:
                 sig = inspect.signature(func)
                 for p in sig.parameters.values():
-                    if p.name == 'request' and p.annotation is not inspect.Parameter.empty:
+                    if p.name == "request" and p.annotation is not inspect.Parameter.empty:
                         ann = p.annotation
                         req_cls = getattr(task_note_tool, ann, None) if isinstance(ann, str) else ann
                         break
@@ -215,7 +215,7 @@ class TaskNoteObserverRunner:
         scene_id = session_input.scene_id or f"scene-{task_id}"
 
         resolved_model = self._resolve_model(target_agent_id)
-        api_format = getattr(resolved_model, "api_format", "openai")
+        api_format = getattr(resolved_model, "api_format", "openai_chat_completions")
 
         # 1. 构建全新独立 Conversation
         conv_id = f"conv_obs_{uuid.uuid4().hex[:12]}"
@@ -239,10 +239,11 @@ class TaskNoteObserverRunner:
                 logger.warning("获取 Note 工具 LlmToolDefinition 异常: %s", exc)
 
         conversation.system_prompt = system_prompt
-        conversation.tools = tuple(
-            copy.deepcopy(t.schema) if hasattr(t, 'schema') else copy.deepcopy(t)
-            for t in llm_tools
-        ) if llm_tools else ()
+        conversation.tools = (
+            tuple(copy.deepcopy(t.schema) if hasattr(t, "schema") else copy.deepcopy(t) for t in llm_tools)
+            if llm_tools
+            else ()
+        )
 
         # 4. 组装首条 User 消息 (D03 payload)
         user_payload = build_observer_user_payload(
@@ -285,7 +286,7 @@ class TaskNoteObserverRunner:
                         conversation=conversation,
                         resolved_model=resolved_model,
                         system_prompt=system_prompt,
-                        tools=list(llm_tools) if llm_tools else None,
+                        tools=tuple(llm_tools) if llm_tools else (),
                     )
                     prompt_res = await self._llm_request_service.send_prompt(prompt_req)
                 except Exception as exc:
@@ -300,7 +301,11 @@ class TaskNoteObserverRunner:
                 # send_prompt 会通过 ingest_response 将 assistant 响应自动写入 conversation；
                 # 仅在未写入（如单元测试 mock 未执行 ingest_response）时进行防重追加
                 if not any(
-                    getattr(m, "message_id", None) == getattr(assistant_msg, "message_id", None)
+                    m is assistant_msg
+                    or (
+                        getattr(assistant_msg, "message_id", None) is not None
+                        and getattr(m, "message_id", None) == getattr(assistant_msg, "message_id", None)
+                    )
                     for m in conversation.messages
                 ):
                     conversation.append_message(assistant_msg)
@@ -309,7 +314,9 @@ class TaskNoteObserverRunner:
                 if not tool_uses:
                     reminder_msg = UniMessage(
                         role=ROLE_USER,
-                        content=[TextPart(text="请调用相应的 Note 工具维护知识库，最后必须调用 note_update_end 提交断点。")],
+                        content=[
+                            TextPart(text="请调用相应的 Note 工具维护知识库，最后必须调用 note_update_end 提交断点。")
+                        ],
                         message_id=f"msg_obs_remind_{uuid.uuid4().hex[:8]}",
                     )
                     conversation.append_message(reminder_msg)
@@ -380,7 +387,9 @@ class TaskNoteObserverRunner:
                             covered_until_message_id=covered_mid,
                         )
                         if nv is None:
-                            logger.warning("note_update_end 提交时 run_id 已过期或已被抢占: run_id=%s", session_input.run_id)
+                            logger.warning(
+                                "note_update_end 提交时 run_id 已过期或已被抢占: run_id=%s", session_input.run_id
+                            )
                             return ObserverSessionResult(
                                 success=False,
                                 error_message="STALE_OBSERVATION",
@@ -390,7 +399,9 @@ class TaskNoteObserverRunner:
                         completed_covered_seq = (tool_res.output or {}).get("covered_until_seq", 0)
                         completed_note_version = nv
 
-                    output_payload = tool_res.output if tool_res.output is not None else {"message": tool_res.error_message or "ok"}
+                    output_payload = (
+                        tool_res.output if tool_res.output is not None else {"message": tool_res.error_message or "ok"}
+                    )
                     result_parts.append(
                         ToolResultPart(
                             tool_use_ref=call_ref,
