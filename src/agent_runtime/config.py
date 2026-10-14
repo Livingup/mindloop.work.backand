@@ -726,6 +726,8 @@ def _build_context_compression_config(data: dict[str, Any]) -> ContextCompressio
         input_mode=raw_input_mode,
         verifier_enabled=bool(data.get("verifier_enabled", False)),
         archive_data_dir=str(data.get("archive_data_dir", "~/.spread-ai/context-compression")),
+        observer_trigger_tokens=int(data.get("observer_trigger_tokens", 80000)),
+        observer_min_advance_ratio=float(data.get("observer_min_advance_ratio", 0.5)),
     )
 
 

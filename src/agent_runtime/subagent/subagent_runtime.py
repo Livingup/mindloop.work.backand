@@ -753,15 +753,28 @@ class SubagentRuntime:
             agent_id=child_agent_definition_id,
             agent_instance_id=child_instance_id,
         )
-        try:
-            from agent_runtime.task_note.task_note_tracking_coordinator import (
-                get_task_note_tracking_coordinator,
-            )
+        from agent_runtime.task_note.task_note_tracking_coordinator import (
+            TaskNoteTrackingInitError,
+            get_task_note_tracking_coordinator,
+        )
 
+        try:
             coordinator = get_task_note_tracking_coordinator()
-            await coordinator.init_child(child_conversation.id, boundary_message.message_id)
         except RuntimeError:
-            pass
+            coordinator = None
+        if coordinator is not None:
+            try:
+                # 写入失败在 init_child 内重试 1 次；仍失败则本次创建失败，删除已复制的会话（R8）
+                await coordinator.init_child(child_conversation.id, boundary_message.message_id)
+            except TaskNoteTrackingInitError:
+                try:
+                    await self._conversation_repository.delete(child_conversation.id)
+                except Exception:  # noqa: BLE001 - 清理失败不得掩盖根因
+                    logger.exception(
+                        "tracking 初始化失败后清理子会话失败: child_conversation_id=%s",
+                        child_conversation.id,
+                    )
+                raise
         logger.info(
             "已为子 Agent 创建父会话历史副本并静默追加范围边界消息与配置时间线: "
             "parent_instance_id=%s child_instance_id=%s parent_conversation_id=%s "

@@ -2396,8 +2396,9 @@ class TaskNoteStore:
 
             return _to_json_compatible(snapshot)
         except Exception as exc:
+            # 读取失败必须抛错，不得返回空骨架：替换路径据此不替换，观察路径据此按失败处理（TASK_NOTE-19）
             logger.error("get_note_snapshot 查询失败: %s", exc)
-            return _to_json_compatible(snapshot)
+            raise TaskNoteStorageUnavailableError(f"读取 Note 快照失败: {exc}") from exc
 
     def cleanup_agent_instance_note(
         self,

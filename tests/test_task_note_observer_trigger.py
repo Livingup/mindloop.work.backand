@@ -25,6 +25,7 @@ def _make_engine(
     engine._runtime_gateway = gateway or MagicMock()
     engine._task_note_tracking_coordinator = coordinator
     engine._task_note_observer_scheduler = scheduler
+    engine._last_gate_thresholds = {}
     return engine
 
 
@@ -150,6 +151,7 @@ async def test_trigger_background_observer_root_and_subagent() -> None:
         instance_id="inst-grandchild",
         conversation=conv,
         is_subagent=True,
+        gate_threshold=None,
     )
     scheduler.start.assert_called_once_with(
         ticket_mock,

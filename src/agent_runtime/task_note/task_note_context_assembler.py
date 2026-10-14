@@ -22,6 +22,10 @@ from agent_runtime.task_note.task_note_markdown_formatter import (
     format_task_note_to_markdown,
 )
 from agent_runtime.task_note.task_note_models import TaskNoteTracking
+from agent_runtime.task_note.task_note_range import (
+    range_messages,
+    resolve_range_start,
+)
 from agent_runtime.task_note.task_note_store import (
     TaskNoteStore,
     get_task_note_store,
@@ -161,40 +165,14 @@ class TaskNoteContextAssembler:
                 snapshot_message_id=None,
             )
 
-        # 3. 提取残差尾部消息：尾部取起点之后的全部消息，起点按 2.1 求
-        start_mid = tracking.covered_until_message_id or tracking.prefix_end_message_id
-        start_idx = 0
-        if start_mid:
-            found_idx = -1
-            for idx, msg in enumerate(current_messages):
-                if _get_msg_id(msg) == start_mid:
-                    found_idx = idx
-                    break
-            if found_idx != -1:
-                start_idx = found_idx + 1
-            else:
-                # 容灾：退回到最后一条首个 TextPart 以 "# 任务手记快照" 开头的消息
-                last_snap_idx = -1
-                for idx, msg in enumerate(current_messages):
-                    content = getattr(msg, "content", None)
-                    if isinstance(content, list) and content:
-                        first = content[0]
-                        text = getattr(first, "text", "") if hasattr(first, "text") else (first.get("text", "") if isinstance(first, dict) else str(first))
-                        if str(text).startswith("# 任务手记快照"):
-                            last_snap_idx = idx
-                    elif isinstance(msg, dict):
-                        c = msg.get("content")
-                        if isinstance(c, list) and c:
-                            first = c[0]
-                            text = first.get("text", "") if isinstance(first, dict) else str(first)
-                            if str(text).startswith("# 任务手记快照"):
-                                last_snap_idx = idx
-                        elif isinstance(c, str) and c.startswith("# 任务手记快照"):
-                            last_snap_idx = idx
-                if last_snap_idx != -1:
-                    start_idx = last_snap_idx + 1
-
-        tail_messages = current_messages[start_idx:]
+        # 3. 提取残差尾部消息：尾部 = 起算范围（起点消息中合并的原文 + 起点之后的全部消息），
+        # 与计数、观察切片共用同一规则，避免再次替换时丢失合并在旧快照里的 user 消息（K2）
+        range_start = resolve_range_start(
+            current_messages,
+            covered_until_message_id=tracking.covered_until_message_id,
+            prefix_end_message_id=tracking.prefix_end_message_id,
+        )
+        tail_messages = range_messages(current_messages, range_start)
 
         # 4. 生成高密度 Markdown 任务手记
         final_lookup = dict(command_lookup or {})
@@ -279,7 +257,7 @@ class TaskNoteContextAssembler:
                 }
                 new_messages = [snapshot_msg] + tail_messages
 
-        pruned_count = len(current_messages) - len(tail_messages)
+        pruned_count = range_start.start_idx
         total_tokens = sum(estimate_message_tokens(m) for m in new_messages)
         logger.info(
             "成功完成 Stage 4 上下文替换 (D05): 原消息=%d, 裁剪历史=%d, 保留尾部=%d, version=%d, snapshot_msg_id=%s",

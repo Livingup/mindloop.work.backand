@@ -54,6 +54,9 @@ from agent_runtime.tool.tool_execution_models import (
 
 logger = logging.getLogger("agent_runtime.task_note.observer_runner")
 
+# TASK_NOTE-20：观察者一次观察最多 200 轮 LLM 请求，用完按观察失败处理；不得另设其他限制
+OBSERVER_MAX_LLM_ROUNDS = 200
+
 
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:
     return [part for part in message.content if isinstance(part, ToolUsePart)]
@@ -280,6 +283,19 @@ class TaskNoteObserverRunner:
 
         try:
             while True:
+                if turns >= OBSERVER_MAX_LLM_ROUNDS:
+                    # TASK_NOTE-20：一次观察最多 200 轮 LLM 请求，用完按观察失败处理
+                    logger.warning(
+                        "观察者会话达到 LLM 请求上限 (%d)，按失败收尾: target_agent=%s, run_id=%s",
+                        OBSERVER_MAX_LLM_ROUNDS,
+                        target_agent_id,
+                        session_input.run_id,
+                    )
+                    return ObserverSessionResult(
+                        success=False,
+                        error_message=f"OBSERVER_ROUND_LIMIT_EXCEEDED: {OBSERVER_MAX_LLM_ROUNDS}",
+                        tools_executed_count=tools_executed_count,
+                    )
                 turns += 1
                 try:
                     prompt_req = LlmPromptRequest(

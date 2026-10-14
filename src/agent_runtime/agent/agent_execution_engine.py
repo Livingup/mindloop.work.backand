@@ -83,7 +83,7 @@ from agent_runtime.conversation_message.message.models import (
 from agent_runtime.conversation_message.message.tool_result_output import normalize_tool_result_output
 from agent_runtime.conversation_message.message.operations import create_conversation
 from agent_runtime.context_compression.compression_service import ContextCompressionService
-from agent_runtime.context_compression.gate import decide_context_compression
+from agent_runtime.context_compression.gate import decide_context_compression, estimate_full_context_tokens
 from agent_runtime.context_compression.models import CompressionDecision
 from agent_runtime.task_note.task_note_prompt_provider import (
     NOTE_UPDATE_SYSTEM_PROMPT_TEMPLATE_ID,
@@ -100,6 +100,7 @@ from agent_runtime.task_note.task_note_tracking_coordinator import (
     get_task_note_tracking_coordinator,
 )
 from agent_runtime.task_note.task_note_unit_slicer import estimate_message_tokens
+from agent_runtime.task_note.task_note_range import estimate_range_tokens, resolve_range_start
 from agent_runtime.infrastructure.runtime_task_registry import get_runtime_task_registry
 from agent_runtime.input_modality import INPUT_MODALITY_IMAGE, INPUT_MODALITY_PDF
 from agent_runtime.llm_client.llm_protocol_clients import LlmRequestCancelled
@@ -428,6 +429,8 @@ class AgentExecutionEngine:
         self._swap_wait_timeout_seconds = swap_wait_timeout_seconds
         self._task_note_context_assembler = task_note_context_assembler or TaskNoteContextAssembler()
         self._background_tasks: set[asyncio.Task[AgentExecutionResult]] = set()
+        # 每个实例最近一次门禁检查得到的压缩阈值，用于触发阈值 T = min(配置值, 门禁阈值 × 0.5)
+        self._last_gate_thresholds: dict[str, int | None] = {}
         self._active_instance_ids: set[str] = set()
         self._active_execution_handles: dict[str, _AgentExecutionHandle] = {}
         self._pause_timeout_handles: dict[str, _PauseTimeoutHandle] = {}
@@ -517,6 +520,7 @@ class AgentExecutionEngine:
                 instance_id=instance.instance_id,
                 conversation=conversation,
                 is_subagent=is_sub,
+                gate_threshold=self._last_gate_thresholds.get(instance.instance_id),
             )
             if ticket is not None:
                 self._task_note_observer_scheduler.start(
@@ -3082,6 +3086,7 @@ class AgentExecutionEngine:
             )
             try:
                 compression_decision = self._check_compression_gate(conversation, resolved_model)
+                self._last_gate_thresholds[instance.instance_id] = compression_decision.threshold
                 if compression_decision.should_compress:
                     if self._task_note_context_assembler is not None and self._task_note_tracking_coordinator is not None:
                         coordinator = self._task_note_tracking_coordinator
@@ -3098,52 +3103,14 @@ class AgentExecutionEngine:
                         # 2. 获取当前 tracking
                         tracking = await coordinator.get(conversation.id, is_subagent=is_sub)
 
-                        # 3. 如果 note_version == 0 或起点之后的 token >= 门禁阈值，强制执行一次同步观察
-                        messages = list(conversation.messages)
-                        msg_ids = [
-                            getattr(m, "message_id", None) or getattr(m, "id", None) or (m.get("message_id") if isinstance(m, dict) else None)
-                            for m in messages
-                        ]
-                        start_mid = tracking.covered_until_message_id or tracking.prefix_end_message_id
-                        if start_mid and start_mid not in msg_ids:
-                            # 起点 ID 丢失（前缀替换崩溃等），回退至最后一条快照标记消息
-                            fallback_mid = None
-                            for m in reversed(messages):
-                                content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
-                                first_text = ""
-                                if isinstance(content, list) and content:
-                                    fp = content[0]
-                                    first_text = getattr(fp, "text", "") if not isinstance(fp, dict) else fp.get("text", "")
-                                elif isinstance(content, str):
-                                    first_text = content
-                                if str(first_text or "").startswith("# 任务手记快照"):
-                                    fallback_mid = getattr(m, "message_id", None) or getattr(m, "id", None) or (m.get("message_id") if isinstance(m, dict) else None)
-                                    break
-                            start_mid = fallback_mid
-
-                        start_idx = 0
-                        if start_mid:
-                            for idx, mid in enumerate(msg_ids):
-                                if mid == start_mid:
-                                    start_idx = idx + 1
-                                    break
-
-                        tokens_after_start = 0
-                        for idx in range(start_idx, len(messages)):
-                            m = messages[idx]
-                            mid = msg_ids[idx]
-                            if tracking.snapshot_message_id and mid == tracking.snapshot_message_id:
-                                content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
-                                if isinstance(content, list) and len(content) > 1:
-                                    from agent_runtime.conversation_message.message.models import UniMessage
-                                    sub_msg = UniMessage(
-                                        role=getattr(m, "role", "user") if not isinstance(m, dict) else m.get("role", "user"),
-                                        content=content[1:],
-                                        message_id=mid,
-                                    )
-                                    tokens_after_start += estimate_message_tokens(sub_msg)
-                            else:
-                                tokens_after_start += estimate_message_tokens(m)
+                        # 3. 按起算范围（起点中合并的原文 + 起点之后的消息）计算增量；
+                        #    note_version == 0 或增量 >= 门禁阈值时，强制执行一次同步观察
+                        range_start = resolve_range_start(
+                            list(conversation.messages),
+                            covered_until_message_id=tracking.covered_until_message_id,
+                            prefix_end_message_id=tracking.prefix_end_message_id,
+                        )
+                        tokens_after_start = estimate_range_tokens(list(conversation.messages), range_start)
 
                         if tracking.note_version == 0 or tokens_after_start >= compression_decision.threshold:
                             ticket = await coordinator.on_round(
@@ -3152,6 +3119,7 @@ class AgentExecutionEngine:
                                 conversation=conversation,
                                 is_subagent=is_sub,
                                 force=True,
+                                gate_threshold=compression_decision.threshold,
                             )
                             if ticket is not None and scheduler is not None:
                                 await scheduler.run_sync(
@@ -3175,6 +3143,13 @@ class AgentExecutionEngine:
                         # 5. swapped 为真时推进并持久化
                         if swap_result.swapped:
                             conversation.messages = list(swap_result.messages)
+                            # 立刻重置 usage 基线（K2）：基线 = 估算(系统提示词 + 工具 + 新消息)，
+                            # 记录点 = 新消息数；failover 候选的门禁按新基线判断，不会再次替换
+                            _reset_context_usage_baseline(
+                                conversation,
+                                system_prompt=system_prompt,
+                                tools=tools,
+                            )
                             await self._conversation_repository.save(conversation)
                             await coordinator.apply_swap(
                                 instance_id=instance.instance_id,
@@ -4597,9 +4572,13 @@ def _pending_user_message_attachments_payload(
 
 def _record_last_context_usage(conversation: Any, llm_response: LlmPromptResponse) -> None:
     token_usage = dict(llm_response.token_usage or {})
+    used_tokens = _int_or_none_usage(token_usage.get("total_tokens"))
+    if used_tokens is None or used_tokens <= 0:
+        # 响应不带 usage 时用全量估算作基线（R3）
+        used_tokens = estimate_full_context_tokens(conversation)
     conversation.state.last_context_usage = {
         "token_usage": token_usage,
-        "context_window_used_tokens": int(token_usage.get("total_tokens") or 0),
+        "context_window_used_tokens": int(used_tokens),
         "context_window_max": llm_response.context_window_max,
         "provider_id": llm_response.provider_id,
         "binding_id": llm_response.binding_id,
@@ -4607,6 +4586,34 @@ def _record_last_context_usage(conversation: Any, llm_response: LlmPromptRespons
         "model_alias": llm_response.model_alias,
         "recorded_message_count": len(getattr(conversation, "messages", [])),
     }
+
+
+def _int_or_none_usage(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _reset_context_usage_baseline(
+    conversation: Any,
+    *,
+    system_prompt: str | None,
+    tools: Any,
+) -> None:
+    """替换后重置 usage 基线：基线 = 估算(系统提示词 + 工具 + 新消息)，记录点 = 新消息数。"""
+    previous = dict(getattr(conversation.state, "last_context_usage", None) or {})
+    baseline = estimate_full_context_tokens(conversation, system_prompt=system_prompt, tools=tools)
+    previous.update(
+        {
+            "token_usage": {},
+            "context_window_used_tokens": int(baseline),
+            "recorded_message_count": len(getattr(conversation, "messages", [])),
+            "baseline_source": "task_note_swap_estimate",
+        }
+    )
+    previous.pop("recorded_message_index", None)
+    conversation.state.last_context_usage = previous
 
 
 def _extract_tool_uses(message: UniMessage) -> list[ToolUsePart]:

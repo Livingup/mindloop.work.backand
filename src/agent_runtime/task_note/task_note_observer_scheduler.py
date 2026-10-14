@@ -283,6 +283,7 @@ class TaskNoteObserverScheduler:
         self.store = store or get_task_note_store()
         self.prompt_provider = prompt_provider or TaskNotePromptProvider()
         self._running_tasks: dict[str, asyncio.Task[ObserverSessionResult]] = {}
+        self._running_tickets: dict[str, ObserveTicket] = {}
         self._latest_results: dict[str, ObserverSessionResult] = {}
 
     def is_observer_running(self, agent_instance_id: str) -> bool:
@@ -308,45 +309,64 @@ class TaskNoteObserverScheduler:
         ancestor_chain: list[str] | None = None,
         scene_id: str | None = None,
     ) -> asyncio.Task[ObserverSessionResult]:
-        """为已获取 ticket 的观察创建并启动异步后台任务。不进行 await。"""
+        """为已获取 ticket 的观察创建并启动异步后台任务。不进行 await。
+
+        签发 ticket 之后，从切片、读快照到观察循环结束都必须有成功或失败收尾（K4）。
+        """
         async def _execute_task() -> ObserverSessionResult:
-            # 1. 增量与继承段切片
-            slice_res = self.slicer.slice_messages(
-                ticket.messages,
-                start_after_message_id=ticket.start_after_message_id,
-                end_message_id=ticket.end_message_id,
-                snapshot_message_id=ticket.snapshot_message_id,
-                inherited_until_message_id=ticket.inherited_until_message_id,
-            )
+            try:
+                # 1. 增量与继承段切片
+                slice_res = self.slicer.slice_messages(
+                    ticket.messages,
+                    start_after_message_id=ticket.start_after_message_id,
+                    end_message_id=ticket.end_message_id,
+                    snapshot_message_id=ticket.snapshot_message_id,
+                    inherited_until_message_id=ticket.inherited_until_message_id,
+                )
 
-            # 2. 异步在线程池读取快照，避免阻塞主循环
-            snapshot = await asyncio.to_thread(
-                self.store.get_note_snapshot,
-                task_id=ticket.task_id,
-                agent_instance_id=ticket.agent_instance_id,
-            )
+                # 2. 异步在线程池读取快照，避免阻塞主循环；读取失败会抛错，按观察失败处理
+                snapshot = await asyncio.to_thread(
+                    self.store.get_note_snapshot,
+                    task_id=ticket.task_id,
+                    agent_instance_id=ticket.agent_instance_id,
+                )
 
-            # 3. 组装 ObserverSessionInput
-            session_input = ObserverSessionInput(
-                task_id=ticket.task_id,
-                agent_instance_id=ticket.agent_instance_id,
-                run_id=ticket.run_id,
-                conversation_id=ticket.conversation_id,
-                target_seq=slice_res.max_seq,
-                note_snapshot=snapshot,
-                incremental_units=slice_res.incremental_units,
-                inherited_units=slice_res.inherited_units,
-                is_subagent=ticket.is_subagent,
-                parent_agent_instance_id=parent_agent_instance_id,
-                ancestor_chain=ancestor_chain or [],
-                target_agent_definition_prompt=target_agent_definition_prompt,
-                scene_id=scene_id,
-            )
+                # 3. 组装 ObserverSessionInput
+                session_input = ObserverSessionInput(
+                    task_id=ticket.task_id,
+                    agent_instance_id=ticket.agent_instance_id,
+                    run_id=ticket.run_id,
+                    conversation_id=ticket.conversation_id,
+                    target_seq=slice_res.max_seq,
+                    note_snapshot=snapshot,
+                    incremental_units=slice_res.incremental_units,
+                    inherited_units=slice_res.inherited_units,
+                    is_subagent=ticket.is_subagent,
+                    parent_agent_instance_id=parent_agent_instance_id,
+                    ancestor_chain=ancestor_chain or [],
+                    target_agent_definition_prompt=target_agent_definition_prompt,
+                    scene_id=scene_id,
+                )
+            except asyncio.CancelledError:
+                logger.info(
+                    "观察准备阶段被取消: agent_instance_id=%s, run_id=%s",
+                    ticket.agent_instance_id,
+                    ticket.run_id,
+                )
+                await self._finish_failed_ticket(ticket)
+                raise
+            except Exception as exc:
+                logger.error("观察准备阶段失败: %s", exc, exc_info=True)
+                await self._finish_failed_ticket(ticket)
+                result = ObserverSessionResult(success=False, error_message=f"观察准备失败: {exc}")
+                self._latest_results[ticket.agent_instance_id] = result
+                return result
 
             return await self._run_observer_session(session_input)
 
         task = asyncio.create_task(_execute_task())
         self._running_tasks[ticket.agent_instance_id] = task
+        self._running_tickets[ticket.agent_instance_id] = ticket
         logger.info(
             "已为业务 Agent %s 启动后台观察任务: run_id=%s",
             ticket.agent_instance_id,
@@ -376,12 +396,40 @@ class TaskNoteObserverScheduler:
     async def cancel(self, agent_instance_id: str) -> None:
         """取消指定 Agent 实例正在运行的观察任务，吞掉 CancelledError。"""
         task = self._running_tasks.get(agent_instance_id)
+        ticket = self._running_tickets.get(agent_instance_id)
         if task and not task.done():
             task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # 任务在开始执行前被取消时协程体不会运行，这里兜底收尾；complete 对已收尾的 run_id 无副作用
+        if ticket is not None and task is not None and task.cancelled():
+            await self._finish_failed_ticket(ticket)
+        if self._running_tasks.get(agent_instance_id) is task:
+            self._running_tasks.pop(agent_instance_id, None)
+        if self._running_tickets.get(agent_instance_id) is ticket:
+            self._running_tickets.pop(agent_instance_id, None)
+
+    async def _finish_failed_ticket(self, ticket: ObserveTicket) -> None:
+        """准备阶段失败或被取消时收尾：清除 observing，断点不变。"""
+        task = self._running_tasks.get(ticket.agent_instance_id)
+        if task is asyncio.current_task():
+            self._running_tasks.pop(ticket.agent_instance_id, None)
+            self._running_tickets.pop(ticket.agent_instance_id, None)
+        try:
+            coordinator = get_task_note_tracking_coordinator()
+        except RuntimeError:
+            return
+        try:
+            await coordinator.complete(
+                instance_id=ticket.agent_instance_id,
+                conversation_id=ticket.conversation_id,
+                run_id=ticket.run_id,
+                success=False,
+            )
+        except Exception as ce:
+            logger.warning("观察准备阶段收尾通知 coordinator 失败: %s", ce)
 
     async def _run_observer_session(self, session_input: ObserverSessionInput) -> ObserverSessionResult:
         """执行单个观察者会话全生命周期并收尾。"""
@@ -405,6 +453,7 @@ class TaskNoteObserverScheduler:
             return result
         finally:
             self._running_tasks.pop(agent_id, None)
+            self._running_tickets.pop(agent_id, None)
             # runner 返回 success=False、抛异常或被取消时，在 finally 里通知 coordinator.complete(success=False)
             # success=True 时 runner 已经调用过 complete，这里不再调用（complete 幂等）
             if result is None or not result.success:

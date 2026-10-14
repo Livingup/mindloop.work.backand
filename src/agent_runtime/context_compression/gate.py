@@ -37,7 +37,12 @@ def decide_context_compression(
     usage = conversation.state.last_context_usage or {}
     base_used_tokens = _int_or_none(usage.get("context_window_used_tokens"))
     if base_used_tokens is None:
-        return CompressionDecision(False, "missing_last_context_usage")
+        # 没有 usage 时用全量估算作基线（R3），记录点 = 当前消息数
+        usage = {
+            "context_window_used_tokens": estimate_full_context_tokens(conversation),
+            "recorded_message_count": len(conversation.messages),
+        }
+        base_used_tokens = int(usage["context_window_used_tokens"])
     threshold = _effective_threshold(resolved_model, config)
     if threshold is None:
         return CompressionDecision(
@@ -70,6 +75,35 @@ def decide_context_compression(
         else "projected_context_usage_exceeded_threshold"
     )
     return CompressionDecision(True, reason, **decision_fields)
+
+
+def effective_compression_threshold(
+    resolved_model: ResolvedLlmProviderModel,
+    config: ContextCompressionConfig,
+) -> int | None:
+    """压缩门禁阈值：模型 compression_threshold，没有则 context_window × default_threshold_ratio。"""
+    return _effective_threshold(resolved_model, config)
+
+
+def estimate_full_context_tokens(
+    conversation: Conversation,
+    *,
+    system_prompt: str | None = None,
+    tools: Any = None,
+) -> int:
+    """全量估算上下文用量：系统提示词 + 工具 Schema + 全部消息。
+
+    用于替换后重置 usage 基线（K2），以及响应不带 usage 时的基线（R3）。
+    """
+    prompt = system_prompt if system_prompt is not None else getattr(conversation, "system_prompt", None)
+    tool_schemas = tools if tools is not None else getattr(conversation, "tools", None)
+    total = _estimate_text_tokens(str(prompt or ""))
+    for tool in tool_schemas or ():
+        schema = getattr(tool, "schema", tool)
+        total += _estimate_value_tokens(schema)
+    for message in conversation.messages:
+        total += _estimate_message_tokens(message)
+    return total
 
 
 def _effective_threshold(

@@ -25,10 +25,24 @@ from agent_runtime.task_note.task_note_models import (
     ObservingRun,
     TaskNoteTracking,
 )
+from agent_runtime.task_note.task_note_range import (
+    estimate_range_tokens,
+    get_msg_id,
+    is_snapshot_header,
+    resolve_range_start,
+)
 from agent_runtime.task_note.task_note_unit_slicer import (
     DEFAULT_OBSERVER_TRIGGER_TOKENS,
-    estimate_message_tokens,
 )
+
+# U3 成功写回时 CAS 冲突的最大写入次数
+_COMPLETE_CAS_MAX_ATTEMPTS = 3
+# 触发阈值不超过压缩门禁阈值的比例
+_TRIGGER_TO_GATE_RATIO = 0.5
+
+
+class TaskNoteTrackingInitError(RuntimeError):
+    """子 Agent tracking 初始化失败（重试后仍失败）。"""
 
 logger = logging.getLogger(__name__)
 
@@ -49,27 +63,9 @@ class ObserveTicket:
     is_subagent: bool
 
 
-def _get_msg_id(msg: Any) -> str | None:
-    if msg is None:
-        return None
-    if isinstance(msg, dict):
-        return str(msg.get("message_id") or msg.get("id") or "") or None
-    mid = getattr(msg, "message_id", None) or getattr(msg, "id", None)
-    return str(mid) if mid else None
-
-
-def _is_snapshot_header(msg: Any) -> bool:
-    """检查消息首个文本块是否为手记快照标记。"""
-    if msg is None:
-        return False
-    content = getattr(msg, "content", None) if not isinstance(msg, dict) else msg.get("content")
-    if isinstance(content, list) and content:
-        first_part = content[0]
-        text = getattr(first_part, "text", "") if not isinstance(first_part, dict) else first_part.get("text", "")
-        return str(text or "").startswith("# 任务手记快照")
-    if isinstance(content, str):
-        return content.startswith("# 任务手记快照")
-    return False
+# 兼容旧引用
+_get_msg_id = get_msg_id
+_is_snapshot_header = is_snapshot_header
 
 
 class TaskNoteTrackingCoordinator:
@@ -91,8 +87,15 @@ class TaskNoteTrackingCoordinator:
             self._locks[instance_id] = asyncio.Lock()
         return self._locks[instance_id]
 
+    def effective_trigger_threshold(self, gate_threshold: int | None = None) -> int:
+        """触发阈值 T = min(observer_trigger_tokens, 门禁阈值 × 0.5)；门禁阈值未知时取配置值。"""
+        threshold = self.trigger_threshold_tokens
+        if gate_threshold is not None and gate_threshold > 0:
+            threshold = min(threshold, max(1, int(gate_threshold * _TRIGGER_TO_GATE_RATIO)))
+        return threshold
+
     async def init_child(self, conversation_id: str, fork_message_id: str) -> None:
-        """子 Agent 创建时初始化 tracking 状态 (2.3 规范)。"""
+        """子 Agent 创建时初始化 tracking：失败重试 1 次，仍失败抛 TaskNoteTrackingInitError。"""
         tracking = TaskNoteTracking(
             version=0,
             prefix_end_message_id=fork_message_id,
@@ -102,9 +105,23 @@ class TaskNoteTrackingCoordinator:
             inherited_processed=False,
             observing=None,
         )
-        ok = await self.repo.cas_task_note_tracking(conversation_id, expected_version=0, tracking=tracking.to_dict())
-        if not ok:
-            logger.warning("子会话 %s 初始化 tracking 失败或已有初始状态", conversation_id)
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                ok = await self.repo.cas_task_note_tracking(
+                    conversation_id, expected_version=0, tracking=tracking.to_dict()
+                )
+            except Exception as exc:  # noqa: BLE001 - 存储异常按写入失败重试
+                ok = False
+                last_exc = exc
+            if ok:
+                return
+            logger.warning(
+                "子会话 %s 初始化 tracking 失败 (attempt=%d)", conversation_id, attempt + 1
+            )
+        raise TaskNoteTrackingInitError(
+            f"子 Agent 会话 tracking 初始化失败: conversation_id={conversation_id}"
+        ) from last_exc
 
     async def get(self, conversation_id: str, *, is_subagent: bool = False) -> TaskNoteTracking:
         """获取当前跟踪状态对象。"""
@@ -119,8 +136,9 @@ class TaskNoteTrackingCoordinator:
         conversation: Conversation,
         is_subagent: bool,
         force: bool = False,
+        gate_threshold: int | None = None,
     ) -> ObserveTicket | None:
-        """U1 阶段：在 LLM 调用返回后或工具批次后检查增量并申请观察 Ticket。"""
+        """U1 阶段：在 LLM 调用返回后或工具批次后检查起算范围增量并申请观察 Ticket。"""
         lock = self._get_lock(instance_id)
         async with lock:
             cid = conversation.id
@@ -143,74 +161,36 @@ class TaskNoteTrackingCoordinator:
                     logger.debug("实例 %s 已有观察者正在运行中 (%s)，跳过本次触发", instance_id, tracking.observing.run_id)
                     return None
 
-            # 2. 确定增量起点 (2.1 规范)
-            start_after_mid = tracking.covered_until_message_id
-            if not start_after_mid:
-                start_after_mid = tracking.prefix_end_message_id
-
             messages = list(conversation.messages)
             if not messages:
                 return None
+            msg_ids = [get_msg_id(m) for m in messages]
 
-            # 检查起点 ID 是否在当前消息列表中存在
-            msg_ids = [_get_msg_id(m) for m in messages]
-            if start_after_mid and start_after_mid not in msg_ids:
-                # 起点 ID 丢失（替换中途崩溃等异常情况），回退到最后一条快照标记消息
-                fallback_mid = None
-                for m in reversed(messages):
-                    if _is_snapshot_header(m):
-                        fallback_mid = _get_msg_id(m)
-                        break
-                logger.warning(
-                    "起点消息 %s 不在当前消息序列中，回退至快照消息 %s",
-                    start_after_mid,
-                    fallback_mid,
-                )
-                start_after_mid = fallback_mid
+            # 2. 解析起算范围：起点中合并的原文 + 起点之后到当前末条
+            range_start = resolve_range_start(
+                messages,
+                covered_until_message_id=tracking.covered_until_message_id,
+                prefix_end_message_id=tracking.prefix_end_message_id,
+            )
+            start_after_mid = range_start.start_message_id
 
-            # 3. 定位切片起点下标
-            start_idx = 0
-            if start_after_mid:
-                for idx, mid in enumerate(msg_ids):
-                    if mid == start_after_mid:
-                        start_idx = idx + 1
-                        break
+            # 3. 每轮全量重算增量（只用估算，不用 usage，不计系统提示词与工具 Schema）
+            incremental_tokens = estimate_range_tokens(messages, range_start)
+            threshold = self.effective_trigger_threshold(gate_threshold)
 
-            # 4. 统计起点之后的增量 Token
-            incremental_tokens = 0
-            for idx in range(start_idx, len(messages)):
-                m = messages[idx]
-                mid = msg_ids[idx]
-                if mid and mid == tracking.snapshot_message_id:
-                    # 快照消息与 user 合并的情况：只计 content[1:]
-                    content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
-                    if isinstance(content, list) and len(content) > 1:
-                        from agent_runtime.conversation_message.message.models import UniMessage
-                        sub_msg = UniMessage(
-                            role=getattr(m, "role", "user"),
-                            content=content[1:],
-                            message_id=mid,
-                        )
-                        incremental_tokens += estimate_message_tokens(sub_msg)
-                else:
-                    incremental_tokens += estimate_message_tokens(m)
-
-            # 首轮全量阶段：若尚无任何手记记录 (note_version == 0) 且未设置起点，
-            # 优先结合真实 LLM 上下文用量 (context_window_used_tokens)，避免因忽略系统提示词与工具 Schema 导致严重低估
-            if start_after_mid is None and tracking.note_version == 0:
-                usage = getattr(getattr(conversation, "state", None), "last_context_usage", None) or {}
-                used_tokens = usage.get("context_window_used_tokens")
-                if used_tokens is not None and isinstance(used_tokens, int):
-                    incremental_tokens = max(incremental_tokens, used_tokens)
-
-            if not force and incremental_tokens < self.trigger_threshold_tokens:
+            if not force and incremental_tokens < threshold:
                 logger.debug(
                     "实例 %s 增量 Token (%d) 未达阈值 (%d)，无需观察",
                     instance_id,
                     incremental_tokens,
-                    self.trigger_threshold_tokens,
+                    threshold,
                 )
                 return None
+
+            # 起点是快照消息时，切片器按该消息提取合并原文
+            ticket_snapshot_mid = tracking.snapshot_message_id
+            if range_start.start_is_snapshot and start_after_mid:
+                ticket_snapshot_mid = start_after_mid
 
             # 5. 满足阈值或 force=True，生成 run_id 并写入 observing
             end_msg_id = msg_ids[-1]
@@ -262,7 +242,7 @@ class TaskNoteTrackingCoordinator:
                 start_after_message_id=start_after_mid,
                 end_message_id=end_msg_id,
                 inherited_until_message_id=inherited_until_mid,
-                snapshot_message_id=tracking.snapshot_message_id,
+                snapshot_message_id=ticket_snapshot_mid,
                 is_subagent=is_subagent,
             )
 
@@ -280,38 +260,50 @@ class TaskNoteTrackingCoordinator:
         new_note_version: int | None = None
         try:
             async with lock:
-                data, version = await self.repo.get_task_note_tracking(conversation_id)
-                tracking = TaskNoteTracking.from_dict(data)
+                for attempt in range(_COMPLETE_CAS_MAX_ATTEMPTS):
+                    data, version = await self.repo.get_task_note_tracking(conversation_id)
+                    tracking = TaskNoteTracking.from_dict(data)
 
-                if tracking.observing is None or tracking.observing.run_id != run_id:
-                    logger.warning(
-                        "complete 调用 run_id 不匹配或已过期 (当前=%s, 调用=%s)",
-                        tracking.observing.run_id if tracking.observing else None,
-                        run_id,
-                    )
-                    return None
+                    if tracking.observing is None or tracking.observing.run_id != run_id:
+                        logger.warning(
+                            "complete 调用 run_id 不匹配或已过期 (当前=%s, 调用=%s)",
+                            tracking.observing.run_id if tracking.observing else None,
+                            run_id,
+                        )
+                        return None
 
-                if success:
-                    tracking.covered_until_message_id = covered_until_message_id
-                    tracking.note_version += 1
+                    if success:
+                        tracking.covered_until_message_id = covered_until_message_id
+                        tracking.note_version += 1
+                        tracking.inherited_processed = True
                     tracking.observing = None
-                    tracking.inherited_processed = True
                     ok = await self.repo.cas_task_note_tracking(conversation_id, version, tracking.to_dict())
                     if ok:
-                        new_note_version = tracking.note_version
-                        logger.info(
-                            "观察成功完成并推进水位: instance=%s, version=%d, covered_mid=%s",
-                            instance_id,
-                            new_note_version,
-                            covered_until_message_id,
-                        )
-                    else:
-                        logger.error("complete 成功推进 CAS 失败 (cid=%s, run_id=%s)", conversation_id, run_id)
-                else:
-                    tracking.observing = None
-                    await self.repo.cas_task_note_tracking(conversation_id, version, tracking.to_dict())
-                    logger.warning("观察执行失败，已清理 observing (instance=%s, run_id=%s)", instance_id, run_id)
-
+                        if success:
+                            new_note_version = tracking.note_version
+                            logger.info(
+                                "观察成功完成并推进水位: instance=%s, version=%d, covered_mid=%s",
+                                instance_id,
+                                new_note_version,
+                                covered_until_message_id,
+                            )
+                        else:
+                            logger.warning(
+                                "观察执行失败，已清理 observing (instance=%s, run_id=%s)", instance_id, run_id
+                            )
+                        return new_note_version
+                    logger.warning(
+                        "complete CAS 冲突，重读重试 (cid=%s, run_id=%s, attempt=%d)",
+                        conversation_id,
+                        run_id,
+                        attempt + 1,
+                    )
+                logger.error(
+                    "complete CAS 连续 %d 次失败 (cid=%s, run_id=%s)",
+                    _COMPLETE_CAS_MAX_ATTEMPTS,
+                    conversation_id,
+                    run_id,
+                )
             return new_note_version
         finally:
             # 无论成功或失败，唤醒并清理完成事件
