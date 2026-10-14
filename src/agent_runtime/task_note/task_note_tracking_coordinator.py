@@ -195,6 +195,14 @@ class TaskNoteTrackingCoordinator:
                 else:
                     incremental_tokens += estimate_message_tokens(m)
 
+            # 首轮全量阶段：若尚无任何手记记录 (note_version == 0) 且未设置起点，
+            # 优先结合真实 LLM 上下文用量 (context_window_used_tokens)，避免因忽略系统提示词与工具 Schema 导致严重低估
+            if start_after_mid is None and tracking.note_version == 0:
+                usage = getattr(getattr(conversation, "state", None), "last_context_usage", None) or {}
+                used_tokens = usage.get("context_window_used_tokens")
+                if used_tokens is not None and isinstance(used_tokens, int):
+                    incremental_tokens = max(incremental_tokens, used_tokens)
+
             if not force and incremental_tokens < self.trigger_threshold_tokens:
                 logger.debug(
                     "实例 %s 增量 Token (%d) 未达阈值 (%d)，无需观察",

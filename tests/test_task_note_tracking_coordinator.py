@@ -170,3 +170,29 @@ async def test_force_true_acquires_ticket_below_threshold(repo, coordinator):
     ticket_force = await coordinator.on_round(task_id="t-1", instance_id="i-1", conversation=conv, is_subagent=False, force=True)
     assert ticket_force is not None
     assert ticket_force.end_message_id == "m-1"
+
+
+@pytest.mark.asyncio
+async def test_on_round_triggers_when_last_context_usage_exceeds_threshold(repo):
+    """测试首轮全量阶段：虽然消息体本身字符少，但模型返回的真实 context_window_used_tokens 超标，能成功触发。"""
+    coord = TaskNoteTrackingCoordinator(
+        conversation_repository=repo,
+        trigger_threshold_tokens=80000,
+    )
+    conv = Conversation(id="conv-large-ctx")
+    conv.append_message(UniMessage(role=ROLE_USER, content=[TextPart("短指令")], message_id="m-1"))
+    conv.state.last_context_usage = {
+        "context_window_used_tokens": 112372,
+        "context_window_max": 1000000,
+    }
+    await repo.create(conv, task_id="t-1", thread_id="th-1", agent_id="a-1", agent_instance_id="i-1")
+
+    ticket = await coord.on_round(
+        task_id="t-1",
+        instance_id="i-1",
+        conversation=conv,
+        is_subagent=False,
+        force=False,
+    )
+    assert ticket is not None
+    assert ticket.end_message_id == "m-1"

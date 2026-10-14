@@ -26,21 +26,25 @@ _CHARS_PER_TOKEN = 4
 _MESSAGE_OVERHEAD_TOKENS = 4
 
 
+def _estimate_text_tokens_smart(text: str) -> int:
+    """中英混杂自适应 Token 估算器 (CJK: ~1.2 tokens/字, 非 CJK: ~1/3.5 tokens/字)。"""
+    if not text:
+        return 0
+    cjk_count = 0
+    for ch in text:
+        code = ord(ch)
+        if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF:
+            cjk_count += 1
+    other_count = len(text) - cjk_count
+    return max(1, int(cjk_count * 1.2 + other_count / 3.5))
+
+
 def estimate_message_tokens(msg: Any) -> int:
     """估算单条消息消耗的 Token 数量（兼容 UniMessage 对象与字典）。"""
     if msg is None:
         return 0
 
-    # 1. 尝试使用 UniMessage 对象的特定属性与 gate 估算逻辑
-    try:
-        from agent_runtime.context_compression.gate import _estimate_message_tokens
-        from agent_runtime.conversation.uni_message import UniMessage
-        if isinstance(msg, UniMessage):
-            return _estimate_message_tokens(msg)
-    except Exception:
-        pass
-
-    # 2. 通用对象或字典提取
+    # 1. 优先提取 UniMessage 或通用字典内容
     role = ""
     content_text = ""
     tool_text = ""
@@ -62,13 +66,12 @@ def estimate_message_tokens(msg: Any) -> int:
             content_text = content
         elif isinstance(content, list):
             try:
-                # 遍历 UniMessage parts
                 parts_str = []
                 for p in content:
                     if hasattr(p, "text"):
-                        parts_str.append(str(p.text))
+                        parts_str.append(str(p.text or ""))
                     elif hasattr(p, "output"):
-                        parts_str.append(str(p.output))
+                        parts_str.append(str(p.output or ""))
                     elif hasattr(p, "input"):
                         parts_str.append(json.dumps(p.input, ensure_ascii=False))
                     else:
@@ -83,9 +86,10 @@ def estimate_message_tokens(msg: Any) -> int:
             except Exception:
                 tool_text = str(tool_calls)
 
-    total_chars = len(role) + len(content_text) + len(tool_text)
-    estimated = _MESSAGE_OVERHEAD_TOKENS + max(1, (total_chars + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN)
-    return estimated
+    role_tokens = _estimate_text_tokens_smart(role)
+    content_tokens = _estimate_text_tokens_smart(content_text)
+    tool_tokens = _estimate_text_tokens_smart(tool_text)
+    return _MESSAGE_OVERHEAD_TOKENS + role_tokens + content_tokens + tool_tokens
 
 
 def _get_msg_id(msg: Any, fallback_index: int) -> str:
