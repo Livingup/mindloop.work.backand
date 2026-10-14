@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 import json
 import logging
@@ -106,7 +107,7 @@ class TaskNoteObserverRunner:
                     if getattr(instance, "llm_provider_id", None):
                         return self._llm_registry_gateway.resolve_provider_model(
                             instance.llm_provider_id,
-                            getattr(instance, "llm_model_id", None),
+                            getattr(instance, "llm_model_binding_id", None),
                         )
             except Exception as exc:
                 logger.debug("从 runtime/registry 解析目标 Agent 模型异常: %s", exc)
@@ -116,7 +117,8 @@ class TaskNoteObserverRunner:
                 # 尝试获取默认/首个可用策略
                 policies = self._llm_registry_gateway.list_execution_policies()
                 if policies:
-                    pol = self._llm_registry_gateway.resolve_execution_policy(policies[0].policy_id)
+                    policy_group_id = getattr(policies[0], 'policy_group_id', None) or getattr(policies[0], 'policy_id', None)
+                    pol = self._llm_registry_gateway.resolve_execution_policy(policy_group_id)
                     if pol and pol.candidates:
                         return pol.candidates[0].resolved_model
             except Exception as exc:
@@ -127,7 +129,7 @@ class TaskNoteObserverRunner:
             provider_id = "default"
             binding_id = "default"
             model_id = "default"
-            api_format = "openai"
+            api_format = "openai_chat_completions"
             supported_input_modalities = ("text",)
 
         return _FallbackResolvedModel()
@@ -141,11 +143,18 @@ class TaskNoteObserverRunner:
         """执行单个 Note 工具调用。"""
         if self._local_tool_gateway is not None:
             try:
-                return await self._local_tool_gateway.execute_tool(
-                    tool_name,
-                    tool_args,
-                    runtime_context=runtime_ctx,
+                from agent_runtime.tool.north_gateway.local_tool_contracts import ToolExecuteRequest
+                req = ToolExecuteRequest(
+                    tool_name=tool_name,
+                    params=tool_args,
+                    task_id=runtime_ctx.task_id,
+                    agent_instance_id=runtime_ctx.agent_instance_id,
+                    scene_id=runtime_ctx.scene_id,
+                    conversation_id=runtime_ctx.conversation_id,
+                    trace_id=runtime_ctx.trace_id,
+                    communication_stream_id=runtime_ctx.communication_stream_id,
                 )
+                return await self._local_tool_gateway.execute_tool(req)
             except Exception as exc:
                 logger.warning("LocalToolGateway 执行 %s 异常: %s，回退直接调用", tool_name, exc)
 
@@ -165,10 +174,20 @@ class TaskNoteObserverRunner:
             import inspect
             sig = inspect.signature(func)
             req_cls = None
-            for p in sig.parameters.values():
-                if p.name == "request" and p.annotation is not inspect.Parameter.empty:
-                    req_cls = p.annotation
-                    break
+            import typing
+            req_cls = None
+            try:
+                type_hints = typing.get_type_hints(func)
+                req_cls = type_hints.get('request')
+            except Exception:
+                req_cls = None
+            if req_cls is None:
+                sig = inspect.signature(func)
+                for p in sig.parameters.values():
+                    if p.name == 'request' and p.annotation is not inspect.Parameter.empty:
+                        ann = p.annotation
+                        req_cls = getattr(task_note_tool, ann, None) if isinstance(ann, str) else ann
+                        break
             if req_cls is not None and hasattr(req_cls, "model_validate"):
                 req_obj = req_cls.model_validate(tool_args)
                 res = func(req_obj, runtime_ctx)
@@ -218,6 +237,12 @@ class TaskNoteObserverRunner:
                 llm_tools = self._prompt_provider.get_note_tools(api_format=api_format)
             except Exception as exc:
                 logger.warning("获取 Note 工具 LlmToolDefinition 异常: %s", exc)
+
+        conversation.system_prompt = system_prompt
+        conversation.tools = tuple(
+            copy.deepcopy(t.schema) if hasattr(t, 'schema') else copy.deepcopy(t)
+            for t in llm_tools
+        ) if llm_tools else ()
 
         # 4. 组装首条 User 消息 (D03 payload)
         user_payload = build_observer_user_payload(
