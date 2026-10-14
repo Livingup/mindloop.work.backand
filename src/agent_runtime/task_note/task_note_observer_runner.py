@@ -272,7 +272,13 @@ class TaskNoteObserverRunner:
                     )
 
                 assistant_msg = prompt_res.assistant_message
-                conversation.append_message(assistant_msg)
+                # send_prompt 会通过 ingest_response 将 assistant 响应自动写入 conversation；
+                # 仅在未写入（如单元测试 mock 未执行 ingest_response）时进行防重追加
+                if not any(
+                    getattr(m, "message_id", None) == getattr(assistant_msg, "message_id", None)
+                    for m in conversation.messages
+                ):
+                    conversation.append_message(assistant_msg)
 
                 tool_uses = _extract_tool_uses(assistant_msg)
                 if not tool_uses:
