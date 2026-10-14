@@ -59,7 +59,7 @@ class _RotatingTextStream:
         text = str(message)
         with self._lock:
             stream = self._handler.stream
-            if stream is None:
+            if stream is None or getattr(stream, "closed", False):
                 stream = self._handler._open()
                 self._handler.stream = stream
             try:
@@ -68,22 +68,34 @@ class _RotatingTextStream:
                 if self._handler.maxBytes > 0 and stream.tell() + encoded_size >= self._handler.maxBytes:
                     self._handler.doRollover()
                     stream = self._handler.stream
-                    if stream is None:
+                    if stream is None or getattr(stream, "closed", False):
                         stream = self._handler._open()
                         self._handler.stream = stream
             except OSError:
                 # Keep stderr usable even if the platform temporarily refuses rollover.
                 pass
-            if stream is None:
+            if stream is None or getattr(stream, "closed", False):
                 stream = self._handler._open()
                 self._handler.stream = stream
-            stream.write(text)
-            stream.flush()
+            try:
+                stream.write(text)
+                stream.flush()
+            except (ValueError, OSError):
+                stream = self._handler._open()
+                self._handler.stream = stream
+                stream.write(text)
+                stream.flush()
         return len(text)
 
     def flush(self) -> None:
         if not self._closed:
-            self._handler.flush()
+            with self._lock:
+                stream = self._handler.stream
+                if stream is not None and not getattr(stream, "closed", False):
+                    try:
+                        self._handler.flush()
+                    except (ValueError, OSError):
+                        pass
 
     def close(self) -> None:
         if self._closed:

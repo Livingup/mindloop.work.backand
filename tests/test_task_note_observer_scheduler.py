@@ -242,3 +242,54 @@ def test_build_observer_user_payload():
     assert "请独立负责支付对接" in payload
     assert "art-999" in payload
     assert "程序底层已自动插入 auto_record" in payload
+
+
+@pytest.mark.asyncio
+async def test_observer_runner_handles_assistant_message_already_appended():
+    """验证当 send_prompt 已将 assistant 响应写入 conversation 时，观察者不会报 Duplicate message_id 异常。"""
+    from unittest.mock import AsyncMock
+    from agent_runtime.llm_client.llm_request_service import LlmPromptResponse
+    from agent_runtime.task_note.task_note_observer_runner import TaskNoteObserverRunner
+
+    prompt_provider = MagicMock()
+    prompt_provider.render_system_prompt.return_value = "system prompt"
+    prompt_provider.get_note_tools.return_value = ()
+
+    mock_llm_svc = MagicMock()
+    call_count = 0
+
+    async def fake_send_prompt(req):
+        nonlocal call_count
+        call_count += 1
+        msg = UniMessage(
+            role=ROLE_ASSISTANT,
+            content=[TextPart(text=f"turn {call_count}")],
+            message_id=f"msg-test-{call_count}",
+        )
+        # 模拟真实运行时：ingest_response 已提前将 assistant message 追加到会话
+        req.conversation.append_message(msg)
+        if call_count > 1:
+            raise RuntimeError("stop observer loop for test")
+        return LlmPromptResponse(assistant_message=msg, raw_response={})
+
+    mock_llm_svc.send_prompt = AsyncMock(side_effect=fake_send_prompt)
+
+    runner = TaskNoteObserverRunner(
+        prompt_provider=prompt_provider,
+        llm_request_service=mock_llm_svc,
+        local_tool_gateway=MagicMock(),
+    )
+
+    inp = ObserverSessionInput(
+        task_id="t1",
+        agent_instance_id="a1",
+        run_id="r1",
+        conversation_id="c1",
+        target_seq=1,
+        note_snapshot={},
+        incremental_units=[],
+    )
+
+    res = await runner(inp)
+    assert res.success is False
+    assert "stop observer loop for test" in (res.error_message or "")
