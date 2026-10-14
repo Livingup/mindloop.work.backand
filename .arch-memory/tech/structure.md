@@ -29,7 +29,7 @@ src/agent_runtime/task_note/task_note_tool.py                  TASK_NOTE-07 TASK
 src/agent_runtime/task_note/task_note_store.py                 TASK_NOTE-04 TASK_NOTE-10 TASK_NOTE-11 TASK_NOTE-12 TASK_NOTE-19
 src/agent_runtime/task_note/task_note_snapshot_service.py      TASK_NOTE-03 TASK_NOTE-13
 src/agent_runtime/task_note/task_note_event_recorder.py        TASK_NOTE-02
-src/agent_runtime/task_note/task_note_observer_runner.py       TASK_NOTE-14 [task_note·观察会话循环]
+src/agent_runtime/task_note/task_note_observer_runner.py       TASK_NOTE-14 TASK_NOTE-20 [task_note·观察会话循环]
 src/agent_runtime/task_note/task_note_observer_binding.py      TASK_NOTE-08 [task_note·目标实例与 run_id 注入]
 src/agent_runtime/task_note/task_note_observer_scheduler.py    [task_note·观察启动与 units 序列化]
 src/agent_runtime/task_note/task_note_context_assembler.py     [task_note·替换内容组装]

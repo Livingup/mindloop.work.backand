@@ -17,13 +17,14 @@
 - 快照消息：替换后作为首条 user 消息的手记；尾部首条为 user 时与之合并
 - 继承段：子 Agent 会话中边界消息及之前复制自父辈的前缀，只作背景
 - 压缩门禁阈值：模型 compression_threshold，缺省为 context_window × default_threshold_ratio；按 last_context_usage 加之后新增消息的估算判断，没有 usage 时不压缩
-- 观察触发阈值：observer_trigger_tokens，与断点之后的消息估算比较
+- 观察触发阈值：T = min(observer_trigger_tokens, 压缩门禁阈值 × 0.5)，与起算范围的消息估算比较
+- 起算范围：起点消息中合并进来的原文（content[1:]）+ 起点之后到当前最后一条消息；起点取 covered_until，没有则取 prefix
 - 推进比例：observer_min_advance_ratio，断点 seq 及之前的 units 占本次 units 的比例
 - 快照标题：快照消息首个文本块的固定前缀“# 任务手记快照”
 
 ## 状态流转
 观察（每实例）：无观察 →(增量达到触发阈值) 观察中 →(note_update_end 通过) 无观察，断点推进
-观察（每实例）：观察中 →(观察失败 / 重启后 run_id 失效 / Agent 结束时取消) 无观察，断点不变
+观察（每实例）：观察中 →(观察失败 / 200 轮 LLM 请求用完 / 准备阶段出错 / 重启后 run_id 失效 / Agent 结束时取消) 无观察，断点不变
 上下文：原始会话 →(达到压缩门禁阈值，等本实例观察结束) 命中门禁 →(note_version=0 或断点后增量 ≥ 门禁阈值) 同步观察 → 替换
 上下文：命中门禁 →(note_version≥1) 系统提示词 + 快照消息 + 断点之后的原始消息
 Mission：pending / in_progress →(TASK_NOTE-09 的完成条件) completed
@@ -50,3 +51,4 @@ Mission：completed / abandoned →(裁剪) 已裁剪
 - TASK_NOTE-17 观察失败时断点不得推进，下次从原断点重新观察。
 - TASK_NOTE-18 替换前缀时，若本实例有观察在运行，必须等其结束；note_version 为 0 或断点后增量不低于门禁阈值时，必须先同步完成一次观察再替换；同步观察后 note_version 仍为 0 时不得替换。
 - TASK_NOTE-19 Note 存储不可用时 Note 工具必须返回 TASK_NOTE_STORAGE_UNAVAILABLE，快照读取失败时不得替换上下文、不得推进断点。
+- TASK_NOTE-20 观察者一次观察最多 200 轮 LLM 请求，用完按观察失败处理；不得另设其他限制。
